@@ -4,10 +4,10 @@ hal_module: telescope_cdk700
 hal_class: Cdk700
 
 # connection info
-host: '192.168.1.3'
+host: '192.168.1.4'
 port: 44444
 
 instrument:
   - spectrograph_kiwispec.yaml
-  - camera_andor1.yaml
+  - camera_andor2.yaml
 

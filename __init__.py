@@ -2,7 +2,7 @@ import logging
 from pathlib import Path
 import time
 
-from mearth.daily_dir_file_handler import DailyDirTimedRotatingFileHandler
+from robofast.daily_dir_file_handler import DailyDirTimedRotatingFileHandler
 
 log_root = Path(__file__).resolve().parent / "logs"
 logger = logging.getLogger()

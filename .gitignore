@@ -1,3 +1,5 @@
-/logs/*
-/data/*
 /credentials/*
+/data/*
+/logs/*
+venv/*
+.idea/*

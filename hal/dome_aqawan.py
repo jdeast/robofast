@@ -1,5 +1,4 @@
 import telnetlib3
-import telnetlib
 import yaml
 import asyncio
 import logging
@@ -18,6 +17,8 @@ class Aqawan:
 
         self.host = config["host"]
         self.port = config["port"]
+
+        self.closed = True
 
         self.loop = asyncio.get_event_loop()
 
@@ -88,7 +89,7 @@ class Aqawan:
         timeout = 500
         elapsedTime = 0
 
-        response = self.loop.run_until_complete(self.send('CLOSE_SEQUENTIAL'))
+        response = self.loop.run_until_complete(self._send('CLOSE_SEQUENTIAL'))
         if 'Success=TRUE' not in response: return True
         return False
 
@@ -110,8 +111,6 @@ class Aqawan:
 
         # open the shutter
         start = datetime.datetime.utcnow()
-        # response = asyncio.run(self.send('OPEN_SHUTTER_' + str(shutter)))
-        # response = await self.send('OPEN_SHUTTER_' + str(shutter))
         response = self.loop.run_until_complete(self._send('OPEN_SHUTTER_' + str(shutter)))
         self.logger.info(response)
 
@@ -205,6 +204,18 @@ class Aqawan:
     # close the dome
     def close(self):
         self._close_both()
+
+    def is_open(self, check=False):
+        if check:
+            status = self.status()
+            self.closed = not status["open"]
+        return not self.closed
+
+    def is_closed(self, check=False):
+        if check:
+            status = self.status()
+            self.closed = not status["open"]
+        return self.closed
 
     # slave the dome to the telescope
     def slave(self):

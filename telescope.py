@@ -8,7 +8,7 @@ import astropy.units as u
 
 class TelescopeBase:
 
-    def __init__(self):
+    def __init__(self, config_file):
         # universal properties go here
         self.header = {}
         pass
@@ -20,7 +20,7 @@ class TelescopeBase:
 
         pass
 
-    def slew(self, ra_icrs, dec_icrs, epoch=epoch):
+    def slew(self, ra_icrs, dec_icrs, epoch="J2000"):
         # convert to alt/az
         altaz = icrs_to_altaz(ra_icrs, dec_icrs)
 
@@ -116,20 +116,26 @@ class TelescopeBase:
         If center_brightest is True, it slews to random bright stars, centers them, and uses their coordinates to compute the actual and observed coordinates. Otherwise, it will slew to a grid of RA/dec, platesolve, and use the center coordinates.
         """
 
-
-
         self.pointing_model = self.compute_pointing_model()
 
 
-def load_telescope(config)
-    with open(config) as f:
+def load_telescope(config_file):
+    with open(config_file) as f:
         config = yaml.safe_load(f)
 
+    pkg_name = __package__
+    hal_module_name = config["hal_module"]
+    hal_class_name = config["hal_class"]
+    full_module_name = f"{pkg_name}.hal.{hal_module_name}"
+
     # import the hardware abstraction layer
-    hal_class = importlib.import_module(config["hal_class"])
+    mod = importlib.import_module(full_module_name)
+    hal_class = getattr(mod, hal_class_name)
 
     class Telescope(TelescopeBase, hal_class):
-        pass
+        def __init__(self):
+            TelescopeBase.__init__(self, config_file)
+            hal_class.__init__(self,config_file)
 
     return Telescope()
 

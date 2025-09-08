@@ -1,0 +1,13 @@
+# hardware abstraction layer 
+# custom code that exposes standard functions for specific hardware
+hal_module: aqawan
+hal_class: Aqawan
+
+# connection info
+host: localhost
+port: 7200
+
+# what telescopes are in this dome?
+telescope: 
+ - t3.yaml
+ - t4.yaml

@@ -1,0 +1,3 @@
+[Setup]
+hardware_abtraction_layer = 'mearth_south_roof'
+telescope = 'tel11.ini','tel12.ini','tel13.ini','tel14.ini','tel15.ini','tel16.ini','tel17.ini','tel18.ini'

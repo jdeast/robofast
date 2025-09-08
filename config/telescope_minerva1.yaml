@@ -1,0 +1,7 @@
+[Setup]
+host = 'tel11'
+port = 3040
+hal_module: telescope_paramount
+hal_class: Paramount
+instrument = ''
+

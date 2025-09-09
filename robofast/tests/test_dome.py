@@ -1,5 +1,3 @@
-import pytest
-from unittest.mock import MagicMock, patch
 from pathlib import Path
 import logging
 import ipdb
@@ -15,11 +13,13 @@ from robofast import dome
 root_dir = Path(__file__).resolve().parent.parent
 config_file = root_dir / "config" / "dome_aqawan1.yaml"
 
-d = dome.load_dome(config_file)
-#status = d.status()
-#ipdb.set_trace()
+# d = dome.load_dome(config_file)
+# status = d.status()
+# ipdb.set_trace()
 
 # ----- Tests -----
+
+
 def test_low_level_status():
     d = dome.load_dome(config_file)
     status = d._status()
@@ -29,18 +29,21 @@ def test_low_level_status():
                      'EnclTemp', 'EnclExhaustTemp', 'EnclIntakeTemp', 'LightsOn']
     assert set(required_keys).issubset(status.keys())
 
-# test the high-level status function, general to all domes
+
 def test_high_level_status():
+    """" test the high-level status function, general to all domes """
     d = dome.load_dome(config_file)
     status = d.status()
-    required_keys = ['open','tracking']
+    required_keys = ['open', 'tracking']
     assert set(required_keys).issubset(status.keys())
+
 
 def test_hal_methods():
     d = dome.load_dome(config_file)
     d.close()
     assert d.is_closed is True
     assert d.is_open is False
+
 
 def test_logs_recording(caplog):
     d = dome.load_dome(config_file)

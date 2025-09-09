@@ -1,5 +1,5 @@
-/credentials/*
-/data/*
-/logs/*
+/robofast/credentials/*
+/robofast/data/*
+/robofast/logs/*
 venv/*
 .idea/*

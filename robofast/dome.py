@@ -12,6 +12,7 @@ This is a generic dome class that controls any dome via a custom hardware abstra
 This class is used by dome_daemon.py to independently control the dome, monitoring weather, site, and user inputs
 """
 
+
 class DomeBase(ABC):
 
     def __init__(self, config):
@@ -61,6 +62,7 @@ class DomeBase(ABC):
     @abstractmethod
     def in_error_state(self): pass
 
+
 def load_dome(config_file):
     with open(config_file) as f:
         config = yaml.safe_load(f)
@@ -85,7 +87,7 @@ def load_dome(config_file):
         # we must write our own pass-through definitions here
         # for required functions.
         #
-        # We can also enhance them by adding logging and error handling
+        # We can also wrap them in general logging and error handling
         def open(self):
             if not self.is_open:
                 self.logger.info("Opening the dome")

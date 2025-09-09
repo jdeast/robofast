@@ -4,13 +4,16 @@ import logging
 import time
 import datetime
 
-#from robofast import mail
+# from robofast import mail
 
 class Aqawan:
 
     def __init__(self, config):
 
+        # goes into robofast.log
         self.logger = logging.getLogger()
+
+        # goes into aqawan.log
         # self.logger = logging.getLogger(__name__)
 
         self.host = config["host"]

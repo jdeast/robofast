@@ -1,0 +1,24 @@
+# hardware abstraction layer
+# custom code that exposes standard functions for specific hardware
+hal_module: camera_ascom # filename of python code
+hal_class: AscomCamera # class name inside python
+
+# connection info (we'll run a custom TCP server to relay commands to the ASCOM driver?)
+host: localhost
+port: 7100
+driver: ASCOM.Apogee.Camera
+
+# these must be unique for a given telescope
+id: apogee1
+num: 1
+
+# settings/properties of the camera (made up for now)
+gain: 1
+platescale: 0.3
+
+# config files for other hardware associated with this camera
+focuser: focuser_mearth1.yaml
+filterwheel: filterwheel_mearth1.yaml
+guider: None
+pdu: pdu_mearth1.yaml
+ao: None

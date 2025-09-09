@@ -199,7 +199,7 @@ class Weather:
             #S website is Date, Mearth, HAT, Aurora, MINERVA.
             # this has a reading every 5 minutes since September 2014
             url = 'http://linmax.sao.arizona.edu/temps/sky_temps_now'
-            #S Try everything, but if anyhting fails we really want to stay closed.
+            #S Try everything, but if anyhting fails we really want to stay _is_closed.
             try:
                 #S Read the last line from the url above, and split it at the spaces.
                 cloudstr = os.popen('curl -s ' + url).read().split(' ')
@@ -334,7 +334,7 @@ class Weather:
             self.logger.debug("Enclosure open; using the close limits")
             weatherLimits = copy.deepcopy(self.closeLimits)
         else:
-            self.logger.debug("Enclosure closed; using the open limits")
+            self.logger.debug("Enclosure _is_closed; using the open limits")
             weatherLimits = copy.deepcopy(self.openLimits)
 
         # change it during execution

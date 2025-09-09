@@ -8,17 +8,20 @@ import astropy.units as u
 
 class TelescopeBase:
 
-    def __init__(self, config_file):
+    def __init__(self, config):
         # universal properties go here
         self.header = {}
-        pass
+
+        # create a list (dictionary?) of instruments
+        self.instrument = []
+        for instrument_config_basename in config["instrument"]:
+            instrument_config_file = root_dir / "config" / instrument_config_basename
+            self.instrument.append(instrument.load_instrument(instrument_config_file))
 
     def initialize(self, tracking=True, derotate=True, pointing_model_file='config/pointing_model.yaml'):
 
         self.pointing_model = self.compute_pointing_model(pointing_model_file)
         self.header["P_MODEL"] = (pointing_model_file,'Pointing model file')
-
-        pass
 
     def slew(self, ra_icrs, dec_icrs, epoch="J2000"):
         # convert to alt/az
@@ -129,13 +132,22 @@ def load_telescope(config_file):
     full_module_name = f"{pkg_name}.hal.{hal_module_name}"
 
     # import the hardware abstraction layer
-    mod = importlib.import_module(full_module_name)
-    hal_class = getattr(mod, hal_class_name)
+    hal_module = importlib.import_module(full_module_name)
+    hal_class = getattr(hal_module, hal_class_name)
 
     class Telescope(TelescopeBase, hal_class):
         def __init__(self):
-            TelescopeBase.__init__(self, config_file)
-            hal_class.__init__(self,config_file)
+            self._hal = hal_class(config)
+            TelescopeBase.__init__(self, config)
+            hal_class.__init__(self, config)
+
+        # normally these definitions would be handled by ABC,
+        # but the dynamically loaded class causes problems
+        # we must write our own pass-through definitions here
+        # for required functions.
+        #
+        # We can also enhance them by adding logging and error handling
+
 
     return Telescope()
 

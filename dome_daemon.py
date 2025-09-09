@@ -93,7 +93,7 @@ def domeControl(dome, base_directory='/home/minerva/minerva-control'):
             else:
                 dome.logger.info('Weather not ok to open')
 
-            # regardless, make sure the dome is closed.
+            # regardless, make sure the dome is _is_closed.
             dome.close_both()
 
         elif (datetime.datetime.utcnow() -
@@ -101,7 +101,7 @@ def domeControl(dome, base_directory='/home/minerva/minerva-control'):
                 and not timeoutOverride:
             dome.logger.info('Conditions must be favorable for 30 minutes\
              before opening; last bad weather at ' + str(test_site.lastClose))
-            dome.close_both()  # should already be closed, but for good measure...
+            dome.close_both()  # should already be _is_closed, but for good measure...
 
         elif not openRequested:
             dome.logger.info("Weather is ok, but domes are not requested to be open")

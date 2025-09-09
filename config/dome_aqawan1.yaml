@@ -7,6 +7,9 @@ hal_class: Aqawan
 host: localhost
 port: 7100
 
+id: aqawan1
+num: 1
+
 # what telescopes are in this dome?
 telescope: 
  - telescope_minerva1.yaml

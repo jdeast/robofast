@@ -1,28 +1,48 @@
 import telnetlib3
-import yaml
 import asyncio
 import logging
 import time
+import datetime
+
+#from robofast import mail
 
 class Aqawan:
 
-    def __init__(self, config_file):
+    def __init__(self, config):
 
-        self.logger = logging.getLogger() 
-        #self.logger = logging.getLogger(__name__) 
-
-
-        with open(config_file) as f:
-            config = yaml.safe_load(f)
+        self.logger = logging.getLogger()
+        # self.logger = logging.getLogger(__name__)
 
         self.host = config["host"]
         self.port = config["port"]
 
-        self.closed = True
+        self.id = config["id"]
+        self.num = str(config["num"])
+
+        self._is_closed = True
 
         self.loop = asyncio.get_event_loop()
 
+        self.allowed_messages = ['HEARTBEAT', 'STOP', 'OPEN_SHUTTERS', 'CLOSE_SHUTTERS',
+                                 'CLOSE_SEQUENTIAL', 'OPEN_SHUTTER_1', 'CLOSE_SHUTTER_1',
+                                 'OPEN_SHUTTER_2', 'CLOSE_SHUTTER_2', 'LIGHTS_ON',
+                                 'LIGHTS_OFF', 'ENC_FANS_HI', 'ENC_FANS_MED',
+                                 'ENC_FANS_LOW', 'ENC_FANS_OFF', 'PANEL_LED_GREEN',
+                                 'PANEL_LED_YELLOW', 'PANEL_LED_RED', 'PANEL_LED_OFF',
+                                 'DOOR_LED_GREEN', 'DOOR_LED_YELLOW', 'DOOR_LED_RED',
+                                 'DOOR_LED_OFF', 'SON_ALERT_ON', 'SON_ALERT_OFF',
+                                 'LED_STEADY', 'LED_BLINK', 'MCB_RESET_POLE_FANS',
+                                 'MCB_RESET_TAIL_FANS', 'MCB_RESET_OTA_BLOWER',
+                                 'MCB_RESET_PANEL_FANS', 'MCB_TRIP_POLE_FANS',
+                                 'MCB_TRIP_TAIL_FANS', 'MCB_TRIP_PANEL_FANS',
+                                 'STATUS', 'GET_ERRORS', 'GET_FAULTS', 'CLEAR_ERRORS',
+                                 'CLEAR_FAULTS', 'RESET_PAC']
+
     async def _send(self, message):
+        if message not in self.allowed_messages:
+            self.logger.error("Command " + message + " not allowed")
+            return ""
+
         reader, writer = await telnetlib3.open_connection(
             host=self.host,
             port=self.port,
@@ -54,14 +74,30 @@ class Aqawan:
         finally:
             writer.close()
 
+    def _get_errors(self):
+        response = self.loop.run_until_complete(self._send('GET_ERRORS'))
+        return response
+
+    def _clear_errors(self):
+        response = self.loop.run_until_complete(self._send('CLEAR_ERRORS'))
+        return response
+
+    def _get_faults(self):
+        response = self.loop.run_until_complete(self._send('GET_FAULTS'))
+        return response
+
+    def _clear_faults(self):
+        response = self.loop.run_until_complete(self._send('CLEAR_FAULTS'))
+        return response
+
     def _status(self):
-        requiredKeys = ['Shutter1', 'Shutter2', 'SWVersion', 'EnclHumidity',
-                        'EntryDoor1', 'EntryDoor2', 'PanelDoor', 'Heartbeat',
-                        'SystemUpTime', 'Fault', 'Error', 'PanelExhaustTemp',
-                        'EnclTemp', 'EnclExhaustTemp', 'EnclIntakeTemp', 'LightsOn']
+        required_keys = ['Shutter1', 'Shutter2', 'SWVersion', 'EnclHumidity',
+                         'EntryDoor1', 'EntryDoor2', 'PanelDoor', 'Heartbeat',
+                         'SystemUpTime', 'Fault', 'Error', 'PanelExhaustTemp',
+                         'EnclTemp', 'EnclExhaustTemp', 'EnclIntakeTemp', 'LightsOn']
 
         response_raw = self.loop.run_until_complete(self._send('STATUS'))
-        #self.logger.debug("Raw response:", repr(response_raw))
+        # self.logger.debug("Raw response:", repr(response_raw))
 
         response = response_raw.split(',')
         status = {}
@@ -71,7 +107,7 @@ class Aqawan:
                 key, value = entry.split('=', 1)
                 status[key.strip()] = value.strip()
 
-        missing_keys = [k for k in requiredKeys if k not in status]
+        missing_keys = [k for k in required_keys if k not in status]
         if not missing_keys:
             return status
 
@@ -83,8 +119,7 @@ class Aqawan:
             self.logger.error('Could not turn off lights')
         return response
 
-
-        # close both shutters
+    # close both shutters
     def _close_both(self):
         timeout = 500
         elapsedTime = 0
@@ -114,7 +149,7 @@ class Aqawan:
         response = self.loop.run_until_complete(self._send('OPEN_SHUTTER_' + str(shutter)))
         self.logger.info(response)
 
-        if not 'Success = TRUE' in response:
+        if 'Success = TRUE' not in response:
             # did the command fail?
             self.logger.warning('Failed to open shutter ' +
                                 str(shutter) +
@@ -166,70 +201,97 @@ class Aqawan:
             self.logger.error('Could not turn off lights')
 
         self.logger.debug('Opening shutter ' + str(first))
-        response = self.open_shutter(first)
+        response = self._open_shutter(first)
         if response == -1:
             return -1
 
         self.logger.debug('Shutter ' + str(first) + ' open')
         self.logger.debug('Opening shutter ' + str(second))
-        response = self.open_shutter(second)
+        response = self._open_shutter(second)
         if response == -1:
             return -1
 
         self.logger.debug('Shutter ' + str(second) + ' open')
 
-    #### These low-level functions are required for the higher-level interface ###
+    """ These low-level functions are required for the higher-level interface """
 
-    # identify if the dome is in an error state
-    def in_error_state(self):
-        aqawan_status = self._status()
+    # open the dome
+    def open(self):
+        status = self.status()
+        self._is_closed = not status["open"]
+
+    # close the dome
+    def close(self):
+        self._close_both()
+        status = self.status()
+        self._is_closed = not status["open"]
+
+    def heartbeat(self):
+        return self.loop.run_until_complete(self._send('HEARTBEAT'))
+
+    def add_header_keys(self, hdr):
+        """ add enclosure specific keywords """
+        status = self._status()
+        hdr['AQSOFTV' + self.num] = (status['SWVersion'], "Aqawan software version number")
+        hdr['AQSHUT1' + self.num] = (status['Shutter1'], "Aqawan shutter 1 state")
+        hdr['AQSHUT2' + self.num] = (status['Shutter2'], "Aqawan shutter 2 state")
+        hdr['INHUMID' + self.num] = (float(status['EnclHumidity']), "Humidity inside enclosure")
+        hdr['DOOR1' + self.num] = (status['EntryDoor1'], "Door 1 into aqawan state")
+        hdr['DOOR2' + self.num] = (status['EntryDoor2'], "Door 2 into aqawan state")
+        hdr['PANELDR' + self.num] = (status['PanelDoor'], "Aqawan control panel door state")
+        hdr['HRTBEAT' + self.num] = (int(status['Heartbeat']), "Heartbeat timer")
+        hdr['AQPACUP' + self.num] = (status['SystemUpTime'], "PAC uptime (seconds)")
+        hdr['AQFAULT' + self.num] = (status['Fault'], "Aqawan fault present?")
+        hdr['AQERROR' + self.num] = (status['Error'], "Aqawan error present?")
+        hdr['PANLTMP' + self.num] = (float(status['PanelExhaustTemp']), "Aqawan control panel exhaust temp (C)")
+        hdr['AQTEMP' + self.num] = (float(status['EnclTemp']), "Enclosure temperature (C)")
+        hdr['AQEXTMP' + self.num] = (float(status['EnclExhaustTemp']), "Enclosure exhaust temperature (C)")
+        hdr['AQINTMP' + self.num] = (float(status['EnclIntakeTemp']), "Enclosure intake temperature (C)")
+        hdr['AQLITON' + self.num] = (status['LightsOn'], "Aqawan lights on?")
+        return hdr
+
+    # prepare the dome for observing (turn lights off, fans on, etc)
+    def prep_for_observing(self):
+        # aqawan_status = self._status()
+        self._lights_off()
+        # return not self.in_error_state
+
+    # slave the dome to the telescope
+    def slave(self):
+        # aqawans are clamshells with no tracking necessary; it's always slaved
+        return self.is_open
 
     # a procedure to autonomously recover from an error state
     def recover(self):
         return False
 
+    @property
+    def is_open(self):
+        return not self._is_closed
+
+    @property
+    def is_closed(self):
+        self.logger.info(str(self._is_closed))
+        return self._is_closed
+
     # is the dome ready to observe? (lights off, fans on, etc)
+    @property
     def ready_to_observe(self):
-        pass
+        return True
 
-    # prepare the dome for observing (turn lights off, fans on, etc)
-    def prep_for_observing(self):
-        aqawan_status = self._status()
-        self._lights_off()
-
-    # open the dome
-    def open(self):
-        pass
-
-    # close the dome
-    def close(self):
-        self._close_both()
-
-    def is_open(self, check=False):
-        if check:
-            status = self.status()
-            self.closed = not status["open"]
-        return not self.closed
-
-    def is_closed(self, check=False):
-        if check:
-            status = self.status()
-            self.closed = not status["open"]
-        return self.closed
-
-    # slave the dome to the telescope
-    def slave(self):
-        # aqawans are clamshells with no tracking necessary; it's always slaved
-        return self.is_open()
+    # identify if the dome is in an error state
+    @property
+    def in_error_state(self):
+        status = self._status()
+        return (status['Fault'] == "TRUE") or (status['Error'] == "TRUE")
 
     # return a standard status dictionary 
     def status(self):
 
         aqawan_status = self._status()
 
-        status = {}
-        status["open"] = (aqawan_status["Shutter1"] == "OPEN"  and aqawan_status["Shutter2"] == "OPEN")
-        status["tracking"] = "Not Enabled"
+        status = {"open": (aqawan_status["Shutter1"] == "OPEN" and aqawan_status["Shutter2"] == "OPEN"),
+                  "tracking": "Not Enabled"}
 
         return status
 

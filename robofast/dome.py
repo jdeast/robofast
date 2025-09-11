@@ -15,17 +15,19 @@ This class is used by dome_daemon.py to independently control the dome, monitori
 
 class DomeBase(ABC):
 
-    def __init__(self, config):
+    def __init__(self, config, observer, directory):
 
         self.logger = logging.getLogger()
 
-        root_dir = Path(__file__).resolve().parent
+        # create a dictionary of telescopes inside the dome
+        # for each entry in the config file
+        self.telescope = {}
+        dir = Path(__file__).resolve().parent / "config"
+        for telescope_config in config["telescope"]:
+            t = telescope.load_telescope(dir / telescope_config, observer, directory)
+            self.telescope[t.id] = t
 
-        # create a list (dictionary?) of telescopes
-        self.telescope = []
-        for telescope_config_basename in config["telescope"]:
-            telescope_config_file = root_dir / "config" / telescope_config_basename
-            self.telescope.append(telescope.load_telescope(telescope_config_file))
+        self.obs = observer.Observer(dir / config["observer"])
 
     @abstractmethod
     def open(self): pass
@@ -63,7 +65,7 @@ class DomeBase(ABC):
     def in_error_state(self): pass
 
 
-def load_dome(config_file):
+def load_dome(config_file, observer, directory):
     with open(config_file) as f:
         config = yaml.safe_load(f)
 
@@ -81,6 +83,8 @@ def load_dome(config_file):
             self._hal = hal_class(config)
             DomeBase.__init__(self, config)
             hal_class.__init__(self, config)
+            self.obs = observer
+            self.directory = directory
 
         # normally these definitions would be handled by ABC,
         # but the dynamically loaded class causes problems

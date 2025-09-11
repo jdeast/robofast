@@ -16,7 +16,6 @@ handler = DailyDirTimedRotatingFileHandler(
     backupCount=30
 )
 
-#fmt = "%(asctime)s.%(msecs).03d [%(filename)s:%(lineno)s - %(funcName)s()] %(levelname)s: %(threadName)s: %(message)s"
 fmt = "{asctime} [{filename}:{lineno} - {funcName}()] {levelname}: {threadName}: {message}"
 
 datefmt = "%Y-%m-%dT%H:%M:%S"

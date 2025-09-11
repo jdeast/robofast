@@ -192,4 +192,19 @@ def load_camera(config_file):
             CameraBase.__init__(self, config)
             hal_class.__init__(self, config)
 
+        def get_header_keys(self,hdr=None):
+
+            if hdr is None: hdr = fits.Header()
+            hdr['DATE-OBS'] = (self.dateobs.strftime('%Y-%m-%dT%H:%M:%S.%f'), 'Observation start, UTC')
+            hdr['EXPTIME'] = (self.exptime, 'Exposure time in seconds')
+            hdr['CCDSUM'] = (str(self.xbin) + ' ' + str(self.ybin), 'CCD on-chip binning')
+            datasec = '[' + str(self.x1) + ':' + str(self.x2) + ',' + str(self.y1) + ':' + str(self.y2) + ']'
+            hdr['DATASEC'] = (datasec, 'Region of CCD read')
+            hdr['CCDTEMP'] = (self.temperature, 'CCD Temperature (C)')
+            hdr['SETTEMP'] = (self.set_temperature, 'CCD Set Temperature (C)')
+
+            # now get hardward-specific header keywords
+            hdr = self._hal.get_header_keys(hdr)
+            return hdr
+
     return Camera()

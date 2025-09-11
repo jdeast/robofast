@@ -6,7 +6,9 @@ hal_class: AscomCamera # class name inside python
 # connection info (we'll run a custom TCP server to relay commands to the ASCOM driver?)
 host: localhost
 port: 7100
-driver: ASCOM.Apogee.Camera
+# driver: ASCOM.Apogee.Camera
+# driver: ASCOM.Simulator.Camera
+driver: ASCOM.OmniSim.Camera
 
 # these must be unique for a given telescope
 id: apogee1

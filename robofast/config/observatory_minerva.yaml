@@ -1,0 +1,13 @@
+latitude: 31.680407     # deg N
+longitude: -110.878977  # deg E
+elevation: 2316.0       # m
+
+weather: weather_flwo.yaml
+
+dome:
+  - dome_aqawan1.yaml
+  - dome_aqawan2.yaml
+
+observer: observer_minerva.yaml
+
+directory: directory_minerva.txt

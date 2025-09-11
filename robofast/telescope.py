@@ -13,14 +13,16 @@ class TelescopeBase:
         self.header = {}
 
         # create a list (dictionary?) of instruments
-        # root_dir = root_dir = Path(__file__).resolve().parent
-        # self.instrument = []
-        # for instrument_config_basename in config["instrument"]:
-        #     instrument_config_file = root_dir / "config" / instrument_config_basename
-        #     self.instrument.append(instrument.load_instrument(instrument_config_file))
+        # dir = root_dir = Path(__file__).resolve().parent / "config"
+        # self.instrument = {}
+        # for instrument_config in config["instrument"]:
+        #     inst = instrument.load_instrument(dir / instrument_config)
+        #     self.instrument[inst.id] = inst
+
+        self.pointing_model_file = config["pointing_model"]
 
     def initialize(self, pointing_model_file='config/pointing_model.yaml'):
-        self.pointing_model = self.compute_pointing_model(pointing_model_file)
+        self.pointing_model = self.compute_pointing_model(self.pointing_model_file)
         self.header["P_MODEL"] = (pointing_model_file,'Pointing model file')
 
     def slew(self, ra_icrs, dec_icrs, epoch="J2000"):

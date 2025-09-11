@@ -152,7 +152,8 @@ setup(
         'astroquery',
         'pywin32',
         'pytest',
-        'pyyaml'
+        'pyyaml',
+        'pyephem'
     ]
 
     # List additional groups of dependencies here (e.g. development

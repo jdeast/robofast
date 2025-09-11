@@ -14,3 +14,6 @@ num: 1
 telescope: 
  - telescope_minerva1.yaml
  - telescope_minerva2.yaml
+
+observer: observer_minerva.yaml
+

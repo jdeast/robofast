@@ -1,0 +1,71 @@
+# these define the limits for opening,
+# these should be more conservative than the close_limits to prevent oscillation in marginal weather
+open_limits:
+  total_rain:
+    - 0.0
+    - 1000.0
+  wxt510_rain:
+    - 0.0
+    - 999.0
+  barometer:
+    - 0.0
+    - 2000.0
+  outside_humidity:
+    - 0.0
+    - 75.0
+  outside_dew_point:
+    - -100.0
+    - 100.0
+  outside_temperature:
+    - -20.0
+    - 50.0
+  wind_speed:
+    - 0.0
+    - 30.0
+  wind_gust_speed:
+    - 0.0
+    - 35.0
+  wind_direction:
+    - 0.0
+    - 360.0
+  sun_altitude:
+    - -90
+    - 15
+  cloud:
+    - -999
+    - 999
+
+close_limits:
+  total_rain:
+    - 0.0
+    - 1000.0
+  wxt510_rain:
+    - 0.0
+    - 999.0
+  barometer:
+    - 0.0
+    - 2000.0
+  outside_humidity:
+    - 0.0
+    - 80.0
+  outside_dew_point:
+    - -100.0
+    - 100.0
+  outside_temperature:
+    - -30.0
+    - 60.0
+  wind_speed:
+    - 0.0
+    - 35.0
+  wind_gust_speed:
+    - 0.0
+    - 40.0
+  wind_direction:
+    - 0.0
+    - 360.0
+  sun_altitude:
+    - -90
+    - 15
+  cloud:
+    - -999
+    - 999

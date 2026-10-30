@@ -1,0 +1,53 @@
+"""robofast_core: a de-risking prototype of robofast's control core.
+
+This package is deliberately separate from the legacy ``robofast`` package
+(which configures file logging at import time and depends on Windows-only
+modules). Nothing here imports ``robofast``.
+
+The pieces:
+
+* :mod:`robofast_core.owner` -- one :class:`DeviceOwner` per physical device.
+  Every command to a device goes through its owner, which serializes them on a
+  dedicated worker thread, bounds each with a timeout, records it in the
+  :class:`Timeline`, and refuses commands from revoked :class:`Grant` objects
+  immediately before they are sent.
+* :mod:`robofast_core.safety` -- the :class:`SafetySupervisor`, the only
+  component allowed to open or close the enclosure. It fails closed: unsafe,
+  stale, missing or erroring weather all mean "close". It hands out expiring
+  :class:`OpenLease` objects; it reopens only after the weather has been
+  continuously safe for a hold time.
+* :mod:`robofast_core.sequencer` -- one asyncio :class:`Sequencer` per
+  enclosure. Its observing task is cancelled when the lease is revoked, and
+  cleanup aborts the exposure and parks the telescope.
+* :mod:`robofast_core.weather_server` -- a small Alpaca SafetyMonitor +
+  ObservingConditions server (the shape the real site-weather bridge will
+  take), with fault injection for tests.
+"""
+
+from robofast_core.owner import (
+    DeviceError,
+    DeviceOwner,
+    DeviceTimeout,
+    Grant,
+    GrantRevoked,
+    NotAuthorized,
+)
+from robofast_core.safety import OpenLease, SafetyConfig, SafetySupervisor
+from robofast_core.sequencer import Observation, Sequencer, SequencerConfig
+from robofast_core.timeline import Timeline
+
+__all__ = [
+    "DeviceError",
+    "DeviceOwner",
+    "DeviceTimeout",
+    "Grant",
+    "GrantRevoked",
+    "NotAuthorized",
+    "Observation",
+    "OpenLease",
+    "SafetyConfig",
+    "SafetySupervisor",
+    "Sequencer",
+    "SequencerConfig",
+    "Timeline",
+]

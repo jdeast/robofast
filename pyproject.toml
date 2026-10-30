@@ -1,0 +1,43 @@
+# Tooling for the robofast_core prototype.
+#
+# There is deliberately no [project] table here: the legacy package is still
+# described by setup.py (which pins pywin32 and other legacy dependencies),
+# and a [project] table would make setuptools take its metadata from this file
+# instead. The prototype is not installed at all; tests run from the repository
+# root (see `pythonpath` below) and its dependencies live in the dependency
+# groups, installed with `pip install --group test` (pip >= 25.1).
+
+[dependency-groups]
+core = ["alpyca>=3.1.3"]
+test = [
+    {include-group = "core"},
+    "pytest>=8",
+    "pytest-asyncio>=0.25",
+    "pytest-timeout>=2.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# The simulator tests need OmniSim; run them with `-m alpaca_sim`.
+addopts = "-ra -m 'not alpaca_sim'"
+timeout = 120
+markers = [
+    "alpaca_sim: integration test against the ASCOM Alpaca OmniSimulators (needs ROBOFAST_OMNISIM_BIN or ROBOFAST_OMNISIM_ADDRESS)",
+]
+log_level = "INFO"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# The legacy package is out of scope for the prototype's lint.
+extend-exclude = ["robofast/**", "setup.py"]
+force-exclude = true
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "RUF"]
+# ASYNC109/110: explicit timeout parameters and poll loops are the design
+# (Alpaca is a polling protocol; every await gets its own bound).
+ignore = ["RUF001", "RUF002", "RUF003", "ASYNC109", "ASYNC110"]

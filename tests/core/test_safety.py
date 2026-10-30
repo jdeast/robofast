@@ -1,0 +1,147 @@
+"""SafetySupervisor on its own (fakes, no sequencer)."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+
+from robofast_core.testing.checks import wait_until
+
+
+async def _open(rig, holder="test"):
+    lease = await asyncio.wait_for(rig.supervisor.request_open(holder), 5)
+    await asyncio.wait_for(lease.wait_open(), 5)
+    return lease
+
+
+async def test_starts_closed_and_waits_for_the_hold(make_rig):
+    rig = make_rig(safety=dict(reopen_hold=0.8))
+    t0 = time.monotonic()
+    await rig.start(sequencer=False)
+    lease = await _open(rig)
+    safe_at = rig.timeline.first_event("weather_safe").t
+    open_cmd = rig.timeline.first_event("open_commanded").t
+    assert open_cmd - safe_at >= 0.8
+    assert open_cmd - t0 >= 0.8
+    assert rig.dome_open()
+    lease.release()
+    await wait_until(rig.dome_closed, 2, what="close after release")
+
+
+async def test_unsafe_revokes_lease_and_closes(make_rig):
+    rig = make_rig()
+    await rig.start(sequencer=False)
+    lease = await _open(rig)
+    t0 = time.monotonic()
+    rig.weather.set_safe(False)
+    await asyncio.wait_for(lease.revoked.wait(), 1)
+    await wait_until(rig.dome_closed, 1, what="dome closed")
+    assert time.monotonic() - t0 < 1.0
+    assert "IsSafe" in lease.revoke_reason
+
+
+async def test_frozen_feed_is_unsafe(make_rig):
+    rig = make_rig()
+    await rig.start(sequencer=False)
+    lease = await _open(rig)
+    rig.weather.freeze()  # IsSafe stays True but the data ages
+    await asyncio.wait_for(lease.revoked.wait(), 2)
+    assert "stale" in lease.revoke_reason
+    await wait_until(rig.dome_closed, 1)
+
+
+async def test_weather_device_error_is_unsafe(make_rig):
+    rig = make_rig()
+    await rig.start(sequencer=False)
+    lease = await _open(rig)
+    rig.sm.fail("weather server gone")
+    await asyncio.wait_for(lease.revoked.wait(), 1)
+    assert "read failed" in lease.revoke_reason
+    await wait_until(rig.dome_closed, 1)
+
+
+async def test_weather_device_hang_is_unsafe_within_read_timeout(make_rig):
+    rig = make_rig()
+    await rig.start(sequencer=False)
+    lease = await _open(rig)
+    t0 = time.monotonic()
+    rig.sm.hang()
+    await asyncio.wait_for(lease.revoked.wait(), 2)
+    await wait_until(rig.dome_closed, 1)
+    # read_timeout 0.3 + poll 0.05 + shutter travel 0.2, with slack
+    assert time.monotonic() - t0 < 1.2
+
+
+async def test_flicker_restarts_the_hold(make_rig):
+    rig = make_rig(safety=dict(reopen_hold=0.6))
+    await rig.start(sequencer=False)
+    lease = await _open(rig)
+    rig.weather.set_safe(False)
+    await asyncio.wait_for(lease.revoked.wait(), 1)
+    lease.release()
+    await wait_until(rig.dome_closed, 1)
+    rig.weather.set_safe(True)
+    req = asyncio.create_task(rig.supervisor.request_open("again"))
+    await asyncio.sleep(0.4)
+    rig.weather.set_safe(False)  # blip before the hold is met
+    await asyncio.sleep(0.15)
+    rig.weather.set_safe(True)
+    t_last_safe = time.monotonic()
+    lease2 = await asyncio.wait_for(req, 3)
+    assert time.monotonic() - t_last_safe >= 0.6 - 0.06
+    await asyncio.wait_for(lease2.wait_open(), 2)
+
+
+async def test_unrenewed_lease_expires_and_closes(make_rig):
+    rig = make_rig(safety=dict(lease_ttl=0.3))
+    await rig.start(sequencer=False)
+    lease = await _open(rig)  # and never renew it
+    await asyncio.wait_for(lease.revoked.wait(), 1)
+    assert "not renewed" in lease.revoke_reason
+    await wait_until(rig.dome_closed, 1)
+
+
+async def test_no_new_lease_until_previous_released(make_rig):
+    rig = make_rig()
+    await rig.start(sequencer=False)
+    lease = await _open(rig)
+    rig.weather.set_safe(False)
+    await asyncio.wait_for(lease.revoked.wait(), 1)
+    rig.weather.set_safe(True)
+    req = asyncio.create_task(rig.supervisor.request_open("second"))
+    await asyncio.sleep(1.5)  # well past the hold
+    assert not req.done(), "granted a new lease while the old one was unreleased"
+    assert rig.dome_closed()
+    lease.release()
+    lease2 = await asyncio.wait_for(req, 2)
+    await asyncio.wait_for(lease2.wait_open(), 2)
+
+
+async def test_sequencer_cannot_command_the_dome(make_rig):
+    from robofast_core import NotAuthorized
+
+    rig = make_rig()
+    g = rig.owners["dome"].grant("seq")
+    for member in ("OpenShutter", "CloseShutter"):
+        try:
+            await g.call(member)
+        except NotAuthorized:
+            continue
+        raise AssertionError(f"{member} allowed")
+
+
+async def test_roll_off_parks_before_closing(make_rig):
+    """park_before_close: with no sequencer to park, safety parks, then closes."""
+    rig = make_rig(safety=dict(park_before_close=True, park_wait=1.0))
+    rig.tel.Unpark()
+    await rig.start(sequencer=False)
+    lease = await _open(rig)
+    rig.weather.set_safe(False)
+    await wait_until(rig.dome_closed, 3)
+    assert rig.parked()
+    park = rig.timeline.commands(device="telescope", source_prefix="safety", outcome="sent")
+    close = rig.timeline.commands(device="dome", outcome="sent")
+    close_t = [e.t for e in close if e.what == "CloseShutter"]
+    assert any(e.what == "Park" for e in park)
+    assert min(e.t for e in park if e.what == "Park") < min(close_t)
+    lease.release()

@@ -28,6 +28,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import httpx
 import pytest
 
 from robofast_core import (
@@ -133,21 +134,40 @@ def omnisim(tmp_path_factory) -> str:
         log.close()
 
 
+class _Plain:
+    """A minimal synchronous Alpaca client, independent of the one under test."""
+
+    def __init__(self, address: str, device_type: str) -> None:
+        self.http = httpx.Client(
+            base_url=f"http://{address}/api/v1/{device_type}/0/", trust_env=False, timeout=10
+        )
+        self.put("Connected", Connected="True")
+
+    def _check(self, r: httpx.Response):
+        r.raise_for_status()
+        body = r.json()
+        if body["ErrorNumber"]:
+            raise RuntimeError(f"{r.url}: {body['ErrorMessage']}")
+        return body.get("Value")
+
+    def get(self, member: str):
+        return self._check(self.http.get(member.lower()))
+
+    def put(self, member: str, **params: str):
+        return self._check(self.http.put(member.lower(), data=params))
+
+
 class Truth:
-    """Ground truth read straight from OmniSim with plain alpyca clients,
-    bypassing the owners (and therefore never in the command log)."""
+    """Ground truth read straight from OmniSim with a plain synchronous
+    client, bypassing the owners (and therefore never in the command log)."""
 
     def __init__(self, address: str) -> None:
-        from alpaca.camera import Camera
-        from alpaca.dome import Dome
-        from alpaca.telescope import Telescope
-
-        self.tel, self.cam, self.dome = Telescope(address, 0), Camera(address, 0), Dome(address, 0)
-        for d in (self.tel, self.cam, self.dome):
-            d.Connected = True
+        self.tel, self.cam, self.dome = (
+            _Plain(address, kind) for kind in ("telescope", "camera", "dome")
+        )
 
     def shutter(self) -> int:
-        return int(self.dome.ShutterStatus)
+        return int(self.dome.get("ShutterStatus"))
 
     def closed(self) -> bool:
         return self.shutter() == 1
@@ -156,10 +176,10 @@ class Truth:
         return self.shutter() == 0
 
     def parked(self) -> bool:
-        return bool(self.tel.AtPark)
+        return bool(self.tel.get("AtPark"))
 
     def camera_state(self) -> int:
-        return int(self.cam.CameraState)
+        return int(self.cam.get("CameraState"))
 
     def exposing(self) -> bool:
         return self.camera_state() == 2
@@ -170,13 +190,13 @@ class Truth:
     def reset(self) -> None:
         """Camera idle, telescope parked, shutter closed."""
         if self.camera_state() != 0:
-            self.cam.AbortExposure()
-        if self.tel.Slewing:
-            self.tel.AbortSlew()
-        if not self.tel.AtPark:
-            self.tel.Park()
+            self.cam.put("AbortExposure")
+        if self.tel.get("Slewing"):
+            self.tel.put("AbortSlew")
+        if not self.tel.get("AtPark"):
+            self.tel.put("Park")
         if self.shutter() != 1:
-            self.dome.CloseShutter()
+            self.dome.put("CloseShutter")
         deadline = time.monotonic() + 60
         while not self.safe_state():
             if time.monotonic() > deadline:
@@ -185,10 +205,12 @@ class Truth:
 
 
 @pytest.fixture
-def truth(omnisim) -> Truth:
+def truth(omnisim):
     t = Truth(omnisim)
     t.reset()
-    return t
+    yield t
+    for d in (t.tel, t.cam, t.dome):
+        d.http.close()
 
 
 @pytest.fixture

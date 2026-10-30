@@ -1,14 +1,16 @@
-"""Pure-Python stand-ins for alpyca devices (no HTTP, no simulator).
+"""Pure-Python stand-in drivers (no HTTP, no simulator).
 
 They expose the same member names the core uses (``ShutterStatus``,
-``AbortExposure``, ...), keep time with ``time.monotonic()``, and are driven
-from the owner's worker threads exactly like alpyca objects. Each has fault
-injection:
+``AbortExposure``, ...) through the same async ``get``/``set``/``call``
+protocol as :class:`~robofast_core.alpaca_client.AlpacaDevice`, and keep time
+with ``time.monotonic()``. Each has fault injection:
 
-* ``hang()`` / ``unhang()`` -- every member access blocks until released
-  (a device that stops answering);
-* ``fail(msg)`` / ``unfail()`` -- every member access raises (a device that
-  has disappeared or errors).
+* ``hang()`` / ``unhang()`` -- every command through the protocol waits until
+  released (a device that stops answering);
+* ``fail(msg)`` / ``unfail()`` -- every command raises (a device that has
+  disappeared or errors).
+
+Tests read ground truth by touching the members directly, bypassing the gate.
 
 ``FakeWeather`` backs both ``FakeSafetyMonitor`` and
 ``FakeObservingConditions``; a test sets it safe/unsafe, or "freezes" it so
@@ -17,6 +19,7 @@ injection:
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from typing import Any
@@ -27,34 +30,32 @@ class FakeDeviceError(Exception):
 
 
 class FakeDevice:
-    _plain_attrs = frozenset(
-        {"_gate", "_hung", "_failure", "_lock", "_now", "hang", "unhang", "fail", "unfail"}
-    )
+    """The owner's driver protocol (async ``get``/``set``/``call``) over plain
+    Python members; every access passes the fault gate first."""
 
     def __init__(self) -> None:
-        object.__setattr__(self, "_lock", threading.Lock())
-        object.__setattr__(self, "_hung", threading.Event())
-        object.__setattr__(self, "_failure", None)
+        self._lock = threading.Lock()
+        self._hung = threading.Event()
+        self._failure: str | None = None
         self.Connected = True
 
-    # Every public member access (get, set or call) passes the gate first.
-    def __getattribute__(self, name: str) -> Any:
-        if not name.startswith("_") and name not in FakeDevice._plain_attrs:
-            object.__getattribute__(self, "_gate")()
-        return object.__getattribute__(self, name)
+    async def _gate(self) -> None:
+        while self._hung.is_set():
+            await asyncio.sleep(0.01)
+        if self._failure is not None:
+            raise FakeDeviceError(self._failure)
 
-    def __setattr__(self, name: str, value: Any) -> None:
-        if not name.startswith("_"):
-            object.__getattribute__(self, "_gate")()
-        object.__setattr__(self, name, value)
+    async def get(self, member: str, *, timeout: float | None = None) -> Any:
+        await self._gate()
+        return getattr(self, member)
 
-    def _gate(self) -> None:
-        hung = object.__getattribute__(self, "_hung")
-        while hung.is_set():
-            time.sleep(0.01)
-        failure = object.__getattribute__(self, "_failure")
-        if failure is not None:
-            raise FakeDeviceError(failure)
+    async def set(self, member: str, value: Any, *, timeout: float | None = None) -> None:
+        await self._gate()
+        setattr(self, member, value)
+
+    async def call(self, member: str, *args: Any, timeout: float | None = None) -> Any:
+        await self._gate()
+        return getattr(self, member)(*args)
 
     def hang(self) -> None:
         self._hung.set()
@@ -63,10 +64,10 @@ class FakeDevice:
         self._hung.clear()
 
     def fail(self, msg: str = "device unreachable") -> None:
-        object.__setattr__(self, "_failure", msg)
+        self._failure = msg
 
     def unfail(self) -> None:
-        object.__setattr__(self, "_failure", None)
+        self._failure = None
 
     @staticmethod
     def _now() -> float:

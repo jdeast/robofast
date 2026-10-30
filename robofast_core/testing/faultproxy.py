@@ -1,6 +1,6 @@
 """A TCP proxy with switchable faults, for making a real device misbehave.
 
-Put it between an alpyca client and an Alpaca server (e.g. OmniSim) and
+Put it between an Alpaca client and an Alpaca server (e.g. OmniSim) and
 switch modes at any time:
 
 * ``"pass"``   -- forward bytes both ways;

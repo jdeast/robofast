@@ -1,6 +1,8 @@
 """S1-S4 end to end on pure-Python fakes (fast; no simulator).
 
-The same scenarios run against OmniSim in tests/sim/.
+Each runs twice: with the sequencer holding the supervisor in-process
+("local"), and through the supervisor's HTTP lease API ("remote"). The same
+scenarios run against OmniSim in tests/sim/.
 """
 
 from __future__ import annotations
@@ -8,11 +10,15 @@ from __future__ import annotations
 import asyncio
 import time
 
+import pytest
+
 from robofast_core.testing.checks import (
     assert_fenced_after_cancel,
     assert_generations_disjoint,
     wait_until,
 )
+
+pytestmark = pytest.mark.parametrize("lease_path", ["local", "remote"])
 
 DEVICES = ("telescope", "camera")
 BOUND = 3.0  # seconds, for the fast fake timings in conftest

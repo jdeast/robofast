@@ -1,4 +1,10 @@
-"""A rig of pure-Python fake devices behind real owners, supervisor and sequencer."""
+"""A rig of pure-Python fake devices behind real owners, supervisor and sequencer.
+
+``lease_path`` selects how the sequencer reaches the supervisor: ``"local"``
+(the in-process object) or ``"remote"`` (the supervisor's HTTP API on a
+loopback port, through :class:`RemoteSupervisor`). A test module
+parametrizes it to run both.
+"""
 
 from __future__ import annotations
 
@@ -17,7 +23,9 @@ from robofast_core import (
     SequencerConfig,
     Timeline,
 )
+from robofast_core.lease_client import RemoteSupervisor
 from robofast_core.safety import ENCLOSURE_MEMBERS
+from robofast_core.supervisor_service import SupervisorServer
 from robofast_core.testing.fakes import (
     FakeCamera,
     FakeDome,
@@ -47,6 +55,8 @@ FAST_SEQ = dict(
     error_backoff=0.5,
     max_consecutive_errors=2,
 )
+#: RemoteSupervisor timings for the "remote" lease path.
+FAST_REMOTE = dict(timeout=0.5, poll=0.3, retry=0.1)
 
 
 @dataclass
@@ -61,10 +71,17 @@ class Rig:
     owners: dict[str, DeviceOwner]
     supervisor: SafetySupervisor
     sequencer: Sequencer
+    lease_path: str = "local"
+    server: SupervisorServer | None = None
+    remote: RemoteSupervisor | None = None
     tasks: list[asyncio.Task] = field(default_factory=list)
 
     async def start(self, sequencer: bool = True) -> None:
         self.tasks.append(asyncio.create_task(self.supervisor.run(), name="supervisor"))
+        if self.lease_path == "remote":
+            self.server = await SupervisorServer(self.supervisor).start()
+            self.remote = RemoteSupervisor(self.server.url, **FAST_REMOTE)
+            self.sequencer.supervisor = self.remote
         if sequencer:
             self.tasks.append(asyncio.create_task(self.sequencer.run(), name="sequencer"))
 
@@ -75,19 +92,19 @@ class Rig:
             t.cancel()
             with contextlib.suppress(BaseException):
                 await asyncio.wait_for(t, 10)
+        if self.remote is not None:
+            await self.remote.aclose()
+        if self.server is not None:
+            await self.server.stop()
         for o in self.owners.values():
             o.close()
 
     # Ground truth straight from the fakes (no owner, no timeline).
     def dome_closed(self) -> bool:
-        return (
-            self.dome._target == 1 and self.dome._now() - self.dome._moved_at >= self.dome._travel
-        )
+        return self.dome.state() == 1
 
     def dome_open(self) -> bool:
-        return (
-            self.dome._target == 0 and self.dome._now() - self.dome._moved_at >= self.dome._travel
-        )
+        return self.dome.state() == 0
 
     def parked(self) -> bool:
         return self.tel._parked and self.tel._now() >= self.tel._park_until
@@ -100,7 +117,12 @@ class Rig:
 
 
 @pytest.fixture
-async def make_rig():
+def lease_path() -> str:
+    return "local"
+
+
+@pytest.fixture
+async def make_rig(lease_path):
     rigs: list[Rig] = []
 
     def build(
@@ -112,10 +134,12 @@ async def make_rig():
         weather_safe: bool = True,
         command_timeout: float = 0.5,
         with_conditions: bool = True,
+        heartbeat_timeout: float | None = None,
     ) -> Rig:
         tl = Timeline()
         weather = FakeWeather(safe=weather_safe)
-        dome, tel, cam = FakeDome(), FakeTelescope(), FakeCamera()
+        dome = FakeDome(heartbeat_timeout=heartbeat_timeout)
+        tel, cam = FakeTelescope(), FakeCamera()
         sm, oc = FakeSafetyMonitor(weather), FakeObservingConditions(weather)
 
         def owner(name, obj, **kw):
@@ -135,6 +159,7 @@ async def make_rig():
             safety_monitor=owners["safetymonitor"],
             observing_conditions=owners["observingconditions"] if with_conditions else None,
             telescope=owners["telescope"] if scfg.park_before_close else None,
+            heartbeat=owners["dome"] if scfg.heartbeat_interval is not None else None,
             timeline=tl,
             config=scfg,
         )
@@ -148,7 +173,7 @@ async def make_rig():
             timeline=tl,
             config=SequencerConfig(**{**FAST_SEQ, **(seq or {})}),
         )
-        rig = Rig(tl, weather, dome, tel, cam, sm, oc, owners, sup, seqr)
+        rig = Rig(tl, weather, dome, tel, cam, sm, oc, owners, sup, seqr, lease_path)
         rigs.append(rig)
         return rig
 

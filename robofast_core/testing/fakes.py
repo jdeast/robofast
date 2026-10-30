@@ -75,20 +75,52 @@ class FakeDevice:
 
 
 class FakeDome(FakeDevice):
-    """A shutter that takes ``travel`` seconds to open or close."""
+    """A shutter that takes ``travel`` seconds to open or close.
 
-    def __init__(self, travel: float = 0.2) -> None:
+    With ``heartbeat_timeout`` it also models the enclosure controller's
+    hardware watchdog (the contract is in
+    :mod:`robofast_core.heartbeat_watchdog`): ``Action("Heartbeat", "")``
+    restarts a countdown that began at power-on; when it runs out the
+    shutter starts closing by itself, and ``OpenShutter`` is refused until
+    the pings resume. (Evaluated lazily, but stamped at the moment it ran
+    out, so ground-truth timings are exact.)
+    """
+
+    def __init__(self, travel: float = 0.2, heartbeat_timeout: float | None = None) -> None:
         super().__init__()
         self._travel = travel
         self._target = 1  # closed
         self._moved_at = -1e9
+        self._heartbeat_timeout = heartbeat_timeout
+        self._pinged_at = self._now()
+        self.watchdog_trips = 0
+        self.SupportedActions = [] if heartbeat_timeout is None else ["Heartbeat"]
 
-    @property
-    def ShutterStatus(self) -> int:
+    def _tripped_at(self) -> float | None:
+        """When the watchdog ran out, if it has (call under the lock)."""
+        if self._heartbeat_timeout is None:
+            return None
+        deadline = self._pinged_at + self._heartbeat_timeout
+        return deadline if self._now() > deadline else None
+
+    def _watchdog(self) -> None:
+        tripped = self._tripped_at()
+        if tripped is not None and self._target != 1:
+            self._target = 1
+            self._moved_at = max(tripped, self._moved_at)
+            self.watchdog_trips += 1
+
+    def state(self) -> int:
+        """The shutter state, as ground truth (no fault gate)."""
         with self._lock:
+            self._watchdog()
             if self._now() - self._moved_at >= self._travel:
                 return self._target
             return 2 if self._target == 0 else 3
+
+    @property
+    def ShutterStatus(self) -> int:
+        return self.state()
 
     def _move(self, target: int) -> None:
         with self._lock:
@@ -96,7 +128,19 @@ class FakeDome(FakeDevice):
                 self._target = target
                 self._moved_at = self._now()
 
+    def Action(self, action: str, parameters: str = "") -> str:
+        if self._heartbeat_timeout is None or action.lower() != "heartbeat":
+            raise FakeDeviceError(f"action {action!r} not supported")
+        with self._lock:
+            self._watchdog()  # a late ping does not undo a trip that happened
+            self._pinged_at = self._now()
+        return "ok"
+
     def OpenShutter(self) -> None:
+        with self._lock:
+            self._watchdog()
+            if self._tripped_at() is not None:
+                raise FakeDeviceError("heartbeat lost: the watchdog holds the shutter closed")
         self._move(0)
 
     def CloseShutter(self) -> None:

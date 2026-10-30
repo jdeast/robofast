@@ -178,6 +178,8 @@ METHODS: dict[str, tuple[str, tuple[str, ...]]] = {
     "CloseShutter": ("PUT", ()),
     # observingconditions
     "TimeSinceLastUpdate": ("GET", ("SensorName",)),
+    # any device: a driver-specific action (the enclosure heartbeat)
+    "Action": ("PUT", ("Action", "Parameters")),
 }
 
 

@@ -9,13 +9,19 @@ that was not renewed, or no lease at all -- means "close". The supervisor
 never asks anyone before closing; it revokes the lease (which tells the
 sequencer to stop and clean up) and closes in the same step.
 
-Two independent loops run under one ``TaskGroup``:
+Its loops run under one ``TaskGroup``:
 
 * the weather loop reads the SafetyMonitor (and, if configured, the
   ObservingConditions ``TimeSinceLastUpdate``) every ``poll_interval``;
 * the enclosure loop enforces the decision every ``poll_interval`` (and
   immediately on a transition to unsafe). It also performs its own staleness
-  check, so a weather loop that is stuck for any reason still fails closed.
+  check, so a weather loop that is stuck for any reason still fails closed;
+* the heartbeat loop (if a heartbeat device is configured) pings the
+  enclosure hardware every ``heartbeat_interval``, but only while the
+  enclosure loop has completed a pass within ``heartbeat_max_loop_age``. If
+  the pings stop -- the supervisor crashed, hung, or its enclosure loop is
+  stuck -- the hardware closes by itself (the device contract is in
+  :mod:`robofast_core.heartbeat_watchdog`).
 
 The supervisor holds the dome owner's single *privileged* grant: the owner
 refuses ``OpenShutter``/``CloseShutter`` from anyone else.
@@ -74,6 +80,11 @@ class SafetyConfig:
     #: ourselves) before closing. Domes close immediately.
     park_before_close: bool = False
     park_wait: float = 60.0
+    #: Seconds between hardware heartbeat pings; ``None`` when the enclosure
+    #: has no heartbeat device. Keep it well below the device's own timeout.
+    heartbeat_interval: float | None = None
+    #: Ping only while the enclosure loop finished a pass within this long.
+    heartbeat_max_loop_age: float = 15.0
 
 
 class OpenLease:
@@ -146,6 +157,7 @@ class SafetySupervisor:
         timeline: Timeline,
         observing_conditions: DeviceOwner | None = None,
         telescope: DeviceOwner | None = None,
+        heartbeat: DeviceOwner | None = None,
         config: SafetyConfig | None = None,
     ) -> None:
         self.name = name
@@ -157,6 +169,9 @@ class SafetySupervisor:
         self._tel = telescope.grant(name) if telescope else None
         if self.config.park_before_close and self._tel is None:
             raise ValueError("park_before_close needs a telescope owner")
+        if (heartbeat is None) != (self.config.heartbeat_interval is None):
+            raise ValueError("a heartbeat device and heartbeat_interval go together")
+        self._hb = heartbeat.grant(f"{name}/heartbeat") if heartbeat else None
 
         self._safe = False
         self._reason = "startup (no weather read yet)"
@@ -168,6 +183,8 @@ class SafetySupervisor:
         self._closing_since: float | None = None
         self._opening_since: float | None = None
         self._parked_for_close = False
+        self._enforced_at: float | None = None
+        self._pinged_at: float | None = None
         self.shutter: int | None = None
         self.alarms: list[str] = []
 
@@ -181,6 +198,11 @@ class SafetySupervisor:
     def reason(self) -> str:
         return self._reason
 
+    @property
+    def lease(self) -> OpenLease | None:
+        """The current (or last) lease."""
+        return self._lease
+
     def open_allowed(self, now: float | None = None) -> bool:
         now = time.monotonic() if now is None else now
         return (
@@ -191,6 +213,7 @@ class SafetySupervisor:
 
     def status(self) -> dict[str, Any]:
         lease = self._lease
+        now = time.monotonic()
         return {
             "safe": self._safe,
             "reason": self._reason,
@@ -198,6 +221,8 @@ class SafetySupervisor:
             "shutter": None if self.shutter is None else Shutter(self.shutter).name,
             "lease": repr(lease) if lease else None,
             "alarms": list(self.alarms),
+            "enforced_ago": None if self._enforced_at is None else now - self._enforced_at,
+            "pinged_ago": None if self._pinged_at is None else now - self._pinged_at,
         }
 
     # -- leases -----------------------------------------------------------
@@ -398,10 +423,38 @@ class SafetySupervisor:
             except Exception as exc:  # never let the loop die
                 log.exception("enclosure loop")
                 self._alarm(f"enclosure loop error: {exc!r}")
+            else:
+                self._enforced_at = time.monotonic()
             try:
                 await asyncio.wait_for(self._wake.wait(), self.config.poll_interval)
             except TimeoutError:
                 pass
+
+    # -- heartbeat ----------------------------------------------------------
+
+    async def _heartbeat_loop(self) -> None:
+        """Ping the enclosure hardware while the enclosure loop is healthy.
+
+        Healthy means "a pass of the enclosure loop completed recently", so the
+        pings also stop when that loop is stuck, not only when the process is
+        gone.
+        """
+        cfg = self.config
+        assert self._hb is not None and cfg.heartbeat_interval is not None
+        while True:
+            enforced = self._enforced_at
+            age = None if enforced is None else time.monotonic() - enforced
+            if age is not None and age <= cfg.heartbeat_max_loop_age:
+                try:
+                    await self._hb.call("Action", "Heartbeat", "", timeout=cfg.dome_timeout)
+                    self._pinged_at = time.monotonic()
+                except DeviceError as exc:
+                    self._alarm(f"heartbeat ping failed: {exc}")
+            elif age is not None:
+                self._alarm(
+                    f"enclosure loop stuck > {cfg.heartbeat_max_loop_age} s; heartbeat withheld"
+                )
+            await asyncio.sleep(cfg.heartbeat_interval)
 
     async def run(self) -> None:
         """Run until cancelled. On the way out, try (bounded) to close."""
@@ -410,6 +463,8 @@ class SafetySupervisor:
             async with asyncio.TaskGroup() as tg:
                 tg.create_task(self._weather_loop(), name=f"{self.name}-weather")
                 tg.create_task(self._enclosure_loop(), name=f"{self.name}-enclosure")
+                if self._hb is not None:
+                    tg.create_task(self._heartbeat_loop(), name=f"{self.name}-heartbeat")
         finally:
             self._safe = False
             self._revoke_lease("supervisor stopping")

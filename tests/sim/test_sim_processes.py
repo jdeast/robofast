@@ -1,0 +1,126 @@
+"""The supervisor and the sequencer as separate processes, against OmniSim.
+
+OmniSim's dome has no heartbeat, so a :class:`HeartbeatWatchdog` (in this
+test process) stands in for the enclosure controller: the supervisor process
+pings it, and it closes the OmniSim dome when the pings stop.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import signal
+import time
+
+import pytest
+
+from robofast_core import Observation, Sequencer, SequencerConfig, Timeline
+from robofast_core.alpaca import alpaca_owner
+from robofast_core.heartbeat_watchdog import HeartbeatWatchdog
+from robofast_core.lease_client import RemoteSupervisor
+from robofast_core.testing.checks import await_until, wait_until
+from robofast_core.testing.processes import Service, SupervisorProcess
+
+from .conftest import BOUND, COMMAND_TIMEOUT, SIM_SAFETY, SIM_SEQ
+
+pytestmark = pytest.mark.alpaca_sim
+
+HB_TIMEOUT = 3.0
+SAFETY = {**SIM_SAFETY, "lease_ttl": 3.0, "heartbeat_interval": 0.5, "heartbeat_max_loop_age": 5.0}
+SEQ = {**SIM_SEQ, "lease_renew_interval": 0.5}
+REMOTE = dict(timeout=2.0, poll=1.0, retry=0.5)
+
+
+@pytest.fixture
+def watchdog(omnisim):
+    wd = HeartbeatWatchdog(omnisim, HB_TIMEOUT).start()
+    yield wd
+    wd.stop()
+
+
+@pytest.fixture
+def services():
+    started: list[Service] = []
+    yield started
+    for s in started:
+        s.stop()
+
+
+@pytest.fixture
+def supervisor(omnisim, weather, watchdog, services, truth, tmp_path):
+    _, server = weather
+    config = {
+        "listen": "127.0.0.1:0",
+        "devices": {
+            "dome": omnisim,
+            "safetymonitor": server.address,
+            "observingconditions": server.address,
+            "heartbeat": watchdog.address,
+        },
+        "safety": SAFETY,
+    }
+    proc = SupervisorProcess(config, tmp_path)
+    services.append(proc)
+    return proc
+
+
+@pytest.fixture
+async def sequencer(omnisim, supervisor):
+    tl = Timeline()
+    remote = RemoteSupervisor(supervisor.url, **REMOTE)
+    seq = Sequencer(
+        "seq",
+        supervisor=remote,
+        telescope=alpaca_owner("telescope", "telescope", omnisim, tl, default_timeout=3.0),
+        camera=alpaca_owner("camera", "camera", omnisim, tl, default_timeout=COMMAND_TIMEOUT),
+        plan=lambda: Observation("field", exptime=60.0, count=1000),
+        timeline=tl,
+        config=SequencerConfig(**SEQ),
+    )
+    task = asyncio.create_task(seq.run())
+    yield seq
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    await remote.aclose()
+
+
+async def _observing(truth) -> None:
+    await await_until(lambda: truth.open() and truth.exposing(), 90, what="open and exposing")
+
+
+@pytest.mark.parametrize("sig", [signal.SIGKILL, signal.SIGSTOP], ids=["killed", "hung"])
+async def test_supervisor_dies_watchdog_closes(
+    supervisor, sequencer, watchdog, truth, record_timing, sig
+):
+    await _observing(truth)
+    t0 = time.monotonic()
+    os.kill(supervisor.pid, sig)
+    closed = await await_until(truth.closed, BOUND, what="watchdog close")
+    await await_until(truth.safe_state, BOUND, what="closed, parked, camera idle")
+    safe = time.monotonic() - t0
+    noticed = sequencer.timeline.first_event("cancel_requested").t - t0
+    await wait_until(lambda: sequencer.cleanups, BOUND)
+    record_timing(sequencer_noticed=noticed, closed=closed, safe_state=safe)
+    assert watchdog.trips == 1
+    assert "unreachable" in sequencer.timeline.first_event("cancel_requested").detail["reason"]
+    report = sequencer.cleanups[0]
+    assert report.aborted and report.parked and not report.errors, report
+    assert noticed < REMOTE["poll"] + REMOTE["timeout"] + 1.0
+    assert closed >= HB_TIMEOUT - SAFETY["heartbeat_interval"]  # the watchdog, not the supervisor
+
+
+async def test_sequencer_process_killed(omnisim, supervisor, services, truth, record_timing):
+    seq = Service(
+        "robofast_core.testing.run_sequencer",
+        *("--supervisor", supervisor.url, "--devices", omnisim, "--exptime", "60"),
+        *("--config", json.dumps(SEQ), "--remote", json.dumps(REMOTE)),
+        log_path=supervisor.log_path.with_name("sequencer.log"),
+    )
+    services.append(seq)
+    await _observing(truth)
+    seq.signal(signal.SIGKILL)
+    closed = await await_until(truth.closed, BOUND, what="close after lease expiry")
+    record_timing(closed=closed, lease_ttl=SAFETY["lease_ttl"])
+    assert closed >= SAFETY["lease_ttl"] - SEQ["lease_renew_interval"]
+    assert truth.exposing() and not truth.parked()  # nobody left to clean up

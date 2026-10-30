@@ -40,7 +40,9 @@ from robofast_core import (
     Timeline,
 )
 from robofast_core.alpaca import alpaca_owner
+from robofast_core.lease_client import RemoteSupervisor
 from robofast_core.safety import ENCLOSURE_MEMBERS
+from robofast_core.supervisor_service import SupervisorServer
 from robofast_core.testing.faultproxy import FaultProxy
 from robofast_core.weather_server import WeatherServer, WeatherState
 
@@ -237,12 +239,21 @@ class SimRig:
     sequencer: Sequencer
     owners: dict
     weather: WeatherState
+    #: "local", or "remote": the sequencer leases through the supervisor's
+    #: HTTP API (served in this process).
+    lease_path: str = "local"
+    server: SupervisorServer | None = None
+    remote: RemoteSupervisor | None = None
     tasks: list = field(default_factory=list)
 
     async def start(self) -> None:
         import asyncio
 
         self.tasks.append(asyncio.create_task(self.supervisor.run()))
+        if self.lease_path == "remote":
+            self.server = await SupervisorServer(self.supervisor).start()
+            self.remote = RemoteSupervisor(self.server.url, timeout=2.0, poll=1.0, retry=0.5)
+            self.sequencer.supervisor = self.remote
         self.tasks.append(asyncio.create_task(self.sequencer.run()))
 
     async def stop(self) -> None:
@@ -252,6 +263,10 @@ class SimRig:
             t.cancel()
             with contextlib.suppress(BaseException):
                 await asyncio.wait_for(t, 20)
+        if self.remote is not None:
+            await self.remote.aclose()
+        if self.server is not None:
+            await self.server.stop()
         for o in self.owners.values():
             o.close()
 
@@ -267,6 +282,7 @@ async def make_sim_rig(omnisim, weather, truth, request):
         exptime: float = 60.0,
         safety: dict | None = None,
         seq: dict | None = None,
+        lease_path: str = "local",
     ) -> SimRig:
         tl = Timeline()
 
@@ -300,7 +316,7 @@ async def make_sim_rig(omnisim, weather, truth, request):
             timeline=tl,
             config=SequencerConfig(**{**SIM_SEQ, **(seq or {})}),
         )
-        rig = SimRig(tl, sup, seqr, owners, state)
+        rig = SimRig(tl, sup, seqr, owners, state, lease_path)
         rigs.append(rig)
         return rig
 

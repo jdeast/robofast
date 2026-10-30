@@ -17,7 +17,10 @@ Each "generation" of observing runs like this::
 
 The sequencer never touches the enclosure: it has no dome grant at all. It
 only learns "open" from ``lease.wait_open()`` and "stop" from
-``lease.revoked``.
+``lease.revoked``. Its ``supervisor`` is anything with ``request_open``: the
+in-process :class:`SafetySupervisor`, or a
+:class:`~robofast_core.lease_client.RemoteSupervisor` for one in another
+process (whose leases revoke themselves if the supervisor cannot be reached).
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 from robofast_core.owner import DeviceError, DeviceOwner, Grant
 from robofast_core.safety import LeaseRevoked, OpenLease, SafetySupervisor
@@ -36,6 +39,12 @@ from robofast_core.timeline import Timeline
 log = logging.getLogger(__name__)
 
 CAMERA_IDLE = 0  # ASCOM CameraState.cameraIdle
+
+
+class LeaseSource(Protocol):
+    """Where open leases come from (a supervisor, local or remote)."""
+
+    async def request_open(self, holder: str) -> OpenLease: ...
 
 
 @dataclass
@@ -83,7 +92,7 @@ class Sequencer:
         self,
         name: str,
         *,
-        supervisor: SafetySupervisor,
+        supervisor: SafetySupervisor | LeaseSource,
         telescope: DeviceOwner,
         camera: DeviceOwner,
         plan: Callable[[], Observation | None],

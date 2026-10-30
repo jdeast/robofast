@@ -61,8 +61,9 @@ async def _cleanup_done(rig, gen: int = 1) -> None:
     )
 
 
-async def test_s1_unsafe_mid_exposure(make_sim_rig, truth, record_timing):
-    rig = make_sim_rig()
+@pytest.mark.parametrize("lease_path", ["local", "remote"])
+async def test_s1_unsafe_mid_exposure(make_sim_rig, truth, record_timing, lease_path):
+    rig = make_sim_rig(lease_path=lease_path)
     await _observing(rig, truth)
     t0 = time.monotonic()
     rig.weather.update(safe=False)

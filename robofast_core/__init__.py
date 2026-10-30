@@ -22,6 +22,11 @@ The pieces:
 * :mod:`robofast_core.sequencer` -- one asyncio :class:`Sequencer` per
   enclosure. Its observing task is cancelled when the lease is revoked, and
   cleanup aborts the exposure and parks the telescope.
+* :mod:`robofast_core.supervisor_service` -- the supervisor as its own
+  process with a small HTTP/JSON lease API (its docstring says how to run
+  it); :mod:`robofast_core.lease_client` is the sequencer's side of it.
+* :mod:`robofast_core.heartbeat_watchdog` -- the enclosure hardware
+  heartbeat contract, and a watchdog that adds one to a simulator's dome.
 * :mod:`robofast_core.weather_server` -- a small Alpaca SafetyMonitor +
   ObservingConditions server (the shape the real site-weather bridge will
   take), with fault injection for tests.

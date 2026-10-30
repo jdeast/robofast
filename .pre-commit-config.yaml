@@ -1,0 +1,13 @@
+# Lint for the robofast_core prototype. The legacy `robofast/` package and
+# setup.py are excluded (see [tool.ruff] in pyproject.toml); they are not
+# being refactored in this change.
+default_install_hook_types: [pre-commit]
+repos:
+-   repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.3
+    hooks:
+    -   id: ruff-check
+        args: [--fix, --fixable, I]
+        files: ^(robofast_core|tests|scripts)/
+    -   id: ruff-format
+        files: ^(robofast_core|tests|scripts)/

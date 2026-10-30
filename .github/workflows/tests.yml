@@ -1,0 +1,130 @@
+name: Tests
+
+on:
+  push:
+    branches: [master]
+  # No `branches:` filter: a PR against any base (including stacked PRs) gets
+  # CI, and retargeting a PR never leaves it with "no checks reported".
+  pull_request:
+  workflow_dispatch:
+
+# A new push to a PR supersedes the run for the previous push; pushes to
+# master always run to completion.
+concurrency:
+  group: tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # NOTE ON JOB NAMES: a branch rule should require the check named `test`
+  # (the gate job at the bottom). A matrix job reports one check per
+  # combination ("pytest (3.12)", ...), so requiring those would break every
+  # time the matrix changes; the gate's name stays stable.
+
+  # Fast tier: pure-Python fakes and an in-process weather server, no
+  # simulator. Covers S1-S4 on fakes plus the owner/supervisor unit tests.
+  pytest:
+    name: pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade "pip>=25.1"
+          python -m pip install --group test
+      - name: Run unit tests
+        run: python -m pytest -m "not alpaca_sim" --durations=10
+
+  # Integration tier: the same scenarios against the official ASCOM Alpaca
+  # OmniSimulators (Linux x64 build, pinned and checksum-verified).
+  alpaca-sim:
+    name: alpaca-sim
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade "pip>=25.1"
+          python -m pip install --group test
+      - name: Cache the OmniSim download
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/robofast/omnisim
+          key: omnisim-${{ runner.os }}-${{ hashFiles('scripts/fetch_omnisim.sh') }}
+      - name: Fetch OmniSim
+        run: |
+          set -euo pipefail
+          bin=$(scripts/fetch_omnisim.sh "$HOME/.cache/robofast/omnisim" | tail -1)
+          echo "ROBOFAST_OMNISIM_BIN=$bin" >> "$GITHUB_ENV"
+      - name: Run simulator tests
+        env:
+          ROBOFAST_TIMINGS_FILE: ${{ runner.temp }}/sim-timings.json
+          ROBOFAST_OMNISIM_LOG: ${{ runner.temp }}/omnisim.log
+        run: python -m pytest -m alpaca_sim -v -s --durations=0 tests/sim
+      - name: Publish the measured bounds
+        if: always()
+        run: |
+          f="${{ runner.temp }}/sim-timings.json"
+          if [ -f "$f" ]; then
+            { echo '### Simulator timings (seconds from fault to state)'; echo;
+              echo '```json'; cat "$f"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload OmniSim log and timings
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: alpaca-sim-logs
+          path: |
+            ${{ runner.temp }}/omnisim.log
+            ${{ runner.temp }}/sim-timings.json
+          if-no-files-found: warn
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Cache the pre-commit hook environments
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+      - name: Install pre-commit
+        run: python -m pip install "pre-commit>=4,<5"
+      - name: Run the pre-commit hooks
+        run: pre-commit run --all-files --show-diff-on-failure
+
+  # The one check branch rules should require.
+  test:
+    name: test
+    if: always()
+    needs: [pytest, alpaca-sim, lint]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any required job did not succeed
+        run: |
+          echo "pytest:     ${{ needs.pytest.result }}"
+          echo "alpaca-sim: ${{ needs.alpaca-sim.result }}"
+          echo "lint:       ${{ needs.lint.result }}"
+          test "${{ needs.pytest.result }}" = "success"
+          test "${{ needs.alpaca-sim.result }}" = "success"
+          test "${{ needs.lint.result }}" = "success"

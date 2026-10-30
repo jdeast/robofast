@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import threading
 import time
 
 import pytest
@@ -15,22 +14,22 @@ from robofast_core.timeline import Timeline
 
 
 class Slow:
-    """Records the maximum number of concurrent calls."""
+    """A driver that records the maximum number of concurrent calls."""
 
     def __init__(self) -> None:
         self.active = 0
         self.max_active = 0
         self.calls: list[int] = []
-        self._lock = threading.Lock()
 
-    def work(self, i: int) -> int:
-        with self._lock:
-            self.active += 1
-            self.max_active = max(self.max_active, self.active)
-        time.sleep(0.02)
-        with self._lock:
-            self.active -= 1
-            self.calls.append(i)
+    async def call(self, member: str, *args, timeout: float | None = None):
+        return await getattr(self, member)(*args)
+
+    async def work(self, i: int) -> int:
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        await asyncio.sleep(0.02)
+        self.active -= 1
+        self.calls.append(i)
         return i
 
 
@@ -98,7 +97,7 @@ async def test_timeout_is_bounded_surfaced_and_recovers():
         await g.get("AtPark")
     assert time.monotonic() - t0 < 0.5
     assert tl.commands(outcome="timeout")
-    assert tl.events("worker_abandoned")
+    assert tl.events("driver_discarded")
     tel.unhang()
     assert await g.get("AtPark") is True
     assert len(builds) == 2  # a fresh driver/session after the timeout

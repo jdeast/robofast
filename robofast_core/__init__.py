@@ -7,10 +7,13 @@ modules). Nothing here imports ``robofast``.
 The pieces:
 
 * :mod:`robofast_core.owner` -- one :class:`DeviceOwner` per physical device.
-  Every command to a device goes through its owner, which serializes them on a
-  dedicated worker thread, bounds each with a timeout, records it in the
+  Every command to a device goes through its owner, which serializes them
+  (asyncio, no threads), bounds each with a timeout, records it in the
   :class:`Timeline`, and refuses commands from revoked :class:`Grant` objects
   immediately before they are sent.
+* :mod:`robofast_core.alpaca_client` -- a small asyncio ASCOM Alpaca client
+  (one HTTP client per device, per-call timeouts, no process-wide lock);
+  :mod:`robofast_core.alpaca` builds owners around it.
 * :mod:`robofast_core.safety` -- the :class:`SafetySupervisor`, the only
   component allowed to open or close the enclosure. It fails closed: unsafe,
   stale, missing or erroring weather all mean "close". It hands out expiring

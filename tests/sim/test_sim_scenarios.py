@@ -1,7 +1,7 @@
 """S1-S4 against the ASCOM Alpaca OmniSimulators (telescope, camera, dome)
 plus the robofast weather server (SafetyMonitor, ObservingConditions).
 
-Ground truth comes from :class:`Truth` (plain alpyca clients reading
+Ground truth comes from :class:`Truth` (a plain synchronous client reading
 OmniSim directly); the "nothing else commanded the devices" assertions come
 from the owners' command log.
 """
@@ -9,11 +9,11 @@ from the owners' command log.
 from __future__ import annotations
 
 import asyncio
-import threading
 import time
 
 import pytest
 
+from robofast_core.alpaca_client import AlpacaDevice
 from robofast_core.testing.checks import (
     assert_fenced_after_cancel,
     assert_generations_disjoint,
@@ -184,43 +184,32 @@ async def test_s4_weather_server_hangs(make_sim_rig, truth, record_timing):
     assert_fenced_after_cancel(rig.timeline, "seq", 1, DEVICES)
 
 
-def _blocked_read_latency(omnisim: str, weather_address: str, isolate: bool) -> float:
-    """While one client's request to a hung weather server is in flight, how
-    long does an unrelated read of the OmniSim dome take?"""
-    from alpaca.dome import Dome
-    from alpaca.safetymonitor import SafetyMonitor
-
-    from robofast_core.alpaca import isolated_class
-
-    sm_cls = isolated_class(SafetyMonitor) if isolate else SafetyMonitor
-    dome_cls = isolated_class(Dome) if isolate else Dome
-    sm, dome = sm_cls(weather_address, 0), dome_cls(omnisim, 0)
-    dome.Connected = True
-    _ = dome.ShutterStatus  # warm the HTTP session
-    hung = threading.Thread(target=lambda: _swallow(lambda: sm.IsSafe), daemon=True)
-    hung.start()
-    time.sleep(0.5)
-    t0 = time.monotonic()
-    _ = dome.ShutterStatus
-    dt = time.monotonic() - t0
-    hung.join(10)
-    return dt
-
-
-def _swallow(fn) -> None:
-    try:
-        fn()
-    except Exception:
-        pass
-
-
-def test_stock_alpyca_lock_blocks_other_devices(omnisim, weather, record_timing):
-    """Evidence for the alpyca shim: stock alpyca serializes all devices."""
+async def test_hung_device_does_not_delay_others(omnisim, weather, record_timing):
+    """While a request to a hung weather server is in flight, reads of the
+    OmniSim dome (its own client) are as fast as ever. alpyca 3.1.x took ~5 s
+    here: it held one class-wide lock for every HTTP request."""
     state, server = weather
+    sm = AlpacaDevice(server.address, "safetymonitor")
+    dome = AlpacaDevice(omnisim, "dome")
+
+    async def dome_reads(n: int = 10) -> float:
+        worst = 0.0
+        for _ in range(n):
+            t0 = time.monotonic()
+            await dome.get("ShutterStatus", timeout=5)
+            worst = max(worst, time.monotonic() - t0)
+        return worst
+
+    await dome.connect(timeout=5)
+    baseline = await dome_reads()
     state.set_mode("hang")
-    stock = _blocked_read_latency(omnisim, server.address, isolate=False)
-    isolated = _blocked_read_latency(omnisim, server.address, isolate=True)
+    hung = asyncio.create_task(sm.get("IsSafe", timeout=10))
+    await asyncio.sleep(0.5)
+    during = await dome_reads()
+    assert not hung.done()  # the weather request was in flight throughout
     state.set_mode("ok")
-    record_timing(stock_dome_read=stock, isolated_dome_read=isolated)
-    assert stock > 3.0  # waited for the hung request's 5 s timeout
-    assert isolated < 1.0
+    assert await hung is True
+    await sm.aclose()
+    await dome.aclose()
+    record_timing(dome_read_max_baseline=baseline, dome_read_max_while_other_hung=during)
+    assert during < 1.0

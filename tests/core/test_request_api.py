@@ -95,15 +95,19 @@ class Rig:
     store: TokenStore
     tokens: dict[str, str]
     client: httpx.AsyncClient
+    #: The OCS paths; "/api/v1" is the previous prefix (kept for one release).
+    prefix: str = "/api"
 
     def auth(self, who: str) -> dict[str, str]:
         return {"Authorization": f"Token {self.tokens[who]}"}
 
     async def get(self, who: str, path: str, **kw) -> httpx.Response:
-        return await self.client.get(f"/api/v1{path}", headers=self.auth(who), **kw)
+        return await self.client.get(f"{self.prefix}{path}", headers=self.auth(who), **kw)
 
     async def post(self, who: str, path: str, body=None, **kw) -> httpx.Response:
-        return await self.client.post(f"/api/v1{path}", headers=self.auth(who), json=body, **kw)
+        return await self.client.post(
+            f"{self.prefix}{path}", headers=self.auth(who), json=body, **kw
+        )
 
     @property
     def box(self) -> Path:
@@ -183,13 +187,13 @@ def imaging(gid: str | None = None, *, ha: float = -1.0, dec: float = 20.0, **kw
 
 async def test_missing_malformed_and_invalid_tokens(api):
     assert (await api.client.get("/healthz")).json() == {"ok": True}  # no token needed
-    r = await api.client.get("/api/v1/status")
+    r = await api.client.get("/api/status")
     assert r.status_code == 401 and r.json() == {"error": "missing token"}
     assert r.headers["WWW-Authenticate"].startswith("Token")
     tok = api.tokens["tom"]
     wrong = tok[:-1] + ("B" if tok[-1] == "A" else "A")
     for value in ("Basic abc", "Token rft_nope", f"Token {wrong}", f"Basic {tok}"):
-        r = await api.client.get("/api/v1/status", headers={"Authorization": value})
+        r = await api.client.get("/api/status", headers={"Authorization": value})
         assert r.status_code == 401, value
     # Bearer works as well as Token.
     r = await api.client.get("/api/v1/", headers={"Authorization": f"Bearer {api.tokens['tom']}"})
@@ -306,14 +310,17 @@ async def test_submit_get_and_list(api):
     out = r.json()
     gid = out["id"]
     assert gid.startswith("rg-") and out["intake"] == "QUEUED" and out["enclosure"] == "aqawan1"
-    assert out["requests"] == [{"id": f"{gid}-r0", "configurations": [f"{gid}-r0-c0"]}]
+    # The OCS answer: the group, with the ids an OCS client keeps.
+    assert [r["id"] for r in out["requests"]] == [f"{gid}-r0"]
+    assert [c["id"] for c in out["requests"][0]["configurations"]] == [f"{gid}-r0-c0"]
+    assert out["state"] == "PENDING" and out["ipp_value"] == 3
     (path,) = api.box.glob("*.json")
     assert path.name.endswith(f"-submit-{gid}.json")
     dropped = json.loads(path.read_text())
-    assert dropped["submitter"] == "tom" and dropped["submitted"] == NIGHT.isoformat()
+    assert dropped["submitter"] == "tom" and dropped["created"] == NIGHT.isoformat()
 
     g = (await api.get("tom", f"/requestgroups/{gid}")).json()
-    assert g["intake"] == g["state"] == "QUEUED" and g["submitter"] == "tom"
+    assert g["intake"] == "QUEUED" and g["state"] == "PENDING" and g["submitter"] == "tom"
     assert g["requests"][0]["configurations"][0]["status"] == "PENDING"
     assert "_path" not in g and str(api.tmp) not in json.dumps(g)
     # Other clients do not see it; admin does.
@@ -324,8 +331,13 @@ async def test_submit_get_and_list(api):
     assert (await api.get("other", "/requestgroups")).json()["count"] == 0
     everyone = {x["id"] for x in (await api.get("boss", "/requestgroups")).json()["results"]}
     assert everyone == {gid, "base"}
-    assert (await api.get("tom", "/requestgroups?state=PENDING")).json()["count"] == 0
+    assert (await api.get("tom", "/requestgroups?state=COMPLETED")).json()["count"] == 0
     assert (await api.get("tom", "/requestgroups?state=QUEUED")).json()["count"] == 1
+    assert (await api.get("tom", "/requestgroups?state=PENDING")).json()["count"] == 1
+    # The OCS lookup of a request's group (TOM's cancel does this).
+    found = (await api.get("tom", f"/requestgroups?request_id={gid}-r0")).json()
+    assert found["count"] == 1 and found["results"][0]["id"] == gid
+    assert (await api.get("tom", "/requestgroups?request_id=nope")).json()["count"] == 0
 
 
 async def test_submitter_and_status_cannot_be_forged(api):
@@ -363,15 +375,25 @@ C0 = "requests.0.configurations.0"
 @pytest.mark.parametrize(
     "body, message",
     [
-        (_bad(**{f"{C0}.target.dec_deg": 95}), "target.dec_deg: 95 is outside [-90, 90]"),
+        (_bad(**{f"{C0}.target.dec": 95}), "target.dec: 95 is outside [-90, 90]"),
         (_bad(**{f"{C0}.exposure": 3}), "unknown keys ['exposure']"),
         (_bad(**{"requests.0.configurations": _DEL}), "missing ['configurations']"),
         (_bad(**{f"{C0}.instrument_configs": []}), "instrument_configs: expected a non-empty"),
-        (_bad(**{"requests.0.telescopes": ["t9"]}), "unknown telescopes ['t9']"),
+        (_bad(**{"requests.0.location": {"telescope": "t9"}}), "unknown telescopes ['t9']"),
         (
-            _bad(**{f"{C0}.instrument": "spectrograph", "requests.0.telescopes": ["t1"]}),
+            _bad(
+                **{
+                    f"{C0}.instrument_type": "spectrograph",
+                    "requests.0.location": {"telescope": "t1"},
+                }
+            ),
             "no 'spectrograph' on ['t1'] (they have ['imager'])",
         ),
+        (
+            _bad(**{"requests.0.location": {"telescope_class": "2m0"}}),
+            "location.telescope_class: '2m0'",
+        ),
+        (_bad(**{"requests.0.location": {"enclosure": "aqawan9"}}), "unknown enclosure"),
         (
             _bad(
                 **{
@@ -383,21 +405,16 @@ C0 = "requests.0.configurations.0"
             "every window has already ended",
         ),
         (
-            _bad(
-                **{
-                    "requests.0.windows": [
-                        {"start": "2026-11-15T01:00:00", "end": "2026-11-16T02:00:00Z"}
-                    ]
-                }
-            ),
-            "has no time zone",
+            _bad(**{"requests.0.windows": [{"start": "tonight", "end": "2026-11-16T02:00:00Z"}]}),
+            "not an ISO 8601 time",
         ),
         (_bad(id="base"), "id 'base' is already in use"),
         (_bad(id="validate"), "'validate' is reserved"),
+        (_bad(id="cadence"), "'cadence' is reserved"),
         (_bad(id="../etc"), "is not a valid id"),
         (_bad(name={"a": 1}), "name: expected a string"),
         (_bad(**{"requests": [imaging("r")["requests"][0]] * 21}), "requests: at most 20"),
-        (_bad(too=too("next")), "submit targets of opportunity to /toos"),
+        (_bad(observation_type="DIRECT"), "observation_type: 'DIRECT'"),
     ],
 )
 async def test_validation_errors_name_the_entry(api, body, message):
@@ -411,7 +428,7 @@ async def test_validation_errors_name_the_entry(api, body, message):
 async def test_bodies_that_are_not_request_groups(api):
     h = {**api.auth("tom"), "Content-Type": "application/json"}
     for body, msg in ((b"{nope", "not JSON"), (b"[1, 2]", "JSON object"), (b"\xff", "not JSON")):
-        r = await api.client.post("/api/v1/requestgroups", content=body, headers=h)
+        r = await api.client.post("/api/requestgroups", content=body, headers=h)
         assert r.status_code == 400 and msg in r.json()["error"]
 
 
@@ -420,7 +437,19 @@ async def test_toos_need_a_future_deadline(api):
     r = await api.post("alerts", "/toos", late)
     assert r.status_code == 400 and "too.deadline" in r.json()["errors"][0]
     r = await api.post("alerts", "/toos", imaging("plain"))
-    assert r.status_code == 400 and "required for a ToO" in r.json()["errors"][0]
+    assert r.status_code == 400 and "for a ToO" in r.json()["errors"][0]
+
+
+async def test_a_too_needs_the_too_scope_wherever_it_is_submitted(api):
+    """RAPID_RESPONSE and TIME_CRITICAL groups go to /requestgroups as in
+    the OCS, and need the too scope there too."""
+    r = await api.post("tom", "/requestgroups", imaging("rr", too=too("next")))
+    assert r.status_code == 403 and "too scope" in r.json()["error"]
+    r = await api.post("alerts", "/requestgroups", imaging("rr", too=too("next")))
+    assert r.status_code == 202 and r.json()["observation_type"] == "RAPID_RESPONSE"
+    assert r.json()["too"] is True
+    # A too-only token cannot submit normal requests.
+    assert (await api.post("alerts", "/requestgroups", imaging("n"))).status_code == 403
 
 
 async def test_validate_is_a_dry_run(api):
@@ -430,7 +459,10 @@ async def test_validate_is_a_dry_run(api):
     r = await api.post("tom", "/requestgroups/validate", good)
     assert r.status_code == 200, r.text
     out = r.json()
-    assert out["valid"] and out["errors"] == [] and out["enclosure"] == "aqawan1"
+    assert out["valid"] and out["errors"] == {} and out["enclosure"] == "aqawan1"
+    durations = out["request_durations"]
+    # One 60 s exposure, 10 s readout, 120 s slew (the dispatch time model).
+    assert durations["duration"] == 190.0 and durations["requests"][0]["id"] == "v1-r"
     dry = out["dry_run"]
     assert dry["night"]["start"] == NIGHT.isoformat() and not dry["truncated"]
     req = dry["requests"]["v1-r"]
@@ -448,11 +480,29 @@ async def test_validate_is_a_dry_run(api):
     assert any("has no spectrograph" in x for x in tels["t1"]["reasons"])
     # Problems come back as a verdict, not an HTTP error.
     r = (await api.post("tom", "/requestgroups/validate", _bad(id="base"))).json()
-    assert not r["valid"] and "already in use" in r["errors"][0] and "dry_run" not in r
+    assert not r["valid"] and "dry_run" not in r
+    assert r["errors"] == {"non_field_errors": ["id 'base' is already in use"]}
+
+
+async def test_validate_answers_errors_the_ocs_way(api):
+    # A body the model refuses: still a 200 with the OCS errors object (TOM's
+    # form shows them), keyed by the entry.
+    r = await api.post("tom", "/requestgroups/validate", _bad(**{f"{C0}.target.dec": 95}))
+    assert r.status_code == 200 and not r.json()["valid"]
+    assert r.json()["errors"] == {
+        "requests[0].configurations[0].target.dec": ["95 is outside [-90, 90]"]
+    }
+    # The previous prefix keeps the previous shape: a 400 for a refused body,
+    # a list of errors for a problem.
+    api.prefix = "/api/v1"
+    r = await api.post("tom", "/requestgroups/validate", _bad(**{f"{C0}.target.dec": 95}))
+    assert r.status_code == 400
+    r = (await api.post("tom", "/requestgroups/validate", _bad(id="base"))).json()
+    assert r["errors"] == ["id 'base' is already in use"]
+    api.prefix = "/api"
+    v4 = imaging("v4", too=too())
+    assert (await api.post("alerts", "/requestgroups/validate", v4)).json()["valid"]
     assert not list(api.box.glob("*.json"))  # nothing submitted
-    assert (await api.post("alerts", "/requestgroups/validate", imaging("v4", too=too()))).json()[
-        "valid"
-    ]
 
 
 # -- intake: the drop box and the scheduler -----------------------------------------------------
@@ -579,7 +629,8 @@ async def test_a_too_end_to_end_into_the_scheduler(api):
         serve.cancel()
     assert p.calls == [("t1", "now", "ToO burst-r")]
     g = (await api.get("alerts", "/requestgroups/burst")).json()
-    assert g["intake"] == "ACCEPTED" and g["too"]["policy"] == "now"
+    assert g["intake"] == "ACCEPTED" and g["extra_params"]["too"]["policy"] == "now"
+    assert g["observation_type"] == "RAPID_RESPONSE"
     sched.report("t1", base, "interrupted", 0)
     obs = await sched.next_observation("t1")
     assert obs.name.startswith("burst ") and obs.count == 2
@@ -694,14 +745,14 @@ async def test_status_from_a_real_supervisor_and_sequencer(make_rig, tmp_path):
     try:
         await wait_until(rig.exposing, 5, what="both cameras exposing")
         write_snapshot(rig.sequencer, tmp_path / "seq-status.json")
-        s = (await client.get("/api/v1/status")).json()["enclosures"]["aqawan1"]
+        s = (await client.get("/api/status")).json()["enclosures"]["aqawan1"]
         assert s["supervisor"]["reachable"] and s["supervisor"]["safe"] is True
         assert s["supervisor"]["lease"]["holder"] == "seq" and s["supervisor"]["lease"]["live"]
         assert s["telescopes"]["t1"]["state"] == "observing"
         assert s["telescopes"]["t1"]["current"]["request"] == "a-r"
         assert s["telescopes"]["t2"]["current"]["group"] == "b"
         burst = imaging("burst", telescopes=["t1"], too=too("now"), exptime=0.2, count=2)
-        assert (await client.post("/api/v1/toos", json=burst)).status_code == 202
+        assert (await client.post("/api/toos", json=burst)).status_code == 202
 
         def started():
             return [
@@ -713,7 +764,7 @@ async def test_status_from_a_real_supervisor_and_sequencer(make_rig, tmp_path):
         await wait_until(started, 5, what="t1 starts the ToO")
         assert started()[0].detail["telescope"] == "t1"
         await wait_until(lambda: sched.status("burst-c") is Status.COMPLETED, 5, what="done")
-        g = (await client.get("/api/v1/requestgroups/burst")).json()
+        g = (await client.get("/api/requestgroups/burst")).json()
         assert g["state"] == "COMPLETED"
     finally:
         serve.cancel()
@@ -802,7 +853,7 @@ async def test_a_slow_client_is_cut_off(make_api):
 
 async def test_routes(api):
     assert (await api.get("tom", "/nowhere")).status_code == 404
-    r = await api.client.delete("/api/v1/requestgroups", headers=api.auth("tom"))
+    r = await api.client.delete("/api/requestgroups", headers=api.auth("tom"))
     assert r.status_code == 405 and "POST" in r.headers["Allow"]
     assert (await api.get("tom", "/requestgroups/")).status_code == 200  # trailing slash
     assert (await api.client.get("/elsewhere")).status_code == 404
@@ -829,19 +880,19 @@ async def test_every_post_is_audited(api):
     await api.post("tom", f"/requestgroups/{gid}/cancel")
     await api.post("reader", "/requestgroups", imaging("nope"))
     await api.post("tom", "/requestgroups", imaging("bad", dec=95))
-    await api.client.post("/api/v1/toos", json=imaging("anon"))
+    await api.client.post("/api/toos", json=imaging("anon"))
     await api.get("tom", "/requestgroups")  # a read: not audited
     entries = api.audit()
     assert [(e.get("client"), e["path"], e["status"]) for e in entries] == [
-        ("tom", "/api/v1/requestgroups", 202),
-        ("tom", "/api/v1/requestgroups/aud/cancel", 200),
-        ("reader", "/api/v1/requestgroups", 403),
-        ("tom", "/api/v1/requestgroups", 400),
-        (None, "/api/v1/toos", 401),
+        ("tom", "/api/requestgroups", 202),
+        ("tom", "/api/requestgroups/aud/cancel", 200),
+        ("reader", "/api/requestgroups", 403),
+        ("tom", "/api/requestgroups", 400),
+        (None, "/api/toos", 401),
     ]
     assert entries[0]["group"] == "aud" and entries[1]["group"] == "aud"
     assert entries[0]["addr"] == "127.0.0.1" and entries[0]["token_id"]
-    assert "dec_deg" in entries[3]["errors"][0]
+    assert "target.dec" in entries[3]["errors"][0]
     text = (api.tmp / "log" / "audit.jsonl").read_text()
     assert not any(t.split("_", 2)[2] in text for t in api.tokens.values())
 
@@ -929,7 +980,7 @@ async def test_the_service_process(tmp_path):
         line = await asyncio.wait_for(proc.stdout.readline(), 60)
         url = json.loads(line)["url"]
         async with httpx.AsyncClient(base_url=url) as c:
-            assert (await c.get("/api/v1/status")).status_code == 401
+            assert (await c.get("/api/status")).status_code == 401
             r = await c.get("/api/v1/", headers={"Authorization": f"Token {token}"})
             assert r.json()["name"] == "tom"
         proc.send_signal(signal.SIGTERM)
@@ -1021,11 +1072,11 @@ async def test_validate_vets_targets_against_the_catalog(api):
     g = group("nu2dra", telescopes=["t1"])
     # nu2 Draconis, 62 arcsec from its near-twin nu1 (J2016 Gaia position).
     g["requests"][0]["configurations"][0]["target"].update(
-        {"name": "nu2 Dra", "ra_hours": 263.04518678 / 15.0, "dec_deg": 55.18448602}
+        {"name": "nu2 Dra", "ra": 263.04518678, "dec": 55.18448602}
     )
     out = (await api.post("tom", "/requestgroups/validate", g)).json()
     assert not out["valid"]
-    assert any("not_brightest" in e for e in out["errors"])
+    assert "not_brightest" in json.dumps(out["errors"])
     assert out["vetting"][0]["match"]["g"] == pytest.approx(4.84, abs=0.01)
     enc.plan["vetting"]["reject"] = []
     enc._view = None

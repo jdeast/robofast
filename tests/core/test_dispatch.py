@@ -39,6 +39,18 @@ class Clock:
         self.t += timedelta(seconds=seconds)
 
 
+def ic(exptime: float = 60.0, count: int = 1, filter: str | None = None) -> dict:
+    """An OCS instrument config."""
+    d: dict = {"exposure_time": exptime, "exposure_count": count}
+    if filter is not None:
+        d["optical_elements"] = {"filter": filter}
+    return d
+
+
+#: Constraint names robofast keeps in the constraints' extra_params.
+_EXTRA_CONSTRAINTS = {"min_alt", "max_alt", "max_sun_alt", "min_ha", "max_ha"}
+
+
 def group(
     gid: str,
     ha: float = -1.0,
@@ -51,30 +63,45 @@ def group(
     ics: list | None = None,
     constraints: dict | None = None,
     too: dict | None = None,
+    telescopes: list[str] | None = None,
+    cadence: dict | None = None,
+    max_attempts: int | None = None,
     **request,
 ) -> dict:
-    """A one-configuration group; ``ha`` is its hour angle at NIGHT."""
-    config = {
+    """A one-configuration group in the OCS shape; ``ha`` is its hour angle
+    at NIGHT. ``too`` (deadline, policy, class) makes it a RAPID_RESPONSE;
+    the robofast-only keywords go into the right ``extra_params``."""
+    config: dict = {
         "id": f"{gid}-c",
-        "instrument": instrument,
-        "target": {"name": gid, "ra_hours": (LST - ha) % 24.0, "dec_deg": dec},
-        "instrument_configs": ics or [{"exptime": exptime, "count": count}],
+        "type": "EXPOSE",
+        "instrument_type": instrument,
+        "target": {"type": "ICRS", "name": gid, "ra": (LST - ha) % 24.0 * 15.0, "dec": dec},
+        "instrument_configs": ics or [ic(exptime, count)],
     }
     if constraints:
-        config["constraints"] = constraints
-    d = {
-        "id": gid,
-        "priority": priority,
-        "requests": [{"id": f"{gid}-r", "configurations": [config], **request}],
-    }
+        ocs = {k: v for k, v in constraints.items() if k not in _EXTRA_CONSTRAINTS}
+        extra = {k: v for k, v in constraints.items() if k in _EXTRA_CONSTRAINTS}
+        config["constraints"] = {**ocs, **({"extra_params": extra} if extra else {})}
+    extra_r: dict = {}
+    if telescopes is not None:
+        extra_r["telescopes"] = telescopes
+    if cadence is not None:
+        extra_r["cadence"] = cadence
+    if max_attempts is not None:
+        extra_r["max_attempts"] = max_attempts
+    r = {"id": f"{gid}-r", "configurations": [config], **request}
+    if extra_r:
+        r["extra_params"] = extra_r
+    d = {"id": gid, "ipp_value": priority, "observation_type": "NORMAL", "requests": [r]}
     if too is not None:
-        d["too"] = too
+        d["observation_type"] = "RAPID_RESPONSE"
+        d["extra_params"] = {"too": too}
     return d
 
 
 def alt_now(g: dict, when: datetime = NIGHT) -> float:
     t = g["requests"][0]["configurations"][0]["target"]
-    return float(sky.altitudes(MINERVA, [t["ra_hours"]], [t["dec_deg"]], [[when]])[0][0])
+    return float(sky.altitudes(MINERVA, [t["ra"] / 15.0], [t["dec"]], [[when]])[0][0])
 
 
 def make(groups, clock=None, limits=None, **kw) -> DispatchScheduler:
@@ -206,11 +233,11 @@ def test_moon_separation():
     moon = sky.sky_now(MINERVA, NIGHT).moon  # topocentric (GCRS) place
     g = group("near-moon")
     g["requests"][0]["configurations"][0]["target"].update(
-        ra_hours=float(moon.ra.hour), dec_deg=float(moon.dec.deg) + 3.0
+        ra=float(moon.ra.deg), dec=float(moon.dec.deg) + 3.0
     )
     assert "from the Moon (limit 10)" in _reasons(make([g]), "near-moon-r")
     # A configuration may ask for more separation, never less.
-    far = group("far", constraints={"min_moon_sep": 179})
+    far = group("far", constraints={"min_lunar_distance": 179})
     assert "from the Moon (limit 179)" in _reasons(make([far]), "far-r")
 
 
@@ -290,7 +317,7 @@ async def test_cadence_and_nightly_max():
 
 
 async def test_one_request_on_one_telescope_at_a_time():
-    d = make([group("a", count=2, ics=[{"exptime": 1}, {"exptime": 2}])])
+    d = make([group("a", count=2, ics=[ic(1), ic(2)])])
     obs = await d.next_observation("t1")
     assert obs.exptime == 1
     assert "in progress on t1" in _reasons(d, "a-r", "t2")
@@ -322,7 +349,12 @@ def test_a_failed_position_is_not_observable(monkeypatch):
     """A target whose position cannot be computed is excluded; the vectorized
     computation falls back to one at a time, so the others are unaffected."""
     d = make([group("good"), group("bad")])
-    d.requests["bad-r"].configurations[0].target.ra_hours = "garbage"  # past validation
+
+    class Garbage:  # past validation: ra_hours comes out as a string
+        def __truediv__(self, other):
+            return "garbage"
+
+    d.requests["bad-r"].configurations[0].target.ra = Garbage()
     c = by_id(d)
     assert c["good-r"].ok
     assert not c["bad-r"].ok and c["bad-r"].reasons
@@ -339,7 +371,7 @@ def test_a_non_finite_score_is_an_error(monkeypatch):
 
 
 async def test_a_visit_runs_every_instrument_config_in_order():
-    d = make([group("a", ics=[{"exptime": 1, "count": 2}, {"exptime": 2, "filter": "gp"}])])
+    d = make([group("a", ics=[ic(1, 2), ic(2, filter="gp")])])
     first = await run_visit(d)
     assert (first.exptime, first.count) == (1, 2)
     assert d.status("a-c") is Status.PENDING
@@ -363,7 +395,7 @@ async def test_interrupted_is_requeued_and_failed_counts_attempts():
 async def test_a_visit_is_abandoned_if_it_becomes_unobservable():
     clock = Clock()
     d = make(
-        [group("a", ha=4.6, ics=[{"exptime": 60}, {"exptime": 60}]), group("b", ha=-2)],
+        [group("a", ha=4.6, ics=[ic(60), ic(60)]), group("b", ha=-2)],
         clock=clock,
         config=DispatchConfig(w_setting=10),
     )
@@ -577,7 +609,7 @@ async def test_repeated_toos():
 
 
 async def test_too_outranks_a_visit_in_progress():
-    d = make([group("a", ics=[{"exptime": 1}, {"exptime": 1}])], limits={"t1": TelescopeLimits()})
+    d = make([group("a", ics=[ic(1), ic(1)])], limits={"t1": TelescopeLimits()})
     await run_visit(d)  # first half of "a"
     await d.submit_too(group("burst", too=too("next")))
     assert (await d.next_observation("t1")).name.startswith("burst ")
@@ -586,7 +618,7 @@ async def test_too_outranks_a_visit_in_progress():
 
 async def test_submit_too_validation():
     d = make([group("a")])
-    with pytest.raises(ValueError, match="no 'too' entry"):
+    with pytest.raises(ValueError, match="is not a ToO"):
         await d.submit_too(group("plain"))
     with pytest.raises(ValueError, match="already in use"):
         await d.submit_too(group("a", too=too()))

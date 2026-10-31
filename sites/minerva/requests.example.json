@@ -1,67 +1,269 @@
 {
   "_note": [
-    "Synthetic example request groups for MINERVA's dispatch scheduler (robofast_core/request_model.py).",
-    "The legacy MINERVA target lists are not in the public minerva-control repository, so these are",
-    "illustrative: well-known RV-standard stars (J2000 coordinates, rounded) in the legacy shape --",
-    "standing requests at least 3 h apart, at most 2 visits a night (the legacy seplimit and maxobs",
-    "defaults) -- plus a telluric B star and a one-shot imaging request for T2.",
+    "Synthetic example request groups for MINERVA's dispatch scheduler, in the OCS request language",
+    "(robofast_core/request_model.py; field by field in docs/request_language.md). The legacy MINERVA",
+    "target lists are not in the public minerva-control repository, so these are illustrative:",
+    "well-known RV-standard stars (J2000 coordinates, rounded; ra and dec in degrees) as legacy observed",
+    "them -- standing requests (extra_params.cadence) at least 3 h apart, at most 2 visits a night (the",
+    "legacy seplimit and maxobs defaults) -- plus a telluric B star and a one-shot imaging request for T2.",
     "Convert a real legacy targets.csv with robofast_core.request_model.from_legacy_csv, or name it",
     "as 'legacy_csv' in the dispatch plan entry (sites/minerva/dispatch.example.json)."
   ],
   "groups": [
-    {"id": "HD10700", "name": "HD 10700", "proposal": "rv-example", "priority": 5,
-     "requests": [{"id": "HD10700-rv", "cadence": {"min_interval": 10800, "max_per_night": 2},
-       "configurations": [{"id": "HD10700-rv-spec", "type": "SPECTRUM", "instrument": "spectrograph",
-         "target": {"name": "HD 10700", "ra_hours": 1.734467, "dec_deg": -15.937478},
-         "instrument_configs": [{"exptime": 300, "count": 3}]}]}]},
-    {"id": "HD4628", "name": "HD 4628", "proposal": "rv-example", "priority": 3,
-     "requests": [{"id": "HD4628-rv", "cadence": {"min_interval": 10800, "max_per_night": 2},
-       "configurations": [{"id": "HD4628-rv-spec", "type": "SPECTRUM", "instrument": "spectrograph",
-         "target": {"name": "HD 4628", "ra_hours": 0.806383, "dec_deg": 5.280614},
-         "instrument_configs": [{"exptime": 600, "count": 3}]}]}]},
-    {"id": "HD217014", "name": "HD 217014", "proposal": "rv-example", "priority": 3,
-     "requests": [{"id": "HD217014-rv", "cadence": {"min_interval": 10800, "max_per_night": 2},
-       "configurations": [{"id": "HD217014-rv-spec", "type": "SPECTRUM", "instrument": "spectrograph",
-         "target": {"name": "HD 217014", "ra_hours": 22.957776, "dec_deg": 20.768833},
-         "instrument_configs": [{"exptime": 600, "count": 3}]}]}]},
-    {"id": "HD201091", "name": "HD 201091", "proposal": "rv-example", "priority": 4,
-     "requests": [{"id": "HD201091-rv", "cadence": {"min_interval": 10800, "max_per_night": 2},
-       "configurations": [{"id": "HD201091-rv-spec", "type": "SPECTRUM", "instrument": "spectrograph",
-         "target": {"name": "HD 201091", "ra_hours": 21.115162, "dec_deg": 38.749414},
-         "instrument_configs": [{"exptime": 300, "count": 3}]}]}]},
-    {"id": "HD185144", "name": "HD 185144", "proposal": "rv-example", "priority": 5,
-     "requests": [{"id": "HD185144-rv", "cadence": {"min_interval": 10800, "max_per_night": 2},
-       "configurations": [{"id": "HD185144-rv-spec", "type": "SPECTRUM", "instrument": "spectrograph",
-         "target": {"name": "HD 185144", "ra_hours": 19.539336, "dec_deg": 69.661176},
-         "instrument_configs": [{"exptime": 300, "count": 3}]}]}]},
-    {"id": "HD141004", "name": "HD 141004", "proposal": "rv-example", "priority": 3,
-     "requests": [{"id": "HD141004-rv", "cadence": {"min_interval": 10800, "max_per_night": 2},
-       "configurations": [{"id": "HD141004-rv-spec", "type": "SPECTRUM", "instrument": "spectrograph",
-         "target": {"name": "HD 141004", "ra_hours": 15.77407, "dec_deg": 7.353066},
-         "instrument_configs": [{"exptime": 600, "count": 3}]}]}]},
-    {"id": "HD122064", "name": "HD 122064", "proposal": "rv-example", "priority": 4,
-     "requests": [{"id": "HD122064-rv", "cadence": {"min_interval": 10800, "max_per_night": 2},
-       "configurations": [{"id": "HD122064-rv-spec", "type": "SPECTRUM", "instrument": "spectrograph",
-         "target": {"name": "HD 122064", "ra_hours": 13.958906, "dec_deg": 61.492867},
-         "instrument_configs": [{"exptime": 600, "count": 3}]}]}]},
-    {"id": "HD95735", "name": "HD 95735", "proposal": "rv-example", "priority": 2,
-     "requests": [{"id": "HD95735-rv", "cadence": {"min_interval": 10800, "max_per_night": 2},
-       "configurations": [{"id": "HD95735-rv-spec", "type": "SPECTRUM", "instrument": "spectrograph",
-         "target": {"name": "HD 95735", "ra_hours": 11.055709, "dec_deg": 35.969886},
-         "instrument_configs": [{"exptime": 600, "count": 3}]}]}]},
-    {"id": "HD87901", "name": "HD 87901 (telluric B star)", "proposal": "rv-example", "priority": 2,
-     "requests": [{"id": "HD87901-tell", "cadence": {"min_interval": 0, "max_per_night": 1},
-       "configurations": [{"id": "HD87901-tell-spec", "type": "SPECTRUM", "instrument": "spectrograph",
-         "target": {"name": "HD 87901", "ra_hours": 10.139532, "dec_deg": 11.967208},
-         "instrument_configs": [{"exptime": 60, "count": 1}],
-         "constraints": {"max_airmass": 1.5}}]}]},
-    {"id": "M67", "name": "M67 imaging (one-shot)", "proposal": "imaging-example", "priority": 2,
-     "requests": [{"id": "M67-img", "telescopes": ["t2"],
-       "windows": [{"start": "2026-11-01T00:00:00Z", "end": "2027-02-01T00:00:00Z"}],
-       "configurations": [{"id": "M67-img-c", "instrument": "imager",
-         "target": {"name": "M67", "ra_hours": 8.855, "dec_deg": 11.814},
-         "instrument_configs": [{"exptime": 60, "count": 5, "filter": "rp"},
-                                {"exptime": 120, "count": 5, "filter": "gp"}],
-         "constraints": {"min_moon_sep": 30}}]}]}
+    {
+      "id": "HD10700",
+      "name": "HD 10700",
+      "proposal": "rv-example",
+      "ipp_value": 5.0,
+      "operator": "SINGLE",
+      "observation_type": "NORMAL",
+      "requests": [
+        {
+          "id": "HD10700-rv",
+          "configurations": [
+            {
+              "id": "HD10700-rv-spec",
+              "type": "SPECTRUM",
+              "instrument_type": "spectrograph",
+              "target": {"type": "ICRS", "name": "HD 10700", "ra": 26.017005, "dec": -15.937478},
+              "instrument_configs": [{"exposure_time": 300.0, "exposure_count": 3}],
+              "guiding_config": {"mode": "ON"}
+            }
+          ],
+          "extra_params": {"cadence": {"min_interval": 10800.0, "max_per_night": 2}}
+        }
+      ]
+    },
+    {
+      "id": "HD4628",
+      "name": "HD 4628",
+      "proposal": "rv-example",
+      "ipp_value": 3.0,
+      "operator": "SINGLE",
+      "observation_type": "NORMAL",
+      "requests": [
+        {
+          "id": "HD4628-rv",
+          "configurations": [
+            {
+              "id": "HD4628-rv-spec",
+              "type": "SPECTRUM",
+              "instrument_type": "spectrograph",
+              "target": {
+                "type": "ICRS",
+                "name": "HD 4628",
+                "ra": 12.095744999999999,
+                "dec": 5.280614
+              },
+              "instrument_configs": [{"exposure_time": 600.0, "exposure_count": 3}],
+              "guiding_config": {"mode": "ON"}
+            }
+          ],
+          "extra_params": {"cadence": {"min_interval": 10800.0, "max_per_night": 2}}
+        }
+      ]
+    },
+    {
+      "id": "HD217014",
+      "name": "HD 217014",
+      "proposal": "rv-example",
+      "ipp_value": 3.0,
+      "operator": "SINGLE",
+      "observation_type": "NORMAL",
+      "requests": [
+        {
+          "id": "HD217014-rv",
+          "configurations": [
+            {
+              "id": "HD217014-rv-spec",
+              "type": "SPECTRUM",
+              "instrument_type": "spectrograph",
+              "target": {
+                "type": "ICRS",
+                "name": "HD 217014",
+                "ra": 344.36663999999996,
+                "dec": 20.768833
+              },
+              "instrument_configs": [{"exposure_time": 600.0, "exposure_count": 3}],
+              "guiding_config": {"mode": "ON"}
+            }
+          ],
+          "extra_params": {"cadence": {"min_interval": 10800.0, "max_per_night": 2}}
+        }
+      ]
+    },
+    {
+      "id": "HD201091",
+      "name": "HD 201091",
+      "proposal": "rv-example",
+      "ipp_value": 4.0,
+      "operator": "SINGLE",
+      "observation_type": "NORMAL",
+      "requests": [
+        {
+          "id": "HD201091-rv",
+          "configurations": [
+            {
+              "id": "HD201091-rv-spec",
+              "type": "SPECTRUM",
+              "instrument_type": "spectrograph",
+              "target": {"type": "ICRS", "name": "HD 201091", "ra": 316.72743, "dec": 38.749414},
+              "instrument_configs": [{"exposure_time": 300.0, "exposure_count": 3}],
+              "guiding_config": {"mode": "ON"}
+            }
+          ],
+          "extra_params": {"cadence": {"min_interval": 10800.0, "max_per_night": 2}}
+        }
+      ]
+    },
+    {
+      "id": "HD185144",
+      "name": "HD 185144",
+      "proposal": "rv-example",
+      "ipp_value": 5.0,
+      "operator": "SINGLE",
+      "observation_type": "NORMAL",
+      "requests": [
+        {
+          "id": "HD185144-rv",
+          "configurations": [
+            {
+              "id": "HD185144-rv-spec",
+              "type": "SPECTRUM",
+              "instrument_type": "spectrograph",
+              "target": {"type": "ICRS", "name": "HD 185144", "ra": 293.09004, "dec": 69.661176},
+              "instrument_configs": [{"exposure_time": 300.0, "exposure_count": 3}],
+              "guiding_config": {"mode": "ON"}
+            }
+          ],
+          "extra_params": {"cadence": {"min_interval": 10800.0, "max_per_night": 2}}
+        }
+      ]
+    },
+    {
+      "id": "HD141004",
+      "name": "HD 141004",
+      "proposal": "rv-example",
+      "ipp_value": 3.0,
+      "operator": "SINGLE",
+      "observation_type": "NORMAL",
+      "requests": [
+        {
+          "id": "HD141004-rv",
+          "configurations": [
+            {
+              "id": "HD141004-rv-spec",
+              "type": "SPECTRUM",
+              "instrument_type": "spectrograph",
+              "target": {"type": "ICRS", "name": "HD 141004", "ra": 236.61105, "dec": 7.353066},
+              "instrument_configs": [{"exposure_time": 600.0, "exposure_count": 3}],
+              "guiding_config": {"mode": "ON"}
+            }
+          ],
+          "extra_params": {"cadence": {"min_interval": 10800.0, "max_per_night": 2}}
+        }
+      ]
+    },
+    {
+      "id": "HD122064",
+      "name": "HD 122064",
+      "proposal": "rv-example",
+      "ipp_value": 4.0,
+      "operator": "SINGLE",
+      "observation_type": "NORMAL",
+      "requests": [
+        {
+          "id": "HD122064-rv",
+          "configurations": [
+            {
+              "id": "HD122064-rv-spec",
+              "type": "SPECTRUM",
+              "instrument_type": "spectrograph",
+              "target": {"type": "ICRS", "name": "HD 122064", "ra": 209.38359, "dec": 61.492867},
+              "instrument_configs": [{"exposure_time": 600.0, "exposure_count": 3}],
+              "guiding_config": {"mode": "ON"}
+            }
+          ],
+          "extra_params": {"cadence": {"min_interval": 10800.0, "max_per_night": 2}}
+        }
+      ]
+    },
+    {
+      "id": "HD95735",
+      "name": "HD 95735",
+      "proposal": "rv-example",
+      "ipp_value": 2.0,
+      "operator": "SINGLE",
+      "observation_type": "NORMAL",
+      "requests": [
+        {
+          "id": "HD95735-rv",
+          "configurations": [
+            {
+              "id": "HD95735-rv-spec",
+              "type": "SPECTRUM",
+              "instrument_type": "spectrograph",
+              "target": {"type": "ICRS", "name": "HD 95735", "ra": 165.835635, "dec": 35.969886},
+              "instrument_configs": [{"exposure_time": 600.0, "exposure_count": 3}],
+              "guiding_config": {"mode": "ON"}
+            }
+          ],
+          "extra_params": {"cadence": {"min_interval": 10800.0, "max_per_night": 2}}
+        }
+      ]
+    },
+    {
+      "id": "HD87901",
+      "name": "HD 87901 (telluric B star)",
+      "proposal": "rv-example",
+      "ipp_value": 2.0,
+      "operator": "SINGLE",
+      "observation_type": "NORMAL",
+      "requests": [
+        {
+          "id": "HD87901-tell",
+          "configurations": [
+            {
+              "id": "HD87901-tell-spec",
+              "type": "SPECTRUM",
+              "instrument_type": "spectrograph",
+              "target": {"type": "ICRS", "name": "HD 87901", "ra": 152.09298, "dec": 11.967208},
+              "instrument_configs": [{"exposure_time": 60.0, "exposure_count": 1}],
+              "constraints": {"max_airmass": 1.5},
+              "guiding_config": {"mode": "ON"}
+            }
+          ],
+          "extra_params": {"cadence": {"min_interval": 0.0, "max_per_night": 1}}
+        }
+      ]
+    },
+    {
+      "id": "M67",
+      "name": "M67 imaging (one-shot)",
+      "proposal": "imaging-example",
+      "ipp_value": 2.0,
+      "operator": "SINGLE",
+      "observation_type": "NORMAL",
+      "requests": [
+        {
+          "id": "M67-img",
+          "configurations": [
+            {
+              "id": "M67-img-c",
+              "type": "EXPOSE",
+              "instrument_type": "imager",
+              "target": {"type": "ICRS", "name": "M67", "ra": 132.82500000000002, "dec": 11.814},
+              "instrument_configs": [
+                {"exposure_time": 60.0, "exposure_count": 5, "optical_elements": {"filter": "rp"}},
+                {"exposure_time": 120.0, "exposure_count": 5, "optical_elements": {"filter": "gp"}}
+              ],
+              "constraints": {"min_lunar_distance": 30.0}
+            }
+          ],
+          "windows": [{"start": "2026-11-01T00:00:00+00:00", "end": "2027-02-01T00:00:00+00:00"}],
+          "location": {"telescope": "t2"}
+        }
+      ]
+    }
   ]
 }

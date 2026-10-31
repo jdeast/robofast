@@ -136,24 +136,13 @@ def test_offline_catalog_is_a_warning(tmp_path):
 
 
 def _group(name: str, ra: float, dec: float, gid: str = "g1") -> dict:
-    return {
-        "id": gid,
-        "name": gid,
-        "requests": [
-            {
-                "id": f"{gid}-r",
-                "configurations": [
-                    {
-                        "id": f"{gid}-c",
-                        "type": "SPECTRUM",
-                        "instrument": "spectrograph",
-                        "target": {"name": name, "ra_hours": ra / 15.0, "dec_deg": dec},
-                        "instrument_configs": [{"exptime": 300, "count": 1}],
-                    }
-                ],
-            }
-        ],
-    }
+    from tests.core.test_dispatch import group
+
+    g = group(gid, instrument="spectrograph", exptime=300)
+    c = g["requests"][0]["configurations"][0]
+    c["type"] = "SPECTRUM"
+    c["target"] = {"type": "ICRS", "name": name, "ra": float(ra), "dec": float(dec)}
+    return g
 
 
 def _vetting_cfg(reject=()):

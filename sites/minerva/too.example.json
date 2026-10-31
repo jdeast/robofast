@@ -1,15 +1,33 @@
 {
-  "_note": "A target-of-opportunity request group (docs/design.md 3.7.1). Write it elsewhere, then rename it into the dispatch plan's too_dropbox. Policies: next, now-after-readout, now.",
+  "_note": "A target-of-opportunity request group in the OCS shape (docs/design.md 3.7.1, docs/request_language.md): observation_type RAPID_RESPONSE or TIME_CRITICAL, with robofast's deadline, interrupt policy (next, now-after-readout, now) and priority class in extra_params.too (each optional: the deadline defaults to the last window's end). Write it elsewhere, then rename it into the dispatch plan's too_dropbox, or POST it to the request API's /api/requestgroups.",
   "id": "too-example-1",
   "name": "Example transient follow-up",
   "proposal": "too-example",
-  "priority": 10,
-  "too": {"deadline": "2026-11-15T12:00:00Z", "policy": "now-after-readout", "priority_class": 1},
+  "ipp_value": 10.0,
+  "operator": "SINGLE",
+  "observation_type": "RAPID_RESPONSE",
+  "extra_params": {
+    "too": {
+      "deadline": "2026-11-15T12:00:00+00:00",
+      "policy": "now-after-readout",
+      "priority_class": 1
+    }
+  },
   "requests": [
-    {"id": "too-example-1-r", "telescopes": ["t1", "t2"],
-     "configurations": [
-       {"id": "too-example-1-c", "instrument": "imager",
-        "target": {"name": "AT 2026example", "ra_hours": 3.5, "dec_deg": 24.1},
-        "instrument_configs": [{"exptime": 120, "count": 5, "filter": "rp"}]}]}
+    {
+      "id": "too-example-1-r",
+      "configurations": [
+        {
+          "id": "too-example-1-c",
+          "type": "EXPOSE",
+          "instrument_type": "imager",
+          "target": {"type": "ICRS", "name": "AT 2026example", "ra": 52.5, "dec": 24.1},
+          "instrument_configs": [
+            {"exposure_time": 120.0, "exposure_count": 5, "optical_elements": {"filter": "rp"}}
+          ]
+        }
+      ],
+      "extra_params": {"telescopes": ["t1", "t2"]}
+    }
   ]
 }

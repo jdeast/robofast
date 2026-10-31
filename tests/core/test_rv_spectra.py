@@ -427,15 +427,21 @@ def test_observation_validation():
 # -- the request model and the dispatch scheduler -------------------------------------
 
 
-def _rv_group(gid, ha=-1.0, *, priority=2.0, telescopes=("t1", "t2"), **ic):
-    from .test_dispatch import group
+def _rv_group(gid, ha=-1.0, *, priority=2.0, telescopes=("t1", "t2"), filter=None, **extra):
+    """A SPECTRUM group in the OCS shape; ``extra``: the instrument config's
+    extra_params (iodine, target_counts)."""
+    from .test_dispatch import group, ic
 
-    g = group(gid, ha, priority=priority, ics=[{"exptime": 600, "count": 1, **ic}])
+    one = ic(600, 1, filter=filter)
+    if extra:
+        one["extra_params"] = extra
+    g = group(gid, ha, priority=priority, ics=[one], telescopes=list(telescopes))
     cfg = g["requests"][0]["configurations"][0]
     cfg["type"] = "SPECTRUM"
-    del cfg["instrument"]
-    cfg["target"].update(pm_ra=-1729.7, pm_dec=855.3, epoch=2000.0, parallax=273.8)
-    g["requests"][0]["telescopes"] = list(telescopes)
+    del cfg["instrument_type"]
+    cfg["target"].update(
+        proper_motion_ra=-1729.7, proper_motion_dec=855.3, epoch=2000.0, parallax=273.8
+    )
     return g
 
 
@@ -459,7 +465,9 @@ def test_spectrum_configurations_validate_and_round_trip():
         RequestGroup.from_dict(bad)
     imaging = _rv_group("y")
     imaging["requests"][0]["configurations"][0]["type"] = "EXPOSE"
-    imaging["requests"][0]["configurations"][0]["instrument_configs"][0]["iodine"] = True
+    imaging["requests"][0]["configurations"][0]["instrument_configs"][0]["extra_params"] = {
+        "iodine": True
+    }
     with pytest.raises(ValueError, match="for SPECTRUM"):
         RequestGroup.from_dict(imaging)
 
@@ -521,6 +529,4 @@ async def test_dispatch_one_spectrum_at_a_time_and_busy_telescopes_are_not_fed()
 def _img_group():
     from .test_dispatch import group
 
-    g = group("img", -0.5, priority=5.0)
-    g["requests"][0]["telescopes"] = ["t2"]
-    return g
+    return group("img", -0.5, priority=5.0, telescopes=["t2"])

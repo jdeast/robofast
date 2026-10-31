@@ -45,37 +45,65 @@ Errors are JSON ``{"error": ...}``; an unexpected one is logged with an
 incident id and answered 500 with only that id, never a stack trace.
 
 **Authentication** (:mod:`robofast_core.api_auth`): ``Authorization: Token
-<token>`` (or ``Bearer``), per-client tokens hashed at rest, scopes
-``read``/``submit``/``too``/``operator``/``admin`` (``operator`` is for the
+<token>`` (the OCS form; ``Bearer`` also works), per-client tokens hashed at
+rest, scopes ``read``/``submit``/``too``/``operator``/``admin`` (``operator`` is for the
 observer console, :mod:`robofast_core.console`; this API grants nothing to
 it), per-token rate limits, and an audit log line for every POST (including
 refused ones).
 
 Endpoints
 ---------
-All under ``/api/v1`` (a trailing slash is ignored):
+The paths and JSON are the LCO Observatory Control System's (OCS)
+observation portal's, so TOM Toolkit's generic ``OCSFacility`` (and any other
+OCS client) talks to robofast with only its settings changed
+(docs/tom_facility.md); the request language is
+:mod:`robofast_core.request_model` (docs/request_language.md). All under
+``/api`` (a trailing slash is ignored). ``/api/v1`` is the same API under
+its previous prefix, kept for one release; there ``validate`` answers in its
+previous shape (``errors`` a list).
 
 * ``GET /`` -- who am I: the token's name, scopes and the enclosures.
-* ``POST /requestgroups`` (``submit``) -- submit a request group (the
-  :class:`~robofast_core.request_model.RequestGroup` JSON, without ``too``).
-  Ids may be omitted (they are generated); ``status``, ``submitted`` and
-  ``submitter`` are set here. 202 with the ids; the group is ``QUEUED``
-  until the scheduler takes it in. ``?enclosure=NAME`` picks the enclosure
-  when the request's ``telescopes`` do not.
+* ``POST /requestgroups`` (``submit``; ``too`` for a RAPID_RESPONSE or
+  TIME_CRITICAL group) -- submit a request group. Ids may be omitted (they
+  are generated); ``state``, ``created`` and ``submitter`` are set here.
+  202 with the group (its requests' ids are what an OCS client keeps); it is
+  ``intake: QUEUED`` until the scheduler takes it in. The enclosure comes
+  from ``?enclosure=NAME``, else the requests' ``location.enclosure``, else
+  their telescopes, else the only one.
 * ``POST /requestgroups/validate`` (``submit`` or ``too``) -- the same checks
-  without submitting, plus a dry run over the coming night on a coarse grid:
-  which telescopes could start each request, when, and the commonest reasons
-  why not; and, when the plan has ``vetting``, what the star catalog says
-  about each target (``vetting``, ``warnings``; flags the site rejects make
-  the group invalid; docs/sky.md).
+  without submitting: ``errors`` (an object, entry path to messages; empty
+  if valid), ``request_durations`` (the scheduler's estimate, s), and a dry
+  run over the coming night on a coarse grid: which telescopes could start
+  each request, when, and the commonest reasons why not; and, when the plan
+  has ``vetting``, what the star catalog says about each target
+  (``vetting``, ``warnings``; flags the site rejects make the group
+  invalid; docs/sky.md).
+* ``POST /requestgroups/cadence`` (``submit`` or ``too``) -- expand an OCS
+  cadence (a request's ``cadence``: ``start``, ``end``, ``period`` and
+  ``jitter`` in hours) into one request per window, returned for
+  submission (windows are not checked for visibility; the scheduler does).
 * ``GET /requestgroups`` (``read``) -- this client's groups (``admin``: all),
-  ``?state=`` and ``?limit=`` filter.
+  ``?state=``, ``?request_id=`` and ``?limit=`` filter; ``{"count",
+  "next", "previous", "results"}``.
 * ``GET /requestgroups/{id}`` (``read``) -- one group, with each
   configuration's status.
 * ``POST /requestgroups/{id}/cancel`` (``submit`` for a normal group,
-  ``too`` for a ToO; own groups, or ``admin``).
-* ``POST /toos`` (``too``) -- submit a target of opportunity (a group with
-  a ``too`` entry).
+  ``too`` for a ToO; own groups, or ``admin``) -- answers ``state:
+  CANCELED`` (with ``cancel_pending`` until the scheduler has done it).
+* ``GET /requests/{id}`` (``read``) -- one request, with its OCS ``state``.
+* ``GET /requests/{id}/observations`` (``read``) -- its completed
+  observations as OCS observation blocks (``state``, ``start``, ``end``,
+  ``site``, ``enclosure``, ``telescope``).
+* ``GET /instruments`` (any token) -- the instrument types, OCS shape
+  (``type``, ``class``, ``name``, ``optical_elements``, ``modes``,
+  ``configuration_types``, ``default_configuration_type``), from the
+  enclosures' dispatch limits and the ``instruments`` setting.
+* ``GET /profile`` and ``GET /proposals`` (any token) -- the client's name
+  and the ``proposals`` it may submit under (the ``proposals`` setting).
+* ``GET /telescope_states`` (``read``) -- ``{"site.enclosure.telescope":
+  [{"event_type": "AVAILABLE" or "NOT_AVAILABLE", "event_reason"}]}``.
+* ``POST /toos`` (``too``) -- submit a target of opportunity (the same as
+  ``POST /requestgroups``, but refuses a NORMAL group).
 * ``GET /status`` (``read``) -- each enclosure: weather verdict and reason,
   shutter, lease, faults (from the supervisor), and each telescope's state
   and current observation (from the sequencer's status snapshot).
@@ -96,11 +124,12 @@ scheduler takes the files in, in order, every ``too_poll`` seconds (10 by
 default) and records the result in its state file, which this process reads
 (never writes). So a submission made while the sequencer is down waits in the
 drop box and is taken in when it starts. A group's ``intake`` is ``QUEUED``
-(in the drop box), ``ACCEPTED`` (in the scheduler's state; ``state`` and the
-configurations' ``status`` come from there), ``REJECTED`` (the scheduler
-refused it: ``error`` says why) or ``CANCELED`` (canceled while still
-queued). Canceling a queued group takes its file back out of the drop box;
-canceling an accepted one asks the scheduler, which cancels every
+(in the drop box; ``state`` PENDING), ``ACCEPTED`` (in the scheduler's
+state; ``state`` and the configurations' ``status`` come from there),
+``REJECTED`` (the scheduler refused it: ``error`` says why; ``state``
+NOT_ATTEMPTED) or ``CANCELED`` (canceled while still queued). Canceling a
+queued group takes its file back out of the drop box; canceling an accepted
+one asks the scheduler, which cancels every
 configuration not yet finished: an observation in progress finishes, then
 its visit ends.
 """
@@ -141,14 +170,16 @@ from robofast_core.api_auth import (
 )
 from robofast_core.config import load_config, telescopes
 from robofast_core.dispatch import DispatchScheduler, dispatch_from_config
-from robofast_core.request_model import RequestGroup, Status
+from robofast_core.request_model import RequestGroup, upgrade_legacy
 
 log = logging.getLogger(__name__)
 
-PREFIX = "/api/v1"
+#: The OCS paths; the previous prefix stays for one release.
+PREFIX = "/api"
+LEGACY_PREFIX = "/api/v1"
 GROUP_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,63}")
 SUB_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+/-]{0,127}")
-RESERVED_IDS = {"validate"}
+RESERVED_IDS = {"validate", "cadence"}
 _DROP_RE = re.compile(r"(\d{20})-(submit|cancel)-(.+)\.json")
 #: Size limits on a submitted group (the body limit bounds the rest).
 MAX_REQUESTS = 20
@@ -195,6 +226,19 @@ class ApiConfig:
     #: fields: enclosure, night (YYYYMMDD, local), telescope, group, request,
     #: configuration, instrument_config, frame. None: no paths.
     data_path_template: str | None = None
+    #: The site code in ``/telescope_states`` keys (``site.enclosure.telescope``;
+    #: TOM's facility settings name it among its sites).
+    site_code: str = "site"
+    #: The OCS telescope class of the telescopes (e.g. ``"0m7"``), reported
+    #: as each instrument's ``class`` (TOM puts it in ``location``).
+    telescope_class: str = "robofast"
+    #: Proposals clients may submit under, ``{id: {"title": ..., "clients":
+    #: [token names]}}`` (no ``clients``: every client); listed by
+    #: ``/profile``. Empty: any proposal is accepted (and none listed).
+    proposals: dict[str, Any] = field(default_factory=dict)
+    #: Per instrument type, ``/instruments`` fields to add or override
+    #: (``name``, ``type``, ``class``, ``optical_elements``, ...).
+    instruments: dict[str, Any] = field(default_factory=dict)
 
 
 class ApiError(Exception):
@@ -238,11 +282,18 @@ def _iso(t: datetime | None) -> str | None:
     return None if t is None else t.isoformat()
 
 
-def _group_state(statuses: list[Status]) -> str:
-    if any(s.schedulable for s in statuses):
-        return "PENDING"
-    kinds = set(statuses)
-    return str(kinds.pop()) if len(kinds) == 1 else "DONE"
+#: A group's ``state`` before the scheduler has it (by ``intake``).
+_INTAKE_STATE = {"QUEUED": "PENDING", "CANCELED": "CANCELED", "REJECTED": "NOT_ATTEMPTED"}
+
+
+def _split(target: str) -> tuple[list[str], bool] | None:
+    """A request target's path parts under ``/api`` and whether it came
+    under ``/api/v1``; None if it is under neither."""
+    path = urlsplit(target).path
+    for prefix, legacy in ((LEGACY_PREFIX, True), (PREFIX, False)):
+        if path == prefix or path.startswith(prefix + "/"):
+            return [unquote(p) for p in path[len(prefix) :].split("/") if p], legacy
+    return None
 
 
 # -- one enclosure, as seen from here ---------------------------------------------------
@@ -390,12 +441,7 @@ class Enclosure:
         out: dict[str, dict[str, Any]] = {}
         for gid, g in view.groups.items():
             d = g.to_dict()
-            d.update(
-                enclosure=self.name,
-                intake="ACCEPTED",
-                state=_group_state([c.status for c in g.configurations()]),
-                cancel_pending=gid in cancel_pending,
-            )
+            d.update(enclosure=self.name, intake="ACCEPTED", cancel_pending=gid in cancel_pending)
             out[gid] = d
         for path, d in queued:
             if isinstance(d, dict) and "cancel" not in d and str(d.get("id")) not in out:
@@ -425,7 +471,11 @@ class Enclosure:
             for c in r.get("configurations", []) if isinstance(r, dict) else []:
                 if isinstance(c, dict):
                     c["status"] = status
-        d.update(enclosure=self.name, intake=intake, state=intake, **extra)
+        state = _INTAKE_STATE[intake]
+        for r in d.get("requests", []) if isinstance(d.get("requests"), list) else []:
+            if isinstance(r, dict):
+                r["state"] = state
+        d.update(enclosure=self.name, intake=intake, state=state, **extra)
         return d
 
 
@@ -497,11 +547,10 @@ class RequestApi:
         return resp
 
     async def _handle(self, req: HttpRequest, addr: str, audit: dict[str, Any] | None) -> Response:
-        url = urlsplit(req.target)
-        path = unquote(url.path)
+        path = unquote(urlsplit(req.target).path)
         if path.rstrip("/") == "/healthz" and req.method == "GET":
             return Response(200, {"ok": True})
-        if not path.startswith(PREFIX + "/") and path != PREFIX:
+        if _split(req.target) is None:
             raise ApiError(404, "not found")
         client = self._authenticate(req, addr)
         return await self.call(client, req.method, req.target, req.body, audit)
@@ -519,12 +568,12 @@ class RequestApi:
         route, scopes. ``audit`` (if given) collects the audit fields; the
         caller writes it. Raises :class:`ApiError`."""
         url = urlsplit(target)
-        path = unquote(url.path)
-        if not path.startswith(PREFIX + "/") and path != PREFIX:
+        split = _split(target)
+        if split is None:
             raise ApiError(404, "not found")
+        parts, legacy = split
         if audit is not None:
             audit.update(client=client.name, token_id=client.id)
-        parts = [p for p in path[len(PREFIX) :].split("/") if p]
         query = {k: v[-1] for k, v in parse_qs(url.query).items()}
         cost = self.config.validate_cost if parts[-1:] == ["validate"] else 1.0
         ok, wait = self.limiter.allow(client.id, cost)
@@ -545,14 +594,17 @@ class RequestApi:
                 },
             )
         if route == "submit":
-            self._need(client, "submit")
-            return self._submit(client, body, query, too=False, audit=audit)
+            self._need(client, "submit", "too")
+            return self._submit(client, body, query, too=None, audit=audit)
         if route == "too":
             self._need(client, "too")
             return self._submit(client, body, query, too=True, audit=audit)
         if route == "validate":
             self._need(client, "submit", "too")
-            return await self._validate(client, body, query)
+            return await self._validate(client, body, query, legacy=legacy)
+        if route == "cadence":
+            self._need(client, "submit", "too")
+            return Response(200, _expand_cadence(_json_object(body), self.clock()))
         if route == "list":
             self._need(client, "read")
             return self._list(client, query)
@@ -569,25 +621,62 @@ class RequestApi:
         if route == "status":
             self._need(client, "read")
             return Response(200, await self._status())
+        if route == "request":
+            self._need(client, "read")
+            return Response(200, self._request(client, gid)[2])
+        if route == "observations":
+            self._need(client, "read")
+            return Response(200, self._observations(client, gid))
+        if route == "instruments":
+            return Response(200, self._instruments())
+        if route == "profile":
+            return Response(
+                200,
+                {
+                    "username": client.name,
+                    "scopes": client.scopes,
+                    "proposals": self._proposals(client),
+                },
+            )
+        if route == "proposals":
+            props = self._proposals(client)
+            return Response(
+                200, {"count": len(props), "next": None, "previous": None, "results": props}
+            )
+        if route == "telescope_states":
+            self._need(client, "read")
+            return Response(200, await self._telescope_states())
         raise ApiError(404, "not found")  # pragma: no cover
 
     _ROUTES: ClassVar[dict[tuple[str, ...], dict[str, str]]] = {
         (): {"GET": "whoami"},
         ("requestgroups",): {"GET": "list", "POST": "submit"},
         ("requestgroups", "validate"): {"POST": "validate"},
+        ("requestgroups", "cadence"): {"POST": "cadence"},
         ("requestgroups", "*"): {"GET": "get"},
         ("requestgroups", "*", "cancel"): {"POST": "cancel"},
         ("requestgroups", "*", "data"): {"GET": "data"},
+        ("requests", "*"): {"GET": "request"},
+        ("requests", "*", "observations"): {"GET": "observations"},
         ("toos",): {"POST": "too"},
         ("status",): {"GET": "status"},
+        ("instruments",): {"GET": "instruments"},
+        ("profile",): {"GET": "profile"},
+        ("proposals",): {"GET": "proposals"},
+        ("telescope_states",): {"GET": "telescope_states"},
     }
 
     def _route(self, method: str, parts: list[str]) -> tuple[str, str | None]:
+        """(route, the group or request id in the path)."""
         gid = None
         key = tuple(parts)
-        if key not in self._ROUTES and len(parts) >= 2 and parts[0] == "requestgroups":
+        if (
+            key not in self._ROUTES
+            and len(parts) >= 2
+            and parts[0] in ("requestgroups", "requests")
+        ):
             gid = parts[1]
-            key = ("requestgroups", "*", *parts[2:])
+            key = (parts[0], "*", *parts[2:])
         methods = self._ROUTES.get(key)
         if methods is None:
             raise ApiError(404, "not found")
@@ -624,36 +713,39 @@ class RequestApi:
         """Parse and check a submitted group: (group, enclosure, problems
         found against the enclosure). Raises ApiError(400) if it does not
         parse at all."""
+        data = _json_object(body)
         try:
-            data = json.loads(body)
-        except (ValueError, UnicodeDecodeError) as exc:
-            raise ApiError(400, f"body is not JSON: {exc}") from None
-        if not isinstance(data, dict):
-            raise ApiError(400, "body must be a JSON object (a request group)")
+            data = upgrade_legacy(data)
+        except ValueError as exc:
+            raise ApiError(400, "invalid request group", [str(exc)]) from None
         errors = _check_input(data)
         if errors:
             raise ApiError(400, "invalid request group", errors)
-        if too is True and data.get("too") is None:
-            raise ApiError(400, "invalid request group", ["too: required for a ToO (/toos)"])
-        if too is False and data.get("too") is not None:
-            raise ApiError(
-                400, "invalid request group", ["too: submit targets of opportunity to /toos"]
-            )
         _fill_ids(data)
         data["submitter"] = client.name
-        data.pop("submitted", None)
+        data.pop("created", None)
         try:
             group = RequestGroup.from_dict(data, "request group")
         except ValueError as exc:
             raise ApiError(400, "invalid request group", [str(exc)]) from None
+        if too is True and group.too is None:
+            raise ApiError(
+                400,
+                "invalid request group",
+                ["observation_type: RAPID_RESPONSE or TIME_CRITICAL for a ToO (/toos)"],
+            )
         enclosure = self._enclosure_for(group, query)
-        return group, enclosure, self._problems(group, enclosure)
+        return group, enclosure, self._problems(client, group, enclosure)
 
     def _enclosure_for(self, group: RequestGroup, query: dict[str, str]) -> Enclosure:
-        if "enclosure" in query:
-            enc = self.enclosures.get(query["enclosure"])
+        wanted = {r.location.get("enclosure") for r in group.requests} - {None}
+        if len(wanted) > 1:
+            raise ApiError(400, f"location.enclosure: the requests name several {sorted(wanted)}")
+        name = query.get("enclosure") or (wanted.pop() if wanted else None)
+        if name is not None:
+            enc = self.enclosures.get(name)
             if enc is None:
-                raise ApiError(400, f"unknown enclosure {query['enclosure']!r}")
+                raise ApiError(400, f"unknown enclosure {name!r}")
             return enc
         named = {t for r in group.requests for t in (r.telescopes or [])}
         if named:
@@ -667,10 +759,13 @@ class RequestApi:
             return next(iter(self.enclosures.values()))
         raise ApiError(400, f"name an enclosure (?enclosure=...): one of {sorted(self.enclosures)}")
 
-    def _problems(self, group: RequestGroup, enc: Enclosure) -> list[str]:
+    def _problems(self, client: TokenRecord, group: RequestGroup, enc: Enclosure) -> list[str]:
         """What would stop this group from ever running on ``enc``."""
         now = self.clock()
         out = []
+        allowed = [p["id"] for p in self._proposals(client)]
+        if self.config.proposals and group.proposal not in allowed:
+            out.append(f"proposal: {group.proposal!r} is not one of yours {allowed}")
         known: set[str] = set()
         for e in self.enclosures.values():
             for gid, d in e.entries().items():
@@ -698,8 +793,14 @@ class RequestApi:
                     )
             if r.windows and all(w.end <= now for w in r.windows):
                 out.append(f"{what}.windows: every window has already ended")
+            tclass = r.location.get("telescope_class")
+            if tclass is not None and tclass != self.config.telescope_class:
+                out.append(
+                    f"{what}.location.telescope_class: {tclass!r}; this observatory's is "
+                    f"{self.config.telescope_class!r}"
+                )
         if group.too is not None and group.too.deadline <= now:
-            out.append(f"too.deadline: {group.too.deadline.isoformat()} has passed")
+            out.append(f"extra_params.too.deadline: {group.too.deadline.isoformat()} has passed")
         return out
 
     def _submit(
@@ -708,39 +809,47 @@ class RequestApi:
         body: bytes,
         query: dict[str, str],
         *,
-        too: bool,
+        too: bool | None,
         audit: dict[str, Any] | None,
     ) -> Response:
         group, enc, problems = self._parse(client, body, query, too)
         if audit is not None:
             audit["group"] = group.id
+        # A ToO needs the too scope wherever it is submitted.
+        self._need(client, "too" if group.too is not None else "submit")
         if problems:
             raise ApiError(400, "request group not accepted", problems)
         group.submitted = self.clock()
-        enc.drop("submit", group.id, group.to_dict())
+        d = group.to_dict()
+        enc.drop("submit", group.id, d)
         log.info("%s: %s submitted %s", enc.name, client.name, group.id)
-        return Response(
-            202,
-            {
-                "id": group.id,
-                "enclosure": enc.name,
-                "intake": "QUEUED",
-                "too": group.too is not None,
-                "requests": [
-                    {"id": r.id, "configurations": [c.id for c in r.configurations]}
-                    for r in group.requests
-                ],
-                "url": f"{PREFIX}/requestgroups/{group.id}",
-            },
+        d.update(
+            enclosure=enc.name,
+            intake="QUEUED",
+            too=group.too is not None,
+            url=f"{PREFIX}/requestgroups/{group.id}",
         )
+        return Response(202, d)
 
-    async def _validate(self, client: TokenRecord, body: bytes, query: dict[str, str]) -> Response:
-        group, enc, problems = self._parse(client, body, query, None)
+    async def _validate(
+        self, client: TokenRecord, body: bytes, query: dict[str, str], *, legacy: bool = False
+    ) -> Response:
+        try:
+            group, enc, problems = self._parse(client, body, query, None)
+        except ApiError as exc:
+            if legacy or exc.status != 400:
+                raise
+            # An OCS client (TOM's form) expects the errors in a 200.
+            errs = exc.errors or [exc.message]
+            return Response(
+                200, {"valid": False, "errors": _error_dict(errs), "request_durations": {}}
+            )
         out: dict[str, Any] = {
             "valid": not problems,
-            "errors": problems,
+            "errors": problems if legacy else _error_dict(problems),
             "id": group.id,
             "enclosure": enc.name,
+            "request_durations": _durations(enc, group),
         }
         loop = asyncio.get_running_loop()
         vetter = getattr(enc.view(), "vetter", None) if not problems else None
@@ -771,6 +880,7 @@ class RequestApi:
                 if rejected:
                     problems += rejected
                     out["valid"] = False
+                    out["errors"] = problems if legacy else _error_dict(problems)
         if not problems:
             deadline = time.monotonic() + self.config.validate_budget
             out["dry_run"] = await loop.run_in_executor(
@@ -796,6 +906,7 @@ class RequestApi:
         except ValueError:
             raise ApiError(400, "limit: expected an integer") from None
         want = query.get("state")
+        rid = query.get("request_id")
         rows = []
         for enc in self.enclosures.values():
             for gid, d in enc.entries().items():
@@ -803,19 +914,179 @@ class RequestApi:
                     continue
                 if want is not None and want not in (d["state"], d["intake"]):
                     continue
+                reqs = [r for r in d.get("requests", []) if isinstance(r, dict)]
+                if rid is not None and rid not in [str(r.get("id")) for r in reqs]:
+                    continue
                 rows.append(
                     {
                         "id": gid,
+                        "name": d.get("name", ""),
+                        "proposal": d.get("proposal", ""),
+                        "observation_type": d.get("observation_type", "NORMAL"),
                         "enclosure": enc.name,
                         "intake": d["intake"],
                         "state": d["state"],
                         "submitter": d.get("submitter", ""),
-                        "submitted": d.get("submitted"),
-                        "too": d.get("too") is not None,
+                        "created": d.get("created"),
+                        "too": d.get("observation_type", "NORMAL") != "NORMAL",
+                        "requests": [{"id": r.get("id"), "state": r.get("state")} for r in reqs],
                     }
                 )
-        rows.sort(key=lambda r: (r["submitted"] or "", r["id"]), reverse=True)
-        return Response(200, {"count": len(rows), "results": rows[:limit]})
+        rows.sort(key=lambda r: (r["created"] or "", r["id"]), reverse=True)
+        return Response(
+            200, {"count": len(rows), "next": None, "previous": None, "results": rows[:limit]}
+        )
+
+    def _request(
+        self, client: TokenRecord, rid: str | None
+    ) -> tuple[Enclosure, dict[str, Any], dict[str, Any]]:
+        """(enclosure, group entry, request) for a request id."""
+        for enc in self.enclosures.values():
+            for entry in enc.entries().values():
+                if not self._visible(client, entry):
+                    continue
+                for r in entry.get("requests", []):
+                    if isinstance(r, dict) and str(r.get("id")) == str(rid):
+                        out = {k: v for k, v in r.items() if not k.startswith("_")}
+                        out.update(
+                            request_group_id=entry["id"],
+                            enclosure=enc.name,
+                            intake=entry["intake"],
+                        )
+                        return enc, entry, out
+        raise ApiError(404, f"no request {rid!r}")
+
+    def _observations(self, client: TokenRecord, rid: str | None) -> list[dict[str, Any]]:
+        """A request's completed observations as OCS observation blocks
+        (newest first). A dispatch scheduler plans nothing ahead, so there are
+        no PENDING (scheduled) blocks."""
+        enc, entry, req = self._request(client, rid)
+        if entry["intake"] != "ACCEPTED":
+            return []
+        view = enc.view()
+        blocks = []
+        for c in req.get("configurations", []):
+            for o in view.observed.get(c.get("id"), []):
+                blocks.append(
+                    {
+                        "id": f"{c['id']}@{o['time']}",
+                        "request": req["id"],
+                        "configuration": c["id"],
+                        "state": "COMPLETED",
+                        "start": o["time"],
+                        "end": o["time"],
+                        "site": self.config.site_code,
+                        "enclosure": enc.name,
+                        "telescope": o.get("telescope"),
+                        "frames": o.get("frames"),
+                    }
+                )
+        blocks.sort(key=lambda b: b["end"], reverse=True)
+        return blocks
+
+    def _proposals(self, client: TokenRecord) -> list[dict[str, Any]]:
+        out = []
+        for pid, p in self.config.proposals.items():
+            p = p if isinstance(p, dict) else {"title": str(p)}
+            clients = p.get("clients")
+            if clients is None or client.name in clients or client.allows("admin"):
+                out.append({"id": pid, "title": p.get("title", pid), "current": True})
+        return out
+
+    def _instruments(self) -> dict[str, Any]:
+        """``/instruments``: the OCS description of every instrument type on
+        an enclosure's telescopes (as their dispatch limits list them)."""
+        found: dict[str, dict[str, Any]] = {}
+        for enc in self.enclosures.values():
+            for tel in enc.telescopes:
+                limits = enc.planner.limits[tel]
+                for inst in limits.instruments:
+                    entry = found.setdefault(inst, {"filters": [], "telescopes": [], "ports": []})
+                    entry["telescopes"].append(f"{enc.name}.{tel}")
+                    for f in limits.filters or []:
+                        if f not in entry["filters"]:
+                            entry["filters"].append(f)
+                    for port in limits.ports:
+                        if port not in entry["ports"]:
+                            entry["ports"].append(port)
+        out = {}
+        for inst in sorted(set(found) | set(self.config.instruments)):
+            have = found.get(inst, {"filters": [], "telescopes": [], "ports": []})
+            spectro = inst == "spectrograph"
+            types = ["SPECTRUM"] if spectro else ["EXPOSE", "AUTO_FOCUS", "DARK", "BIAS"]
+            d: dict[str, Any] = {
+                "type": "SPECTRA" if spectro else "IMAGE",
+                "class": self.config.telescope_class,
+                "name": inst,
+                "optical_elements": {}
+                if spectro
+                else {
+                    "filters": [
+                        {"name": f, "code": f, "schedulable": True, "default": i == 0}
+                        for i, f in enumerate(have["filters"])
+                    ]
+                },
+                "modes": {
+                    "readout": {
+                        "type": "readout",
+                        "modes": [{"name": "Default", "code": "default", "schedulable": True}],
+                        "default": "default",
+                    },
+                    "guiding": {
+                        "type": "guiding",
+                        "modes": [
+                            {"name": "On", "code": "ON", "schedulable": True},
+                            {"name": "Off", "code": "OFF", "schedulable": not spectro},
+                        ],
+                        "default": "ON" if spectro else "OFF",
+                    },
+                    "acquisition": {
+                        "type": "acquisition",
+                        "modes": [{"name": "Off", "code": "OFF", "schedulable": True}],
+                        "default": "OFF",
+                    },
+                },
+                "default_acceptability_threshold": 100,
+                "configuration_types": {
+                    t: {"name": t.replace("_", " ").title(), "code": t, "schedulable": True}
+                    for t in types
+                },
+                "default_configuration_type": types[0],
+                # robofast's: where it is, and the M3 ports (extra_params.port).
+                "telescopes": have["telescopes"],
+                "ports": have["ports"],
+            }
+            d.update(self.config.instruments.get(inst) or {})
+            out[inst] = d
+        return out
+
+    async def _telescope_states(self) -> dict[str, list[dict[str, Any]]]:
+        status = await self._status()
+        out = {}
+        for name, enc in status["enclosures"].items():
+            sup = enc["supervisor"]
+            for tel, t in enc["telescopes"].items():
+                reasons = []
+                if not sup.get("reachable"):
+                    reasons.append("supervisor unreachable")
+                elif not sup.get("safe"):
+                    reasons.append(f"weather: {sup.get('reason') or 'unsafe'}")
+                if sup.get("fault"):
+                    reasons.append(f"fault: {sup['fault']}")
+                if not enc["sequencer"].get("running"):
+                    reasons.append("sequencer not running")
+                if t.get("state") in ("unknown", "gave_up", "error", None):
+                    reasons.append(f"telescope {t.get('state') or 'unknown'}")
+                out[f"{self.config.site_code}.{name}.{tel}"] = [
+                    {
+                        "telescope": f"{self.config.site_code}.{name}.{tel}",
+                        "event_type": "NOT_AVAILABLE" if reasons else "AVAILABLE",
+                        "event_reason": "; ".join(reasons) or "available",
+                        "start": status["time"],
+                        "end": status["time"],
+                    }
+                ]
+        return out
 
     def _data(self, client: TokenRecord, gid: str | None) -> dict[str, Any]:
         enc, entry = self._find(client, gid)
@@ -879,7 +1150,7 @@ class RequestApi:
 
     def _cancel(self, client: TokenRecord, gid: str | None) -> Response:
         enc, entry = self._find(client, gid)
-        is_too = entry.get("too") is not None
+        is_too = entry.get("observation_type", "NORMAL") != "NORMAL"
         self._need(client, "too" if is_too else "submit")
         gid = entry["id"]
         if entry["intake"] == "QUEUED":
@@ -905,7 +1176,9 @@ class RequestApi:
             {
                 "id": gid,
                 "intake": "ACCEPTED",
-                "state": "PENDING",
+                # The OCS answers the canceled group; the scheduler cancels it
+                # at its next drop-box check (an accepted cancel is final).
+                "state": "CANCELED",
                 "cancel_pending": True,
                 "detail": "the scheduler cancels it at its next drop-box check; an "
                 "observation in progress finishes first",
@@ -1038,10 +1311,13 @@ def _check_input(d: dict[str, Any]) -> list[str]:
                 f"{'/' if pattern is SUB_ID_RE else ''}, starting with a letter or digit)"
             )
 
+    def obj(v: Any) -> dict[str, Any]:
+        return v if isinstance(v, dict) else {}
+
     ident(d.get("id"), "id", GROUP_ID_RE)
     if d.get("id") in RESERVED_IDS:
         errs.append(f"id: {d['id']!r} is reserved")
-    for k in ("name", "proposal"):
+    for k in ("name", "proposal", "observation_type", "operator"):
         text(d.get(k), k)
     reqs = d.get("requests")
     if not isinstance(reqs, list):
@@ -1053,17 +1329,22 @@ def _check_input(d: dict[str, Any]) -> list[str]:
             continue
         rw = f"requests[{i}]"
         ident(r.get("id"), f"{rw}.id", SUB_ID_RE)
+        text(r.get("observation_note"), f"{rw}.observation_note")
         if isinstance(r.get("windows"), list) and len(r["windows"]) > MAX_WINDOWS:
             errs.append(f"{rw}.windows: at most {MAX_WINDOWS}")
-        tels = r.get("telescopes")
+        for k, v in obj(r.get("location")).items():
+            text(v, f"{rw}.location.{k}", 64)
+        tels = obj(r.get("extra_params")).get("telescopes")
         if isinstance(tels, list):
             for j, t in enumerate(tels):
-                text(t, f"{rw}.telescopes[{j}]", 64)
+                text(t, f"{rw}.extra_params.telescopes[{j}]", 64)
         configs = r.get("configurations")
         if not isinstance(configs, list):
             continue
-        if len(configs) > MAX_CONFIGURATIONS:
-            errs.append(f"{rw}.configurations: at most {MAX_CONFIGURATIONS}")
+        repeats = r.get("configuration_repeats")
+        n = len(configs) * (repeats if isinstance(repeats, int) and repeats > 1 else 1)
+        if n > MAX_CONFIGURATIONS:
+            errs.append(f"{rw}.configurations: at most {MAX_CONFIGURATIONS} (with repeats)")
         for j, c in enumerate(configs[:MAX_CONFIGURATIONS]):
             if not isinstance(c, dict):
                 continue
@@ -1072,17 +1353,115 @@ def _check_input(d: dict[str, Any]) -> list[str]:
             for k in ("status", "failures"):
                 if k in c:
                     errs.append(f"{cw}.{k}: set by the scheduler, not by clients")
-            text(c.get("instrument"), f"{cw}.instrument", 64)
-            if isinstance(c.get("target"), dict):
-                text(c["target"].get("name"), f"{cw}.target.name")
+            text(c.get("instrument_type"), f"{cw}.instrument_type", 64)
+            text(c.get("type"), f"{cw}.type", 64)
+            text(obj(c.get("target")).get("name"), f"{cw}.target.name")
             ics = c.get("instrument_configs")
             if isinstance(ics, list):
                 if len(ics) > MAX_INSTRUMENT_CONFIGS:
                     errs.append(f"{cw}.instrument_configs: at most {MAX_INSTRUMENT_CONFIGS}")
                 for k, ic in enumerate(ics[:MAX_INSTRUMENT_CONFIGS]):
                     if isinstance(ic, dict):
-                        text(ic.get("filter"), f"{cw}.instrument_configs[{k}].filter", 64)
+                        iw = f"{cw}.instrument_configs[{k}]"
+                        text(obj(ic.get("optical_elements")).get("filter"), f"{iw}.filter", 64)
+                        text(obj(ic.get("extra_params")).get("port"), f"{iw}.port", 64)
+                        text(ic.get("mode"), f"{iw}.mode", 64)
     return errs
+
+
+def _json_object(body: bytes) -> dict[str, Any]:
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ApiError(400, f"body is not JSON: {exc}") from None
+    if not isinstance(data, dict):
+        raise ApiError(400, "body must be a JSON object (a request group)")
+    return data
+
+
+def _error_dict(errors: list[str]) -> dict[str, list[str]]:
+    """Errors as the OCS reports them: an object from the entry
+    (``requests[0].configurations[0].target.ra``) to its messages; one
+    that names no entry goes under ``non_field_errors``."""
+    out: dict[str, list[str]] = {}
+    for e in errors:
+        key, sep, msg = e.partition(": ")
+        key = key.removeprefix("request group").lstrip(".")
+        if not sep or not key or " " in key:
+            key, msg = "non_field_errors", e
+        out.setdefault(key, []).append(msg)
+    return out
+
+
+def _durations(enc: Enclosure, group: RequestGroup) -> dict[str, Any]:
+    """The OCS ``request_durations``: the scheduler's time model (exposures,
+    readout and slew overheads), per configuration, request and group, s."""
+    reqs = []
+    for r in group.requests:
+        configs = [
+            {"id": c.id, "duration": round(enc.planner.duration(c), 1)} for c in r.configurations
+        ]
+        reqs.append(
+            {
+                "id": r.id,
+                "duration": round(sum(c["duration"] for c in configs), 1),
+                "configurations": configs,
+            }
+        )
+    return {"duration": round(sum(r["duration"] for r in reqs), 1), "requests": reqs}
+
+
+def _expand_cadence(d: dict[str, Any], now: datetime) -> dict[str, Any]:
+    """``POST /requestgroups/cadence``: each request with an OCS ``cadence``
+    (``start``, ``end``, ``period`` and ``jitter`` in hours) becomes one
+    request per period, its window ``jitter`` wide centred on the period's
+    start and clipped to [start, end]; windows already over are left out.
+    Visibility is the scheduler's business, not checked here."""
+    reqs = d.get("requests")
+    if not isinstance(reqs, list) or not reqs:
+        raise ApiError(400, "invalid request group", ["requests: expected a non-empty list"])
+    out = []
+    for i, r in enumerate(reqs):
+        cad = r.get("cadence") if isinstance(r, dict) else None
+        if cad is None:
+            out.append(r)
+            continue
+        what = f"requests[{i}].cadence"
+        try:
+            if not isinstance(cad, dict):
+                raise ValueError(f"{what}: expected an object")
+            start = _cadence_time(cad.get("start"), f"{what}.start")
+            end = _cadence_time(cad.get("end"), f"{what}.end")
+            period = float(cad["period"])
+            jitter = float(cad["jitter"])
+            if not (period > 0 and jitter >= 0) or end <= start:
+                raise ValueError(f"{what}: needs period > 0, jitter >= 0 and end after start")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ApiError(400, "invalid cadence", [str(exc)]) from None
+        if (end - start) / timedelta(hours=period) > MAX_REQUESTS:
+            raise ApiError(400, "invalid cadence", [f"{what}: more than {MAX_REQUESTS} windows"])
+        half = timedelta(hours=jitter / 2.0)
+        t = start
+        while t < end:
+            w0, w1 = max(t - half, start), min(t + half, end)
+            if w1 > now and w1 > w0:
+                copy_r = {k: v for k, v in r.items() if k not in ("cadence", "windows", "id")}
+                copy_r["windows"] = [{"start": w0.isoformat(), "end": w1.isoformat()}]
+                out.append(json.loads(json.dumps(copy_r)))
+            t += timedelta(hours=period)
+    if not out:
+        raise ApiError(400, "invalid cadence", ["no cadence window is in the future"])
+    result = {k: v for k, v in d.items() if k != "requests"}
+    result["requests"] = out
+    result["operator"] = "SINGLE" if len(out) == 1 else "MANY"
+    return result
+
+
+def _cadence_time(v: Any, what: str) -> datetime:
+    t = datetime.fromisoformat(str(v))
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=UTC)
+    return t
 
 
 def _fill_ids(d: dict[str, Any]) -> None:

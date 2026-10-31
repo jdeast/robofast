@@ -658,29 +658,33 @@ class SimulatedNight:
             [(1.0, 20), (2.0, 30), (3.5, 15), (5.0, 35), (6.5, 25), (8.0, 10)]
         ):
             gid = f"RV{i + 1}"
-            ic: dict[str, Any] = {"exptime": self.s.rv_exptime, "count": 1, "iodine": True}
+            extra: dict[str, Any] = {"iodine": True}
             if i == 2:
-                ic["target_counts"] = self.s.expmeter_rate * self.s.rv_exptime * 0.6
+                extra["target_counts"] = self.s.expmeter_rate * self.s.rv_exptime * 0.6
+            ic = {"exposure_time": self.s.rv_exptime, "exposure_count": 1, "extra_params": extra}
             groups.append(
                 {
                     "id": gid,
                     "name": f"RV standard {i + 1}",
                     "proposal": "rv-demo",
-                    "priority": 5 - 0.5 * i,
+                    "ipp_value": 5 - 0.5 * i,
                     "requests": [
                         {
                             "id": f"{gid}-r",
-                            "telescopes": list(NAMES),
+                            # Fiber feeds: every telescope may take part.
+                            "extra_params": {"telescopes": list(NAMES)},
                             "configurations": [
                                 {
                                     "id": f"{gid}-spec",
                                     "type": "SPECTRUM",
+                                    "instrument_type": "spectrograph",
                                     "target": {
+                                        "type": "ICRS",
                                         "name": f"RV{i + 1}",
-                                        "ra_hours": (lst0 + dh) % 24.0,
-                                        "dec_deg": float(dec),
-                                        "pm_ra": 100.0 * (i + 1),
-                                        "pm_dec": -50.0 * (i + 1),
+                                        "ra": (lst0 + dh) % 24.0 * 15.0,
+                                        "dec": float(dec),
+                                        "proper_motion_ra": 100.0 * (i + 1),
+                                        "proper_motion_dec": -50.0 * (i + 1),
                                         "epoch": 2000.0,
                                     },
                                     "instrument_configs": [ic],
@@ -696,24 +700,26 @@ class SimulatedNight:
                 "id": "FIELD",
                 "name": "Imaging field",
                 "proposal": "imaging-demo",
-                "priority": 20,
+                "ipp_value": 20,
                 "requests": [
                     {
                         "id": "FIELD-r",
-                        "telescopes": ["t1"],
+                        "location": {"telescope": "t1"},
                         "windows": [
                             {"start": w0.isoformat(), "end": (w0 + timedelta(hours=2)).isoformat()}
                         ],
                         "configurations": [
                             {
                                 "id": "FIELD-img",
-                                "instrument": "imager",
+                                "type": "EXPOSE",
+                                "instrument_type": "imager",
                                 "target": {
+                                    "type": "ICRS",
                                     "name": "FIELD",
-                                    "ra_hours": (lst0 + 4.5) % 24.0,
-                                    "dec_deg": 25.0,
+                                    "ra": (lst0 + 4.5) % 24.0 * 15.0,
+                                    "dec": 25.0,
                                 },
-                                "instrument_configs": [{"exptime": 0.3, "count": 2}],
+                                "instrument_configs": [{"exposure_time": 0.3, "exposure_count": 2}],
                             }
                         ],
                     }
@@ -729,26 +735,35 @@ class SimulatedNight:
             "id": "TOO1",
             "name": "Target of opportunity",
             "proposal": "too-demo",
-            "priority": 10,
-            "too": {
-                "deadline": (now + timedelta(hours=3)).isoformat(),
-                "policy": "next",
-                "priority_class": 1,
+            "ipp_value": 10,
+            # TIME_CRITICAL: ranks above every normal request, interrupts
+            # nothing (policy "next").
+            "observation_type": "TIME_CRITICAL",
+            "extra_params": {
+                "too": {
+                    "deadline": (now + timedelta(hours=3)).isoformat(),
+                    "policy": "next",
+                    "priority_class": 1,
+                }
             },
             "requests": [
                 {
                     "id": "TOO1-r",
-                    "telescopes": list(NAMES),
+                    "extra_params": {"telescopes": list(NAMES)},
                     "configurations": [
                         {
                             "id": "TOO1-spec",
                             "type": "SPECTRUM",
+                            "instrument_type": "spectrograph",
                             "target": {
+                                "type": "ICRS",
                                 "name": "TOO1",
-                                "ra_hours": (lst + 0.5) % 24.0,
-                                "dec_deg": 28.0,
+                                "ra": (lst + 0.5) % 24.0 * 15.0,
+                                "dec": 28.0,
                             },
-                            "instrument_configs": [{"exptime": self.s.rv_exptime, "count": 1}],
+                            "instrument_configs": [
+                                {"exposure_time": self.s.rv_exptime, "exposure_count": 1}
+                            ],
                         }
                     ],
                 }

@@ -53,6 +53,7 @@ once after any action) and falls back to polling `/console/api/status`.
 | Spectrograph | busy, job, phase, frame *n* of *m*, exposure progress, target counts, exposure meter, CCD temperature, iodine stage, pressure | KiwiSpec `GET /status` |
 | Plan | the night's plan record, newest first (decisions with score and runner-up count, outcomes, idles, preemptions, ToOs); the pending queue (ToOs first, then priority) | `record` directory of the dispatch plan; the scheduler's state file, read as the request API reads it |
 | Timeline | the supervisor's recent commands and events | supervisor `GET /timeline` |
+| Sky | an alt/az chart: each telescope's pointing, the targets (current ones highlighted, ToOs marked), the Sun and the Moon, the altitude limits; a target table with altitude, azimuth, airmass now and in 1 and 2 h, and hour angle | the snapshot's `tel.alt`/`tel.az` and `current`; the dispatch scheduler's requests; astropy (`robofast_core/console/skyview.py`) |
 | Images | each guider's live frame with the fiber, the centroid and the guide window drawn on it; each telescope's latest saved frame; the spectrograph's latest raw frame (below) | guider `GET /frame`, the frame index, `spectrograph_frames` |
 | Requests | submit, validate or cancel a request group or ToO; list one's own groups | the request API, in process |
 
@@ -67,6 +68,23 @@ its enclosure, source and text, so an acknowledgement sticks to that alarm
 The page works on a phone (one column under 360 px), and has three themes,
 kept in the browser: dark (the default), **red** (red on black, nothing
 else, for a dark control room) and light.
+
+## Sky
+
+`GET /console/api/sky` (`read` scope; recomputed at most every
+`sky_cache`, 10 s) gives, per enclosure: the site and the local sidereal
+time; the Sun's and Moon's altitude and azimuth (and the Moon's
+illuminated fraction); each telescope's pointing (from the sequencer's
+value registry; none while stale) and limits (the dispatch plan's
+`min_alt`/`max_alt`, else 21 and 83 deg); and every unfinished target of the
+dispatch scheduler's requests, the ones a telescope is on first, then ToOs,
+then by priority, each with altitude, azimuth and airmass now and 1 and 2 h
+later, and its hour angle. Positions are computed with the same code and
+bundled IERS tables as the scheduler (never a download). The page draws it
+as an SVG chart (zenith at the centre, north up, east to the left as seen
+from below; the limits dashed) next to the table, refreshed every 15 s.
+Without a dispatch plan the chart shows the telescopes, Sun and Moon only
+(the enclosure config's `site`).
 
 ## Images
 

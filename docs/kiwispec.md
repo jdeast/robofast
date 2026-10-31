@@ -155,7 +155,7 @@ something. robofast's client sends only the allowlisted ones
 
 | Action | Moves | Powers | robofast |
 |---|---|---|---|
-| iodine stage to a named position / to mm (`i2stage_move`, `i2stage_movef`) | **yes** (Thorlabs stage, up to 150 mm) | | allowed; arrival polled, bounded by `stage_timeout` |
+| iodine stage to a named position / to mm (`i2stage_move`, `i2stage_movef`) | **yes** (Thorlabs stage, up to 150 mm) | | allowed; arrival polled (within `stage_tolerance` and stopped: two consecutive readings agree), bounded by `stage_timeout` |
 | home the iodine stage (`i2stage_home`) | **yes** | | allowed (client only; the service does not home on its own) |
 | reconnect the stage (`i2stage_connect`) | **yes** (home, out, in) | **yes** (PDU outlet off/on) | allowed in the client; **the service never sends it** (legacy did, automatically, after a stuck move) |
 | `i2stage_disconnect` | | | allowed (client only) |

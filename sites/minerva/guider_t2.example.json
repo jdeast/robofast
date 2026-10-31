@@ -1,0 +1,63 @@
+{
+  "_note": [
+    "The guider service for T2's FAU (docs/guider.md), on the computer the FAU camera is plugged into:",
+    "  python -m robofast_core.guider.service --config sites/minerva/guider_t2.example.json",
+    "Hardware-shaped but locked: allow_hardware is false, so nothing is opened until it is true AND --hardware is given,",
+    "which needs JDE's approval (docs/guider.md, Commissioning). Addresses are 127.0.0.1 placeholders.",
+    "From minerva-control (sites/minerva/README.md has the table): fau_t2.ini -- ZWO ASI174 (the file's",
+    "MANUFACTURER = SBIG is stale), 0.265 arcsec/px, the fiber at (948, 626) (0-based pixels of the legacy FITS",
+    "frame: confirm with POST /locate before trusting it), legacy loop gains (Loop_params KPx/KIx, Deadband).",
+    "The FAU is on M3 port 1 (telescope_2.ini [PORT] FAU); 'port' names the calibration, not the port number.",
+    "The SX AO tip/tilt is NOT enabled: legacy never used it (fau_t2.ini USETIPTILT = False; imager_server_t2.ini",
+    "#AOINI) and it has never been commissioned. _tiptilt_uncommissioned is its legacy set-up (ao_t2.ini: PORT COM9,",
+    "9600 baud, XMIN..YMAX +/-500 steps): rename it to 'tiptilt' (and add an 'offload') only during commissioning.",
+    "_legacy_seed_calibrations (NOT loaded): the mount's matrix from the plate scale at PA 0, and the AO's from",
+    "ao_t2.ini as the pre-2019 legacy code used it (PLATESCALE = 40 steps per arcsec, so 0.025 arcsec/step;",
+    "ROTOFFSET 45) via calibration.from_sx_legacy(0.025, 45, 0.265). Both are unverified starting points to",
+    "compare with POST /calibrate; README.md lists the conflicting alternatives."
+  ],
+  "name": "t2-guider",
+  "scope": "t2",
+  "listen": "127.0.0.1:8142",
+  "allow_hardware": false,
+  "port": "fau",
+  "calibration_dir": "/var/lib/robofast/guider-calibrations/t2",
+  "camera": {"kind": "zwo", "index": 0},
+  "mount": {"kind": "alpaca", "address": "127.0.0.1:11122", "number": 0, "method": "offset", "max_offset": 30},
+  "backlight": {"kiwispec": "http://127.0.0.1:8130"},
+  "guide": {
+    "exposure": 1.0,
+    "acq_exposure": 1.0,
+    "roi_size": 64,
+    "target": [948.0, 626.0],
+    "fiber_radius": 3.0,
+    "centroider": {"kind": "annulus"},
+    "gains": {"kp": 0.5, "ki": 0.1, "deadband": 0.0},
+    "capture_radius": 8,
+    "plate_scale": 0.265
+  },
+  "_tiptilt_uncommissioned": {
+    "kind": "sxao",
+    "port": "COM9",
+    "baudrate": 9600,
+    "limits": [[-500, 500], [-500, 500]]
+  },
+  "_legacy_seed_calibrations": {
+    "mount": {
+      "matrix": [[-3.773585, 0.0], [0.0, 3.773585]],
+      "units": "arcsec",
+      "plate_scale": 0.265,
+      "pa": 0.0,
+      "parity": 1,
+      "notes": "seed: inv(sky_matrix(0.265, 0, +1)) from fau_t2.ini platescale/rotangle (unverified)"
+    },
+    "tiptilt": {
+      "matrix": [[0.066708, -0.066708], [0.066708, 0.066708]],
+      "units": "steps",
+      "plate_scale": 0.265,
+      "pa": 0.0,
+      "parity": 1,
+      "notes": "seed: from_sx_legacy(0.025, 45.0, 0.265) from ao_t2.ini PLATESCALE/ROTOFFSET (unverified)"
+    }
+  }
+}

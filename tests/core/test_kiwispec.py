@@ -378,6 +378,18 @@ async def test_configure(http, sim):
     assert (await http.post("/configure", json={"iodine": "sideways"})).status_code == 400
 
 
+async def test_configure_waits_for_the_stage_to_stop(http, sim):
+    """Within ``stage_tolerance`` is not arrived: a stage still creeping into
+    place reads "unknown" (the server names a position only at round(mm,
+    1)). Once failed on CI as {'mm': 101.91, 'name': 'unknown'}."""
+    r = await http.post("/configure", json={"iodine": 101.95})
+    assert r.json()["stage"]["mm"] == 101.95
+    sim.config.stage_speed = 0.5  # 0.05 mm (inside the 0.1 mm tolerance) takes 0.1 s
+    r = await http.post("/configure", json={"iodine": "out"})
+    assert r.status_code == 200, r.text
+    assert r.json()["stage"] == {"mm": 102.0, "name": "out"}
+
+
 async def test_science_exposure(http, sim):
     sim.set_sky(2000.0)
     job = await run_job(

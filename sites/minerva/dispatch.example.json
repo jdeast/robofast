@@ -4,7 +4,10 @@
     "  python -m robofast_core.sequencer_service --config sites/minerva/aqawan1.json --plan sites/minerva/dispatch.example.json",
     "or paste it (without _note) as the 'plan' entry of aqawan1.json.",
     "site: Mt. Hopkins (legacy site_mtHopkins.ini). Limits: legacy scheduler.ini (MINALT 21, MAXALT 83,",
-    "HORIZON -12, MINMOONSEP 10), which the legacy scheduler read but never applied.",
+    "HORIZON -12, MINMOONSEP 10), which the legacy scheduler read but never applied; MINALT equals",
+    "telescope_N.ini HORIZON (21). No hour-angle limits: legacy had none (min_ha/max_ha default to -12/+12 h).",
+    "filters: imager_t1.ini and imager_t2.ini [FILTERS] (legacy names; the Alpaca wheel's Names must match).",
+    "ports are not listed: no telescope has a port_action yet (instruments.json has the M3 port numbers).",
     "state and too_dropbox are relative to this file here; use absolute paths (e.g. under",
     "/var/lib/robofast) in production. A ToO is a JSON request group with a 'too' entry dropped",
     "into too_dropbox (see too.example.json)."
@@ -15,8 +18,10 @@
   "state": "dispatch-state.json",
   "too_dropbox": "too-dropbox",
   "telescopes": {
-    "t1": {"instruments": ["spectrograph", "imager"], "min_alt": 21, "max_alt": 83},
-    "t2": {"instruments": ["spectrograph", "imager"], "min_alt": 21, "max_alt": 83}
+    "t1": {"instruments": ["spectrograph", "imager"], "min_alt": 21, "max_alt": 83,
+           "filters": ["air", "V", "R", "gp", "rp", "zp", "ip"]},
+    "t2": {"instruments": ["spectrograph", "imager"], "min_alt": 21, "max_alt": 83,
+           "filters": ["B", "V", "gp", "rp", "ip", "zp", "air"]}
   },
   "max_sun_alt": -12,
   "min_moon_sep": 10,

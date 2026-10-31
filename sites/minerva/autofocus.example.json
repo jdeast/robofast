@@ -1,14 +1,51 @@
 {
   "_note": [
-    "Autofocus for MINERVA's T2 (a CDK700; docs/autofocus.md). Merge 'telescopes.t2' into the enclosure config's t2 entry (aqawan1.json) and add 'autofocus_triggers' at its top level.",
-    "The focuser address is a 127.0.0.1 placeholder (PWI's port focuser through ASCOM Remote).",
-    "Values from minerva-control's config: imager_t2.ini (FLI CG230, 0.679 arcsec/px: 15 um pixels at the 4560 mm focal length), fau_t2.ini (ZWO ASI174, 0.265 arcsec/px, 5.86 um pixels, saturation 60000), telescope_2.ini (the imager is M3 port 2 and the FAU port 1; MINFOCUS 100, MAXFOCUS 33000; the focus is in microns, so um_per_step is 1). The ports are named 'imager' and 'fau' here; port_action maps them.",
+    "Autofocus for MINERVA's T1 and T2 (CDK700s; docs/autofocus.md). Merge each 'telescopes' entry into the enclosure config's entry of the same name (aqawan1.json) and add 'autofocus_triggers' at its top level.",
+    "The focuser addresses are 127.0.0.1 placeholders (PWI's port focuser through ASCOM Remote).",
+    "Values from minerva-control's config (sites/minerva/README.md has the table): T1 imager_t1.ini (Andor DW936N, 0.61 arcsec/px: 13.5 um pixels at the 4560 mm focal length); T2 imager_t2.ini (Apogee Aspen CG230, 0.679 arcsec/px: 15 um pixels); fau_t1.ini, fau_t2.ini (ZWO ASI174, 0.265 arcsec/px, 5.86 um pixels).",
+    "telescope_1.ini: imager on M3 port 1, FAU on port 2, MINFOCUS 455 (port 1) and 100 (port 2), MAXFOCUS 33000. telescope_2.ini: imager on port 2, FAU on port 1, MINFOCUS 100, MAXFOCUS 33000. The focus is in microns (um_per_step 1). The ports are named 'imager' and 'fau' here.",
     "f/6.5 (700 mm, 4560 mm); the CDK700 focusers move the instrument (focal_plane_factor 1). The obstruction is a placeholder until measured; the calibration's slope checks it.",
-    "model: the legacy focus model's temperature term (telescope_2.ini: C0 = -52.94 um per C about T0 = 8.95 C, on the primary's temperature); here on the focuser's temperature until the primary's is in the registry. The other legacy terms (delta-T, gravity) wait for those values. Its zero point is learned from each successful autofocus (store).",
-    "max_start_error: the legacy guesses were 130-600 um off on 2026-04-23. Backlash is not known: measure it (0 here).",
+    "Saturation: legacy SATURATION is 60000 for every camera; 55000 here keeps the measured stars below the non-linear top.",
+    "model: the legacy focus model's temperature term (C0 per C about T0, on the primary's temperature; T1: -29.1 about 10.089 C, T2: -52.94 about 8.95 C); here on the focuser's temperature until the primary's is in the registry. The delta-T and gravity terms (instruments.json) wait for those values. Its zero point is learned from each successful autofocus (store).",
+    "max_start_error: the legacy guesses were 130-600 um off on 2026-04-23 (T2). Backlash is not known: measure it (0 here).",
     "Run a calibration sweep ({\"kind\": \"autofocus\", \"autofocus\": {\"calibrate\": true}}) once per port and filter before relying on the V-curve."
   ],
   "telescopes": {
+    "t1": {
+      "focuser": "127.0.0.1:11121/0",
+      "autofocus": {
+        "optics": {
+          "f_ratio": 6.5,
+          "pixel_size": 13.5,
+          "pixel_scale": 0.61,
+          "obstruction": 0.47,
+          "um_per_step": 1.0,
+          "focal_plane_factor": 1.0
+        },
+        "method": "vcurve",
+        "side": 1,
+        "exptime": 5.0,
+        "max_seeing": 4.0,
+        "max_start_error": 600,
+        "backlash": 0,
+        "min_position": 455,
+        "max_position": 33000,
+        "measure": {"saturation": 55000},
+        "overrides": {
+          "fau/-": {
+            "exptime": 15.0,
+            "min_position": 100,
+            "optics": {"pixel_size": 5.86, "pixel_scale": 0.265},
+            "measure": {"saturation": 55000, "min_hfd": 2.5}
+          }
+        },
+        "model": {
+          "terms": {"{tel}.focuser.temperature": -29.1},
+          "reference": {"{tel}.focuser.temperature": 10.089}
+        },
+        "store": "/var/lib/robofast/focus_t1.json"
+      }
+    },
     "t2": {
       "focuser": "127.0.0.1:11122/0",
       "autofocus": {

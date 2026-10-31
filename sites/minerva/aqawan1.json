@@ -10,9 +10,10 @@
     "t1, t2: ASCOM Remote on each telescope's Windows PC, serving its mount (PWI4) and camera as device 0.",
     "safety and sequencer: SafetyConfig and SequencerConfig fields; omitted ones take the defaults in docs/design.md section 6.",
     "plan: calibration frames only (taken with the enclosure closed); or run with --plan dispatch.example.json (the dispatch scheduler) or --plan targets.example.json (a static list).",
-    "site: Mt. Hopkins, for python -m robofast_core.when (start the night at a Sun altitude; deploy/robofast-sequencer@.service).",
+    "site: Mt. Hopkins (minerva-control site_mtHopkins.ini), for python -m robofast_core.when (start the night at a Sun altitude; deploy/robofast-sequencer@.service).",
     "A telescope may also name a filterwheel (an Alpaca FilterWheel) and a port_action (its Alpaca Action that selects an M3 port), and a focuser and rotator (read only, for the FITS headers).",
-    "images: every frame is saved under data_root (docs/data.md); plate_scale (arcsec per unbinned pixel) gives an approximate WCS. The values here are placeholders until measured."
+    "images: every frame is saved under data_root (docs/data.md); the optics give an approximate WCS. plate_scale (arcsec per unbinned imager pixel) from minerva-control imager_t1.ini/imager_t2.ini PLATESCALE; aperture and focal length from the legacy FITS headers (control.py APTDIA, FOCALLEN). position_angle 0 (north up, east left) assumes PWI4 derotates the imager port to PA 0 as legacy did (sites/minerva/README.md: rotator offsets).",
+    "T3 and T4 are in Aqawan 2 (down) and are not listed here; their values are in instruments.json, disabled."
   ],
   "name": "aqawan1",
   "listen": "127.0.0.1:8100",
@@ -46,8 +47,8 @@
     "compress": false,
     "queue_size": 4,
     "telescopes": {
-      "t1": {"plate_scale": 0.6, "aperture": 700.0, "focal_length": 4560.0},
-      "t2": {"plate_scale": 0.6, "aperture": 700.0, "focal_length": 4560.0}
+      "t1": {"plate_scale": 0.61, "position_angle": 0.0, "flip": false, "aperture": 700.0, "focal_length": 4560.0},
+      "t2": {"plate_scale": 0.679, "position_angle": 0.0, "flip": false, "aperture": 700.0, "focal_length": 4560.0}
     }
   },
   "plan": {"type": "calibration", "biases": 10, "darks": [[60, 5]]}

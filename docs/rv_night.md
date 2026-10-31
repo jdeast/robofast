@@ -48,9 +48,21 @@ the sequencer's `preempt` with policy `next`, which interrupts nothing.
   other telescope may start another (`spectrograph in use by t1`).
 * A busy telescope is not waited for. If T1 is imaging when T2 picks an RV
   target, T2 leads it alone.
-* The plan record has `join` entries (a member given the spectrum) and
-  `member_outcome` entries; `python -m robofast_core.plan_record FILE
-  --replay` replays them.
+* **A held telescope is not reserved.** The observer console's pause, stop
+  or park (an operator hold, `docs/console.md`) reaches the scheduler
+  (`set_held`, through the `OperatorHold` plan wrapper): a held telescope
+  is never put in a feed, and a reservation it already has is dropped when
+  the hold arrives. In the sequencer, a leader stops waiting for a member
+  as soon as that member is held (`spectrum_member_held`) instead of
+  waiting out `spectrum_ready_timeout`.
+* **No spectra while the spectrograph is down** (section 3, "Spectrograph
+  health"): every `SPECTRUM` configuration is rejected (`spectrograph down
+  (...)`), imaging requests go on, and spectra are scheduled again once it
+  is back.
+* The plan record has `join` entries (a member given the spectrum),
+  `member_outcome` entries, `held` (the telescopes under a hold) and
+  `spectrograph` (down or back) entries, and its snapshots keep both;
+  `python -m robofast_core.plan_record FILE --replay` replays them.
 
 ## 3. The sequencer
 
@@ -98,10 +110,58 @@ position, as legacy did), and start guiding. Then:
 * **Autofocus.** The autofocus triggers run before spectra as well as
   before images: legacy `doSpectra` focused on the target before guiding.
 
+### Spectrograph health
+
+A spectrum that cannot be taken because of the spectrograph is not the
+telescope's error:
+
+* **Busy** (`SpectrographBusy`): another job holds the spectrograph -- the
+  other enclosure's, after the service's bounded queue wait
+  (`docs/kiwispec.md`, "Sharing the spectrograph"), or this sequencer's own.
+  The observation is reported `interrupted` (re-queued) with a
+  `spectrograph_busy` event. Nothing is counted.
+* **Fault** (`SpectrographFault`): the service refused or failed the job
+  (a warm CCD, SI Image not answering), did not finish it in time, or did
+  not answer at all. The observation is reported `interrupted` (re-queued,
+  not counted towards the request's `max_attempts`), with a
+  `spectrograph_error` event. The telescope is **not** parked, backed off
+  or counted towards its give-up: its guider is stopped and it asks its
+  plan again. A spectrum or calibration that succeeds resets the count.
+* **Marked down.** After `spectrograph_max_failures` (3) faults in a row
+  the sequencer marks the spectrograph down: a `spectrograph_down` event
+  (critical), the status snapshot's `spectrograph.down` (the observer
+  console shows it as a critical alarm), and the plan is told
+  (`set_spectrograph_available(False, why)`), so the dispatch scheduler
+  stops scheduling `SPECTRUM` configurations. Imaging goes on.
+* **Recovery.** While it is down, the sequencer reads the service's status
+  (fresh, `?refresh=1`) every `spectrograph_recovery_interval` (300 s,
+  `spectrograph_check` events). With `spectrograph_auto_recover` (default)
+  a check that answers with no alarms marks it up again. Either way the
+  operator can clear it: `python -m robofast_core.console.hold CONTROL_DIR
+  clear_spectrograph --operator NAME --reason TEXT` (through the
+  enclosure's `operator_control` directory, like the console's pause).
+  Marked up (`spectrograph_up`), the plan is told, the count is reset and
+  idle telescopes are woken.
+
 Settings (`SequencerConfig`, defaults): `spectrum_ready_timeout` 300 s,
 `spectrum_check_interval` 2 s, `spectrum_poll` 2 s, `spectrum_margin` 180 s
 (the bound beyond the exposure time), `locate_fiber` true, `locate_timeout`
-60 s, `spectrograph_abort_wait` 10 s.
+60 s, `spectrograph_abort_wait` 10 s, `spectrograph_max_failures` 3,
+`spectrograph_recovery_interval` 300 s, `spectrograph_auto_recover` true,
+`spectrograph_queue_wait` 600 s.
+
+### One clock for every night name
+
+Every path that names a night or stamps a time on what it keeps takes
+"now" from one injected clock (`robofast_core/clock.py`): the FITS writer
+(`DATE`, the night directory and `NIGHT`, from the clock at
+`StartExposure`; `DATE-OBS` is still the camera's) and its frame index,
+the spectrum sidecars and their index (the record's `night` and
+`sequencer_utc`), the raw spectrum's file name (the sequencer sends
+`night` to the spectrograph service), the autofocus results and the
+nightly plan record. In production it is the host's clock (NTP; see
+`docs/deploy.md`). The simulated night (`docs/demo.md`) runs a compressed
+clock, and its outputs carry one night name, `n20261109`, everywhere.
 
 ## 4. The metadata: sidecars, not rewritten raw files
 
@@ -148,13 +208,12 @@ data pointers lead to them.
 
 ## 5. What is left
 
-* The spectrograph is shared by both MINERVA enclosures, but here it is an
-  enclosure-level resource. Two sequencers would contend for it: the
-  service answers 409 and the second spectrum is that telescope's error.
 * ThAr and fiber-flat lamps are not switched (`docs/kiwispec.md`, question
   3).
-* An operator hold on a reserved member is not known to dispatch. The
-  leader waits `spectrum_ready_timeout` for the held member, then starts
-  without it.
-* A spectrograph that keeps failing causes errors and backoffs on the
-  leading telescopes. Nothing marks the spectrograph itself as down.
+* Sharing the spectrograph between the two enclosures is first come,
+  first served with a bounded wait (`docs/kiwispec.md`); the two dispatch
+  schedulers do not plan around each other's spectra, and the guider's
+  backlight request does not wait in the queue yet.
+* The observer console shows a spectrograph marked down as an alarm; the
+  operator's clear is a command-line tool for now (a console button is left
+  for the console's next round).

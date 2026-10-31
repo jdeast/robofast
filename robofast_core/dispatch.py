@@ -87,6 +87,15 @@ timeout, with those that are). Only the leader's report changes the
 request's status; a member's report just ends its reservation, as does the
 leader's report or the leader moving on.
 
+A telescope under an operator hold (:meth:`DispatchScheduler.set_held`, from
+the observer console's pause, stop or park) is never reserved to feed a
+spectrum, and a reservation it has is dropped when the hold arrives, so a
+leader does not wait for it. While the sequencer has marked the
+spectrograph down (:meth:`DispatchScheduler.set_spectrograph_available`;
+docs/rv_night.md), no SPECTRUM configuration is scheduled; imaging requests
+go on. Both changes are written to the plan record (``held``,
+``spectrograph``) and kept in its snapshots, so a replay sees them.
+
 
 ``idle_poll``), not "done": the night may bring a rising target or a ToO.
 The night is over (``None``) once the Sun is above ``max_sun_alt`` and
@@ -342,6 +351,12 @@ class DispatchScheduler:
         self._submitted: set[str] = set()
         #: Completed observations by configuration id (for data pointers).
         self.observed: dict[str, list[dict[str, Any]]] = {}
+        #: Telescopes under an operator hold (the observer console's pause,
+        #: stop or park; :meth:`set_held`): never reserved to feed a spectrum.
+        self.held: set[str] = set()
+        #: Why the spectrograph is down (:meth:`set_spectrograph_available`),
+        #: or None: while it is down no SPECTRUM configuration is scheduled.
+        self.spectrograph_down: str | None = None
         for g in groups:
             self._add(g)
         if self.state_path is not None:
@@ -351,6 +366,29 @@ class DispatchScheduler:
 
     def set_preempt_callback(self, fn: PreemptCallback) -> None:
         self._preempt = fn
+
+    def set_held(self, telescopes: Iterable[str]) -> None:
+        """The telescopes under an operator hold now (the observer console,
+        through :class:`~robofast_core.console.hold.OperatorHold`). A held
+        telescope is not reserved to feed a spectrum, and a reservation it
+        has is dropped."""
+        held = {t for t in telescopes if t in self.limits}
+        if held == self.held:
+            return
+        self.held = held
+        for tel in held:
+            self._members.pop(tel, None)
+        self._record(self.clock(), "held", telescopes=sorted(held))
+
+    def set_spectrograph_available(self, available: bool, reason: str = "") -> None:
+        """The sequencer's verdict on the spectrograph (module doc): while it
+        is down, SPECTRUM configurations are not scheduled (imaging goes on)."""
+        down = None if available else (reason or "down")
+        if down == self.spectrograph_down:
+            return
+        self.spectrograph_down = down
+        log.warning("spectrograph %s", "available again" if down is None else f"down: {down}")
+        self._record(self.clock(), "spectrograph", available=available, reason=reason)
 
     async def next_observation(self, telescope: str) -> Observation | Idle | None:
         now = self.clock()
@@ -883,6 +921,8 @@ class DispatchScheduler:
                 ):
                     reasons.append(f"{telescope} has no filter {ic.filter!r}")
         if any(c.type == "SPECTRUM" for c in configs):
+            if self.spectrograph_down is not None:
+                reasons.append(f"spectrograph down ({self.spectrograph_down})")
             for tel, v in self._current.items():
                 if tel not in (telescope, lead) and v.cfg < len(v.configs):
                     if v.config.type == "SPECTRUM":
@@ -1132,6 +1172,9 @@ class DispatchScheduler:
         held = self._members.get(telescope)
         if held is None:
             return None
+        if telescope in self.held:
+            del self._members[telescope]
+            return None
         leader, obs = held
         visit = self._current.get(leader)
         if visit is None or visit.obs is not obs:
@@ -1157,8 +1200,8 @@ class DispatchScheduler:
         busy = set(self._current) | set(self._members)
         feed = [telescope]
         for tel in sorted(self.limits):
-            if tel == telescope or tel in busy:
-                continue
+            if tel == telescope or tel in busy or tel in self.held:
+                continue  # busy, or held by an operator
             if any(
                 s.reserved_for == tel and s.reserved_until is not None and now < s.reserved_until
                 for rid, s in self._too.items()
@@ -1362,6 +1405,8 @@ class DispatchScheduler:
             "config": asdict(self.config),
             "groups": [g.to_dict() for g in self.groups.values()],
             "state": self._state(),
+            "held": sorted(self.held),
+            "spectrograph_down": self.spectrograph_down,
         }
 
     @classmethod
@@ -1381,6 +1426,8 @@ class DispatchScheduler:
             **kw,
         )
         sched.restore_state(snap["state"])
+        sched.held = set(snap.get("held") or ())
+        sched.spectrograph_down = snap.get("spectrograph_down")
         return sched
 
     def _save_state(self) -> None:

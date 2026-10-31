@@ -351,3 +351,21 @@ def test_the_page_has_the_button_and_its_dialog():
     page = render_page("n0nce")
     assert 'id="emergency"' in page and 'id="emergency-dialog"' in page
     assert "/console/api/emergency_close" in page and "does NOT wait for the telescopes" in page
+
+
+async def test_clear_spectrograph_goes_through_the_command_box(mc):
+    """(Here because it is the other new console button of this change.)"""
+    rig = await mc()
+    await rig.login("watcher")
+    assert (await rig.act("clear_spectrograph", reason="x", confirm=True)).status_code == 403
+    await rig.login("alice")
+    assert (await rig.act("clear_spectrograph", reason="fixed")).status_code == 400  # confirm
+    r = await rig.act("clear_spectrograph", reason="camera server restarted", confirm=True)
+    assert r.status_code == 200, r.text
+    (cmd,) = [json.loads(p.read_text()) for p in (rig.control / "inbox").iterdir()]
+    assert cmd["action"] == "clear_spectrograph" and cmd["telescopes"] == []
+    assert cmd["operator"] == "alice" and cmd["reason"] == "camera server restarted"
+    line = rig.audit()[-1]
+    assert line["action"] == "clear_spectrograph" and line["status"] == 200
+    st = await rig.status()
+    assert st["spectrograph"]["queue"] == []

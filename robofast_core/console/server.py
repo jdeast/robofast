@@ -86,8 +86,18 @@ COOKIE = "robofast_console"
 MAX_REASON = 500
 #: Operator actions (``POST /console/api/<action>``), and those that must be
 #: confirmed (``"confirm": true`` in the body; the page asks first).
-ACTIONS = ("ack", "pause", "resume", "stop", "clear_lease", "clear_faults", "emergency_close")
-CONFIRM = ("stop", "clear_lease", "clear_faults", "emergency_close")
+ACTIONS = (
+    "ack",
+    "pause",
+    "resume",
+    "stop",
+    "park",
+    "clear_lease",
+    "clear_faults",
+    "emergency_close",
+    "clear_spectrograph",
+)
+CONFIRM = ("stop", "park", "clear_lease", "clear_faults", "emergency_close", "clear_spectrograph")
 #: Actions that the per-token action rate limit never blocks (closing is the
 #: safe direction; an observer who has pressed other buttons must still be
 #: able to close).
@@ -742,8 +752,23 @@ class Console:
         if action == "emergency_close":
             return await self._emergency_close(operator, reason, body)
         enc = self._enclosure(body)
-        if action in ("pause", "resume", "stop"):
+        if action in ("pause", "resume", "stop", "park"):
             return await self._hold(enc, action, operator, reason, body.get("telescope"))
+        if action == "clear_spectrograph":
+            # The sequencer's own clear (docs/rv_night.md), through the
+            # command box: the console never talks to the spectrograph.
+            if enc.control_dir is None:
+                raise ApiError(
+                    409, f"{enc.name} has no operator_control: clear_spectrograph needs it"
+                )
+            cid = send_command(
+                enc.control_dir, "clear_spectrograph", [], operator=operator, reason=reason
+            )
+            return {
+                "enclosure": enc.name,
+                "command": cid,
+                "applied": await self._applied(enc, cid),
+            }
         sup = self.supervisors[enc.name]
         if action == "clear_faults":
             return {
@@ -773,6 +798,9 @@ class Console:
         self, enc: ConsoleEnclosure, action: str, operator: str, reason: str, telescope: Any
     ) -> dict[str, Any]:
         whole = telescope is None
+        if action == "park" and whole:
+            # One telescope, now; the whole enclosure is "stop" (which closes).
+            raise ApiError(400, "park: name one telescope (to park them all, stop the enclosure)")
         if not whole and telescope not in enc.telescopes:
             raise ApiError(400, f"telescope: one of {enc.telescopes} (or none: all of them)")
         tels = list(enc.telescopes) if whole else [str(telescope)]
@@ -780,12 +808,12 @@ class Console:
         if enc.control_dir is None:
             if not (action == "stop" and whole):
                 raise ApiError(
-                    409, f"{enc.name} has no operator_control: pause, resume and stop need it"
+                    409, f"{enc.name} has no operator_control: pause, resume, stop and park need it"
                 )
         else:
             cid = send_command(enc.control_dir, action, tels, operator=operator, reason=reason)
             out["command"] = cid
-            if action == "stop" and whole:
+            if (action == "stop" and whole) or action == "park":
                 out["hold_confirmed"] = await self._applied(enc, cid)
         if action == "stop" and whole:
             # Abort and park everything: the supervisor revokes the lease (the

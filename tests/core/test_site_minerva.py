@@ -162,7 +162,8 @@ def test_weather_config_loads():
 def test_kiwispec_config_loads():
     cfg = KiwiSpecConfig.from_dict(_json("kiwispec.example.json"))
     assert not cfg.allow_hardware
-    assert cfg.stage_positions == {"in": 11.0, "flat": 68.0, "out": 102.0}
+    # Moved by name; the live server's positions are authoritative (README).
+    assert cfg.stage_positions == {}
 
 
 @pytest.mark.parametrize("tel", ["t1", "t2"])

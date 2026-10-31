@@ -306,6 +306,9 @@ class FakeCamera(FakeDevice):
         self.Offset = 10
         self.LastExposureStartTime: str | None = None
         self.LastExposureDuration: float | None = None
+        #: The camera's UTC clock (``LastExposureStartTime``); a simulation
+        #: injects its own (robofast_core.clock).
+        self.clock: Any = lambda: datetime.now(UTC)
         self.image_error: str | None = None
         self.download_time = 0.0
         self.downloads = 0
@@ -349,7 +352,7 @@ class FakeCamera(FakeDevice):
         self._ready = False
         self._ends = self._now() + duration
         self.exposures_started += 1
-        start = datetime.now(UTC)
+        start = self.clock()
         self.LastExposureStartTime = start.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
         self.LastExposureDuration = float(duration)
 

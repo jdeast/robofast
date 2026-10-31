@@ -606,7 +606,8 @@ broker outage costs only ToOs, never the night.
   the spectrograph (job, progress, exposure meter), the plan record and
   queue, alarms and the supervisor's timeline, all read from the services'
   status APIs and files. With an `operator` token an observer acknowledges
-  alarms, pauses, resumes or stops a telescope or the enclosure, clears a
+  alarms, pauses, resumes or stops a telescope or the enclosure, parks one
+  telescope now (never the roof), clears a
   dead lease or the faults, and submits or cancels requests (through the
   request API's code); every action is authenticated, CSRF-protected,
   rate-limited and audited with who and why. Pause, resume and stop reach

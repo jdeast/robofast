@@ -54,9 +54,10 @@ class FakeSpectrograph:
                 start = datetime.now(UTC)
                 await asyncio.sleep(f.get("exptime", 0.0) * self.scale + self.readout)
                 n = sum(len(j["results"]) for j in self.jobs.values()) + 1
+                night = f.get("night") or "n20261031"
                 job["results"].append(
                     {
-                        "file": f"n20261031.{f.get('object', f['kind'])}.{n:04d}.fits",
+                        "file": f"{night}.{f.get('object', f['kind'])}.{n:04d}.fits",
                         "kind": f["kind"],
                         "object": f.get("object", f["kind"]),
                         "telescopes": f.get("telescopes", []),
@@ -86,7 +87,7 @@ class FakeSpectrograph:
         self._log("expose", **frame)
         return self._start("expose", [frame])
 
-    async def calibrate(self, frames):
+    async def calibrate(self, frames, night=None):
         self._log("calibrate", frames=frames)
         out = []
         for f in frames:
@@ -107,7 +108,7 @@ class FakeSpectrograph:
             await asyncio.wait({self.tasks[job["id"]]})
         return True
 
-    async def status(self):
+    async def status(self, refresh=False):
         job = self.jobs.get(self.current) if self.current else None
         return {"job": dict(job) if job else None}
 

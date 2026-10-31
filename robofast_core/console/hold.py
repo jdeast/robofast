@@ -17,15 +17,30 @@ takes the files in and acts through the two hooks every plan already has:
   ``pause`` asks for ``now-after-readout`` (the exposure in progress finishes,
   is read out and kept), ``stop`` for ``now`` (exposure and slew aborted).
   The observation is reported ``interrupted``, so the plan re-queues it.
+* ``park`` is ``stop`` plus "park this telescope now": the sequencer's
+  park hook (:meth:`~robofast_core.sequencer.Sequencer.request_park`) parks
+  that one telescope as soon as its observation has stopped, with the
+  telescope's own grant. Only the mount moves; the roof, the lease and the
+  other telescopes are not touched (the supervisor alone opens and closes).
+  The telescope stays held (and parked) until ``resume``.
+* ``clear_spectrograph`` (no telescopes) is the operator's clear of a
+  spectrograph the sequencer marked down after repeated failures
+  (:meth:`~robofast_core.sequencer.Sequencer.clear_spectrograph`;
+  docs/rv_night.md).
 * ``resume`` lifts the hold and wakes the telescope (``preempt(..., "next")``,
   which interrupts nothing); it asks its plan afresh. If the enclosure is
   closed, the sequencer asks the supervisor for a lease as it always does;
   the supervisor alone decides whether and when to open.
 
-Commands are JSON files ``inbox/<ns>-<id>.json`` (written atomically by
-:func:`send_command`)::
+The held telescopes are also told to the plan (``set_held``, the dispatch
+scheduler's), so a held telescope is never reserved to feed a spectrum.
 
-    {"id": "...", "action": "pause"|"resume"|"stop",
+Commands are JSON files ``inbox/<ns>-<id>.json`` (written atomically by
+:func:`send_command`, or from a shell: ``python -m
+robofast_core.console.hold DIR ACTION [TELESCOPE ...] --operator NAME
+--reason TEXT``)::
+
+    {"id": "...", "action": "pause"|"resume"|"stop"|"park"|"clear_spectrograph",
      "telescopes": ["t1"], "operator": "...", "reason": "...", "time": "..."}
 
 Each is applied in order, then moved to ``done/`` with its result. The
@@ -56,9 +71,11 @@ from robofast_core.plan import Idle, Observation, PlanProvider
 
 log = logging.getLogger(__name__)
 
-ACTIONS = ("pause", "resume", "stop")
+ACTIONS = ("pause", "resume", "stop", "park", "clear_spectrograph")
+#: Actions on no telescope.
+GLOBAL_ACTIONS = ("clear_spectrograph",)
 #: The preemption each action asks for (``resume`` only wakes the telescope).
-PREEMPT_FOR = {"pause": "now-after-readout", "stop": "now", "resume": "next"}
+PREEMPT_FOR = {"pause": "now-after-readout", "stop": "now", "park": "now", "resume": "next"}
 _NAME_RE = re.compile(r"\d{20}-[0-9a-f]{12}\.json")
 HOLDS_FILE = "holds.json"
 
@@ -84,7 +101,7 @@ def send_command(
     """Drop one command into ``control_dir``; returns its id."""
     if action not in ACTIONS:
         raise ValueError(f"action {action!r}: expected one of {ACTIONS}")
-    if not telescopes:
+    if not telescopes and action not in GLOBAL_ACTIONS:
         raise ValueError("no telescopes named")
     inbox = Path(control_dir) / "inbox"
     inbox.mkdir(parents=True, exist_ok=True)
@@ -141,6 +158,9 @@ class OperatorHold:
         self.poll = poll
         self.hold_idle = hold_idle
         self._preempt: Callable[[str, str, str], bool] | None = None
+        #: The sequencer's hooks (:meth:`set_operator_hooks`).
+        self._park: Callable[[str, str], Any] | None = None
+        self._clear_spectrograph: Callable[[str, str], Any] | None = None
         #: telescope -> {"action", "operator", "reason", "since", "command"}.
         self.holds: dict[str, dict[str, Any]] = {}
         self.applied: deque[dict[str, Any]] = deque(maxlen=50)
@@ -153,6 +173,7 @@ class OperatorHold:
             }
             if self.holds:
                 log.warning("operator holds carried over from %s: %s", self.dir, sorted(self.holds))
+        self._tell_plan()
         if getattr(inner, "peek", None) is None:
             # No peek to wrap: the sequencer asks next_observation instead.
             self.peek = None  # type: ignore[assignment]
@@ -195,6 +216,31 @@ class OperatorHold:
         hook = getattr(self.inner, "set_preempt_callback", None)
         if hook is not None:
             hook(fn)
+
+    @property
+    def held(self) -> set[str]:
+        """The telescopes under a hold now."""
+        return set(self.holds)
+
+    def set_operator_hooks(
+        self,
+        *,
+        park: Callable[[str, str], Any] | None = None,
+        clear_spectrograph: Callable[[str, str], Any] | None = None,
+    ) -> None:
+        """The sequencer's hooks for ``park`` (telescope, reason) and
+        ``clear_spectrograph`` (operator, reason)."""
+        self._park = park
+        self._clear_spectrograph = clear_spectrograph
+
+    def _tell_plan(self) -> None:
+        hook = getattr(self.inner, "set_held", None)
+        if hook is None:
+            return
+        try:
+            hook(sorted(self.holds))
+        except Exception:
+            log.exception("operator holds: plan.set_held")
 
     async def serve(self) -> None:
         """Take commands in every ``poll`` s (and run the inner plan's
@@ -240,16 +286,19 @@ class OperatorHold:
         return results
 
     def apply(self, cmd: dict[str, Any]) -> dict[str, Any]:
-        action, tels = cmd["action"], cmd["telescopes"]
+        action, tels = cmd["action"], cmd.get("telescopes") or []
         if action not in ACTIONS:
             raise ValueError(f"action {action!r}")
+        operator, reason = str(cmd["operator"]), str(cmd.get("reason", ""))
+        if action in GLOBAL_ACTIONS:
+            return self._apply_global(cmd, action, operator, reason)
         if not isinstance(tels, list) or not tels:
             raise ValueError("telescopes: expected a non-empty list")
         unknown = sorted(set(map(str, tels)) - set(self.telescopes))
         if unknown:
             raise ValueError(f"unknown telescopes {unknown}")
-        operator, reason = str(cmd["operator"]), str(cmd.get("reason", ""))
         preempted = {}
+        parked: dict[str, bool] = {}
         for tel in map(str, tels):
             was_held = tel in self.holds
             if action == "resume":
@@ -265,12 +314,36 @@ class OperatorHold:
             if action == "resume" and not was_held:
                 continue
             preempted[tel] = self._stop(tel, PREEMPT_FOR[action], f"operator {action}: {reason}")
+            if action == "park":
+                parked[tel] = self._call(self._park, tel, f"operator park by {operator}: {reason}")
+        self._tell_plan()
         log.warning(
             "operator %s by %s on %s: %s (preempted: %s)", action, operator, tels, reason, preempted
         )
         result = {"ok": True, "id": cmd.get("id"), "action": action, "preempted": preempted}
+        if action == "park":
+            result["park_requested"] = parked
         self.applied.append({"id": cmd.get("id"), "action": action, "time": _now_iso()})
         return result
+
+    def _apply_global(
+        self, cmd: dict[str, Any], action: str, operator: str, reason: str
+    ) -> dict[str, Any]:
+        assert action == "clear_spectrograph"
+        done = self._call(self._clear_spectrograph, operator, reason)
+        log.warning("operator %s by %s: %s (applied: %s)", action, operator, reason, done)
+        self.applied.append({"id": cmd.get("id"), "action": action, "time": _now_iso()})
+        return {"ok": done, "id": cmd.get("id"), "action": action}
+
+    @staticmethod
+    def _call(fn: Callable[[str, str], Any] | None, a: str, b: str) -> bool:
+        if fn is None:
+            return False
+        try:
+            return bool(fn(a, b))
+        except Exception:
+            log.exception("operator holds: sequencer hook %s(%s)", fn, a)
+            return False
 
     def _stop(self, telescope: str, policy: str, reason: str) -> bool:
         if self._preempt is None:
@@ -296,3 +369,31 @@ class OperatorHold:
             )
         except OSError:
             log.exception("operator holds: writing %s", self.dir / HOLDS_FILE)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Send one command from a shell (module doc)."""
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Send an operator command to a sequencer.")
+    ap.add_argument("control_dir", help="the enclosure's operator_control directory")
+    ap.add_argument("action", choices=ACTIONS)
+    ap.add_argument("telescopes", nargs="*")
+    ap.add_argument("--operator", required=True)
+    ap.add_argument("--reason", required=True)
+    args = ap.parse_args(argv)
+    try:
+        cid = send_command(
+            args.control_dir,
+            args.action,
+            args.telescopes,
+            operator=args.operator,
+            reason=args.reason,
+        )
+    except ValueError as exc:
+        ap.error(str(exc))
+    print(cid)
+
+
+if __name__ == "__main__":
+    main()

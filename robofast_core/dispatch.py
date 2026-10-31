@@ -997,9 +997,7 @@ class DispatchScheduler:
         req = visit.request
         why = None
         if any(c.status == Status.CANCELED for c in visit.configs[visit.cfg :]):
-            log.info("%s: abandoning %s mid-visit: canceled", telescope, req.id)
-            del self._current[telescope]
-            return None
+            return "canceled"
         outranked = [
             r
             for r in self.requests.values()

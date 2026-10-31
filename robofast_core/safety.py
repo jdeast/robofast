@@ -396,6 +396,22 @@ class SafetySupervisor:
         if lease is not None and lease._revoke(reason):
             self.timeline.event(self.name, "lease_revoked", lease=lease.id, reason=reason)
 
+    def operator_close(self, operator: str, reason: str) -> bool:
+        """An operator asks for the enclosure to close (the observer console):
+        the current lease is revoked, so the sequencer stops and cleans up
+        and the enclosure closes, as for any revocation. True if a live
+        lease was revoked; False if there was none (it is closed, or closing,
+        already). There is no operator *open*: only this supervisor's policy
+        opens."""
+        lease = self._lease
+        self.timeline.event(self.name, "operator_close", operator=operator, reason=reason)
+        log.warning("%s: close requested by %s: %s", self.name, operator, reason)
+        if lease is None or not lease.live:
+            return False
+        self._revoke_lease(f"operator {operator}: {reason}")
+        self._wake.set()
+        return True
+
     async def recover(self, lease_id: int, holder: str) -> bool:
         """A restarted sequencer releases its predecessor's lease, after cleanup.
 

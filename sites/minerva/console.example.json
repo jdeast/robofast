@@ -1,0 +1,28 @@
+{
+  "_note": [
+    "The observer console (robofast_core/console/; docs/console.md).",
+    "  python -m robofast_core.console serve --config sites/minerva/console.example.json",
+    "It listens on loopback; put the same TLS reverse proxy as the request API in front of it for anyone else.",
+    "tokens: the request API's tokens file. Observers get named tokens with the operator scope, e.g.",
+    "  python -m robofast_core.request_api tokens add --config request_api.json --name alice --scope read,operator,submit,too",
+    "Watchers get read-only tokens (--scope read).",
+    "enclosures: each enclosure's config (shared with its supervisor and sequencer) and, when the sequencer",
+    "runs with --plan, that plan file. Give the enclosure config a status_file (the telescopes' state) and an",
+    "operator_control directory (pause, resume and stop); without them the console shows less and can only",
+    "stop the whole enclosure. spectrograph: the KiwiSpec service (deploy/kiwispec.example.json listens on 8130).",
+    "Every address is a 127.0.0.1 placeholder."
+  ],
+  "listen": "127.0.0.1:8400",
+  "tokens": "/etc/robofast/api-tokens.json",
+  "audit_log": "/var/log/robofast/console-audit.jsonl",
+  "acks": "/var/lib/robofast/console-acks.json",
+  "cookie_secure": true,
+  "enclosures": {
+    "aqawan1": {
+      "config": "aqawan1.json",
+      "plan": "dispatch.example.json",
+      "spectrograph": "http://127.0.0.1:8130"
+    }
+  },
+  "refresh": 2.0
+}

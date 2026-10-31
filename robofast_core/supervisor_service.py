@@ -63,6 +63,11 @@ is random per process start, so after a restart every old token is unknown
   another holder's, or the enclosure is not confirmed closed yet.
 * ``POST /leases/{token}/clear`` ``{"operator", "reason"}`` -- the same, for
   an operator who has made the telescope safe; logged.
+* ``POST /close`` ``{"operator", "reason"}`` -- an operator asks for the
+  enclosure to close: the current lease is revoked (logged). Answers
+  ``{"revoked": bool}``. There is no endpoint that opens.
+* ``GET /timeline?n=N`` -- the last ``N`` (at most 500) timeline entries,
+  newest last, each with its wall-clock ``time``.
 * ``POST /faults/clear`` ``{"operator", "reason"}`` -- an operator clears
   the enclosure's faults (``Action("ClearFaults")`` on the supervisor's
   privileged dome grant; logged). 409 if the dome refuses, e.g. because it
@@ -83,6 +88,8 @@ import json
 import logging
 import secrets
 import signal
+import time
+from datetime import UTC, datetime
 from http import HTTPStatus
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -105,6 +112,8 @@ log = logging.getLogger(__name__)
 MAX_WAIT = 30.0
 #: Released leases kept for lookups (older tokens answer 404).
 KEEP_LEASES = 100
+#: The most timeline entries one ``GET /timeline`` returns.
+MAX_TIMELINE = 500
 
 
 def lease_state(lease: OpenLease, token: str) -> dict[str, Any]:
@@ -158,7 +167,7 @@ class SupervisorServer:
                 n = int(headers.get("content-length") or 0)
                 body = await reader.readexactly(n) if n else b""
                 status, payload = await self._respond(method, target, body)
-                data = json.dumps(payload).encode()
+                data = json.dumps(payload, default=str).encode()
                 head = (
                     f"HTTP/1.1 {status} {HTTPStatus(status).phrase}\r\n"
                     "Content-Type: application/json\r\n"
@@ -184,6 +193,15 @@ class SupervisorServer:
                 return 200, self.status()
             if method == "POST" and parts == ["leases"]:
                 return 200, await self._request(args)
+            if method == "GET" and parts == ["timeline"]:
+                return 200, self.timeline(int(query.get("n", 100)))
+            if method == "POST" and parts == ["close"]:
+                operator = str(args["operator"]).strip()
+                if not operator:
+                    raise _Error(400, "close needs an operator name")
+                return 200, {
+                    "revoked": self.supervisor.operator_close(operator, str(args["reason"]))
+                }
             if method == "POST" and parts == ["faults", "clear"]:
                 operator = str(args["operator"]).strip()
                 if not operator:
@@ -272,6 +290,23 @@ class SupervisorServer:
         finally:
             for w in waiters:
                 w.cancel()
+
+    def timeline(self, n: int) -> list[dict[str, Any]]:
+        n = max(1, min(MAX_TIMELINE, n))
+        entries = self.supervisor.timeline.entries()[-n:]
+        mono, wall = time.monotonic(), time.time()
+        return [
+            {
+                "time": datetime.fromtimestamp(wall - (mono - e.t), UTC).isoformat(),
+                "kind": e.kind,
+                "source": e.source,
+                "device": e.device,
+                "what": e.what,
+                "outcome": e.outcome,
+                "detail": e.detail,
+            }
+            for e in entries
+        ]
 
     def status(self) -> dict[str, Any]:
         lease = self.supervisor.lease

@@ -30,8 +30,9 @@ The pieces:
 * :mod:`robofast_core.weather_server` -- a small Alpaca SafetyMonitor +
   ObservingConditions server, with fault injection for tests.
 * :mod:`robofast_core.weather_bridge` -- the site weather bridge: polls the
-  site's weather pages (:mod:`robofast_core.weather_sources`, site adapters
-  in :mod:`robofast_core.sites`), judges them
+  site's weather sources, a Redis server and web pages
+  (:mod:`robofast_core.weather_sources`, site adapters in
+  :mod:`robofast_core.sites`), judges them
   (:mod:`robofast_core.weather_eval`) and publishes to the weather server;
   also a shadow mode that only logs (``docs/weather_bridge.md``).
 """

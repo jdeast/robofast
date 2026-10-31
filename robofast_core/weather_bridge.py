@@ -48,6 +48,7 @@ import robofast_core.sites  # noqa: F401  (registers the site adapters)
 from robofast_core.sun import now_utc
 from robofast_core.weather_eval import (
     UNKNOWN,
+    DynamicLimit,
     Evaluation,
     Evaluator,
     FieldLimits,
@@ -78,6 +79,9 @@ _SOURCE_KEYS = {
     "limits",
     "groups",
     "rain_counters",
+    "rain_rates",
+    "enforce_rain",
+    "dynamic_limits",
 }
 _TOP_KEYS = {
     "site",
@@ -173,6 +177,14 @@ def parse_config(raw: dict[str, Any]) -> BridgeConfig:
             for f, v in (known.get("rain_counters") or {}).items()
         }
         groups = {g: list(fs) for g, fs in (known.get("groups") or {}).items()}
+        rain_rates = {f: float(v) for f, v in (known.get("rain_rates") or {}).items()}
+        dynamic = {
+            f: DynamicLimit.parse(v, f"{name}.dynamic_limits.{f}")
+            for f, v in (known.get("dynamic_limits") or {}).items()
+        }
+        enforce_rain = known.get("enforce_rain", True)
+        if not isinstance(enforce_rain, bool):
+            raise ValueError(f"source {name}: enforce_rain must be true or false")
         live = known["type"] == "sun"
         sources.append(
             (
@@ -185,6 +197,9 @@ def parse_config(raw: dict[str, Any]) -> BridgeConfig:
                     limits=limits,
                     groups=groups,
                     rain=rain,
+                    rain_rates=rain_rates,
+                    enforce_rain=enforce_rain,
+                    dynamic_limits={f: d for f, d in dynamic.items() if d is not None},
                 ),
             )
         )
@@ -304,7 +319,7 @@ class WeatherBridge:
                 raw = status.values.get(c.field)
                 if raw is not None:
                     value = to_ascom(raw, c.unit)
-                    times[c.member] = status.time.timestamp()
+                    times[c.member] = status.field_times.get(c.field, status.time).timestamp()
             conditions[c.member] = value
         return conditions, times, descriptions
 

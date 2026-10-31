@@ -189,6 +189,7 @@ dialog; the destructive ones (marked *confirm*) must also send
 | `clear_lease` (*confirm*) | `enclosure` | release a dead (crashed or quarantined) lease once the telescopes are safe: the supervisor's `clear`, with the observer's name (design.md 3.3). Refused while the lease is live |
 | `clear_spectrograph` (*confirm*) | `enclosure` | the sequencer takes spectra again after it marked the spectrograph down (through `operator_control`; the spectrograph panel shows up/down, the failures and who waits in its queue) |
 | `clear_faults` (*confirm*) | `enclosure` | the enclosure's `ClearFaults` (the supervisor refuses unless it is closed); also releases an emergency close latch |
+| `manual` | `enclosure`, `telescope`, `op`, ... | manual control of one telescope (below; `take` needs *confirm*) |
 | `emergency_close` (*confirm*) | `enclosure` (omit: all), `direct`, `reason` (optional) | close now, by any path that answers (below). Never rate limited |
 
 Requests and ToOs go through the request API's own code
@@ -323,6 +324,55 @@ Each enclosure chooses with `emergency_close.fallback`:
 Without an `emergency_close` entry an enclosure has no fallback (`"none"`).
 None of this replaces the hardware E-stop or the enclosure's local
 controls.
+
+## Manual control
+
+An operator can take **one telescope out of robotic control** and drive it
+by hand, from the **Manual control** section (operators only):
+
+| `op` (`POST /console/api/manual`, with `enclosure`, `telescope`) | Body | What happens |
+|---|---|---|
+| `take` (*confirm*, reason) | | the telescope is held for manual control: its observation in progress finishes the exposure, then the plan never gets it again until it is released (the hold wrapper answers the sequencer with a `kind="manual"` observation instead of asking the plan) |
+| `slew` | `ra_hours`, `dec_deg` (J2000), or `target` (a name from the dispatch plan's requests; no name server, so offline-safe) | refused below `min_alt` or above `max_alt` (the plan's limits, else 21 and 83 deg) at the site, computed now; the sequencer's `SlewGuard` vets it too |
+| `offset` | `east_arcsec`, `north_arcsec` (up to 3600 each) | from where the mount points now |
+| `focus` | `position`, or `delta` (steps) | through the sequencer's autofocus mover (its limits and backlash); only on a telescope whose focuser the sequencer moves |
+| `expose` | `exptime` (s), `count` (1 to 50), `light` (default true), `object` | saved like every frame (`docs/data.md`), object `manual` unless named |
+| `guide_start`, `guide_stop` | | the telescope's guider at the mount's declination |
+| `abort` | | stop what it is doing now (the exposure and the slew aborted, as for a `now` preemption); the session goes on |
+| `release` (reason) | | back to robotic: the session ends and the telescope asks its plan |
+
+**The owner and grant model holds.** The console still never touches a
+device: each command goes through `operator_control` to the sequencer,
+whose manual session runs as an observation in the current lease's
+generation, on grants made for it (holder `<sequencer>/manual:<operator>#<gen>`)
+and fenced with every other grant of the generation. While a telescope is
+manual it is not idle, so the sequencer asks for and keeps the lease as for
+any light work; the supervisor alone decides to open (weather safe for the
+reopen hold), exactly as before.
+
+**Refused while the lease is not live.** Anything that needs the sky
+(slew, offset, light exposures, guiding) is refused (409) unless the
+supervisor reports a live, opened lease and the manual session runs in it;
+the sequencer checks again before it acts. Focus and dark exposures need
+only the session.
+
+**The supervisor overrides everything.** Bad weather (or any revocation)
+revokes the lease; the generation's fence revokes the manual grants with it,
+the command in progress is cancelled and reported `interrupted`, and the
+usual cleanup aborts and parks. The telescope stays under manual control,
+waiting: when the supervisor reopens by its own policy the session runs
+again, and commands are accepted again. A `pause`, `stop` or `park` on a
+manual telescope ends the session too. Emergency close holds every
+telescope.
+
+**One operator at a time.** Only the operator who took a telescope sends
+it commands (another must take it). One command at a time per telescope
+(409 while one is running; `abort` always goes). Every command is audited
+(`op` with the rest) and in the sequencer's timeline (`manual_start`,
+`manual_command`, `manual_end`) and so in the log; results (and failures,
+e.g. "no focuser") show in the section, from `holds.json`'s `manual` entry.
+Manual commands count against the per-token action limit
+(`action_per_minute`, `action_burst`).
 
 ## The console cannot open the roof
 

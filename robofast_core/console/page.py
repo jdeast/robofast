@@ -78,7 +78,7 @@ button.emergency { background: var(--bad); color: var(--bg); border-color: var(-
   font-weight: 800; letter-spacing: .04em; min-height: 44px; padding: 8px 14px; }
 #emergency-dialog { border: 2px solid var(--bad); }
 #emergency-dialog h3 { color: var(--bad); }
-#em-text, #em-result { white-space: pre-line; }
+#em-text, #em-result, #mc-status { white-space: pre-line; }
 .strip { display: flex; flex-wrap: wrap; gap: 8px; }
 .thumb { display: flex; flex-direction: column; align-items: center; gap: 2px; cursor: pointer;
   background: none; border: 1px solid var(--line); padding: 4px; min-height: 0; }
@@ -105,6 +105,10 @@ table.targets tr.now td { font-weight: 700; }
 .chips { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 13px; }
 .chips label { display: inline-flex; gap: 4px; align-items: center; }
 .chips input { width: auto; }
+.form { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr)); gap: 6px; }
+.form label { display: flex; flex-direction: column; font-size: 13px; color: var(--dim); }
+fieldset { border: 1px solid var(--line); border-radius: 6px; margin: 8px 0; padding: 6px 10px; }
+legend { color: var(--dim); font-size: 13px; }
 label.check { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
 label.check input { width: auto; }
 .hidden { display: none !important; }
@@ -138,6 +142,35 @@ BODY = """
   <section id="weather"><h2>Weather</h2><div id="weather-body"></div></section>
   <section id="enclosure"><h2>Enclosure</h2><div id="enclosure-body"></div></section>
   <section id="telescopes" class="wide"><h2>Telescopes</h2><div id="telescope-body"></div></section>
+  <section id="manual" class="wide hidden"><h2>Manual control</h2>
+    <div class="actions">
+      <select id="mc-tel" aria-label="telescope"></select>
+      <button id="mc-take" type="button" class="danger">take manual control</button>
+      <button id="mc-release" type="button">return to robotic</button>
+      <button id="mc-abort" type="button" class="danger">abort</button>
+    </div>
+    <p id="mc-status" class="mono"></p>
+    <fieldset><legend>slew</legend><div class="form">
+      <label>target name<input id="mc-target" autocomplete="off" placeholder="from the plan"></label>
+      <label>RA (h)<input id="mc-ra" inputmode="decimal"></label>
+      <label>Dec (deg)<input id="mc-dec" inputmode="decimal"></label>
+      <div class="actions"><button id="mc-slew" type="button">slew</button></div></div></fieldset>
+    <fieldset><legend>offset, focus</legend><div class="form">
+      <label>east (arcsec)<input id="mc-east" inputmode="decimal" value="0"></label>
+      <label>north (arcsec)<input id="mc-north" inputmode="decimal" value="0"></label>
+      <div class="actions"><button id="mc-offset" type="button">offset</button></div>
+      <label>focus position<input id="mc-focus" inputmode="numeric"></label>
+      <label>or by (steps)<input id="mc-dfocus" inputmode="numeric"></label>
+      <div class="actions"><button id="mc-focus-go" type="button">focus</button></div></div></fieldset>
+    <fieldset><legend>expose, guide</legend><div class="form">
+      <label>exposure (s)<input id="mc-exptime" inputmode="decimal" value="10"></label>
+      <label>count<input id="mc-count" inputmode="numeric" value="1"></label>
+      <label>object<input id="mc-object" autocomplete="off" value="manual"></label>
+      <label class="check"><input id="mc-dark" type="checkbox"> dark (shutter closed)</label>
+      <div class="actions"><button id="mc-expose" type="button">expose</button></div>
+      <div class="actions"><button id="mc-guide" type="button">start guiding</button>
+        <button id="mc-unguide" type="button">stop guiding</button></div></div></fieldset>
+  </section>
   <section id="log" class="wide"><h2>Log</h2>
     <div class="actions">
       <input id="log-search" placeholder="search" aria-label="search the log" class="grow">
@@ -339,6 +372,9 @@ function signedOut() {
 function signedIn(s) {
   session = s;
   $("emergency").classList.toggle("hidden", !s.can.operate);
+  $("manual").classList.toggle("hidden", !s.can.operate);
+  fill("mc-tel", Object.entries(s.enclosures || {}).flatMap(([e, ts]) => ts.map((t) =>
+    h("option", {value: e + "/" + t}, (Object.keys(s.enclosures).length > 1 ? e + " / " : "") + t))));
   $("signin").classList.add("hidden");
   $("main").classList.remove("hidden");
   $("signout").classList.remove("hidden");
@@ -398,6 +434,7 @@ function opButton(label, action, body, title, text, danger) {
 
 function render(doc) {
   lastDoc = doc; lastAt = Date.now();
+  drawManual(doc);
   const encs = Object.entries(doc.enclosures || {});
   const multi = encs.length > 1;
   const title = (name) => multi ? h("h3", {}, name) : null;
@@ -582,6 +619,49 @@ $("em-go").addEventListener("click", async () => {
     $("em-go").disabled = false;
   }
 });
+
+// -- manual control ---------------------------------------------------------------------
+function mcTarget() { const [enclosure, telescope] = $("mc-tel").value.split("/"); return {enclosure, telescope}; }
+function numIn(id) { const v = $(id).value.trim(); return v === "" ? null : Number(v); }
+async function manual(op, params, title, text) {
+  const body = {...mcTarget(), op, ...params};
+  if (title) {
+    const reason = await ask(title, text, true);
+    if (reason === null) return;
+    Object.assign(body, {reason, confirm: true});
+  }
+  $("mc-status").textContent = op + "...";
+  const r = await call("POST", "/console/api/manual", body);
+  $("mc-status").textContent = r.ok ? op + ": sent" + (r.data.result && r.data.result.manual && r.data.result.manual.alt !== undefined ? " (alt " + r.data.result.manual.alt + "°)" : "")
+    : op + " refused: " + ((r.data && r.data.error) || r.status);
+}
+$("mc-take").addEventListener("click", () => manual("take", {}, "Take " + mcTarget().telescope + " out of robotic control",
+  "The scheduler stops using it (its exposure in progress finishes first). Slewing, offsets, light exposures and guiding need the lease: the supervisor alone opens, and bad weather closes and ends what you are doing."));
+$("mc-release").addEventListener("click", () => manual("release", {}, "Return " + mcTarget().telescope + " to robotic control", "The scheduler takes it from here."));
+$("mc-abort").addEventListener("click", () => manual("abort", {}));
+$("mc-slew").addEventListener("click", () => {
+  const t = $("mc-target").value.trim();
+  manual("slew", t ? {target: t} : {ra_hours: numIn("mc-ra"), dec_deg: numIn("mc-dec")});
+});
+$("mc-offset").addEventListener("click", () => manual("offset", {east_arcsec: numIn("mc-east") || 0, north_arcsec: numIn("mc-north") || 0}));
+$("mc-focus-go").addEventListener("click", () => manual("focus", numIn("mc-focus") !== null ? {position: numIn("mc-focus")} : {delta: numIn("mc-dfocus") || 0}));
+$("mc-expose").addEventListener("click", () => manual("expose", {exptime: numIn("mc-exptime"), count: numIn("mc-count") || 1, light: !$("mc-dark").checked, object: $("mc-object").value}));
+$("mc-guide").addEventListener("click", () => manual("guide_start", {}));
+$("mc-unguide").addEventListener("click", () => manual("guide_stop", {}));
+function drawManual(doc) {
+  if (!session || !session.can.operate || !$("mc-tel").value) return;
+  const {enclosure, telescope} = mcTarget();
+  const e = (doc.enclosures || {})[enclosure] || {}, x = ((e.telescopes || {})[telescope]) || {};
+  const m = x.manual;
+  const lines = [];
+  if (!m) lines.push(telescope + ": robotic" + (x.hold ? " (held: " + x.hold.action + ")" : ""));
+  else {
+    lines.push(telescope + ": MANUAL, " + m.operator + (m.active ? ", running in lease generation " + m.generation : ", waiting for the lease"));
+    if (m.current) lines.push("doing: " + m.current.op);
+    for (const r of (m.results || []).slice(-4).reverse()) lines.push((r.time || "").slice(11, 19) + " " + r.op + ": " + (r.ok ? "ok " : "FAILED ") + (typeof r.detail === "string" ? r.detail : JSON.stringify(r.detail)));
+  }
+  if ($("mc-status").dataset.last !== lines.join("\n")) { $("mc-status").dataset.last = lines.join("\n"); $("mc-status").textContent = lines.join("\n"); }
+}
 
 // -- the log ----------------------------------------------------------------------------
 const LEVELS = ["info", "warning", "alarm", "critical"];

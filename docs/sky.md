@@ -77,7 +77,7 @@ Gaia DR3 is distributed by ESA under **CC BY-NC 3.0 IGO**
 (<https://www.cosmos.esa.int/web/gaia-users/license>): redistribution is
 allowed for non-commercial use, with attribution. The bundled bright-star
 file and the test fixture tiles are Gaia data under that licence, not the
-code's; `robofast_core/data/README.md` has the attribution and what a
+code's BSD 3-Clause licence; `robofast_core/data/README.md` has the attribution and what a
 commercial user should do. The Hipparcos catalogue's redistribution terms
 are not stated as plainly, so it is fetched and cached, not bundled. The WDS
 is a US Naval Observatory product (a US Government work), fetched and cached

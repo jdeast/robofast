@@ -17,7 +17,7 @@ without a Gaia counterpart into the local cache (not bundled: see below).
 licence (<https://www.cosmos.esa.int/web/gaia-users/license>), which allows
 redistribution for non-commercial use with attribution. This file, and the
 Gaia fixture tiles under `tests/core/data/catalog/`, are therefore under
-CC BY-NC 3.0 IGO, **not** the licence of the code. Attribution:
+CC BY-NC 3.0 IGO, **not** the code's BSD 3-Clause licence (`LICENSE`). Attribution:
 
 > This work has made use of data from the European Space Agency (ESA)
 > mission Gaia (<https://www.cosmos.esa.int/gaia>), processed by the Gaia Data

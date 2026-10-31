@@ -161,6 +161,7 @@ async def make_rig(lease_path):
         supervise_parking: bool = False,
         filterwheels: bool = False,
         port_action: str | None = None,
+        imaging=None,
     ) -> Rig:
         tl = Timeline()
         weather = FakeWeather(safe=weather_safe)
@@ -221,6 +222,7 @@ async def make_rig(lease_path):
             timeline=tl,
             config=SequencerConfig(**{**FAST_SEQ, **(seq or {})}),
             slew_guard=slew_guard,
+            imaging=imaging,
         )
         rig = Rig(tl, weather, dome, tels, cams, sm, oc, owners, sup, seqr, lease_path)
         rig.wheels = wheels

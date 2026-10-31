@@ -76,9 +76,10 @@ All under ``/api/v1`` (a trailing slash is ignored):
   shutter, lease, faults (from the supervisor), and each telescope's state
   and current observation (from the sequencer's status snapshot).
 * ``GET /requestgroups/{id}/data`` (``read``) -- data pointers: each
-  completed observation of each configuration (telescope, time, frames) and,
-  with ``data_path_template`` set, the expected file paths. No files are
-  served.
+  completed observation of each configuration (telescope, time, frames) and
+  its ``files``: the frames as the sequencer wrote them (relative to its
+  data root; ``docs/data.md``), or, for a record without them, the paths
+  expected from ``data_path_template`` if that is set. No files are served.
 
 ``GET /healthz`` (no token) answers ``{"ok": true}`` for the proxy.
 
@@ -777,7 +778,9 @@ class RequestApi:
                 records = []
                 for o in obs:
                     rec = dict(o)
-                    if tmpl is not None:
+                    # Recorded paths (the frames as written) win over the
+                    # template's expected ones.
+                    if "files" not in rec and tmpl is not None:
                         t = datetime.fromisoformat(o["time"])
                         local = view.site.night_start(t) + timedelta(
                             hours=view.site.longitude / 15.0
@@ -811,7 +814,8 @@ class RequestApi:
             "id": entry["id"],
             "enclosure": enc.name,
             "configurations": configs,
-            "paths_configured": tmpl is not None,
+            "paths_configured": tmpl is not None
+            or any("files" in o for c in configs for o in c["observations"]),
         }
 
     @staticmethod

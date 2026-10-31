@@ -38,6 +38,15 @@ and optionally:
   Alpaca ``Action`` that selects an M3 port, given the port name as its
   parameter; without it, an observation that names a port fails rather than
   use the wrong one).
+* per telescope, ``focuser`` and ``rotator`` (Alpaca devices, only read:
+  their positions go into the FITS headers).
+* ``images`` -- save every frame (:mod:`robofast_core.imaging`;
+  ``docs/data.md``): ``{"data_root": "/data", "site": "minerva", ...}``
+  with :class:`~robofast_core.imaging.ImagingConfig` fields; a relative
+  ``data_root`` is relative to the config file. The enclosure's ``site``
+  gives the Sun and Moon and the night; ``devices.observingconditions``
+  (the weather bridge, only read) the weather keywords; the supervisor's
+  status the shutter. Without ``images`` no frame is saved.
 * ``status_file`` -- write a status snapshot (:func:`snapshot`) to this
   JSON file every ``status_interval`` seconds (default 5), atomically. The
   request API (:mod:`robofast_core.request_api`) reads it; a snapshot older
@@ -87,7 +96,9 @@ from typing import Any
 
 from robofast_core.alpaca import alpaca_owner
 from robofast_core.config import device_address, load_config, telescopes
+from robofast_core.imaging import imaging_from_config
 from robofast_core.lease_client import RemoteSupervisor
+from robofast_core.owner import DeviceOwner
 from robofast_core.plan import PlanProvider, StaticPlan, plan_from_config
 from robofast_core.sequencer import Sequencer, SequencerConfig, TelescopeUnit
 from robofast_core.timeline import Timeline
@@ -98,19 +109,29 @@ log = logging.getLogger(__name__)
 NEEDS_OPERATOR = 3
 
 
+TELESCOPE_KEYS = {"telescope", "camera", "filterwheel", "port_action", "focuser", "rotator"}
+
+
 def build_units(
-    config: dict[str, Any], timeline: Timeline, command_timeout: float
+    config: dict[str, Any],
+    timeline: Timeline,
+    command_timeout: float,
+    *,
+    imagebytes: bool = True,
+    aux: dict[str, dict[str, DeviceOwner]] | None = None,
 ) -> list[TelescopeUnit]:
-    """One :class:`TelescopeUnit` per entry of ``telescopes``."""
+    """One :class:`TelescopeUnit` per entry of ``telescopes``. Focusers and
+    rotators (read only, for headers) go into ``aux["focuser"]`` and
+    ``aux["rotator"]`` by telescope name, if ``aux`` is given."""
     units = []
     for name, entry in telescopes(config).items():
         if "camera" not in entry:
             raise ValueError(f"telescope {name!r} has no camera")
-        unknown = set(entry) - {"telescope", "camera", "filterwheel", "port_action"}
+        unknown = set(entry) - TELESCOPE_KEYS
         if unknown:
             raise ValueError(f"telescope {name!r}: unknown keys {sorted(unknown)}")
         owners: dict[str, Any] = {}
-        for kind in ("telescope", "camera", "filterwheel"):
+        for kind in ("telescope", "camera", "filterwheel", "focuser", "rotator"):
             if kind not in entry:
                 continue
             address, number = device_address(entry[kind])
@@ -121,7 +142,10 @@ def build_units(
                 timeline,
                 number=number,
                 default_timeout=command_timeout,
+                imagebytes=imagebytes,
             )
+            if kind in ("focuser", "rotator") and aux is not None:
+                aux.setdefault(kind, {})[name] = owners[kind]
         port_action = entry.get("port_action")
         if port_action is not None and (not isinstance(port_action, str) or not port_action):
             raise ValueError(f"telescope {name!r}: port_action must be a non-empty string")
@@ -155,8 +179,18 @@ def build(
     plan: PlanProvider | None = None,
     base: Path | None = None,
 ) -> tuple[Sequencer, RemoteSupervisor]:
-    """A sequencer wired to the devices and the supervisor in ``config``."""
-    units = build_units(config, timeline, float(config.get("command_timeout", 5.0)))
+    """A sequencer wired to the devices and the supervisor in ``config``
+    (and, with an ``images`` entry, its frame pipeline: ``seq.imaging``)."""
+    command_timeout = float(config.get("command_timeout", 5.0))
+    images = config.get("images") or {}
+    aux: dict[str, dict[str, DeviceOwner]] = {}
+    units = build_units(
+        config,
+        timeline,
+        command_timeout,
+        imagebytes=bool(images.get("imagebytes", True)),
+        aux=aux,
+    )
     names = [u.name for u in units]
     if plan is None:
         if "plan" not in config:
@@ -164,6 +198,31 @@ def build(
         plan = plan_from_config(config["plan"], names, base=base)
     url = config.get("supervisor_url") or f"http://{config.get('listen', '127.0.0.1:8100')}"
     remote = RemoteSupervisor(url, **config.get("lease_client", {}))
+    weather = None
+    oc = (config.get("devices") or {}).get("observingconditions")
+    if config.get("images") is not None and oc:
+        address, number = device_address(oc)
+        weather = alpaca_owner(
+            "telemetry.observingconditions",
+            "observingconditions",
+            address,
+            timeline,
+            number=number,
+            default_timeout=command_timeout,
+        )
+    imaging = imaging_from_config(
+        config,
+        timeline,
+        supervisor=remote,
+        weather=weather,
+        focusers=aux.get("focuser"),
+        rotators=aux.get("rotator"),
+        base=base,
+    )
+    if imaging is not None:
+        imaging.owners = [o for d in aux.values() for o in d.values()]
+        if weather is not None:
+            imaging.owners.append(weather)
     seq = Sequencer(
         config.get("sequencer_name") or config["name"],
         supervisor=remote,
@@ -171,6 +230,7 @@ def build(
         plan=plan,
         timeline=timeline,
         config=SequencerConfig(**config.get("sequencer", {})),
+        imaging=imaging,
     )
     return seq, remote
 
@@ -208,7 +268,7 @@ def snapshot(seq: Sequencer, interval: float = 5.0) -> dict[str, Any]:
             "consecutive_errors": u.consecutive_errors,
             "current": current.get(name),
         }
-    return {
+    out = {
         "time": datetime.now(UTC).isoformat(),
         "max_age": 3 * interval,
         "sequencer": seq.name,
@@ -217,6 +277,14 @@ def snapshot(seq: Sequencer, interval: float = 5.0) -> dict[str, Any]:
         "needs_operator": seq.needs_operator,
         "telescopes": tels,
     }
+    if seq.imaging is not None:
+        # The value registry (design.md 3.8), and frames lost per telescope.
+        out["values"] = seq.imaging.registry.as_json()
+        for name in tels:
+            failed = seq.imaging.failed(name)
+            if failed:
+                tels[name]["frames_failed"] = failed
+    return out
 
 
 def write_snapshot(seq: Sequencer, path: Path, interval: float = 5.0) -> None:
@@ -250,6 +318,8 @@ async def run(
     # A plan's background task (the dispatch scheduler's ToO intake), if any.
     serve = getattr(seq.plan, "serve", None)
     background = [asyncio.create_task(serve(), name="plan-serve")] if serve else []
+    if seq.imaging is not None:
+        background.append(asyncio.create_task(seq.imaging.telemetry.run(), name="telemetry"))
     if status_file is not None:
         background.append(
             asyncio.create_task(
@@ -264,6 +334,10 @@ async def run(
         for t in background:
             t.cancel()
         await asyncio.gather(*background, return_exceptions=True)
+        if seq.imaging is not None:
+            await seq.imaging.aclose()  # the frames still queued are written
+            for owner in seq.imaging.owners:
+                owner.close()
         if status_file is not None:
             write_snapshot(seq, Path(status_file), status_interval)  # the final state
         await remote.aclose()

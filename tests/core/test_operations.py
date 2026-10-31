@@ -285,7 +285,7 @@ async def test_example_calibration_plan_and_telescope_options():
         assert seq.config.idle_release_after == 900
     finally:
         await remote.aclose()
-    for bad in ({"port_action": ""}, {"focuser": "127.0.0.1:1"}):
+    for bad in ({"port_action": ""}, {"guider": "127.0.0.1:1"}):
         entry = {"telescope": "127.0.0.1:1", "camera": "127.0.0.1:1", **bad}
         with pytest.raises(ValueError):
             build_units({"telescopes": {"t1": entry}}, Timeline(), 1.0)

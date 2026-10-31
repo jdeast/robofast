@@ -14,7 +14,16 @@ from robofast_core.timeline import Timeline
 
 #: The device types robofast_core drives.
 DEVICE_TYPES = frozenset(
-    {"telescope", "camera", "filterwheel", "dome", "safetymonitor", "observingconditions"}
+    {
+        "telescope",
+        "camera",
+        "filterwheel",
+        "focuser",
+        "rotator",
+        "dome",
+        "safetymonitor",
+        "observingconditions",
+    }
 )
 
 
@@ -27,13 +36,16 @@ def alpaca_owner(
     number: int = 0,
     default_timeout: float = 5.0,
     privileged_members: frozenset[str] | set[str] = frozenset(),
+    imagebytes: bool = True,
 ) -> DeviceOwner:
-    """An owner for device ``number`` of ``device_type`` at ``address`` (host:port)."""
+    """An owner for device ``number`` of ``device_type`` at ``address``
+    (host:port). ``imagebytes``: a camera's images come by the ImageBytes
+    transfer (else JSON; :mod:`robofast_core.alpaca_client`)."""
     if device_type.lower() not in DEVICE_TYPES:
         raise ValueError(f"unsupported device type {device_type!r}")
     return DeviceOwner(
         name,
-        lambda: AlpacaDevice(address, device_type, number),
+        lambda: AlpacaDevice(address, device_type, number, imagebytes=imagebytes),
         timeline,
         default_timeout=default_timeout,
         privileged_members=privileged_members,

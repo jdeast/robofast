@@ -526,6 +526,25 @@ async def test_cancel_an_accepted_group_mid_visit(api):
     assert [len(c["observations"]) for c in data["configurations"]] == [1, 0]
 
 
+async def test_data_endpoint_returns_the_recorded_frame_paths(api):
+    """Frames the sequencer wrote (reported with ``files``) are the data
+    pointers, in place of the template's expected paths."""
+    body = imaging("real", telescopes=["t2"])
+    assert (await api.post("tom", "/requestgroups", body)).status_code == 202
+    sched = api.scheduler()
+    await sched.poll_dropbox()
+    obs = await sched.next_observation("t2")
+    assert obs.name.startswith("real ") and obs.object == "real"
+    files = [f"minerva/t2/n20261114/n20261114.t2.real.{i:04d}.fits" for i in (7, 8)]
+    sched.report("t2", obs, "complete", 2, files=files)
+    data = (await api.get("tom", "/requestgroups/real/data")).json()
+    (o,) = data["configurations"][0]["observations"]
+    assert o["files"] == files and data["paths_configured"] is True
+    # And they survive the scheduler's state file (what the API reads).
+    restored = api.scheduler()
+    assert restored.observed["real-c"][0]["files"] == files
+
+
 async def test_cancel_scopes_and_ownership(api):
     await api.post("tom", "/requestgroups", imaging("mine"))
     await api.post("alerts", "/toos", imaging("alert", too=too("next")))

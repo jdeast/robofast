@@ -11,7 +11,8 @@
     "safety and sequencer: SafetyConfig and SequencerConfig fields; omitted ones take the defaults in docs/design.md section 6.",
     "plan: calibration frames only (taken with the enclosure closed); or run with --plan dispatch.example.json (the dispatch scheduler) or --plan targets.example.json (a static list).",
     "site: Mt. Hopkins, for python -m robofast_core.when (start the night at a Sun altitude; deploy/robofast-sequencer@.service).",
-    "A telescope may also name a filterwheel (an Alpaca FilterWheel) and a port_action (its Alpaca Action that selects an M3 port)."
+    "A telescope may also name a filterwheel (an Alpaca FilterWheel) and a port_action (its Alpaca Action that selects an M3 port), and a focuser and rotator (read only, for the FITS headers).",
+    "images: every frame is saved under data_root (docs/data.md); plate_scale (arcsec per unbinned pixel) gives an approximate WCS. The values here are placeholders until measured."
   ],
   "name": "aqawan1",
   "listen": "127.0.0.1:8100",
@@ -38,6 +39,16 @@
     "error_backoff": 300,
     "max_consecutive_errors": 3,
     "idle_release_after": 900
+  },
+  "images": {
+    "data_root": "/data",
+    "site": "minerva",
+    "compress": false,
+    "queue_size": 4,
+    "telescopes": {
+      "t1": {"plate_scale": 0.6, "aperture": 700.0, "focal_length": 4560.0},
+      "t2": {"plate_scale": 0.6, "aperture": 700.0, "focal_length": 4560.0}
+    }
   },
   "plan": {"type": "calibration", "biases": 10, "darks": [[60, 5]]}
 }

@@ -30,6 +30,19 @@ exceeds its timeout raises :class:`~robofast_core.owner.DeviceTimeout`.
 Device methods (as opposed to properties) are listed in :data:`METHODS` with
 their HTTP verb and parameter names; only the ones robofast_core uses are
 there. :meth:`AlpacaDevice.get` and :meth:`AlpacaDevice.put` reach any member.
+
+Camera images
+-------------
+``get("ImageArray")`` (so also ``Grant.get("ImageArray", timeout=...)``
+through the camera's owner) returns an
+:class:`~robofast_core.imagebytes.ImageArray`, not a nested list. It asks
+for the ImageBytes binary transfer (``Accept: application/imagebytes``) and
+takes whatever the server sends: ImageBytes, or JSON from a server without
+it (and for errors). ``imagebytes=False`` asks for JSON only. The body is
+read into one preallocated buffer when its length is known, and the pixels
+are a zero-copy view of it (:mod:`robofast_core.imagebytes`). The caller's
+timeout bounds the whole transfer, so size it by the image
+(:func:`robofast_core.imaging.download_timeout`).
 """
 
 from __future__ import annotations
@@ -40,6 +53,7 @@ from typing import Any
 
 import httpx
 
+from robofast_core import imagebytes
 from robofast_core.owner import DeviceError, DeviceTimeout
 
 #: One ClientID per process, as the spec suggests (a random 1..65535).
@@ -207,8 +221,11 @@ class AlpacaDevice:
         number: int = 0,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        imagebytes: bool = True,
     ) -> None:
         self.device_type = device_type.lower()
+        #: Ask cameras for the ImageBytes transfer (module doc).
+        self.imagebytes = imagebytes
         self.number = number
         self.label = f"{self.device_type}/{number}@{address}"
         self._ctid = itertools.count(1)
@@ -257,8 +274,47 @@ class AlpacaDevice:
     # -- generic -----------------------------------------------------------
 
     async def get(self, member: str, *, timeout: float, **params: Any) -> Any:
-        """Read a property (or call a GET method); return ``Value``."""
+        """Read a property (or call a GET method); return ``Value``.
+        ``ImageArray`` returns an :class:`~robofast_core.imagebytes.ImageArray`
+        (module doc)."""
+        if member.lower() == "imagearray" and not params:
+            return await self.image_array(timeout=timeout)
         return await self._request("GET", member, params, timeout)
+
+    async def image_array(
+        self, *, timeout: float, binary: bool | None = None
+    ) -> imagebytes.ImageArray:
+        """The camera's last image (module doc); ``binary`` overrides
+        :attr:`imagebytes` for this call."""
+        want_bytes = self.imagebytes if binary is None else binary
+        args = {"ClientID": CLIENT_ID, "ClientTransactionID": self._next_ctid()}
+        accept = f"{imagebytes.MEDIA_TYPE}, application/json" if want_bytes else "application/json"
+        what = f"{self.label} GET ImageArray"
+        try:
+            async with self._http.stream(
+                "GET", "imagearray", params=args, headers={"Accept": accept}, timeout=timeout
+            ) as r:
+                ctype = r.headers.get("content-type", "").split(";")[0].strip().lower()
+                body = await _read_body(r)
+        except httpx.TimeoutException as exc:
+            raise DeviceTimeout(f"{what}: no complete answer within {timeout} s") from exc
+        except httpx.TransportError as exc:
+            raise AlpacaTransportError(f"{what}: {type(exc).__name__}: {exc}") from exc
+        if r.status_code != 200:
+            cls = _BY_STATUS.get(r.status_code, AlpacaHTTPError)
+            text = bytes(body[:200]).decode("utf-8", "replace").strip()
+            raise cls(f"{what}: HTTP {r.status_code}: {text}", r.status_code)
+        try:
+            if ctype == imagebytes.MEDIA_TYPE:
+                return imagebytes.parse_imagebytes(body)
+            return imagebytes.parse_json(bytes(body))
+        except imagebytes.ImageDeviceError as exc:
+            cls = error_class(exc.number)
+            raise cls(
+                f"{what}: {cls.__name__} (0x{exc.number:X}): {exc.message}", exc.number
+            ) from None
+        except imagebytes.ImageFormatError as exc:
+            raise AlpacaProtocolError(f"{what}: {exc}") from exc
 
     async def put(self, member: str, *, timeout: float, **params: Any) -> Any:
         """Write a property or call a method; ``params`` names are sent as given."""
@@ -287,3 +343,25 @@ class AlpacaDevice:
 
     async def aclose(self) -> None:
         await self._http.aclose()
+
+
+async def _read_body(r: httpx.Response) -> bytearray | bytes:
+    """The whole body, into one preallocated buffer when its length is known
+    (an image is read once, not accumulated and then joined)."""
+    try:
+        length = int(r.headers.get("content-length", ""))
+    except ValueError:
+        length = -1
+    if length < 0 or r.headers.get("content-encoding"):
+        return b"".join([chunk async for chunk in r.aiter_bytes()])
+    buf = bytearray(length)
+    view = memoryview(buf)
+    n = 0
+    async for chunk in r.aiter_bytes():
+        if n + len(chunk) > length:
+            raise AlpacaProtocolError(f"body longer than its Content-Length {length}")
+        view[n : n + len(chunk)] = chunk
+        n += len(chunk)
+    if n != length:
+        raise AlpacaProtocolError(f"body of {n} bytes, Content-Length {length}")
+    return buf

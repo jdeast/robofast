@@ -9,10 +9,13 @@
     "safetymonitor, observingconditions: the site weather bridge (sites/minerva/weather.yaml listens on 11111).",
     "t1, t2: ASCOM Remote on each telescope's Windows PC, serving its mount (PWI4) and camera as device 0.",
     "safety and sequencer: SafetyConfig and SequencerConfig fields; omitted ones take the defaults in docs/design.md section 6.",
-    "plan: calibration frames only; or run with --plan dispatch.example.json (the dispatch scheduler) or --plan targets.example.json (a static list)."
+    "plan: calibration frames only (taken with the enclosure closed); or run with --plan dispatch.example.json (the dispatch scheduler) or --plan targets.example.json (a static list).",
+    "site: Mt. Hopkins, for python -m robofast_core.when (start the night at a Sun altitude; deploy/robofast-sequencer@.service).",
+    "A telescope may also name a filterwheel (an Alpaca FilterWheel) and a port_action (its Alpaca Action that selects an M3 port)."
   ],
   "name": "aqawan1",
   "listen": "127.0.0.1:8100",
+  "site": {"latitude": 31.680407, "longitude": -110.878977, "elevation": 2316.0},
   "devices": {
     "dome": "127.0.0.1:11113",
     "safetymonitor": "127.0.0.1:11111",
@@ -33,7 +36,8 @@
   "command_timeout": 10,
   "sequencer": {
     "error_backoff": 300,
-    "max_consecutive_errors": 3
+    "max_consecutive_errors": 3,
+    "idle_release_after": 900
   },
   "plan": {"type": "calibration", "biases": 10, "darks": [[60, 5]]}
 }

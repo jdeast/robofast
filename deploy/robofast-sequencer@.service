@@ -1,23 +1,46 @@
 # Example systemd unit for the sequencer of one enclosure (instance %i).
 # Not installed anywhere; copy and adapt. Paths below are placeholders.
 #
-#   systemctl enable --now robofast-sequencer@aqawan1
+#   systemctl enable --now robofast-sequencer@aqawan1.timer
+#
+# One night per run. robofast-sequencer@.timer starts it every afternoon;
+# then, in order:
+#
+# 1. evening calibrations (ExecStartPre): biases and darks with the
+#    enclosure closed -- a calibration plan's frames are all dark, so the
+#    sequencer never requests a lease (docs/design.md 3.4). Only while the
+#    Sun is still up, so a restart in the night does not take them again;
+#    their failure does not stop the night (the leading "-");
+# 2. wait for the Sun (ExecStartPre): python -m robofast_core.when returns
+#    once the Sun is below -6 deg at the site in the config (at once if it
+#    already is, e.g. after a restart in the night);
+# 3. the night (ExecStart): the sequencer with the config's plan (the
+#    dispatch scheduler). With nothing observable it holds no lease and the
+#    enclosure stays closed; it opens when something is observable and the
+#    weather allows, and closes again after idle_release_after with every
+#    telescope idle. The process exits 0 when the plan ends the night (the
+#    dispatch scheduler: Sun above max_sun_alt and rising);
+# 4. morning calibrations: on a clean exit (OnSuccess=, systemd 249 or
+#    later) robofast-calibrations@%i.service runs the calibration plan, if
+#    the Sun is above -12 deg (the dawn exit; not a stop at midnight).
 #
 # It reads the enclosure's config file, the same one its supervisor reads
 # (sites/minerva/aqawan1.json is an example): the telescopes and cameras, the
-# supervisor's address, the sequencer settings and the plan. One unit per
-# enclosure is what keeps a single sequencer per lease holder
+# supervisor's address, the sequencer settings, the site and the plan. One
+# unit per enclosure keeps a single sequencer per lease holder
 # (sequencer_name in the config): a restarted process uses the same name, so
 # it can recover the lease its crashed predecessor left behind (see
-# robofast_core/sequencer.py).
+# robofast_core/sequencer.py). The calibration runs use the same name; they
+# run before and after the night's process, never alongside it.
 #
 # On a crash it is restarted after RestartSec. The new process waits for the
 # old lease to lapse (lease_ttl), aborts every exposure and parks every
 # telescope, then recovers the lease; the supervisor reopens after its usual
 # checks. Exit status 3 (quarantined, or a telescope gave up for the night)
-# needs an operator: no restart. Exit status 0 (stopped, or the plan is
-# done) is not restarted either. If it keeps crashing, systemd stops trying
-# after StartLimitBurst and the supervisor raises its orphaned-lease alarm.
+# needs an operator: no restart. Exit status 0 (stopped, or the night is
+# over) is not restarted either; the timer starts the next night. If it
+# keeps crashing, systemd stops trying after StartLimitBurst and the
+# supervisor raises its orphaned-lease alarm.
 
 [Unit]
 Description=robofast sequencer (%i)
@@ -25,18 +48,21 @@ After=network-online.target robofast-supervisor@%i.service
 Wants=network-online.target
 StartLimitIntervalSec=600
 StartLimitBurst=5
+OnSuccess=robofast-calibrations@%i.service
 
 [Service]
 Type=simple
 User=robofast
 WorkingDirectory=/opt/robofast
-ExecStart=/opt/robofast/venv/bin/python -m robofast_core.sequencer_service --config /etc/robofast/%i.json
+Environment=PY=/opt/robofast/venv/bin/python CONFIG=/etc/robofast/%i.json CALIB=/etc/robofast/%i-calibration.json
+ExecStartPre=-/bin/sh -c '"$$PY" -m robofast_core.when --config "$$CONFIG" --sun-above 0 --check && exec "$$PY" -m robofast_core.sequencer_service --config "$$CONFIG" --plan "$$CALIB"'
+ExecStartPre=/opt/robofast/venv/bin/python -m robofast_core.when --config ${CONFIG} --sun-below -6
+ExecStart=/opt/robofast/venv/bin/python -m robofast_core.sequencer_service --config ${CONFIG}
+# The calibrations and the wait for the Sun take hours.
+TimeoutStartSec=infinity
 Restart=on-failure
 RestartSec=10
 RestartPreventExitStatus=3
 # SIGTERM cancels the observations, cleans up (bounded by cancel_ack_timeout
 # and park_timeout) and releases the lease; allow for that before SIGKILL.
 TimeoutStopSec=180
-
-[Install]
-WantedBy=multi-user.target

@@ -15,9 +15,11 @@ it (``sites/minerva/aqawan1.json`` is a complete example)::
       "listen": "127.0.0.1:8100",
       "telescopes": {
         "t1": {"telescope": "127.0.0.1:11120/0", "camera": "127.0.0.1:11130/0"},
-        "t2": {"telescope": "127.0.0.1:11121/0", "camera": "127.0.0.1:11131/0"}
+        "t2": {"telescope": "127.0.0.1:11121/0", "camera": "127.0.0.1:11131/0",
+               "filterwheel": "127.0.0.1:11131/0", "port_action": "..."}
       },
-      "sequencer": {"error_backoff": 300, "max_consecutive_errors": 3},
+      "sequencer": {"error_backoff": 300, "max_consecutive_errors": 3,
+                    "idle_release_after": 900},
       "plan": {"type": "calibration", "biases": 10, "darks": [[60, 5]]}
     }
 
@@ -31,6 +33,11 @@ and optionally:
   keyword arguments (``timeout``, ``poll``, ``retry``).
 * ``command_timeout`` -- default per-command timeout for the telescopes and
   cameras (s; default 5).
+* per telescope, ``filterwheel`` (an Alpaca FilterWheel; filters are
+  selected by name from its ``Names``) and ``port_action`` (the telescope's
+  Alpaca ``Action`` that selects an M3 port, given the port name as its
+  parameter; without it, an observation that names a port fails rather than
+  use the wrong one).
 
 ``sequencer`` holds :class:`~robofast_core.sequencer.SequencerConfig` fields.
 ``plan`` is a plan entry (:func:`robofast_core.plan.plan_from_config`): the
@@ -46,7 +53,12 @@ Signals and exit status
 -----------------------
 SIGTERM or SIGINT stops it cleanly: the observations are cancelled, every
 exposure aborted and every telescope parked, and the lease released. It also
-exits when the plan has nothing more for any telescope. Exit status:
+exits when the plan has nothing more for any telescope: the dispatch
+scheduler's night ends at dawn, a calibration plan's once its frames are
+taken (with the enclosure closed). ``deploy/robofast-sequencer@.service``
+and its timer start it each afternoon: evening calibrations, a wait for the
+Sun (:mod:`robofast_core.when`), the night, morning calibrations. Exit
+status:
 
 * 0 -- stopped by a signal, or the plan is done;
 * 2 -- bad command line or config;
@@ -87,20 +99,34 @@ def build_units(
     for name, entry in telescopes(config).items():
         if "camera" not in entry:
             raise ValueError(f"telescope {name!r} has no camera")
-        owners = []
-        for kind in ("telescope", "camera"):
+        unknown = set(entry) - {"telescope", "camera", "filterwheel", "port_action"}
+        if unknown:
+            raise ValueError(f"telescope {name!r}: unknown keys {sorted(unknown)}")
+        owners: dict[str, Any] = {}
+        for kind in ("telescope", "camera", "filterwheel"):
+            if kind not in entry:
+                continue
             address, number = device_address(entry[kind])
-            owners.append(
-                alpaca_owner(
-                    f"{name}.{kind}",
-                    kind,
-                    address,
-                    timeline,
-                    number=number,
-                    default_timeout=command_timeout,
-                )
+            owners[kind] = alpaca_owner(
+                f"{name}.{kind}",
+                kind,
+                address,
+                timeline,
+                number=number,
+                default_timeout=command_timeout,
             )
-        units.append(TelescopeUnit(name, *owners))
+        port_action = entry.get("port_action")
+        if port_action is not None and (not isinstance(port_action, str) or not port_action):
+            raise ValueError(f"telescope {name!r}: port_action must be a non-empty string")
+        units.append(
+            TelescopeUnit(
+                name,
+                owners["telescope"],
+                owners["camera"],
+                filterwheel=owners.get("filterwheel"),
+                port_action=port_action,
+            )
+        )
     if not units:
         raise ValueError("the config lists no telescopes")
     return units
@@ -162,8 +188,9 @@ async def run(seq: Sequencer, remote: RemoteSupervisor) -> None:
             await asyncio.gather(background, return_exceptions=True)
         await remote.aclose()
         for unit in seq.units.values():
-            unit.telescope.close()
-            unit.camera.close()
+            for owner in (unit.telescope, unit.camera, unit.filterwheel):
+                if owner is not None:
+                    owner.close()
 
 
 def main(argv: list[str] | None = None) -> None:

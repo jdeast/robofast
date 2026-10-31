@@ -1,0 +1,25 @@
+# Example systemd unit: morning calibrations for one enclosure (instance %i).
+# Not installed anywhere; copy and adapt. Paths below are placeholders.
+#
+# Started by robofast-sequencer@%i.service when the night's process exits
+# cleanly (OnSuccess=). It runs the sequencer once more with the calibration
+# plan (sites/minerva/calibration.example.json): biases and darks only, so no
+# lease is requested and the enclosure stays closed (docs/design.md 3.4);
+# the process exits when the frames are taken. The condition skips it unless
+# the Sun is above -12 deg: the dawn exit, not an operator's stop at
+# midnight. Start it by hand for calibrations at any other time.
+
+[Unit]
+Description=robofast calibrations (%i)
+After=network-online.target robofast-supervisor@%i.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=robofast
+WorkingDirectory=/opt/robofast
+ExecCondition=/opt/robofast/venv/bin/python -m robofast_core.when --config /etc/robofast/%i.json --sun-above -12 --check
+ExecStart=/opt/robofast/venv/bin/python -m robofast_core.sequencer_service --config /etc/robofast/%i.json --plan /etc/robofast/%i-calibration.json
+TimeoutStartSec=2h
+# As for the sequencer: SIGTERM aborts the exposures and parks.
+TimeoutStopSec=180

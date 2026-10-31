@@ -1,0 +1,24 @@
+# Example systemd timer: start the sequencer of one enclosure (instance %i)
+# every afternoon. Not installed anywhere; copy and adapt.
+#
+#   systemctl enable --now robofast-sequencer@aqawan1.timer
+#
+# The service itself waits for the Sun (python -m robofast_core.when in its
+# ExecStartPre), so the time here only has to be early enough for the
+# evening calibrations and before the earliest sunset of the year, and
+# after the latest sunrise (the previous night's process must have exited:
+# a timer does not start a unit that is still running). Local time of the
+# machine running it.
+
+[Unit]
+Description=Start the robofast sequencer (%i) each afternoon
+
+[Timer]
+OnCalendar=*-*-* 14:00:00
+# Missed while the machine was down: start at boot (the service then waits
+# for the Sun, or starts at once in the night).
+Persistent=true
+Unit=robofast-sequencer@%i.service
+
+[Install]
+WantedBy=timers.target

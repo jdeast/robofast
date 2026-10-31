@@ -148,6 +148,9 @@ class _ToOPlan:
         self.too_pending = False
         self.history: list[tuple[str, str, str, int]] = []
 
+    async def peek(self, telescope: str) -> Observation:
+        return Observation("field", exptime=self.exptime, count=1000)
+
     async def next_observation(self, telescope: str) -> Observation:
         if telescope == "t1" and self.too_pending:
             self.too_pending = False

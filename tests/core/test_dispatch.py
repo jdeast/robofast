@@ -148,7 +148,7 @@ def test_ties_are_broken_by_id():
     a, b = d.evaluate("t1")[::-1]
     assert a.score == b.score
     for _ in range(3):
-        assert d._best("t1", NIGHT, sky.sky_now(MINERVA, NIGHT)).request.id == "a-r"
+        assert d._best("t1", NIGHT, sky.sky_now(MINERVA, NIGHT))[0].request.id == "a-r"
 
 
 # -- hard constraints -----------------------------------------------------------

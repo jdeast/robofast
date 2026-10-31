@@ -33,6 +33,7 @@ from robofast_core.supervisor_service import SupervisorServer
 from robofast_core.testing.fakes import (
     FakeCamera,
     FakeDome,
+    FakeFilterWheel,
     FakeObservingConditions,
     FakeSafetyMonitor,
     FakeTelescope,
@@ -80,6 +81,8 @@ class Rig:
     server: SupervisorServer | None = None
     remote: RemoteSupervisor | None = None
     tasks: list[asyncio.Task] = field(default_factory=list)
+    #: Filter wheels (with ``filterwheels=True``), one per telescope.
+    wheels: list[FakeFilterWheel] = field(default_factory=list)
 
     @property
     def tel(self) -> FakeTelescope:
@@ -156,12 +159,17 @@ async def make_rig(lease_path):
         plan=None,
         slew_guard=None,
         supervise_parking: bool = False,
+        filterwheels: bool = False,
+        port_action: str | None = None,
     ) -> Rig:
         tl = Timeline()
         weather = FakeWeather(safe=weather_safe)
         dome = FakeDome(heartbeat_timeout=heartbeat_timeout)
         tels = [FakeTelescope() for _ in range(telescopes)]
         cams = [FakeCamera() for _ in range(telescopes)]
+        wheels = [FakeFilterWheel() for _ in range(telescopes)] if filterwheels else []
+        for t in tels:
+            t.port_action = port_action
         names = [f"t{i + 1}" for i in range(telescopes)]
         sm, oc = FakeSafetyMonitor(weather), FakeObservingConditions(weather)
 
@@ -175,6 +183,10 @@ async def make_rig(lease_path):
                 for n, t in zip(names, tels, strict=True)
             },
             **{f"{n}.camera": owner(f"{n}.camera", c) for n, c in zip(names, cams, strict=True)},
+            **{
+                f"{n}.filterwheel": owner(f"{n}.filterwheel", w)
+                for n, w in zip(names, wheels, strict=False)
+            },
             "safetymonitor": owner("safetymonitor", sm),
             "observingconditions": owner("observingconditions", oc),
         }
@@ -196,7 +208,14 @@ async def make_rig(lease_path):
             "seq",
             supervisor=sup,
             telescopes=[
-                TelescopeUnit(n, owners[f"{n}.telescope"], owners[f"{n}.camera"]) for n in names
+                TelescopeUnit(
+                    n,
+                    owners[f"{n}.telescope"],
+                    owners[f"{n}.camera"],
+                    filterwheel=owners.get(f"{n}.filterwheel"),
+                    port_action=port_action,
+                )
+                for n in names
             ],
             plan=plan or (lambda: Observation(f"target{next(k)}", exptime=exptime, count=count)),
             timeline=tl,
@@ -204,6 +223,7 @@ async def make_rig(lease_path):
             slew_guard=slew_guard,
         )
         rig = Rig(tl, weather, dome, tels, cams, sm, oc, owners, sup, seqr, lease_path)
+        rig.wheels = wheels
         rigs.append(rig)
         return rig
 

@@ -16,12 +16,22 @@ Providers:
   telescope through the sequencer's ``preempt`` (design.md 3.7.1);
 * :class:`StaticPlan` -- a fixed target list (JSON), worked through in order;
 * :class:`CalibrationPlan` -- dark and bias frames only; the telescope is
-  never unparked.
+  never unparked and the enclosure never opened (the sequencer takes
+  frames with ``light=False`` without a lease when no telescope has light
+  work: its closed phase, design.md 3.4).
 
-A provider may also implement two optional hooks, which the sequencer and
-its service use when present: ``set_preempt_callback(fn)`` (the sequencer
-passes its ``preempt``) and ``async serve()`` (a background task run
-alongside the sequencer, e.g. to take in ToOs).
+A provider may also implement optional hooks, which the sequencer and its
+service use when present:
+
+* ``async peek(telescope)`` -- what ``next_observation`` would answer now,
+  *without* handing it out or changing any state. The sequencer asks it
+  while it holds no lease (its closed phase), to decide whether to request
+  one (light work), take dark frames with the enclosure closed, or keep
+  waiting. Without it the sequencer asks ``next_observation`` and holds the
+  answer as that telescope's next observation.
+* ``set_preempt_callback(fn)`` -- the sequencer passes its ``preempt``;
+* ``async serve()`` -- a background task run alongside the sequencer (the
+  dispatch scheduler's ToO intake).
 
 :func:`plan_from_config` builds any of them from a config entry (see
 :mod:`robofast_core.sequencer_service`).
@@ -33,7 +43,7 @@ import inspect
 import json
 from collections import deque
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -55,7 +65,19 @@ class Observation:
     count: int = 1
     #: False for dark and bias frames: the telescope is not unparked or
     #: slewed, and the shutter stays closed (``StartExposure(..., False)``).
+    #: With no light work on any telescope they are taken with the
+    #: enclosure closed (no lease).
     light: bool = True
+    #: Filter name, selected on the telescope's filter wheel (its ``Names``)
+    #: before the exposures; None: leave the wheel alone.
+    filter: str | None = None
+    #: M3 port, selected through the telescope's port ``Action``; None: leave
+    #: it. A telescope without a port action fails an observation that names
+    #: one (never observes through the wrong port).
+    port: str | None = None
+    #: If it is interrupted or fails part-way, only the frames not yet taken
+    #: are re-taken (otherwise the whole observation is).
+    allow_partial: bool = False
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Observation:
@@ -72,7 +94,11 @@ class Idle:
     ask again after ``seconds`` (or sooner, if the sequencer is woken by
     :meth:`~robofast_core.sequencer.Sequencer.preempt`). The telescope stops
     tracking and stays where it is (not parked) while it waits; the
-    enclosure stays open. ``None`` still means "nothing more tonight"."""
+    enclosure stays open -- until every telescope of the enclosure has been
+    idle for the sequencer's ``idle_release_after``: then the generation ends
+    (park, release the lease, the enclosure closes) and the sequencer asks
+    the plan again, without a lease, until something is observable.
+    ``None`` still means "nothing more tonight"."""
 
     seconds: float
     reason: str = ""
@@ -100,9 +126,10 @@ class PlanProvider(Protocol):
 
 class _Queues:
     """Per-telescope FIFO queues. An observation that did not complete goes
-    back to the front of its telescope's queue (whole: frames already taken
-    are taken again), so the telescope retries it after the enclosure reopens
-    or after its error backoff; the sequencer's give-up bounds the retries."""
+    back to the front of its telescope's queue, so the telescope retries it
+    after the enclosure reopens or after its error backoff; the sequencer's
+    give-up bounds the retries. It is re-taken whole, or, with
+    ``allow_partial``, only its frames not yet taken."""
 
     def __init__(self, queues: dict[str, Iterable[Observation]]) -> None:
         self.queues = {tel: deque(obs) for tel, obs in queues.items()}
@@ -112,9 +139,15 @@ class _Queues:
         queue = self.queues.get(telescope)
         return queue.popleft() if queue else None
 
+    async def peek(self, telescope: str) -> Observation | None:
+        queue = self.queues.get(telescope)
+        return queue[0] if queue else None
+
     def report(self, telescope: str, obs: Observation, outcome: str, frames: int) -> None:
         self.history.append((telescope, obs.name, outcome, frames))
         if outcome != "complete":
+            if obs.allow_partial and 0 < frames < obs.count:
+                obs = replace(obs, count=obs.count - frames)
             self.queues.setdefault(telescope, deque()).appendleft(obs)
 
 
@@ -142,10 +175,10 @@ class StaticPlan(_Queues):
 class CalibrationPlan(_Queues):
     """Bias and dark frames on every telescope, then nothing.
 
-    ``darks`` is a list of ``[exptime, count]``. The frames run under the
-    sequencer's open lease like any other observation (the telescope stays
-    parked; the enclosure may open); a closed-roof calibration mode is
-    future work.
+    ``darks`` is a list of ``[exptime, count]``. Every frame is dark
+    (``light=False``), so the sequencer takes them in its closed phase: no
+    lease is requested, the enclosure stays closed and the telescopes stay
+    parked (design.md 3.4).
     """
 
     def __init__(
@@ -195,6 +228,7 @@ def plan_from_config(
       (:func:`robofast_core.dispatch.dispatch_from_config`).
     """
     config = dict(config)
+    config.pop("_note", None)
     kind = config.pop("type", None)
     if kind == "static":
         if "file" in config:

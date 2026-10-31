@@ -202,17 +202,61 @@ means nothing to do now (the telescope stops tracking, stays where it is,
 and asks again after `seconds` or when woken by a preemption); outcomes are
 `complete`, `interrupted` (the enclosure closed, the sequencer stopped, or
 a target of opportunity preempted it) and `failed` (a device error or a
-refused slew). The dispatch scheduler (section 3.7) implements it; there is
-also a static target list and a calibration-only plan (bias and dark
-frames, telescope parked; they still run under an open lease). The night
-ends, and the process exits, when every telescope's plan is done or it gave
-up.
+refused slew). A plan may also offer `peek(telescope)`: the same answer
+without handing it out or changing anything. The dispatch scheduler
+(section 3.7) implements it all; there is also a static target list and a
+calibration-only plan (bias and dark frames). The night ends, and the
+process exits, when every telescope's plan is done or it gave up.
+
+**Idle telescopes release the enclosure.** A short idle (a target about to
+rise, a gap between visits) keeps the enclosure open: the telescope stops
+tracking, so it cannot track into a limit, and stays where it is, ready to
+slew; closing and reopening would cost the shutter travel twice and risk a
+reopen hold. Once *every* telescope of the generation has been idle for
+`idle_release_after` (15 min), the generation ends cleanly: the telescopes
+park, the lease is released, the supervisor closes.
+
+**The closed phase.** Before every lease the sequencer asks the plan,
+holding no lease, what each telescope would do now (`peek`; a plan without
+it is asked `next_observation` and given the answer back as `interrupted`
+with no frames, so nothing stale is acted on later). If any telescope has
+light work it requests a lease (the reopen hold applies as usual). If the
+only work is dark frames (`light=False`: biases, darks), it takes them in a
+*closed generation*: grants and cleanup as usual, no lease, enclosure
+closed, telescopes parked. Otherwise it waits out the shortest `Idle`
+(woken early by a preemption request, e.g. a ToO) and asks again. So a
+calibration plan never opens the enclosure, and the sequencer started at
+dusk opens only once something is observable. Dark frames a plan hands out
+during an open generation are taken there.
+
+**Filters and M3 ports.** An observation may name a `filter` and a `port`.
+The filter is looked up by name in the telescope's optional Alpaca
+FilterWheel (`Names`) and the wheel moved to it, bounded by
+`filter_timeout`; the port is selected with the telescope's Alpaca
+`Action(port_action, port)` (configurable per telescope: PWI4 on the
+CDK700s), bounded by `port_timeout`. Both happen before the exposures,
+while the enclosure opens. A telescope without a filter wheel or a
+`port_action`, or a filter its wheel lacks, fails that observation (an
+ordinary error of that telescope) rather than observe through the wrong
+one; the dispatch scheduler already keeps such requests off it (section
+3.7).
+
+**Evening start, morning end.** The sequencer process runs one night.
+`deploy/robofast-sequencer@.timer` starts its unit every afternoon; the
+unit takes evening calibrations (closed) while the Sun is up, waits with
+`python -m robofast_core.when --sun-below -6 --config <enclosure.json>`
+(astropy, the site from the config; at once if it is already dark, e.g.
+after a restart), then runs the night. The dispatch scheduler ends the
+night once the Sun is above its `max_sun_alt` and rising; on that clean
+exit `deploy/robofast-calibrations@.service` takes the morning
+calibrations.
 
 **Entry point.** `python -m robofast_core.sequencer_service --config
 <enclosure.json>` builds the owners, the lease client and the plan from the
 enclosure's config file, which the supervisor service reads too
 (`robofast_core/config.py`; `sites/minerva/aqawan1.json` is MINERVA's
-Aqawan 1 with T1 and T2, on placeholder addresses). SIGTERM cleans up and
+Aqawan 1 with T1 and T2, on placeholder addresses). A telescope entry may
+add `filterwheel` (an Alpaca address) and `port_action`. SIGTERM cleans up and
 releases the lease; exit status 3 means "needs an operator" (quarantined, or
 a telescope gave up) and is not restarted. The config is JSON for now; YAML
 is read when PyYAML is installed.
@@ -274,7 +318,8 @@ model.
   *standing*: it returns to PENDING after each visit, as MINERVA's RV
   targets do. Requests load from JSON files, validated with errors that
   name the entry; `from_legacy_csv` converts a legacy MINERVA target
-  spreadsheet export. A small authenticated REST API (accept, validate,
+  spreadsheet export. An InstrumentConfig may name a `filter` and an M3
+  `port`; a Configuration may set `allow_partial`. A small authenticated REST API (accept, validate,
   report, cancel) comes next; a TOM Toolkit facility module can sit on it
   later.
 - The scheduler is a **dispatch scheduler** (`robofast_core/dispatch.py`),
@@ -310,16 +355,38 @@ model.
   instrument config) is re-checked against the hard constraints between its
   observations and abandoned if it no longer passes or a ToO outranks it.
   `interrupted` re-queues the configuration (ATTEMPTED), `failed` counts an
-  attempt. Status, completed-visit history (for cadence and nightly counts)
-  and received ToOs persist in a JSON state file, written atomically after
-  each change, so a restart neither repeats a completed one-shot nor breaks
-  a cadence; a corrupt file is moved aside with an error.
+  attempt. An interrupted or failed configuration is re-taken whole, unless
+  it sets `allow_partial`: then the frames already taken are kept, and the
+  next visit takes only the rest (the planned duration shrinks to match).
+  Status, completed-visit history (for cadence and nightly counts),
+  `allow_partial` progress and received ToOs persist in a JSON state file,
+  written atomically after each change, so a restart neither repeats a
+  completed one-shot nor breaks a cadence; a corrupt file is moved aside
+  with an error.
+- **Filters and ports are hard constraints.** A configuration naming an M3
+  `port` is only for telescopes whose limits list it in `ports` (default
+  none: a telescope that cannot select ports never gets one, rather than
+  observe through the wrong port); one naming a `filter`, only for
+  telescopes whose `filters`, if listed, include it. The sequencer selects
+  them (section 3.4).
+- **The nightly plan record** (`robofast_core/plan_record.py`, plan entry
+  `"record": {"dir": ..., "night_rollover_hour": 12, "timezone": ...}`):
+  every answer and report as one JSON line, one file per night (the local
+  date of the evening; times before `night_rollover_hour` belong to the
+  previous night; the site's mean solar time without a time zone). Each
+  decision carries the chosen request and configuration, the score and its
+  terms, the runners-up with their scores and the top rejected candidates
+  with the constraints they failed; then idle answers, visits continued or
+  abandoned, ToOs received or cancelled, expiries, preemptions and
+  outcomes. The first line a process writes to a night's file is a snapshot
+  of the scheduler (requests, state, limits, settings), so `python -m
+  robofast_core.plan_record FILE --replay` rebuilds the scheduler, replays
+  the night's calls at their recorded times and checks that it makes the
+  same choices (a test does exactly that).
 - Configured as the enclosure's plan entry, `{"type": "dispatch", "site":
   ..., "requests": ..., "telescopes": {...limits...}, ...}`
   (`sites/minerva/dispatch.example.json`).
-- Still to come: the night's decisions written as a JSON plan, for
-  inspection and replay; filter and M3-port selection in the sequencer (the
-  model carries them); a look-ahead scheduler if dispatch proves myopic.
+- Still to come: a look-ahead scheduler if dispatch proves myopic.
 
 #### 3.7.1 Targets of opportunity
 
@@ -482,6 +549,11 @@ support is often worse. So:
 | `error_backoff` | 300 s | a telescope's wait after a device error |
 | `max_consecutive_errors` | 3 | then that telescope gives up for the night and alarms |
 | `plan_timeout` | 30 s | bound on asking the plan for a telescope's next observation |
+| `idle_release_after` | 15 min | every telescope idle this long: park, release the lease, close (section 3.4) |
+| `filter_timeout`, `port_timeout` | 60 s, 60 s | bounds on a filter wheel move and an M3 port selection |
+| evening start | Sun below -6° | `robofast_core.when` in the sequencer unit (`deploy/`) |
+| `night_rollover_hour` | 12 | plan record: earlier local times belong to the previous night |
+| `record_top_n` | 5 | runners-up and rejected candidates recorded per decision |
 | `park_before_close` | off | roll-off roofs: park every telescope (bounded, in parallel) before closing |
 | `park_wait` | 60 s | bound on that park |
 | `heartbeat_interval` | none | supervisor ping period; at most `heartbeat_timeout`/4, or the config is rejected |
@@ -534,8 +606,11 @@ Each step is a CI-tested deliverable.
    system and logs what it *would* have done, for comparison.
 8. One telescope, attended nights, then robotic; then the rest of MINERVA.
 9. Dispatch scheduler, request model and target-of-opportunity interrupts
-   (built; sections 3.7, 3.7.1); next the request API; then MEarth
-   (collision checker).
+   (built; sections 3.7, 3.7.1), with the night's operations around them
+   (built: idle release, closed-roof calibrations, evening start and
+   morning end, filter and M3-port selection, partial re-takes, the nightly
+   plan record with replay); next the request API; then MEarth (collision
+   checker).
 10. **Done:** several telescopes per enclosure (section 3.5) and the
     production sequencer entry point with its plan-provider interface.
 

@@ -13,7 +13,9 @@ from robofast_core.owner import DeviceOwner
 from robofast_core.timeline import Timeline
 
 #: The device types robofast_core drives.
-DEVICE_TYPES = frozenset({"telescope", "camera", "dome", "safetymonitor", "observingconditions"})
+DEVICE_TYPES = frozenset(
+    {"telescope", "camera", "filterwheel", "dome", "safetymonitor", "observingconditions"}
+)
 
 
 def alpaca_owner(

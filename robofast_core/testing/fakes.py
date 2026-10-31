@@ -148,7 +148,11 @@ class FakeDome(FakeDevice):
             self._watchdog()
             if self._tripped_at() is not None:
                 raise FakeDeviceError("heartbeat lost: the watchdog holds the shutter closed")
+        self.opens += 1
         self._move(0)
+
+    #: How many times OpenShutter was accepted.
+    opens = 0
 
     def CloseShutter(self) -> None:
         self._move(1)
@@ -206,6 +210,45 @@ class FakeTelescope(FakeDevice):
             raise FakeDeviceError("parked")
         self.ra, self.dec = ra, dec
         self._slew_until = self._now() + self._slew_time
+
+    #: The Alpaca Action that selects an M3 port (None: no port selection);
+    #: its parameter is the port name, one of ``ports``.
+    port_action: str | None = None
+    ports: tuple[str, ...] = ("1", "2")
+    port: str | None = None
+
+    def Action(self, action: str, parameters: str = "") -> str:
+        if self.port_action is None or action != self.port_action:
+            raise FakeDeviceError(f"ActionNotImplemented: {action}")
+        if parameters not in self.ports:
+            raise FakeDeviceError(f"no port {parameters!r}")
+        self.port = parameters
+        return ""
+
+
+class FakeFilterWheel(FakeDevice):
+    """A filter wheel that takes ``move_time`` seconds per move; ``Position``
+    reads -1 while it moves (as the ASCOM interface says)."""
+
+    def __init__(self, names: tuple[str, ...] = ("B", "V", "R", "I"), move_time: float = 0.1):
+        super().__init__()
+        self.Names = list(names)
+        self._move_time = move_time
+        self._position = 0
+        self._until = 0.0
+        self.moves = 0
+
+    @property
+    def Position(self) -> int:
+        return -1 if self._now() < self._until else self._position
+
+    @Position.setter
+    def Position(self, value: int) -> None:
+        if not 0 <= value < len(self.Names):
+            raise FakeDeviceError(f"no position {value}")
+        self._position = int(value)
+        self._until = self._now() + self._move_time
+        self.moves += 1
 
 
 class FakeCamera(FakeDevice):

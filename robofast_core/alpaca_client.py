@@ -185,11 +185,17 @@ METHODS: dict[str, tuple[str, tuple[str, ...]]] = {
     # telescope
     "SlewToCoordinatesAsync": ("PUT", ("RightAscension", "Declination")),
     "AbortSlew": ("PUT", ()),
+    "PulseGuide": ("PUT", ("Direction", "Duration")),  # GuideDirections, ms
+    "MoveAxis": ("PUT", ("Axis", "Rate")),  # TelescopeAxes, deg/s
     "Park": ("PUT", ()),
     "Unpark": ("PUT", ()),
     # dome
     "OpenShutter": ("PUT", ()),
     "CloseShutter": ("PUT", ()),
+    "SlewToAzimuth": ("PUT", ("Azimuth",)),
+    # focuser (also Halt: no parameters)
+    "Move": ("PUT", ("Position",)),
+    "Halt": ("PUT", ()),
     # observingconditions
     "TimeSinceLastUpdate": ("GET", ("SensorName",)),
     # any device: a driver-specific action (the enclosure heartbeat)

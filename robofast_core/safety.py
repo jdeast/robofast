@@ -639,6 +639,12 @@ class SafetySupervisor:
             self._closing_since = now
         if cfg.park_before_close and not self._parked_for_close:
             await self._park_before_close()
+            if self._want_open(time.monotonic()):
+                # A new lease was granted while we parked (an idle release
+                # followed at once by more work): opening is wanted again,
+                # so do not close on it; the next pass keeps it open.
+                self._parked_for_close = False
+                return
         try:
             await self._dome.call("CloseShutter", timeout=cfg.dome_timeout)
         except DeviceError as exc:
@@ -666,6 +672,8 @@ class SafetySupervisor:
         async def park(tel: Grant) -> None:
             try:
                 async with asyncio.timeout(cfg.park_wait / 2):
+                    if self._want_open(time.monotonic()):
+                        return  # a new live lease: its sequencer has the telescopes
                     if not await tel.get("AtPark"):
                         await tel.call("Park", timeout=cfg.park_wait / 2)
                         while not await tel.get("AtPark"):

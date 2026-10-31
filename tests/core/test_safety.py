@@ -150,6 +150,24 @@ async def test_roll_off_parks_before_closing(make_rig):
     lease.release()
 
 
+async def test_a_new_lease_during_park_before_close_is_not_parked_or_closed_on(make_rig):
+    """An idle release followed at once by more work: the supervisor, parking
+    before it closes, gets a new live lease meanwhile. It must not park the
+    telescope the new lease's sequencer has unparked, nor close on it."""
+    rig = make_rig(safety=dict(park_before_close=True, park_wait=1.0))
+    await rig.start(sequencer=False)
+    lease = await _open(rig)
+    rig.tel.Unpark()  # the new lease's sequencer, slewing
+    parks = len(rig.timeline.commands(device="t1.telescope", source_prefix="safety"))
+    closes = len(rig.timeline.commands(device="dome", outcome="sent"))
+    await rig.supervisor._ensure_closed()
+    assert not rig.tel.AtPark
+    assert len(rig.timeline.commands(device="t1.telescope", source_prefix="safety")) == parks
+    sent = rig.timeline.commands(device="dome", outcome="sent")
+    assert not [c for c in sent[closes:] if c.what == "CloseShutter"]
+    lease.release()
+
+
 async def test_recover_only_a_dead_lease_of_the_holder_once_closed(make_rig):
     rig = make_rig()
     await rig.start(sequencer=False)

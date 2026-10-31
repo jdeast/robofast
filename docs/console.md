@@ -53,6 +53,8 @@ once after any action) and falls back to polling `/console/api/status`.
 | Spectrograph | busy, job, phase, frame *n* of *m*, exposure progress, target counts, exposure meter, CCD temperature, iodine stage, pressure | KiwiSpec `GET /status` |
 | Plan | the night's plan record, newest first (decisions with score and runner-up count, outcomes, idles, preemptions, ToOs); the pending queue (ToOs first, then priority) | `record` directory of the dispatch plan; the scheduler's state file, read as the request API reads it |
 | Timeline | the supervisor's recent commands and events | supervisor `GET /timeline` |
+| Log | one merged, scrolling, colour-coded stream: the supervisor's and the sequencer's timelines, alarms raised and cleared, weather verdict and sources, shutter, telescope and guider states, the spectrograph's job, holds, and every console action; filter by source and level, search, pause | supervisor `GET /timeline`, the snapshot's `timeline`, the changes between reads (`robofast_core/console/logstream.py`) |
+| Sky | an alt/az chart: each telescope's pointing, the targets (current ones highlighted, ToOs marked), the Sun and the Moon, the altitude limits; a target table with altitude, azimuth, airmass now and in 1 and 2 h, and hour angle | the snapshot's `tel.alt`/`tel.az` and `current`; the dispatch scheduler's requests; astropy (`robofast_core/console/skyview.py`) |
 | Images | each guider's live frame with the fiber, the centroid and the guide window drawn on it; each telescope's latest saved frame; the spectrograph's latest raw frame (below) | guider `GET /frame`, the frame index, `spectrograph_frames` |
 | Requests | submit, validate or cancel a request group or ToO; list one's own groups | the request API, in process |
 
@@ -67,6 +69,47 @@ its enclosure, source and text, so an acknowledgement sticks to that alarm
 The page works on a phone (one column under 360 px), and has three themes,
 kept in the browser: dark (the default), **red** (red on black, nothing
 else, for a dark control room) and light.
+
+## Log
+
+Each time the console gathers the services' status it adds to one log:
+the supervisor's timeline (`GET /timeline`) and the sequencer's (the last
+100 entries of its status snapshot, `timeline`), each entry once, with
+every command's outcome ("sent" lines left out) and every event; and what
+changed since the last read: an alarm raised or cleared (so every guider's,
+the spectrograph's, the weather bridge's and the supervisor's alarms), the
+weather verdict and each weather source's state, the shutter, each
+telescope's and guider's state, the spectrograph's job and phase, the
+holds. The console's own actions are added as they happen. Entries carry
+an increasing `id`, a time, the enclosure, the source and a level
+(`info`, `warning`, `alarm`, `critical`).
+
+The event stream pushes new entries as `event: log` (the last
+`log_backlog`, 300, on connecting); `GET /console/api/log?after=<id>`
+serves the same for polling. The page lists the newest first, colour-coded
+by level, with a checkbox per source (supervisor, sequencer, weather,
+enclosure, telescopes, guiders, spectrograph, console), a level filter, a
+search box and **pause** (new entries are counted, not drawn, until
+resumed). The console keeps `log_size` (3000) entries in memory. Changes
+are noticed while someone is watching (the console gathers on demand); the
+two timelines are complete either way.
+
+## Sky
+
+`GET /console/api/sky` (`read` scope; recomputed at most every
+`sky_cache`, 10 s) gives, per enclosure: the site and the local sidereal
+time; the Sun's and Moon's altitude and azimuth (and the Moon's
+illuminated fraction); each telescope's pointing (from the sequencer's
+value registry; none while stale) and limits (the dispatch plan's
+`min_alt`/`max_alt`, else 21 and 83 deg); and every unfinished target of the
+dispatch scheduler's requests, the ones a telescope is on first, then ToOs,
+then by priority, each with altitude, azimuth and airmass now and 1 and 2 h
+later, and its hour angle. Positions are computed with the same code and
+bundled IERS tables as the scheduler (never a download). The page draws it
+as an SVG chart (zenith at the centre, north up, east to the left as seen
+from below; the limits dashed) next to the table, refreshed every 15 s.
+Without a dispatch plan the chart shows the telescopes, Sun and Moon only
+(the enclosure config's `site`).
 
 ## Images
 
@@ -337,9 +380,8 @@ The request API's posture (design.md 3.7):
   built): it reads the same sources and this page's acknowledgements file, so
   an acknowledgement here stops its escalation. Acknowledging from an email
   or a chat message is not done.
-* The sequencer's own timeline (only the supervisor's is shown) and a
-  per-telescope "upcoming" from the scheduler's look-ahead (the queue is
-  shown instead).
+* A per-telescope "upcoming" from the scheduler's look-ahead (the queue and
+  the sky's target table are shown instead).
 * Guider and spectrograph controls (start, stop, abort) -- by design the
   sequencer drives them; an observer stops the telescope instead.
 * The spectrograph frame needs the raw files where the console can read

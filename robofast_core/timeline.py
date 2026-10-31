@@ -15,6 +15,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -73,6 +74,27 @@ class Timeline:
     def entries(self) -> list[Entry]:
         with self._lock:
             return list(self._entries)
+
+    def recent(self, n: int, *, skip_sent: bool = False) -> list[dict[str, Any]]:
+        """The last ``n`` entries as JSON, each with its wall-clock ``time``
+        (for status pages; ``skip_sent`` leaves out commands' "sent" lines,
+        whose outcome follows)."""
+        mono, wall = time.monotonic(), time.time()
+        entries = self.entries()
+        if skip_sent:
+            entries = [e for e in entries if not (e.kind == "command" and e.outcome == "sent")]
+        return [
+            {
+                "time": datetime.fromtimestamp(wall - (mono - e.t), UTC).isoformat(),
+                "kind": e.kind,
+                "source": e.source,
+                "device": e.device,
+                "what": e.what,
+                "outcome": e.outcome,
+                "detail": e.detail,
+            }
+            for e in entries[-n:]
+        ]
 
     def commands(
         self,

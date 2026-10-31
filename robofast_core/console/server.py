@@ -64,7 +64,9 @@ from robofast_core.config import load_config
 from robofast_core.console.aggregate import Aggregator, ConsoleEnclosure, alarm_id
 from robofast_core.console.hold import read_holds, send_command
 from robofast_core.console.images import ImageSources, NoFrame
+from robofast_core.console.logstream import LogStream
 from robofast_core.console.page import render_page
+from robofast_core.console.skyview import sky_for
 from robofast_core.emergency import EmergencyFailed, close_dome, read_token
 from robofast_core.frameview import SCALES, STRETCHES, render
 from robofast_core.request_api import (
@@ -160,6 +162,11 @@ class ConsoleConfig:
     image_file_poll: float = 2.0
     guider_frame_max: int = 256
     image_max_side: int = 1024
+    #: The log (docs/console.md, "Log"): entries kept, and the most sent at once.
+    log_size: int = 3000
+    log_backlog: int = 300
+    #: The sky view (targets, positions) is recomputed at most this often (s).
+    sky_cache: float = 10.0
     record_lines: int = 40
     timeline_entries: int = 60
 
@@ -330,6 +337,7 @@ class Console:
             guider_frame_max=c.guider_frame_max,
         )
         self.image_limiter = RateLimiter(c.image_per_minute, c.image_burst)
+        self.log = LogStream(c.log_size)
         self.limiter = RateLimiter(c.rate_per_minute, c.rate_burst)
         self.action_limiter = RateLimiter(c.action_per_minute, c.action_burst)
         self.fail_limiter = RateLimiter(c.auth_fail_per_minute, c.auth_fail_burst)
@@ -342,6 +350,8 @@ class Console:
             if requests
             else None
         )
+        self._sky: tuple[float, dict[str, Any]] | None = None
+        self._sky_lock = asyncio.Lock()
         #: Emergency closes, shown as alarms (newest last, bounded).
         self.emergencies: list[dict[str, Any]] = []
         self._cache: tuple[float, dict[str, Any]] | None = None
@@ -360,7 +370,12 @@ class Console:
         async with self._lock:
             now = time.monotonic()
             if fresh or self._cache is None or now - self._cache[0] > self.config.cache:
-                self._cache = (now, await self.aggregator.collect())
+                doc = await self.aggregator.collect()
+                self.log.ingest(doc)
+                for enc in doc["enclosures"].values():
+                    for k in [k for k in enc if k.startswith("_")]:
+                        del enc[k]  # for the log only
+                self._cache = (now, doc)
             doc = self._cache[1]
         out = json.loads(json.dumps(doc, default=str))  # a copy to annotate
         for e in self.emergencies:
@@ -382,6 +397,7 @@ class Console:
         """Server-sent events: ``status`` every ``refresh`` s and after each
         action; ends when the session or token does."""
         yield b"retry: 3000\n\n"
+        sent = max(0, self.log.next_id - 1 - self.config.log_backlog)
         while True:
             kick = self._kick
             if self._active(token_id) is None:
@@ -389,6 +405,10 @@ class Console:
                 return
             doc = await self.status()
             yield b"event: status\ndata: " + json.dumps(doc, default=str).encode() + b"\n\n"
+            new = self.log.since(sent, self.config.log_backlog)
+            if new:
+                sent = new[-1]["id"]
+                yield b"event: log\ndata: " + json.dumps(new, default=str).encode() + b"\n\n"
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(kick.wait(), self.config.refresh)
 
@@ -468,6 +488,18 @@ class Console:
         if parts == ["events"] and req.method == "GET":
             self._need(client, "read", "operator")
             return self._open_stream(client)
+        if parts == ["log"] and req.method == "GET":
+            self._need(client, "read", "operator")
+            q = parse_qs(urlsplit(req.target).query)
+            try:
+                after = int(q.get("after", ["0"])[0])
+            except ValueError:
+                raise ApiError(400, "after: an entry id") from None
+            await self.status()  # gather (and so log) if due
+            return Response(200, {"entries": self.log.since(after, self.config.log_backlog)})
+        if parts == ["sky"] and req.method == "GET":
+            self._need(client, "read", "operator")
+            return Response(200, await self.sky())
         if parts == ["images"] and req.method == "GET":
             self._need(client, "read", "operator")
             return Response(200, {"sources": self.images.sources()})
@@ -494,11 +526,42 @@ class Console:
                     },
                 )
             result = await self.act(parts[0], client.name, body)
+            target = body.get("telescope") or body.get("enclosure") or "all"
+            self.log.note(
+                str(body.get("enclosure") or ""),
+                f"{client.name}: {parts[0]} {target}: {body.get('reason') or ''}".strip(),
+                "warning" if parts[0] in CONFIRM else "info",
+            )
             self.changed()
             return Response(200, {"ok": True, "result": result})
         if len(parts) == 1 and parts[0] in ACTIONS:
             raise ApiError(405, f"{req.method} not allowed", headers={"Allow": "POST"})
         raise ApiError(404, "not found")
+
+    # -- the sky ---------------------------------------------------------------------------
+
+    async def sky(self) -> dict[str, Any]:
+        """Each enclosure's sky (console/skyview.py), at most every
+        ``sky_cache`` seconds (astropy is not free)."""
+        async with self._sky_lock:
+            now = time.monotonic()
+            if self._sky is not None and now - self._sky[0] < self.config.sky_cache:
+                return self._sky[1]
+            doc = {"enclosures": {}}
+            for name, enc in self.enclosures.items():
+                seq, values = Aggregator._sequencer_view(enc, lambda *a, **k: None)
+                current = {
+                    t: (s or {}).get("current")
+                    for t, s in (seq.get("telescopes") or {}).items()
+                    if isinstance(s, dict)
+                }
+                try:
+                    doc["enclosures"][name] = await asyncio.to_thread(sky_for, enc, values, current)
+                except Exception as exc:
+                    log.exception("console: the sky of %s", name)
+                    doc["enclosures"][name] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+            self._sky = (now, doc)
+            return doc
 
     # -- images ---------------------------------------------------------------------------
 
@@ -924,6 +987,7 @@ class Console:
             f"{k}: {out[k]}" for k in ("supervisor", "error") if out.get(k)
         )
         log.critical("console: %s: %s (%s)", enc.name, text, detail)
+        self.log.add(enc.name, "console", level, f"{text}: {detail}")
         self.emergencies.append(
             {
                 "id": alarm_id(enc.name, "emergency", text),

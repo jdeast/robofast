@@ -318,7 +318,10 @@ Each step is a CI-tested deliverable.
    "supervisor dies" scenario.
 4. Site weather bridge (Alpaca SafetyMonitor + ObservingConditions) for
    MINERVA's real feeds.
-5. Aqawan enclosure Alpaca server with a simulator mode, passing ConformU.
+5. Aqawan enclosure Alpaca server with a simulator mode, passing ConformU
+   (`robofast_core/devices/`: PAC client, PAC simulator, Dome server;
+   ConformU runs in CI). Hardware facts not yet confirmed on a real PAC are
+   listed in `aqawan_pac`'s and `aqawan_sim`'s module docs.
 6. Windows bridge on one control PC: ASCOM Remote for the camera and PWI4;
    measure command latency and full-frame download time.
 7. Shadow mode: robofast's supervisor runs read-only alongside the legacy

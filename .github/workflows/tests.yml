@@ -94,6 +94,43 @@ jobs:
             ${{ runner.temp }}/sim-timings.json
           if-no-files-found: warn
 
+  # Conformance: ConformU (pinned, checksum-verified) against every Alpaca
+  # server robofast ships. Now: the Aqawan Dome server, backed by its PAC
+  # simulator (scripts/conformu_aqawan.py).
+  conformu:
+    name: conformu
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade "pip>=25.1"
+          python -m pip install --group core
+      - name: Cache the ConformU download
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/robofast/conformu
+          key: conformu-${{ runner.os }}-${{ hashFiles('scripts/fetch_conformu.sh') }}
+      - name: Fetch ConformU
+        run: |
+          set -euo pipefail
+          bin=$(scripts/fetch_conformu.sh "$HOME/.cache/robofast/conformu" | tail -1)
+          echo "CONFORMU_BIN=$bin" >> "$GITHUB_ENV"
+      - name: ConformU against the Aqawan Dome server
+        run: python scripts/conformu_aqawan.py --conformu "$CONFORMU_BIN" --out "${{ runner.temp }}/conformu"
+      - name: Upload ConformU logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: conformu-logs
+          path: ${{ runner.temp }}/conformu
+          if-no-files-found: warn
+
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -117,14 +154,16 @@ jobs:
   test:
     name: test
     if: always()
-    needs: [pytest, alpaca-sim, lint]
+    needs: [pytest, alpaca-sim, conformu, lint]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any required job did not succeed
         run: |
           echo "pytest:     ${{ needs.pytest.result }}"
           echo "alpaca-sim: ${{ needs.alpaca-sim.result }}"
+          echo "conformu:   ${{ needs.conformu.result }}"
           echo "lint:       ${{ needs.lint.result }}"
           test "${{ needs.pytest.result }}" = "success"
           test "${{ needs.alpaca-sim.result }}" = "success"
+          test "${{ needs.conformu.result }}" = "success"
           test "${{ needs.lint.result }}" = "success"

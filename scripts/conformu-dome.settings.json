@@ -1,0 +1,6 @@
+{
+  "UpdateCheck": false,
+  "DomeOpenShutter": true,
+  "DomeShutterMovementTimeout": 60,
+  "DomeStabilisationWaitTime": 1
+}

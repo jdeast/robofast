@@ -65,6 +65,7 @@ from robofast_core.console.aggregate import Aggregator, ConsoleEnclosure, alarm_
 from robofast_core.console.hold import read_holds, send_command
 from robofast_core.console.images import ImageSources, NoFrame
 from robofast_core.console.page import render_page
+from robofast_core.console.skyview import sky_for
 from robofast_core.emergency import EmergencyFailed, close_dome, read_token
 from robofast_core.frameview import SCALES, STRETCHES, render
 from robofast_core.request_api import (
@@ -150,6 +151,8 @@ class ConsoleConfig:
     image_file_poll: float = 2.0
     guider_frame_max: int = 256
     image_max_side: int = 1024
+    #: The sky view (targets, positions) is recomputed at most this often (s).
+    sky_cache: float = 10.0
     record_lines: int = 40
     timeline_entries: int = 60
 
@@ -332,6 +335,8 @@ class Console:
             if requests
             else None
         )
+        self._sky: tuple[float, dict[str, Any]] | None = None
+        self._sky_lock = asyncio.Lock()
         #: Emergency closes, shown as alarms (newest last, bounded).
         self.emergencies: list[dict[str, Any]] = []
         self._cache: tuple[float, dict[str, Any]] | None = None
@@ -458,6 +463,9 @@ class Console:
         if parts == ["events"] and req.method == "GET":
             self._need(client, "read", "operator")
             return self._open_stream(client)
+        if parts == ["sky"] and req.method == "GET":
+            self._need(client, "read", "operator")
+            return Response(200, await self.sky())
         if parts == ["images"] and req.method == "GET":
             self._need(client, "read", "operator")
             return Response(200, {"sources": self.images.sources()})
@@ -489,6 +497,31 @@ class Console:
         if len(parts) == 1 and parts[0] in ACTIONS:
             raise ApiError(405, f"{req.method} not allowed", headers={"Allow": "POST"})
         raise ApiError(404, "not found")
+
+    # -- the sky ---------------------------------------------------------------------------
+
+    async def sky(self) -> dict[str, Any]:
+        """Each enclosure's sky (console/skyview.py), at most every
+        ``sky_cache`` seconds (astropy is not free)."""
+        async with self._sky_lock:
+            now = time.monotonic()
+            if self._sky is not None and now - self._sky[0] < self.config.sky_cache:
+                return self._sky[1]
+            doc = {"enclosures": {}}
+            for name, enc in self.enclosures.items():
+                seq, values = Aggregator._sequencer_view(enc, lambda *a, **k: None)
+                current = {
+                    t: (s or {}).get("current")
+                    for t, s in (seq.get("telescopes") or {}).items()
+                    if isinstance(s, dict)
+                }
+                try:
+                    doc["enclosures"][name] = await asyncio.to_thread(sky_for, enc, values, current)
+                except Exception as exc:
+                    log.exception("console: the sky of %s", name)
+                    doc["enclosures"][name] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+            self._sky = (now, doc)
+            return doc
 
     # -- images ---------------------------------------------------------------------------
 

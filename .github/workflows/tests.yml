@@ -95,12 +95,13 @@ jobs:
           if-no-files-found: warn
 
   # Conformance: ConformU (pinned, checksum-verified) against every Alpaca
-  # server robofast ships. Now: the Aqawan Dome server, backed by its PAC
-  # simulator (scripts/conformu_aqawan.py).
+  # server robofast ships, each backed by its simulator: the Aqawan Dome
+  # server (scripts/conformu_aqawan.py) and the FLWO 60-inch TCSGO
+  # Telescope/Focuser/Dome server (scripts/conformu_tcsgo.py).
   conformu:
     name: conformu
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -122,13 +123,18 @@ jobs:
           echo "CONFORMU_BIN=$bin" >> "$GITHUB_ENV"
       - name: ConformU against the Aqawan Dome server
         run: python scripts/conformu_aqawan.py --conformu "$CONFORMU_BIN" --out "${{ runner.temp }}/conformu"
+      - name: ConformU against the TCSGO Telescope, Focuser and Dome server
+        if: ${{ !cancelled() }}
+        run: python scripts/conformu_tcsgo.py --conformu "$CONFORMU_BIN" --out "${{ runner.temp }}/conformu-tcsgo"
       - name: Upload ConformU logs
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: conformu-logs
-          path: ${{ runner.temp }}/conformu
+          path: |
+            ${{ runner.temp }}/conformu
+            ${{ runner.temp }}/conformu-tcsgo
           if-no-files-found: warn
 
   lint:

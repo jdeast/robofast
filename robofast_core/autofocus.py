@@ -365,10 +365,12 @@ class FocusModel:
             return None
         return self.zero_point + self.correction(values)[0]
 
-    def update(self, measured: float, values: dict[str, float | None]) -> None:
+    def update(
+        self, measured: float, values: dict[str, float | None], when: datetime | None = None
+    ) -> None:
         """Re-anchor the zero point on a measured focus (never the reverse)."""
         self.zero_point = measured - self.correction(values)[0]
-        self.updated = datetime.now(UTC).isoformat()
+        self.updated = (when or datetime.now(UTC)).isoformat()
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> FocusModel:
@@ -625,6 +627,7 @@ class Autofocus:
         model: FocusModel | None = None,
         values: Callable[[], dict[str, float | None]] | None = None,
         event: Callable[..., None] | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         if exposer is None and camera is None:
             raise ValueError("give a camera grant or an exposer")
@@ -648,6 +651,8 @@ class Autofocus:
         self._values = values or (lambda: {})
         self._event = event or (lambda what, **kw: None)
         self._limits: tuple[float, float] | None = None
+        #: Result and calibration times (the sequencer's clock, robofast_core.clock).
+        self.clock = clock or (lambda: datetime.now(UTC))
         self._approached: float | None = None  # last position reached from `side`
         self._result: AutofocusResult | None = None
         self._binning = 1
@@ -695,7 +700,7 @@ class Autofocus:
         res = AutofocusResult(
             self.telescope,
             "calibrate" if calibrate else method,
-            time=datetime.now(UTC).isoformat(timespec="seconds"),
+            time=self.clock().isoformat(timespec="seconds"),
             model_values=values,
         )
         self._result = res
@@ -738,7 +743,7 @@ class Autofocus:
                     if math.isfinite(p.fwhm):
                         res.seeing = p.fwhm
                 # Only the model's zero point follows the measurement.
-                self.model.update(res.focus, values)
+                self.model.update(res.focus, values, self.clock())
                 self.store.set_model_zero_point(self.key, self.model)
         finally:
             await restore()
@@ -989,7 +994,7 @@ class Autofocus:
             offset_plus=float(arms[1].zero - x0),
             offset_minus=float(arms[-1].zero - x0),
             seeing_hfd=float(hfit.a),
-            time=datetime.now(UTC).isoformat(timespec="seconds"),
+            time=self.clock().isoformat(timespec="seconds"),
             points=len(good),
         )
         if 1 in donuts and donuts[1].slope > 0:

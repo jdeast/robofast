@@ -49,6 +49,7 @@ import json
 from collections import deque
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, fields, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -337,7 +338,10 @@ def as_plan(plan: PlanProvider | Callable[..., Observation | None]) -> PlanProvi
 
 
 def plan_from_config(
-    config: dict[str, Any], telescopes: Sequence[str], base: Path | None = None
+    config: dict[str, Any],
+    telescopes: Sequence[str],
+    base: Path | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> PlanProvider:
     """Build a plan from a config entry.
 
@@ -346,7 +350,8 @@ def plan_from_config(
       :class:`Observation`'s fields plus an optional ``telescopes`` list.
     * ``{"type": "calibration", "biases": 10, "darks": [[60, 5]]}``.
     * ``{"type": "dispatch", "site": {...}, "requests": "requests.json", ...}``
-      (:func:`robofast_core.dispatch.dispatch_from_config`).
+      (:func:`robofast_core.dispatch.dispatch_from_config`; ``clock`` is
+      its clock, :mod:`robofast_core.clock`).
     """
     config = dict(config)
     config.pop("_note", None)
@@ -367,5 +372,5 @@ def plan_from_config(
     if kind == "dispatch":
         from robofast_core.dispatch import dispatch_from_config  # imports astropy
 
-        return dispatch_from_config(config, telescopes, base=base)
+        return dispatch_from_config(config, telescopes, base=base, clock=clock)
     raise ValueError(f"plan type {kind!r}: expected 'static', 'calibration' or 'dispatch'")

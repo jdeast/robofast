@@ -62,7 +62,10 @@ and optionally:
   (:class:`~robofast_core.devices.kiwispec_service.KiwiSpecRemote`;
   ``docs/kiwispec.md``, ``docs/rv_night.md``): ``{"url": ...,
   "telescopes": {"t1": "T1", ...}, "timeout": s, "abort_timeout": s,
-  "data_root": ..., "instrument": "kiwispec"}``. ``telescopes`` maps the
+  "queue_wait": s, "data_root": ..., "instrument": "kiwispec"}``.
+  ``queue_wait`` (default ``sequencer.spectrograph_queue_wait``) is how
+  long a request waits in the service's queue while another enclosure
+  holds the shared spectrograph (docs/kiwispec.md). ``telescopes`` maps the
   enclosure's telescope names to the spectrograph service's (default: the
   same). Spectrum and spectrograph calibration sidecars go under
   ``data_root`` (default: ``images.data_root``; relative to the config
@@ -74,6 +77,10 @@ and optionally:
   resume and stop commands come in through it
   (:class:`~robofast_core.console.hold.OperatorHold`, which wraps the plan;
   ``docs/console.md``). Relative to the config file.
+* ``clock`` -- simulation only: the clock every night name and time stamp
+  comes from (:func:`robofast_core.clock.clock_from_config`; e.g.
+  ``{"file": "clock.json"}``). Default: the host's clock (which must be
+  NTP-disciplined, docs/deploy.md).
 * ``status_file`` -- write a status snapshot (:func:`snapshot`) to this
   JSON file every ``status_interval`` seconds (default 5), atomically. The
   request API (:mod:`robofast_core.request_api`) reads it; a snapshot older
@@ -124,6 +131,7 @@ from typing import Any
 from robofast_core.alpaca import alpaca_owner
 from robofast_core.autofocus import AutofocusSetup
 from robofast_core.autofocus_plan import AutofocusTriggers, TriggerConfig
+from robofast_core.clock import Clock, clock_from_config
 from robofast_core.config import device_address, load_config, telescopes
 from robofast_core.imaging import imaging_from_config
 from robofast_core.lease_client import RemoteSupervisor
@@ -237,9 +245,14 @@ def build(
     *,
     plan: PlanProvider | None = None,
     base: Path | None = None,
+    clock: Clock | None = None,
 ) -> tuple[Sequencer, RemoteSupervisor]:
     """A sequencer wired to the devices and the supervisor in ``config``
-    (and, with an ``images`` entry, its frame pipeline: ``seq.imaging``)."""
+    (and, with an ``images`` entry, its frame pipeline: ``seq.imaging``).
+    ``clock`` (else the config's ``clock``, else a given plan's, else the
+    host's) is the one clock of :mod:`robofast_core.clock`."""
+    if clock is None and config.get("clock") is not None:
+        clock = clock_from_config(config["clock"], base)
     command_timeout = float(config.get("command_timeout", 5.0))
     images = config.get("images") or {}
     aux: dict[str, dict[str, DeviceOwner]] = {}
@@ -255,7 +268,7 @@ def build(
     if plan is None:
         if "plan" not in config:
             raise ValueError("no plan: give the config a 'plan' entry or use --plan")
-        plan = plan_from_config(config["plan"], names, base=base)
+        plan = plan_from_config(config["plan"], names, base=base, clock=clock)
     triggers = None
     if config.get("autofocus_triggers") is not None:
         focusable = [u.name for u in units if u.autofocus is not None]
@@ -301,29 +314,41 @@ def build(
         imaging.owners = [o for d in aux.values() for o in d.values()]
         if weather is not None:
             imaging.owners.append(weather)
-    spectrograph, spec_names, spectra = spectrograph_from_config(config, base)
+    seq_config = SequencerConfig(**config.get("sequencer", {}))
+    spectrograph, spec_names, spectra = spectrograph_from_config(
+        config, base, queue_wait=seq_config.spectrograph_queue_wait
+    )
     seq = Sequencer(
         config.get("sequencer_name") or config["name"],
         supervisor=remote,
         telescopes=units,
         plan=plan,
         timeline=timeline,
-        config=SequencerConfig(**config.get("sequencer", {})),
+        config=seq_config,
         imaging=imaging,
         spectrograph=spectrograph,
         spectrograph_names=spec_names,
         spectra=spectra,
+        clock=clock,
     )
     if triggers is not None:
         triggers.bind(seq.registry)
     return seq, remote
 
 
-SPECTROGRAPH_KEYS = {"url", "telescopes", "timeout", "abort_timeout", "data_root", "instrument"}
+SPECTROGRAPH_KEYS = {
+    "url",
+    "telescopes",
+    "timeout",
+    "abort_timeout",
+    "queue_wait",
+    "data_root",
+    "instrument",
+}
 
 
 def spectrograph_from_config(
-    config: dict[str, Any], base: Path | None = None
+    config: dict[str, Any], base: Path | None = None, *, queue_wait: float = 600.0
 ) -> tuple[Any, dict[str, str], SpectrumRecorder | None]:
     """The ``spectrograph`` entry (module doc): its client, the telescope
     name map, and the sidecar writer (None without a data root)."""
@@ -345,6 +370,8 @@ def spectrograph_from_config(
         str(entry["url"]),
         timeout=float(entry.get("timeout", 10.0)),
         abort_timeout=float(entry.get("abort_timeout", 45.0)),
+        client=str(config.get("sequencer_name") or config.get("name") or ""),
+        queue_wait=float(entry.get("queue_wait", queue_wait)),
     )
     names = {str(k): str(v) for k, v in (entry.get("telescopes") or {}).items()}
     unknown_tels = set(names) - set(telescopes(config))
@@ -404,6 +431,7 @@ def snapshot(seq: Sequencer, interval: float = 5.0) -> dict[str, Any]:
             "exposing": u.exposing,
             "consecutive_errors": u.consecutive_errors,
             "current": current.get(name),
+            "park_requested": u.park_requested,
         }
     out = {
         "time": datetime.now(UTC).isoformat(),
@@ -414,6 +442,11 @@ def snapshot(seq: Sequencer, interval: float = 5.0) -> dict[str, Any]:
         "needs_operator": seq.needs_operator,
         "telescopes": tels,
     }
+    if seq.spectrograph is not None:
+        out["spectrograph"] = {
+            "down": seq.spectrograph_down,
+            "failures": seq.spectrograph_failures,
+        }
     if seq.imaging is not None:
         # The value registry (design.md 3.8), and frames lost per telescope.
         out["values"] = seq.imaging.registry.as_json()

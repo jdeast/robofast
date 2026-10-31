@@ -26,11 +26,17 @@ Every piece is the real robofast code, against simulators on loopback
   ``deploy/robofast-sequencer@.service`` runs it: evening calibrations
   (``calibration`` plan), the night, morning calibrations.
 
-The scheduler's clock runs ``scale`` times faster than real time (it starts
-at ``start``, early evening twilight), so the night's Sun, targets and
-dawn pass in a few minutes; everything else -- exposures, holds, timeouts --
-runs in real (short) seconds. File names and FITS times are wall-clock
-times.
+One simulated clock (:class:`robofast_core.clock.FileClock` on
+``clock.json`` in ``out``) is the time of every night name and time stamp:
+the scheduler, the sequencer (FITS times and frame directories, spectrum
+sidecars, autofocus results, the plan record) and the KiwiSpec service (raw
+file names and exposure start times). It runs at real speed during the
+evening calibrations (starting half an hour before ``start``), ``scale``
+times faster than real time during the night (from ``start``, early evening
+twilight, so the night's Sun, targets and dawn pass in a few minutes), and
+at real speed again for the morning calibrations. Exposures, holds and
+timeouts run in real (short) seconds. The whole night is therefore one
+night, ``n20261109``, everywhere.
 
 A *director* plays the night's events: bad weather in the middle of a
 spectrum (and good weather again once the roof is shut), a target of
@@ -63,6 +69,7 @@ import numpy as np
 from robofast_core import sky
 from robofast_core.autofocus import AutofocusSetup, FocusModel, FocusStore
 from robofast_core.autofocus_plan import AutofocusTriggers, TriggerConfig
+from robofast_core.clock import FileClock, ScaledClock
 from robofast_core.console.hold import send_command
 from robofast_core.devices.aqawan_server import AqawanConfig, AqawanServer
 from robofast_core.devices.aqawan_sim import AqawanSim
@@ -120,17 +127,6 @@ class NightSettings:
     pause: float = 3.0
     #: Bound on the whole night (real seconds), as a safety net.
     timeout: float = 600.0
-
-
-class ScaledClock:
-    """``start`` plus ``scale`` times the real time elapsed since creation."""
-
-    def __init__(self, start: datetime, scale: float) -> None:
-        self.start, self.scale = start, scale
-        self.t0 = time.monotonic()
-
-    def __call__(self) -> datetime:
-        return self.start + timedelta(seconds=(time.monotonic() - self.t0) * self.scale)
 
 
 def _recording_telescope(name: str, events: list[tuple[float, str, str]]) -> Any:
@@ -252,7 +248,14 @@ class SimulatedNight:
         self.services: list[Service] = []
         self.telescopes: dict[str, Telescope] = {}
         self._stack = contextlib.AsyncExitStack()
-        self.clock: ScaledClock | None = None
+        #: The one clock (module doc); its phases are written to clock.json.
+        self.clock_file = self.out / "clock.json"
+        self.set_clock(self.s.start - timedelta(minutes=30), 1.0)
+        self.clock = FileClock(self.clock_file)
+
+    def set_clock(self, start: datetime, scale: float) -> None:
+        """Move every process's clock (module doc)."""
+        ScaledClock(start, scale).write(self.clock_file)
 
     # -- the services ----------------------------------------------------------------
 
@@ -347,6 +350,7 @@ class SimulatedNight:
             mount = _recording_telescope(name, self.outcome.mount_events)
             foc = SimFocuser(position=round(TRUE_FOCUS + 250 * (1 if i == 0 else -1)))
             cam = StarfieldCamera(foc, _scene(31 + i))
+            cam.clock = self.clock
             self.telescopes[name] = Telescope(name, mount, cam, foc)
             devices[f"telescope/{i}"] = mount
             devices[f"camera/{i}"] = cam
@@ -397,6 +401,7 @@ class SimulatedNight:
             save_retry=0.2,
             status_interval=1.0,
             status_timeout=3.0,
+            clock={"file": str(self.clock_file)},
         )
         path = self.out / "kiwispec.json"
         path.write_text(json.dumps(base, indent=1))
@@ -541,6 +546,7 @@ class SimulatedNight:
         }
         cfg["status_file"] = str(self.out / "sequencer-status.json")
         cfg["status_interval"] = 1.0
+        cfg["clock"] = {"file": str(self.clock_file)}
         for name, t in self.telescopes.items():
             cfg["telescopes"][name]["guider"] = {
                 "url": t.guider_url,
@@ -688,7 +694,7 @@ class SimulatedNight:
         return groups
 
     def _too(self) -> dict[str, Any]:
-        now = self.clock() if self.clock is not None else self.s.start
+        now = self.clock()
         lst = sky.sky_now(MINERVA, now).lst_hours
         return {
             "id": "TOO1",
@@ -746,7 +752,7 @@ class SimulatedNight:
         # 2. The night.
         self._note("night")
         entry = self._dispatch_entry()
-        self.clock = ScaledClock(s.start, s.scale)
+        self.set_clock(s.start, s.scale)
         dispatch = dispatch_from_config(
             {k: v for k, v in entry.items() if k != "type"},
             list(NAMES),
@@ -773,6 +779,7 @@ class SimulatedNight:
         }
         # 3. Morning calibrations, once the roof is shut.
         await self._until(lambda: self.aqawan_sim.closed(), 30, "roof closed at dawn")
+        self.set_clock(self.clock(), 1.0)
         self._note("morning calibrations")
         cal = self._build("morning", self._calibration_plan())
         await self._run(cal, 120)
@@ -853,6 +860,16 @@ class SimulatedNight:
             await asyncio.sleep(s.pause)
             send_command(control, "resume", ["t2"], operator="demo", reason="FAU fine")
             self._note("console: resume t2")
+            await self._until(lambda: "t2" not in _holds(control), 30, "t2 resumed")
+            # Then parks T2 alone at once, and resumes it again.
+            await asyncio.sleep(1.0)
+            send_command(control, "park", ["t2"], operator="demo", reason="check the mount")
+            self._note("console: park t2")
+            await self._until(lambda: tl.events("operator_parked"), 30, "t2 parked")
+            self._note("t2 parked by the console")
+            await asyncio.sleep(0.5)
+            send_command(control, "resume", ["t2"], operator="demo", reason="mount fine")
+            self._note("console: resume t2 after the park")
             await self._until(lambda: "t2" not in _holds(control), 30, "t2 resumed")
         except asyncio.CancelledError:
             raise
@@ -976,6 +993,7 @@ def check(o: Outcome) -> list[str]:
             bad.append(f"the spectrum t2 dropped out of did not finish with t1: {fin}")
     if not any(c == "console: resume t2" for _, c in o.script):
         bad.append("the console never paused and resumed t2")
+    bad += console_park_problems(o)
     if any(u.gave_up for u in o.runs["night"].units.values()):
         bad.append("a telescope gave up for the night")
     if not ev(night, "plan_exhausted"):
@@ -1062,6 +1080,49 @@ def safety_violations(o: Outcome) -> list[str]:
     return bad
 
 
+def console_park_problems(o: Outcome) -> list[str]:
+    """The console parked T2 alone: T2 parked, T1 not, the roof untouched."""
+    bad = []
+    tl = o.timelines["night"]
+    req = [e for e in tl.events("park_requested", SEQUENCER) if e.detail["telescope"] == "t2"]
+    parked = tl.events("operator_parked", SEQUENCER)
+    if not req or not parked:
+        return ["the console's park of t2 never happened"]
+    p = parked[0]
+    if p.detail["telescope"] != "t2" or not p.detail["parked"]:
+        bad.append(f"console park: {p.detail}")
+    t0, t1 = req[0].t, p.t
+    for t, c in o.dome_log:
+        if t0 <= t <= t1 + 1.0 and c.startswith(("OPEN", "CLOSE")):
+            bad.append(f"the roof moved ({c}) while the console parked t2")
+    if any(e[1] == "t1" and e[2] == "park" and t0 <= e[0] <= t1 + 1.0 for e in o.mount_events):
+        bad.append("t1 parked when the console parked t2")
+    if not any(e[1] == "t2" and e[2] == "park" and t0 <= e[0] <= t1 + 0.5 for e in o.mount_events):
+        bad.append("t2's mount never parked for the console")
+    return bad
+
+
+def night_names(o: Outcome) -> list[str]:
+    """Every night name the night's outputs carry: data directories, FITS
+    ``NIGHT`` and index files, raw spectrum file names, sidecar ``night``
+    fields, plan-record files (as nYYYYMMDD)."""
+    data = o.out / "data"
+    names: set[str] = set()
+    for d in data.glob("minerva/*/n*"):
+        names.add(d.name)
+    for f in data.glob("minerva/*/n*/*"):
+        names.add(f.name.split(".", 1)[0])
+    for p in data.glob("minerva/kiwispec/n*/*.fits.json"):
+        r = json.loads(p.read_text())
+        names.add(str(r.get("night")))
+        names.add(str(r.get("file")).split(".", 1)[0])
+    for name in o.spectrograph_files:
+        names.add(str(name).rsplit("/", 1)[-1].split(".", 1)[0])
+    for p in (o.out / "plans").glob("*.jsonl"):
+        names.add("n" + p.stem.split("-", 1)[1].replace("-", ""))
+    return sorted(names)
+
+
 def output_problems(o: Outcome) -> list[str]:
     """The files: sidecars for every spectrum (with the barycentric
     correction), the plan record, the FITS frames' index."""
@@ -1089,6 +1150,11 @@ def output_problems(o: Outcome) -> list[str]:
         bad.append("no telescope joined a spectrum in the plan record")
     if not list(data.glob("minerva/t*/n*/*.frames.jsonl")):
         bad.append("no frame index")
+    # One night, by the one clock, everywhere (robofast_core.clock).
+    want = f"n{o.settings.start - timedelta(hours=12):%Y%m%d}"
+    names = night_names(o)
+    if names != [want]:
+        bad.append(f"night names {names}, expected only {want}")
     return bad
 
 

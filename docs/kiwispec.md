@@ -155,7 +155,7 @@ something. robofast's client sends only the allowlisted ones
 
 | Action | Moves | Powers | robofast |
 |---|---|---|---|
-| iodine stage to a named position / to mm (`i2stage_move`, `i2stage_movef`) | **yes** (Thorlabs stage, up to 150 mm) | | allowed; arrival polled (within `stage_tolerance` and stopped: two consecutive readings agree), bounded by `stage_timeout` |
+| iodine stage to a named position / to mm (`i2stage_move`, `i2stage_movef`) | **yes** (Thorlabs stage, up to 150 mm) | | allowed; arrival polled (stopped -- two consecutive readings agree -- and at the position the live server names as the one asked for, or within `stage_tolerance` of a millimetre target), bounded by `stage_timeout` |
 | home the iodine stage (`i2stage_home`) | **yes** | | allowed (client only; the service does not home on its own) |
 | reconnect the stage (`i2stage_connect`) | **yes** (home, out, in) | **yes** (PDU outlet off/on) | allowed in the client; **the service never sends it** (legacy did, automatically, after a stuck move) |
 | `i2stage_disconnect` | | | allowed (client only) |
@@ -198,9 +198,10 @@ something. robofast's client sends only the allowlisted ones
 The API is in the module doc. In short: `GET /status`, `POST /configure`,
 `POST /expose` (science, thar, slitflat, fiberflat, dark, bias), `POST
 /calibrate` (a list of frames as one job), `GET /jobs/{id}?wait=S`, `POST
-/abort`, `POST /stop`, `POST /backlight`. One job at a time (a synchronous
-claim, released in `finally`); every step has a bound and every frame an
-overall bound. It differs from legacy on purpose:
+/abort`, `POST /stop`, `POST /backlight`. One job at a time (a claim taken
+with no await between the check and the take, released in `finally`;
+waiting requests queue, see "Sharing the spectrograph"); every step has a
+bound and every frame an overall bound. It differs from legacy on purpose:
 
 - **Biases and darks are dark frames.** Legacy computed the exposure type but
   never passed it (`expose_with_timeout(exptime, expmeter)` leaves `exptype`
@@ -228,6 +229,70 @@ overall bound. It differs from legacy on purpose:
 ThAr or fiber-flat frame sets up the stage and LED exactly as legacy did and
 exposes; the lamp itself is not controlled (legacy's lamp calls are commented
 out, and the server does not implement them). See question 3.
+
+### The iodine stage's positions: the live server is authoritative
+
+The two legacy files disagree on where the named positions are: the
+client's `spectrograph.ini` says in 145, flat 88, out 55 mm; the server's
+`spectrograph_server.ini` says in 11, flat 68, out 102. JDE (2026-10-31):
+the stage's home sensor once died, and the motor and sensor were swapped
+at the wire level, which flipped the positions; the **live** values on the
+spectrograph PC are correct. So the service hard-codes neither:
+
+- It moves the stage **by name** (`i2stage_move in`): the server resolves
+  the name with its own live ini.
+- It decides arrival from the server's own reply: the stage has stopped
+  (two consecutive readings agree) and `i2stage_get_pos` names the
+  position asked for. It records the millimetres the server reports for
+  each name (`/status` `stage_positions_live`).
+- `stage_positions` in the service config is optional (default: none) and
+  only a cross-check. If a configured value disagrees with the live server
+  by more than `stage_tolerance`, `/status` raises an alarm saying the
+  server is authoritative. Set it only with values confirmed on the
+  spectrograph PC, before any hardware use (`sites/minerva/README.md`).
+
+### Sharing the spectrograph between enclosures
+
+KiwiSpec is fed by telescopes in both MINERVA enclosures, so two
+sequencers (one per enclosure) may want it at once. The service is the one
+owner of the spectrograph, and it arbitrates:
+
+- **One claim at a time.** A job, a `configure` or a `backlight` holds the
+  spectrograph until it ends (released in `finally`, also on abort,
+  failure or cancellation).
+- **A bounded, first-come first-served queue.** `expose`, `calibrate`,
+  `configure` and `backlight` take `"wait": S` and `"client": name`. While
+  the spectrograph is held, the request waits up to `S` s (capped by
+  `max_queue_wait`, default 1800 s) in a FIFO queue of at most `max_queue`
+  (default 4) requests; when the holder releases it, the first live waiter
+  gets it at once. A request without `wait` is answered at once, and
+  nobody jumps the queue (a request without `wait` is refused while others
+  wait). A waiter whose connection goes away does not keep the
+  spectrograph. `/status` lists the queue (`what`, `client`, `waiting`);
+  job views carry their `client`.
+- **Busy is not an error.** When the wait runs out (or the queue is full)
+  the answer is 409 with `"busy": true`, and `KiwiSpecRemote` raises
+  `KiwiSpecBusy`. The sequencer reports the spectrum `interrupted` (the
+  dispatch scheduler re-queues it) and counts it neither as the
+  telescope's error nor as a spectrograph fault (`docs/rv_night.md`).
+  Other refusals (a warm CCD) and failures are spectrograph faults.
+- **The sequencer's wait.** Each sequencer's `KiwiSpecRemote` sends its
+  name as `client` and waits `spectrograph.queue_wait` (default
+  `sequencer.spectrograph_queue_wait`, 600 s: a long RV exposure on the
+  other enclosure, plus readout) while its telescopes stay on target and
+  guiding.
+- **Policy.** First come, first served: no enclosure has priority, and a
+  running exposure is never preempted by the other enclosure (only its own
+  sequencer, an operator or a cleanup aborts it). A ToO on one enclosure
+  therefore waits for the other's spectrum in progress, bounded as above.
+  `/abort` aborts whatever job is running, so each sequencer aborts only
+  the job it started, and at startup only a job fed by its own telescopes.
+
+Not done: the fiber backlight (`POST /backlight` from the guider) does not
+yet send `wait` -- while the other enclosure exposes it is refused at once
+and the guider guides on the configured fiber position (as legacy did);
+and the two enclosures' dispatch schedulers do not see each other's
+spectra in advance (each finds out from the queue).
 
 ### Exposure-meter termination and the flux-weighted midpoint
 
@@ -269,6 +334,16 @@ no midpoint.
 | camera restart mid-exposure | the job fails at once; the next exposure reconnects |
 | camera hung during an abort | `/abort` returns after `abort_timeout` with `ended: false`; the job is cancelled, the camera connection dropped, the claim released |
 
+### Night names and times
+
+The raw file is named `n<YYYYMMDD>.<object>.<NNNN>.fits`. The sequencer
+sends the night (`"night"` in `expose` and `calibrate`), from its clock, so
+the raw file, its sidecar's directory and every other night name agree
+(`robofast_core/clock.py`, `docs/rv_night.md`). Without it the service uses
+the legacy label, `n` + the UTC date. Exposure start times come from the
+service's host clock (NTP-disciplined; `docs/deploy.md`); a simulation may
+give it a `clock` (`{"file": "clock.json"}`).
+
 ## 4. Spectra in the sequencer
 
 Done: `docs/rv_night.md`. In short, a `SPECTRUM` request is fed by every
@@ -296,10 +371,10 @@ anything it records itself).
    `flat_turn_on` would crash it. Their warm-up times? (Legacy:
    `WARMUPMINUTES = 0`, and "Slit flat lamp is dead, skipping slit flats" in
    `specCalib` -- is the LED dead?)
-4. **Iodine stage:** its speed and homing time; are the server's positions
-   (in 11, flat 68, out 102 mm in `spectrograph_server.ini`) current (the
-   client's `spectrograph.ini` lists 145/88/55)? Should the service ever
+4. **Iodine stage:** its speed and homing time? Should the service ever
    power-cycle the stage by itself (legacy did, after two failed moves)?
+   (The positions are answered: the live server's values are correct, and
+   robofast reads them from it; see "The iodine stage's positions".)
 5. **Does a second connection to SI Image work**, and what does
    `GetStatusFromCamera` return (format, CCD temperature field)? The
    simulator assumes `name,value` lines.

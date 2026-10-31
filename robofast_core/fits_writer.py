@@ -7,7 +7,9 @@ Layout (``docs/data.md``)::
 ``.fits.fz`` when Rice-compressed. The night is the local date of the
 *evening* (:func:`robofast_core.plan_record.night_of`, the plan record's
 convention: before ``night_rollover_hour`` local time is the previous
-night), from the exposure's own start time. ``seq`` counts up per telescope
+night), from the sequencer's clock when ``StartExposure`` was sent
+(``DATE-CMD``; :mod:`robofast_core.clock`: the one clock every night name
+comes from). ``seq`` counts up per telescope
 and night (the legacy ``getIndex``: one more than the highest number in the
 directory). Beside the frames, ``n<YYYYMMDD>.<telescope>.frames.jsonl``
 indexes them, one JSON line per frame.
@@ -50,6 +52,7 @@ from typing import Any
 import numpy as np
 from astropy.io import fits
 
+from robofast_core.clock import Clock, real_clock
 from robofast_core.imagebytes import ImageArray, fits_order
 from robofast_core.plan_record import night_of
 from robofast_core.registry import Snapshot, Value
@@ -247,8 +250,11 @@ def _fmt(v: Any, unit: str) -> str:
 # -- the header ----------------------------------------------------------------------
 
 
-def build_header(info: FrameInfo, image_shape: tuple[int, ...]) -> tuple[fits.Header, datetime]:
-    """The frame's header (no data-structure keywords) and its ``DATE-OBS``."""
+def build_header(
+    info: FrameInfo, image_shape: tuple[int, ...], written: datetime | None = None
+) -> tuple[fits.Header, datetime]:
+    """The frame's header (no data-structure keywords) and its ``DATE-OBS``;
+    ``written`` (default: now) is ``DATE``."""
     h = fits.Header()
     start = info.start or Snapshot(info.host_start, {})
     end = info.end or Snapshot(info.host_start, {})
@@ -271,7 +277,7 @@ def build_header(info: FrameInfo, image_shape: tuple[int, ...]) -> tuple[fits.He
     from astropy.time import Time
 
     t_obs = Time(date_obs)
-    _card(h, "DATE", iso_ms(datetime.now(UTC)), "UTC date this file was written")
+    _card(h, "DATE", iso_ms(written or datetime.now(UTC)), "UTC date this file was written")
     _card(h, "DATE-OBS", iso_ms(date_obs), "UTC start of exposure")
     _card(h, "DATE-END", iso_ms(date_obs + timedelta(seconds=exptime)), "UTC end of exposure")
     _card(h, "TIMESYS", "UTC", "Time scale of DATE keywords")
@@ -459,8 +465,12 @@ class FrameStore:
         timezone: str | None = None,
         longitude: float | None = None,
         index: bool = True,
+        clock: Clock = real_clock,
     ) -> None:
         self.root = Path(data_root)
+        #: Where ``DATE`` and the index's ``written`` come from (the
+        #: sequencer's clock, :mod:`robofast_core.clock`).
+        self.clock = clock
         self.site = safe_name(site)
         self.compress = compress
         self.rollover_hour = rollover_hour
@@ -501,8 +511,10 @@ class FrameStore:
     def write(self, info: FrameInfo, image: ImageArray) -> WrittenFrame:
         """Build the header and write the frame (atomic, never overwrites)."""
         data = storage_array(image)
-        header, date_obs = build_header(info, data.shape)
-        night = self.night(date_obs)
+        header, _ = build_header(info, data.shape, self.clock())
+        # The night: the sequencer's clock at StartExposure, the same clock
+        # as every other night name (robofast_core.clock).
+        night = self.night(info.host_start)
         d = self.directory(info.telescope, night)
         d.mkdir(parents=True, exist_ok=True)
         key = (info.telescope, night)
@@ -544,7 +556,7 @@ class FrameStore:
             **{k: v for k, v in info.ids.items() if v is not None},
             "shape": list(data.shape),
             "bytes": final.stat().st_size,
-            "written": datetime.now(UTC).isoformat(),
+            "written": self.clock().isoformat(),
         }
         if self.index:
             self._append_index(

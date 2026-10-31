@@ -204,8 +204,11 @@ class AutofocusTriggers:
                 "message",
             )
             try:
+                # The plan's clock (the dispatch scheduler's), so the entry
+                # lands in the same night's file as the decisions.
+                clock = getattr(self.inner, "clock", None) or (lambda: datetime.now(UTC))
                 record.write(
-                    datetime.now(UTC),
+                    clock(),
                     "autofocus",
                     {"telescope": telescope, "observation": obs.name}
                     | {k: result.get(k) for k in keep},

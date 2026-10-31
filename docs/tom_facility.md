@@ -22,7 +22,7 @@ FACILITIES = {
     "ROBOFAST": {
         "url": "https://api.observatory.example",
         "token": os.environ["ROBOFAST_API_TOKEN"],
-        "enclosure": "aqawan1",      # optional; the API infers it from telescopes
+        "enclosure": "aqawan1",  # optional; the API infers it from telescopes
     }
 }
 ```
@@ -62,23 +62,37 @@ def _request_group(self, payload):
         "name": p["name"],
         "proposal": p.get("proposal", ""),
         "priority": p.get("priority", 1),
-        "requests": [{
-            "telescopes": p.get("telescopes") or None,
-            "windows": [{"start": p["start"], "end": p["end"]}] if p.get("start") else [],
-            "configurations": [{
-                "instrument": p.get("instrument", "imager"),
-                "target": {"name": target.name, "ra_hours": target.ra / 15.0,
-                           "dec_deg": target.dec},
-                "instrument_configs": [{"exptime": p["exposure_time"],
-                                        "count": p["exposure_count"],
-                                        "filter": p.get("filter")}],
-                "constraints": {"max_airmass": p.get("max_airmass")},
-            }],
-        }],
+        "requests": [
+            {
+                "telescopes": p.get("telescopes") or None,
+                "windows": [{"start": p["start"], "end": p["end"]}] if p.get("start") else [],
+                "configurations": [
+                    {
+                        "instrument": p.get("instrument", "imager"),
+                        "target": {
+                            "name": target.name,
+                            "ra_hours": target.ra / 15.0,
+                            "dec_deg": target.dec,
+                        },
+                        "instrument_configs": [
+                            {
+                                "exptime": p["exposure_time"],
+                                "count": p["exposure_count"],
+                                "filter": p.get("filter"),
+                            }
+                        ],
+                        "constraints": {"max_airmass": p.get("max_airmass")},
+                    }
+                ],
+            }
+        ],
     }
     if p.get("too"):
-        group["too"] = {"deadline": p["deadline"], "policy": p.get("policy", "next"),
-                        "priority_class": 1}
+        group["too"] = {
+            "deadline": p["deadline"],
+            "policy": p.get("policy", "next"),
+            "priority_class": 1,
+        }
     return group
 ```
 

@@ -9,7 +9,7 @@
 # only the scheduler's drop box and its own audit log, so it runs as its own
 # user with write access to just those. Tokens are managed with
 #
-#   sudo -u robofast-api /opt/robofast/venv/bin/python -m robofast_core.request_api \
+#   sudo -u robofast-api /opt/robofast/current/venv/bin/python -m robofast_core.request_api \
 #       tokens add --config /etc/robofast/request_api.json --name my-tom --scope read --scope submit
 #
 # Stopping or restarting it never affects observing: submissions made while
@@ -23,8 +23,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=robofast-api
-WorkingDirectory=/opt/robofast
-ExecStart=/opt/robofast/venv/bin/python -m robofast_core.request_api serve --config /etc/robofast/request_api.json
+WorkingDirectory=/opt/robofast/current
+ExecStart=/opt/robofast/current/venv/bin/python -m robofast_core.request_api serve --config /etc/robofast/request_api.json
 Restart=always
 RestartSec=5
 NoNewPrivileges=yes

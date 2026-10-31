@@ -23,7 +23,8 @@ fields)::
       },
       "telescopes": {"t1": {"telescope": "127.0.0.1:11120/0", ...}, ...},
       "safety": {"poll_interval": 5, "reopen_hold": 1200, "lease_ttl": 60,
-                 "heartbeat_interval": 2}
+                 "heartbeat_interval": 10, "heartbeat_timeout": 60,
+                 "fault_action": "Faults"}
     }
 
 ``observingconditions``, ``telescopes`` (needed for ``park_before_close``;
@@ -62,6 +63,10 @@ is random per process start, so after a restart every old token is unknown
   another holder's, or the enclosure is not confirmed closed yet.
 * ``POST /leases/{token}/clear`` ``{"operator", "reason"}`` -- the same, for
   an operator who has made the telescope safe; logged.
+* ``POST /faults/clear`` ``{"operator", "reason"}`` -- an operator clears
+  the enclosure's faults (``Action("ClearFaults")`` on the supervisor's
+  privileged dome grant; logged). 409 if the dome refuses, e.g. because it
+  is not closed. Nothing clears faults automatically.
 
 ``recover`` and ``clear`` are idempotent: they answer 200 with
 ``"released_now"`` true or false. A lease's state is ``{"token", "id",
@@ -84,6 +89,7 @@ from urllib.parse import parse_qs, urlparse
 
 from robofast_core.alpaca import alpaca_owner
 from robofast_core.config import device_address, load_config, telescopes
+from robofast_core.owner import DeviceError
 from robofast_core.safety import (
     ENCLOSURE_MEMBERS,
     OpenLease,
@@ -178,6 +184,15 @@ class SupervisorServer:
                 return 200, self.status()
             if method == "POST" and parts == ["leases"]:
                 return 200, await self._request(args)
+            if method == "POST" and parts == ["faults", "clear"]:
+                operator = str(args["operator"]).strip()
+                if not operator:
+                    raise _Error(400, "clearing faults needs an operator name")
+                try:
+                    reply = await self.supervisor.clear_faults(operator, str(args["reason"]))
+                except DeviceError as exc:
+                    raise _Error(409, f"ClearFaults refused: {exc}") from None
+                return 200, {"reply": reply}
             if parts[:1] == ["leases"] and len(parts) in (2, 3):
                 lease, token = self._lookup(parts[1])
                 action = parts[2] if len(parts) == 3 else None

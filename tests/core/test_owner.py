@@ -131,6 +131,21 @@ async def test_only_the_privileged_grant_may_close():
     owner.close()
 
 
+async def test_a_privileged_action_is_refused_to_others():
+    """``Action:ClearFaults`` in the privileged set: only that one action
+    (any case) is the supervisor's; other actions stay open to everyone."""
+    tl = Timeline()
+    dome = FakeDome(heartbeat_timeout=60.0)
+    owner = DeviceOwner("dome", lambda: dome, tl, privileged_members=ENCLOSURE_MEMBERS)
+    other = owner.grant("sequencer")
+    for name in ("ClearFaults", "clearfaults", "CLEARFAULTS"):
+        with pytest.raises(NotAuthorized):
+            await other.call("Action", name, "please")
+    assert len(tl.commands(outcome="not_authorized")) == 3
+    await other.call("Action", "Heartbeat", "")  # not privileged
+    owner.close()
+
+
 async def test_cancelled_caller_does_not_reorder_commands():
     tl = Timeline()
     dev = Slow()

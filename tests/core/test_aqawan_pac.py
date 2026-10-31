@@ -196,6 +196,38 @@ async def test_resends_are_bounded(make_sim):
     assert sim.dropped == 3 and sim.commands() == []
 
 
+async def test_reset_pac_is_never_resent(make_sim):
+    """RESET_PAC is not idempotent: one send, even when nothing comes back."""
+    sim = make_sim(settle=10.0)
+    c = client(sim, resend_after=0.1, max_attempts=3, command_timeout=3.0)
+    with pytest.raises(PACTimeout, match="after 1 attempts"):
+        await c.command("RESET_PAC")
+    assert sim.dropped == 1 and c.resends == 0
+
+
+async def test_resent_open_is_harmless(make_sim):
+    """A slow PAC gets OPEN_SHUTTER_1 twice; the second changes nothing: the
+    shutter opens once, on its original schedule."""
+    sim = make_sim(settle=0.0, slow_delay=0.5, open_time=0.6, heartbeat_timeout=None)
+    c = client(sim, resend_after=0.2, max_attempts=3, command_timeout=3.0)
+    sim.set_mode("slow")
+    t0 = time.monotonic()
+    assert "Success=TRUE" in await c.action("OPEN_SHUTTER_1")
+    assert c.resends == 2
+    while sim.commands().count("OPEN_SHUTTER_1") < 2:  # the duplicate lands late
+        assert time.monotonic() - t0 < 2.0
+        await asyncio.sleep(0.02)
+    sim.set_mode("ok")
+    first, dup = [t for t, cmd in sim.log if cmd == "OPEN_SHUTTER_1"][:2]
+    assert dup - first >= 0.4
+    assert sim.shutter_states()[0] in ("OPENING", "OPEN")
+    while sim.shutter_states()[0] != "OPEN":
+        await asyncio.sleep(0.02)
+    # Opened 0.6 s after the *first* command; restarted by the duplicate
+    # it would take 0.6 s from that, i.e. >= 1.0 s from the first.
+    assert time.monotonic() - first < 0.6 + 0.25
+
+
 @pytest.mark.parametrize(
     "quirks",
     [dict(prompt=False), dict(echo=True), dict(negotiate=False), dict(settle=0.0)],

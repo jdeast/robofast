@@ -27,7 +27,13 @@ from .conftest import BOUND, COMMAND_TIMEOUT, SIM_SAFETY, SIM_SEQ
 pytestmark = pytest.mark.alpaca_sim
 
 HB_TIMEOUT = 3.0
-SAFETY = {**SIM_SAFETY, "lease_ttl": 3.0, "heartbeat_interval": 0.5, "heartbeat_max_loop_age": 5.0}
+SAFETY = {
+    **SIM_SAFETY,
+    "lease_ttl": 3.0,
+    "heartbeat_interval": 0.5,
+    "heartbeat_timeout": HB_TIMEOUT,
+    "heartbeat_max_loop_age": 5.0,
+}
 SEQ = {**SIM_SEQ, "lease_renew_interval": 0.5}
 REMOTE = dict(timeout=2.0, poll=1.0, retry=0.5)
 

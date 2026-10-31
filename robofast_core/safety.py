@@ -21,7 +21,23 @@ Its loops run under one ``TaskGroup``:
   enclosure loop has completed a pass within ``heartbeat_max_loop_age``. If
   the pings stop -- the supervisor crashed, hung, or its enclosure loop is
   stuck -- the hardware closes by itself (the device contract is in
-  :mod:`robofast_core.heartbeat_watchdog`).
+  :mod:`robofast_core.heartbeat_watchdog`). ``heartbeat_interval`` must be
+  at most a quarter of the device's ``heartbeat_timeout`` (four pings per
+  timeout, as the legacy MINERVA code ensured); a config that breaks this
+  is rejected.
+
+Enclosure faults are a separate axis from the shutter position. With
+``fault_action`` set, each enclosure pass first reads the dome's read-only
+fault channel (``Action(fault_action)``, JSON with booleans ``fault`` and
+``error``; the Aqawan server's ``"Faults"``) through a non-privileged grant.
+Any fault, or a failed read, alarms (once per change), revokes the lease and
+blocks opening. If the enclosure is not closed, that is the dangerous case:
+a second, louder alarm, and it closes (the Aqawan also reports
+``shutterError`` then). A fault with the enclosure closed only alarms; the
+close is not re-sent. Nothing clears a fault automatically:
+:meth:`SafetySupervisor.clear_faults` is for an operator (logged with their
+name), and goes out on the supervisor's privileged grant, since
+``Action:ClearFaults`` is in :data:`ENCLOSURE_MEMBERS`.
 
 The supervisor holds the dome owner's single *privileged* grant: the owner
 refuses ``OpenShutter``/``CloseShutter`` from anyone else.
@@ -51,6 +67,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import itertools
+import json
 import logging
 import time
 from collections import deque
@@ -63,8 +80,9 @@ from robofast_core.timeline import Timeline
 
 log = logging.getLogger(__name__)
 
-#: Dome members only the safety supervisor may call.
-ENCLOSURE_MEMBERS = frozenset({"OpenShutter", "CloseShutter"})
+#: Dome members only the safety supervisor may call (``Action:Name`` is one
+#: Alpaca action; ``ClearFaults`` is for an operator, through the supervisor).
+ENCLOSURE_MEMBERS = frozenset({"OpenShutter", "CloseShutter", "Action:ClearFaults"})
 
 
 class Shutter(enum.IntEnum):
@@ -106,13 +124,33 @@ class SafetyConfig:
     park_before_close: bool = False
     park_wait: float = 60.0
     #: Seconds between hardware heartbeat pings; ``None`` when the enclosure
-    #: has no heartbeat device. Keep it well below the device's own timeout.
+    #: has no heartbeat device. At most ``heartbeat_timeout / 4``.
     heartbeat_interval: float | None = None
+    #: The heartbeat device's own timeout (the Aqawan PAC's is 60 s);
+    #: required with ``heartbeat_interval``, so the 4-pings rule is checked.
+    heartbeat_timeout: float | None = None
     #: Ping only while the enclosure loop finished a pass within this long.
     heartbeat_max_loop_age: float = 15.0
     #: Alarm when a revoked lease is still unreleased this long after its
     #: revocation (its sequencer died and has not been restarted).
     orphan_timeout: float = 600.0
+    #: The dome's read-only fault channel, an Alpaca action answering JSON
+    #: with booleans ``fault`` and ``error`` (the Aqawan server's
+    #: ``"Faults"``); ``None`` for a dome without one.
+    fault_action: str | None = None
+
+    def __post_init__(self) -> None:
+        hb, timeout = self.heartbeat_interval, self.heartbeat_timeout
+        if hb is not None:
+            if timeout is None:
+                raise ValueError(
+                    "heartbeat_interval needs heartbeat_timeout (the device's own timeout)"
+                )
+            if not 0 < hb <= timeout / 4:
+                raise ValueError(
+                    f"heartbeat_interval {hb:g} s must be > 0 and <= heartbeat_timeout/4"
+                    f" ({timeout / 4:g} s): at least 4 pings per device timeout"
+                )
 
 
 class OpenLease:
@@ -220,6 +258,13 @@ class SafetySupervisor:
         if (heartbeat is None) != (self.config.heartbeat_interval is None):
             raise ValueError("a heartbeat device and heartbeat_interval go together")
         self._hb = heartbeat.grant(f"{name}/heartbeat") if heartbeat else None
+        # Read-only, so not privileged.
+        self._faults = dome.grant(f"{name}/faults") if self.config.fault_action else None
+        #: What is wrong with the enclosure (``None``: nothing, or no fault
+        #: channel). Unknown until the first good read.
+        self._fault: str | None = "not read yet" if self._faults else None
+        self._fault_kind: object = "not read yet"  # (fault, error), or why unknown
+        self._fault_escalated = False
 
         self._safe = False
         self._reason = "startup (no weather read yet)"
@@ -255,9 +300,15 @@ class SafetySupervisor:
         now = time.monotonic() if now is None else now
         return (
             self._safe
+            and self._fault is None
             and self._safe_since is not None
             and now - self._safe_since >= self.config.reopen_hold
         )
+
+    @property
+    def fault(self) -> str | None:
+        """The enclosure fault (from ``fault_action``), if any."""
+        return self._fault
 
     def status(self) -> dict[str, Any]:
         lease = self._lease
@@ -266,6 +317,7 @@ class SafetySupervisor:
             "safe": self._safe,
             "reason": self._reason,
             "open_allowed": self.open_allowed(),
+            "fault": self._fault,
             "shutter": None if self.shutter is None else Shutter(self.shutter).name,
             "lease": repr(lease) if lease else None,
             "orphaned_for": self._orphan_age(now),
@@ -448,7 +500,68 @@ class SafetySupervisor:
         lease = self._lease
         return self.open_allowed(now) and lease is not None and lease.live
 
+    async def _check_faults(self) -> None:
+        """Read the dome's fault channel; alarm when a fault appears or changes.
+
+        A fault (or a failed read: unknown counts as faulted) revokes the
+        lease and stops opening, so the enclosure closes unless it already
+        is. A fault while closed only alarms (once).
+        """
+        if self._faults is None:
+            return
+        cfg = self.config
+        try:
+            raw = await self._faults.call("Action", cfg.fault_action, "", timeout=cfg.dome_timeout)
+            data = json.loads(raw)
+            fault, error = data["fault"], data["error"]
+            if not (isinstance(fault, bool) and isinstance(error, bool)):
+                raise ValueError(f"fault/error not booleans in {raw!r}")
+        except Exception as exc:  # anything: never skip the enforcement below
+            kind: object = "unreadable"
+            problem: str | None = f"cannot read enclosure faults: {exc}"
+        else:
+            kind = (fault, error)
+            parts = [
+                name + (f" ({data.get(text)})" if data.get(text) else "")
+                for flag, name, text in ((fault, "Fault", "faults"), (error, "Error", "errors"))
+                if flag
+            ]
+            problem = f"enclosure reports {', '.join(parts)}" if parts else None
+        previous = self._fault
+        if kind == self._fault_kind:
+            self._fault = problem  # same condition; its text may have arrived
+            return
+        self._fault, self._fault_kind = problem, kind
+        if problem is None:
+            self._fault_escalated = False
+            self.timeline.event(self.name, "enclosure_fault_cleared", was=previous)
+            log.warning("%s: enclosure fault cleared (was: %s)", self.name, previous)
+            return
+        self._alarm(f"{problem}; not opening until it clears")
+        self._revoke_lease(problem)
+        self._wake.set()
+
+    async def clear_faults(self, operator: str, reason: str) -> str:
+        """An operator clears the enclosure's faults (logged with their name).
+
+        The dome refuses unless it is closed; nothing calls this automatically.
+        """
+        note = f"{operator}: {reason}"
+        self.timeline.event(self.name, "clear_faults", operator=operator, reason=reason)
+        log.warning("%s: ClearFaults by %s", self.name, note)
+        try:
+            reply = await self._dome.call(
+                "Action", "ClearFaults", note, timeout=self.config.dome_timeout
+            )
+        except DeviceError as exc:
+            self._alarm(f"ClearFaults by {operator} failed: {exc}")
+            raise
+        self.timeline.event(self.name, "faults_cleared", operator=operator, reply=reply)
+        self._wake.set()
+        return str(reply)
+
     async def _enforce_once(self) -> None:
+        await self._check_faults()
         now = time.monotonic()
         cfg = self.config
         if self._safe and (
@@ -480,7 +593,13 @@ class SafetySupervisor:
                 self.timeline.event(self.name, "enclosure_closed", took=now - self._closing_since)
             self._closing_since = None
             self._parked_for_close = False
+            self._fault_escalated = False
             return
+        if self._fault is not None and not self._fault_escalated:
+            # The dangerous case: a fault with the enclosure not closed.
+            self._fault_escalated = True
+            name = "unknown" if status is None else Shutter(status).name
+            self._alarm(f"FAULT WITH ENCLOSURE NOT CLOSED (shutter {name}): {self._fault}; closing")
         if status == Shutter.CLOSING:
             if self._closing_since is None:
                 self._closing_since = now

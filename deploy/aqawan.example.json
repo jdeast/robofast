@@ -4,5 +4,6 @@
   "pac": {"host": "127.0.0.1", "port": 22004},
   "allow_hardware": false,
   "open_order": [2, 1],
-  "close_command": "CLOSE_SEQUENTIAL"
+  "close_command": "CLOSE_SEQUENTIAL",
+  "interlock_doors": []
 }

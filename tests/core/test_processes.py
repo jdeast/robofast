@@ -37,7 +37,12 @@ from .conftest import FAST_REMOTE, FAST_SAFETY, FAST_SEQ
 
 HB_TIMEOUT = 1.0  # the dome's own heartbeat timeout
 TRAVEL = 0.2  # shutter travel
-SAFETY = {**FAST_SAFETY, "heartbeat_interval": 0.1, "heartbeat_max_loop_age": 0.5}
+SAFETY = {
+    **FAST_SAFETY,
+    "heartbeat_interval": 0.1,
+    "heartbeat_timeout": HB_TIMEOUT,
+    "heartbeat_max_loop_age": 0.5,
+}
 MARGIN = 1.0
 
 

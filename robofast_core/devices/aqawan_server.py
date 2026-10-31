@@ -22,23 +22,46 @@ Members
 * ``CloseShutter`` cancels any open sequence, then sends ``close_command``
   (default ``CLOSE_SEQUENTIAL``, the legacy close, ``aqawan.py:281``). Close
   and ``STOP`` pre-empt any routine PAC exchange in flight.
-* ``ShutterStatus`` aggregates both shutters: ``closed`` only if both report
-  ``CLOSED``; ``closing`` if either is closing; ``shutterError`` for a PAC
-  ``Fault``/``Error``, a failed open sequence, an unexpected state string, or
-  one open and one closed with no sequence running; ``open`` if both are
-  open; else ``opening``. (Closed and closing win over Fault/Error: the
-  enclosure is, or is getting, safe, and reporting ``error`` would only make
-  the supervisor re-send the close every poll.) When the Fault/Error flags
-  appear, the PAC's ``GET_FAULTS``/``GET_ERRORS`` text is logged.
-* ``AbortSlew`` cancels the open sequence and sends ``STOP``.
+* ``ShutterStatus`` is the shutters' *position*; a fault is a separate axis
+  (JDE, 2026-10-31: "closed and fault" is two states, and the dangerous one
+  is "open and fault"). ``closed`` only if both report ``CLOSED``, fault or
+  not; ``closing`` if either is closing; ``shutterError`` for a PAC
+  ``Fault``/``Error`` with a shutter open or part-way open, a failed open
+  sequence, an unexpected state string, or one open and one closed with no
+  sequence running; ``open`` if both are open; else ``opening``. (Closing
+  wins over Fault/Error: the enclosure is getting safe, and the supervisor
+  re-commands a close that takes longer than its ``shutter_timeout``.) So
+  "open and fault" reads ``shutterError`` and the supervisor closes, while
+  "closed and fault" reads ``closed`` and nothing is re-sent. When the
+  Fault/Error flags appear, the PAC's ``GET_FAULTS``/``GET_ERRORS`` text is
+  logged. A shutter string the server does not know (the PAC's state after
+  ``STOP`` or an E-stop mid-travel is not yet known) is ``shutterError``,
+  and the raw string is logged once.
+* ``AbortSlew`` cancels the open sequence, sends ``STOP``, then re-reads
+  ``STATUS`` and logs the shutter strings the PAC reports.
 * ``Action("Heartbeat", "")`` sends ``HEARTBEAT`` (the contract is in
   :mod:`robofast_core.heartbeat_watchdog`; the PAC itself closes the
-  shutters when the pings stop, and refuses to open until they resume).
+  shutters when the pings stop, and refuses to open until they resume; its
+  timeout is 60 s, confirmed by JDE 2026-10-31).
   ``Action("Status", "")`` returns the parsed PAC status as JSON;
   ``GetFaults``/``GetErrors`` return the PAC's text.
+* ``Action("Faults", "")`` is the fault channel (read-only): JSON
+  ``{"fault": bool, "error": bool, "faults": str|null, "errors": str|null,
+  "shutters": [s1, s2]}``, from a STATUS at most ``status_max_age`` old
+  (``faults``/``errors`` are the PAC's text, once fetched). The safety
+  supervisor polls it (``SafetyConfig.fault_action``) and alarms.
+* ``Action("ClearFaults", note)`` sends ``CLEAR_FAULTS`` then
+  ``CLEAR_ERRORS``, logged with ``note`` (who and why). It is refused unless
+  both shutters are reported ``CLOSED`` and no open sequence runs. It is for
+  an operator, through the supervisor (``POST /faults/clear``); the dome
+  owner makes it privileged (``"Action:ClearFaults"`` in
+  :data:`robofast_core.safety.ENCLOSURE_MEMBERS`), so a sequencer cannot
+  call it. Nothing clears faults automatically (not decided, 2026-10-31).
 * ``OpenShutter`` is refused (``InvalidOperationException``) while the PAC
-  reports a Fault or Error, a door that is not ``CLOSED``, or an operating
-  mode other than ``AUTO``.
+  reports a Fault or Error, or an operating mode other than ``AUTO``, and
+  (only if ``interlock_doors`` names them) a door that is not ``CLOSED``.
+  Door state does not matter for observing (JDE, 2026-10-31), so the default
+  interlocks no doors.
 * No azimuth, altitude, park, home or slaving: those members raise
   ``NotImplementedException``; the ``Can*`` flags say so.
 
@@ -158,8 +181,10 @@ class AqawanConfig:
     status_max_age: float = 1.0
     #: Bound on each Alpaca request (the supervisor's dome_timeout is 5 s).
     request_timeout: float = 4.5
-    #: Doors that must report CLOSED before opening.
-    interlock_doors: tuple[str, ...] = ("EntryDoor1", "EntryDoor2", "PanelDoor")
+    #: Doors that must report CLOSED before opening (STATUS keys, e.g.
+    #: EntryDoor1, EntryDoor2, PanelDoor). None by default: door state does
+    #: not matter for observing (JDE, 2026-10-31).
+    interlock_doors: tuple[str, ...] = ()
     #: Refuse to open unless EnclOpMode (when reported) is AUTO.
     require_auto: bool = True
     #: UDP port for Alpaca discovery (32227 is standard); None: off.
@@ -221,6 +246,9 @@ class Aqawan:
         self._failed: str | None = None
         self._commanded: tuple[int, float] | None = None  # (OPENING/CLOSING, when)
         self._flags = (False, False)
+        #: The PAC's GET_FAULTS / GET_ERRORS text while the flag is set.
+        self._pac_text: dict[str, str | None] = {"GET_FAULTS": None, "GET_ERRORS": None}
+        self._odd_shutters: tuple[str, str] | None = None
         self._background: set[asyncio.Task] = set()
 
     # -- status -------------------------------------------------------------
@@ -233,25 +261,83 @@ class Aqawan:
                 st = await self.pac.status()
                 self._status, self._status_at = st, t
                 self._note_flags(st)
+                self._note_shutters(st)
             return self._status
 
     def _note_flags(self, st: PACStatus) -> None:
         flags = (st.fault, st.error)
         if flags != self._flags:
             self._flags = flags
+            if not st.fault:
+                self._pac_text["GET_FAULTS"] = None
+            if not st.error:
+                self._pac_text["GET_ERRORS"] = None
             if st.fault or st.error:
-                log.warning("PAC reports Fault=%s Error=%s", st.fault, st.error)
+                log.warning(
+                    "PAC reports Fault=%s Error=%s (shutters %s)", st.fault, st.error, st.shutters
+                )
                 self._spawn(self._log_pac_text(st.fault, st.error))
             else:
                 log.info("PAC Fault and Error cleared")
+
+    def _note_shutters(self, st: PACStatus) -> None:
+        """Log, once per distinct value, a shutter string we do not know."""
+        odd = st.shutters if any(x not in SHUTTER_STATES for x in st.shutters) else None
+        if odd is not None and odd != self._odd_shutters:
+            log.warning(
+                "PAC reports unrecognised shutter state Shutter1=%r Shutter2=%r"
+                " (treated as shutterError); raw STATUS: %s",
+                st.raw.get("Shutter1"),
+                st.raw.get("Shutter2"),
+                st.raw,
+            )
+        self._odd_shutters = odd
 
     async def _log_pac_text(self, fault: bool, error: bool) -> None:
         for flag, command in ((fault, "GET_FAULTS"), (error, "GET_ERRORS")):
             if flag:
                 try:
-                    log.warning("PAC %s: %s", command, await self.pac.command(command))
+                    text = await self.pac.command(command)
                 except PACError as exc:
                     log.warning("PAC %s failed: %s", command, exc)
+                    continue
+                log.warning("PAC %s: %s", command, text)
+                if self._flags[0 if command == "GET_FAULTS" else 1]:
+                    self._pac_text[command] = text
+
+    async def faults(self) -> dict[str, Any]:
+        """The fault channel: Fault/Error flags, the PAC's text, the shutters."""
+        st = await self.status()
+        return {
+            "fault": st.fault,
+            "error": st.error,
+            "faults": self._pac_text["GET_FAULTS"] if st.fault else None,
+            "errors": self._pac_text["GET_ERRORS"] if st.error else None,
+            "shutters": list(st.shutters),
+        }
+
+    async def clear_faults(self, note: str) -> str:
+        """Operator only (privileged at the owner): clear the PAC's faults and
+        errors, but only with the enclosure closed. Never automatic."""
+        st = await self.status(max_age=0)
+        if st.shutters != ("CLOSED", "CLOSED") or self.sequence_running:
+            raise AlpacaException(
+                INVALID_OPERATION,
+                f"not clearing faults: enclosure not closed (shutters {st.shutters})",
+            )
+        log.warning(
+            "ClearFaults requested (%s); PAC Fault=%s Error=%s",
+            note or "no note",
+            st.fault,
+            st.error,
+        )
+        try:
+            replies = [await self.pac.action(c) for c in ("CLEAR_FAULTS", "CLEAR_ERRORS")]
+        finally:
+            self._invalidate()
+        st = await self.status(max_age=0)
+        log.warning("after ClearFaults: PAC Fault=%s Error=%s", st.fault, st.error)
+        return "; ".join(replies)
 
     def _spawn(self, coro: Awaitable[Any]) -> None:
         task = asyncio.ensure_future(coro)
@@ -270,7 +356,14 @@ class Aqawan:
         state = aggregate(st, sequence=self.sequence_running, failed=self._failed)
         if self._commanded is not None:
             direction, at = self._commanded
-            if time.monotonic() - at > self.config.start_grace:
+            target = "OPENING" if direction == OPENING else "CLOSING"
+            if (
+                time.monotonic() - at > self.config.start_grace
+                or target in st.shutters
+                or state == (OPEN if direction == OPENING else CLOSED)
+            ):
+                # Expired, or the PAC has acknowledged the move: from now on
+                # its own report counts (so a late, contrary motion shows).
                 self._commanded = None
             elif direction == OPENING and state == CLOSED:
                 return OPENING  # accepted; the PAC has not reported it yet
@@ -399,6 +492,14 @@ class Aqawan:
         finally:
             self._invalidate()
             self._commanded = None
+        # What a stopped shutter reports is not known yet: read it back and
+        # log it (an unknown string is shutterError, and logged as such).
+        try:
+            st = await self.status(max_age=0)
+        except PACError as exc:
+            log.warning("STATUS after STOP failed: %s", exc)
+        else:
+            log.info("after STOP: Shutter1=%r Shutter2=%r", st.shutter1, st.shutter2)
 
     async def heartbeat(self) -> str:
         return await self.pac.action("HEARTBEAT")
@@ -449,7 +550,7 @@ NOT_IMPLEMENTED_PUT = frozenset(
         "commandstring",
     }
 )
-ACTIONS = ("Heartbeat", "Status", "GetFaults", "GetErrors")
+ACTIONS = ("Heartbeat", "Status", "Faults", "GetFaults", "GetErrors", "ClearFaults")
 UINT32_MAX = 2**32 - 1
 
 
@@ -752,7 +853,7 @@ class AqawanServer(ThreadingHTTPServer):
                 raise AlpacaException(NOT_IMPLEMENTED, "Slaved: this enclosure cannot slave")
             return None
         if member == "action":
-            return self._action(params.get("Action", ""))
+            return self._action(params.get("Action", ""), params.get("Parameters", ""), client)
         if member in NOT_IMPLEMENTED_PUT:
             raise AlpacaException(NOT_IMPLEMENTED, f"{member} is not implemented")
         return self._unknown(verb, member)
@@ -761,7 +862,7 @@ class AqawanServer(ThreadingHTTPServer):
     def _unknown(verb: str, member: str) -> Any:
         raise _BadRequest(f"{verb} {member}: no such member")
 
-    def _action(self, name: str) -> str:
+    def _action(self, name: str, parameters: str, client: int) -> str:
         a = self.aqawan
         key = name.lower()
         if key == "heartbeat":
@@ -769,6 +870,11 @@ class AqawanServer(ThreadingHTTPServer):
         if key == "status":
             st = self._call(lambda: a.status(max_age=0), "Status")
             return json.dumps(st.as_dict())
+        if key == "faults":
+            return json.dumps(self._call(a.faults, "Faults"))
+        if key == "clearfaults":
+            note = f"ClientID {client}: {parameters.strip() or 'no reason given'}"
+            return self._call(lambda: a.clear_faults(note), "ClearFaults")
         if key in ("getfaults", "geterrors"):
             command = "GET_FAULTS" if key == "getfaults" else "GET_ERRORS"
             return self._call(lambda: a.pac.command(command), name)

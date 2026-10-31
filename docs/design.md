@@ -357,6 +357,9 @@ support is often worse. So:
 | `plan_timeout` | 30 s | bound on asking the plan for a telescope's next observation |
 | `park_before_close` | off | roll-off roofs: park every telescope (bounded, in parallel) before closing |
 | `park_wait` | 60 s | bound on that park |
+| `heartbeat_interval` | none | supervisor ping period; at most `heartbeat_timeout`/4, or the config is rejected |
+| `heartbeat_timeout` | none | the enclosure's own heartbeat timeout (Aqawan PAC: 60 s, confirmed); required with `heartbeat_interval` |
+| `fault_action` | none | the dome's read-only fault channel (Aqawan: `Faults`); any fault alarms and blocks opening, and a fault with the enclosure not closed closes it |
 
 ## 7. Open decisions
 
@@ -386,7 +389,8 @@ Each step is a CI-tested deliverable.
 5. Aqawan enclosure Alpaca server with a simulator mode, passing ConformU
    (`robofast_core/devices/`: PAC client, PAC simulator, Dome server;
    ConformU runs in CI). Hardware facts not yet confirmed on a real PAC are
-   listed in `aqawan_pac`'s and `aqawan_sim`'s module docs.
+   listed in `aqawan_pac`'s and `aqawan_sim`'s module docs; the confirmed
+   ones and the fault policy are in `docs/aqawan.md`.
 6. Windows bridge on one control PC: ASCOM Remote for the camera and PWI4;
    measure command latency and full-frame download time.
 7. Shadow mode: robofast's supervisor runs read-only alongside the legacy

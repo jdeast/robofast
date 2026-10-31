@@ -1,9 +1,15 @@
-"""The site weather bridge: MINERVA page parsing, limits, staleness, rain, sun.
+"""The site weather bridge: MINERVA page parsing, limits, staleness, rain.
 
 Most tests drive :class:`WeatherBridge` with an in-memory HTTP transport and
 an injected clock, using the real pages captured from the site on
 2026-10-30 (``RIDGE_FIXTURE``, ``CLOUD_FIXTURE``) and synthetic variants.
-The shipped ``sites/minerva/weather.yaml`` is the config under test.
+
+The config under test is the shipped ``sites/minerva/weather.yaml`` reduced
+to its two SAO pages (:func:`pages_only`): the Redis primary disabled, the
+pages required and enforcing rain, ObservingConditions served from them --
+the bridge as it was before Redis, so these tests exercise the page parsers
+and the evaluator's mechanics. The shipped config itself (Redis primary,
+pages advisory, shadow rain) is tested in ``test_weather_redis.py``.
 """
 
 from __future__ import annotations
@@ -19,7 +25,6 @@ import httpx
 import pytest
 
 from robofast_core.sites.minerva import MearthSource, SkyTempsSource
-from robofast_core.sun import sun_altitude, sun_ra_dec
 from robofast_core.testing.weather_feed import (
     CLOUD_FIXTURE,
     GOOD_CLOUD,
@@ -53,6 +58,34 @@ CLOUD_URL = "http://linmax.sao.arizona.edu/temps/sky_temps_now"
 FIXTURE_NOW = datetime(2026, 10, 31, 3, 17, 0, tzinfo=UTC)
 #: Local midnight a night later; the Sun is far down.
 NIGHT = datetime(2026, 11, 1, 7, 0, 0, tzinfo=UTC)
+
+#: ObservingConditions from the pages (the shipped config serves Redis).
+PAGE_CONDITIONS = {
+    "temperature": {"source": "ridge", "field": "outsideTemp", "unit": "degC"},
+    "humidity": {"source": "ridge", "field": "outsideHumidity", "unit": "percent"},
+    "dewpoint": {"source": "ridge", "field": "outsideDewPt", "unit": "degC"},
+    "pressure": {"source": "ridge", "field": "barometer", "unit": "inHg"},
+    "windspeed": {"source": "ridge", "field": "windSpeed", "unit": "mph"},
+    "windgust": {"source": "ridge", "field": "windGustSpeed", "unit": "mph"},
+    "winddirection": {"source": "ridge", "field": "windDirectionDegrees", "unit": "deg"},
+    "rainrate": {"source": "ridge", "field": "wxt510Rain_rate", "unit": "mm/h"},
+    "skytemperature": {
+        "source": "cloud",
+        "field": "sky",
+        "unit": "degC",
+        "description": "first available cloud sensor (MEarth, HAT, MINERVA, Aurora)",
+    },
+}
+
+
+def pages_only(data: dict) -> dict:
+    """The shipped config with only the SAO pages, required and enforcing rain."""
+    data["sources"]["redis"]["enabled"] = False
+    for name in ("ridge", "cloud"):
+        data["sources"][name]["required"] = True
+        data["sources"][name]["enforce_rain"] = True
+    data["conditions"] = copy.deepcopy(PAGE_CONDITIONS)
+    return data
 
 
 class Clock:
@@ -108,7 +141,7 @@ def creds(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def raw(creds: Path) -> dict:
-    data = load_config(CONFIG)
+    data = pages_only(load_config(CONFIG))
     data["sources"]["cloud"]["credentials_file"] = str(creds)
     return data
 
@@ -167,7 +200,7 @@ async def test_fixtures_evaluate_unsafe_with_reasons(make_bridge):
     assert "ridge: outsideHumidity=100 > 75 (open limit)" in ev.reasons
     assert "cloud: sky(mearth)=-3.9 > -40 (open limit)" in ev.reasons
     assert ev.sources["sun"].state == SAFE
-    assert ev.sources["sun"].values["altitude"] == pytest.approx(-34.81, abs=0.02)
+    assert ev.sources["sun"].values["altitude_geometric"] == pytest.approx(-34.81, abs=0.01)
     # The shadow-mode line carries the verdict, the reasons and the readings.
     line = ev.line()
     assert line.startswith("UNSAFE limits=open reasons=[")
@@ -237,12 +270,13 @@ async def test_cloud_limits_trip_in_legacy_priority_order(make_bridge, cloud, re
 
 
 async def test_sun_limit(make_bridge):
-    # 2026-10-31 01:00 UTC (18:00 MST): the Sun is at about -5.8 deg: safe;
+    # 2026-10-31 01:00:20 UTC (18:00 MST): the Sun is at about -5.7 deg
+    # (apparent; the shipped config refracts as legacy PyEphem did): safe;
     # 2026-10-30 22:00 UTC (15:00 MST): well up: unsafe.
     when = datetime(2026, 10, 31, 1, 0, tzinfo=UTC)
     pages, clock = _good(when)
     ev = await _poll(make_bridge(pages, clock))
-    assert ev.sources["sun"].values["altitude"] == pytest.approx(-5.91, abs=0.02)
+    assert ev.sources["sun"].values["altitude"] == pytest.approx(-5.736, abs=0.005)
     assert ev.state == SAFE, ev.reasons
     when = datetime(2026, 10, 30, 22, 0, tzinfo=UTC)
     pages, clock = _good(when)
@@ -493,11 +527,11 @@ async def test_rain_from_counter_increase_holds_then_clears(make_bridge):
     rate = ev.sources["ridge"].values["wxt510Rain_rate"]
     assert rate == pytest.approx(0.14 / 120 * 3600)
     # It stops raining (no increase within the window any more), but the hold
-    # keeps it unsafe for 1800 s after the last detection.
+    # keeps it unsafe for rain_hold (3600 s) after the last detection.
     assert await step(600, 138.05) == UNSAFE
     assert not bridge.evaluator._counters[("ridge", "wxt510Rain")].raining()
-    assert await step(1100, 138.05) == UNSAFE  # 1700 s after the rain
-    assert await step(200, 138.05) == SAFE  # 1900 s after
+    assert await step(2900, 138.05) == UNSAFE  # 3500 s after the rain
+    assert await step(200, 138.05) == SAFE  # 3700 s after
 
 
 async def test_rain_counter_reset_is_not_rain(make_bridge):
@@ -573,8 +607,11 @@ async def test_bridge_error_fails_closed(make_bridge):
 
 def test_shipped_config_parses():
     cfg = parse_config(load_config(CONFIG))
-    assert [s.name for s, _ in cfg.sources] == ["ridge", "cloud", "sun"]  # MEarth disabled
+    # MEarth disabled
+    assert [s.name for s, _ in cfg.sources] == ["redis", "ridge", "cloud", "sun"]
+    assert [s.name for s, spec in cfg.sources if spec.required] == ["redis", "sun"]
     assert cfg.poll_interval == 60
+    assert cfg.rain_hold == 3600
 
 
 @pytest.mark.parametrize(
@@ -622,42 +659,6 @@ def test_unit_conversions():
     assert to_ascom(36, "km/h") == pytest.approx(10.0)
     assert to_ascom(760, "mmHg") == pytest.approx(1013.25, abs=0.01)
     assert to_ascom(32, "degF") == pytest.approx(0.0)
-
-
-# -- the Sun -----------------------------------------------------------------------------
-
-# Geometric (no refraction), topocentric altitudes of the Sun's centre from
-# astropy 7.2 (get_body + AltAz, pressure=0), computed offline: the
-# reference for our low-precision formula, which agrees to < 0.005 deg.
-SUN_REFERENCE = [
-    ("2026-10-31T03:16:02", 31.680407, -110.878977, -34.607),
-    ("2026-10-31T01:00:00", 31.680407, -110.878977, -5.844),
-    ("2026-06-21T19:00:00", 31.680407, -110.878977, 80.023),
-    ("2026-12-21T14:00:00", 31.680407, -110.878977, -4.519),
-    ("2026-03-20T13:30:00", 31.680407, -110.878977, -0.212),
-    ("2000-01-01T12:00:00", 51.4769, 0.0, 15.485),
-    ("2045-07-04T08:00:00", -30.2446, -70.7494, -46.632),
-    ("1990-02-15T22:45:00", 19.8207, -155.4681, 57.586),
-]
-
-
-@pytest.mark.parametrize(("when", "lat", "lon", "alt"), SUN_REFERENCE)
-def test_sun_altitude_reference_values(when, lat, lon, alt):
-    t = datetime.fromisoformat(when).replace(tzinfo=UTC)
-    assert sun_altitude(t, lat, lon) == pytest.approx(alt, abs=0.02)
-
-
-def test_sun_position_meeus_example():
-    # Meeus, Astronomical Algorithms (2nd ed.), example 25.a: 1992 Oct 13.0 TD,
-    # apparent RA 198.38083 deg, declination -7.78507 deg.
-    ra, dec = sun_ra_dec(datetime(1992, 10, 13, 0, 0, tzinfo=UTC))
-    assert ra == pytest.approx(198.38083, abs=0.01)
-    assert dec == pytest.approx(-7.78507, abs=0.01)
-
-
-def test_sun_needs_aware_time():
-    with pytest.raises(ValueError):
-        sun_altitude(datetime(2026, 1, 1), 0, 0)
 
 
 # -- shadow mode ---------------------------------------------------------------------

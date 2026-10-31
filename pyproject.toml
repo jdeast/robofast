@@ -10,7 +10,9 @@
 [dependency-groups]
 # pyyaml: site configs (sites/*/weather.yaml) are YAML so every limit can
 # carry a comment saying where it came from (design.md 3.10).
-core = ["httpx>=0.27", "pyyaml>=6"]
+# astropy: the Sun's altitude for the weather bridge (robofast_core/sun.py),
+# so it agrees exactly with the same calculation made elsewhere.
+core = ["astropy>=6.1", "httpx>=0.27", "pyyaml>=6"]
 test = [
     {include-group = "core"},
     "pytest>=8",

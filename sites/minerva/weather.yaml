@@ -13,6 +13,13 @@
 # NO CREDENTIALS IN THIS FILE: `credentials_file` names a file (username on
 # line 1, password on line 2, the legacy credentials/webpage.txt format)
 # kept outside the repository, mode 600. `~` and $VARS are expanded.
+#
+# Sources (JDE 2026-10-31): the site Redis server is the required primary;
+# the ridge page and the cloud page are advisory backups (an "unsafe" from
+# them still closes; a failed or stale page does not). Rain is evaluated
+# everywhere but enforced only from the cloud page's MEarth rain sentinel,
+# which legacy enforced; WXT-based rain (Redis and ridge) is shadow-only
+# until its false-positive rate has been validated (enforce_rain).
 
 site:
   name: minerva
@@ -26,17 +33,106 @@ poll_interval: 60        # s between fetches of every page
 evaluate_interval: 5     # s between evaluations/publishes (staleness, Sun)
 server_stale_after: 60   # Alpaca IsSafe=False if the bridge stops publishing
 max_clock_skew: 120      # s; a reading stamped further in the future is unknown
-# legacy oktoopen: no opening within 1800 s of the last rain (its comment
-# says "1 hour", the code says 1800 s).
-rain_hold: 1800
+# JDE 2026-10-31: any rain in the last hour means closed. (Legacy
+# oktoopen's comment said "1 hour"; its code held 1800 s.) Applies to
+# enforced rain; shadow rain is held and reported the same way.
+rain_hold: 3600
 
 sources:
+  redis:
+    # The site's Redis server, db 7 = current site weather (JDE 2026-10-31).
+    # Read-only: the client sends only SELECT and MGET. No auth. db 8 is an
+    # older station last written 2024-06-21 -- never point this at it.
+    type: redis
+    url: redis://starlord.sao.arizona.edu:6379/7
+    required: true
+    stale_after: 300     # for `time` (as the ridge page)
+    timeout: 5
+    # Timestamps are local MST like `2026-10-31 02:27:20` (mjd agrees: UTC-7).
+    utc_offset_hours: -7
+    time_key: time
+    timestamps:          # the other timestamp keys and their staleness (s)
+      boltwood_time: 300
+      mbolt_time: 300
+    enforce_rain: false  # ACTION: validate the false-positive rate first
+    # key -> field mapping. Values match the ridge page at the same moment
+    # (temperature 8.7, humidity 100, pressure 22.69 vs 22.68 inHg,
+    # rain_current = wxt510Rain 137.91, rain = totalRain 2240.33): the same
+    # station.
+    fields:
+      temperature:    {key: temperature, unit: degC}
+      humidity:       {key: humidity, unit: percent}
+      dewpoint:       {key: dew, unit: degC}
+      pressure:       {key: pressure, unit: inHg}
+      # UNITS NOT ESTABLISHED. At capture Redis said wind 11.3 / gust 38.4
+      # while the ridge page said 7.21 / 20.38 mph: 11.3 km/h = 7.02 mph,
+      # so km/h fits the mean wind (gusts differ in averaging window). The
+      # MEarth station (same WXT keys: rain/hail intensity and duration)
+      # reported km/h in legacy getWeatherMearth. If it is really mph this
+      # reads wind 1.6x low -- the ridge page's mph limits still apply while
+      # it answers. Check in shadow mode (compare with ridge windSpeed).
+      wind:           {key: wind, unit: km/h, to: mph}
+      wind_gust:      {key: wind_gust, unit: km/h, to: mph}
+      wind_direction: {key: wind_direction, unit: deg}
+      # Cumulative counters (mm, as wxt510Rain / totalRain on the ridge page).
+      rain_wxt:       {key: rain_current}
+      rain_total:     {key: rain}
+      rain_intensity: {key: rain_intensity, unit: mm/h}  # WXT, current
+      rain_duration:  {key: rain_duration}               # s, cumulative
+      hail:           {key: hail}                        # cumulative
+      hail_intensity: {key: hail_intensity}
+      hail_duration:  {key: hail_duration}
+      # Cloud sensors (sky - ambient, degC). Identities are inferred from
+      # the key names, not verified: m_bolt = the MEarth Boltwood (timed by
+      # mbolt_time), aurora = the Aurora sensor; a_sky equalled aurora at
+      # capture. boltwood (timed by boltwood_time) read -0.0 = legacy's
+      # "sensor down" 0.0; which sensor it is is unknown, so it is logged
+      # but not limited. 0.0 is "down" for all, as legacy.
+      mearth:         {key: m_bolt, time: mbolt_time, missing_values: [0.0]}
+      boltwood:       {key: boltwood, time: boltwood_time, missing_values: [0.0]}
+      aurora:         {key: aurora, missing_values: [0.0]}
+      a_sky:          {key: a_sky, missing_values: [0.0]}
+      # The FLWO 48" observers' MEarth cloud limit (rts2 me_sky_limit,
+      # which legacy fetched with getskylimit.sh); see dynamic_limits.
+      sky_limit:      {key: sky_limit}
+    limits:
+      # The ridge page's legacy limits (wind converted to mph above).
+      wind:           {open: [0.0, 30.0],     close: [0.0, 35.0]}
+      wind_gust:      {open: [0.0, 35.0],     close: [0.0, 40.0]}
+      humidity:       {open: [0.0, 75.0],     close: [0.0, 80.0]}
+      temperature:    {open: [-20.0, 50.0],   close: [-30.0, 60.0]}
+      dewpoint:       {open: [-100.0, 100.0], close: [-100.0, 100.0]}
+      wind_direction: {open: [0.0, 360.0],    close: [0.0, 360.0]}
+      pressure:       {open: [0, 2000],       close: [0, 2000]}
+      # Cloud limits as for the cloud page's MEarth and Aurora columns.
+      mearth:         {open: [-999, -40.0], close: [-999, -38.0]}
+      aurora:         {open: [-999, -32.0], close: [-999, -31.0]}
+    groups:
+      sky: [mearth, aurora]
+    dynamic_limits:
+      # Legacy domeControl.py read me_sky_limit every 30 min (default -38)
+      # and applied it to the MEarth sensor only: close limit = sky_limit,
+      # open limit = sky_limit - 2. Off by default (JDE 2026-10-31); outside
+      # `range` the static limits apply.
+      mearth: {enabled: false, field: sky_limit, side: high,
+               open_offset: -2.0, close_offset: 0.0, range: [-50.0, -25.0]}
+    rain_rates:
+      # Rain while the WXT intensity is above 0 (any rain).
+      rain_intensity: 0.0
+      hail_intensity: 0.0
+    rain_counters:
+      rain_wxt:   {window: 600, threshold: 0.1}
+      rain_total: {window: 600, threshold: 0.1}
+
   ridge:
     type: minerva.ridge
     url: http://linmax.sao.arizona.edu/weather/weather.cur_cond
     # Legacy sent the cloud page's credentials here too; the page answers
     # without them (2026-10-30). Add credentials_file if that changes.
-    required: true
+    # Advisory backup since 2026-10-31: its limits still close the roof,
+    # but a failed or stale page does not.
+    required: false
+    enforce_rain: false  # the same WXT510 as Redis
     # legacy limits['date']: utcnow() - 5 min (but frozen at startup there)
     stale_after: 300
     timeout: 10
@@ -69,7 +165,11 @@ sources:
     type: minerva.sky_temps
     url: http://linmax.sao.arizona.edu/temps/sky_temps_now
     credentials_file: ~/.config/robofast/sao-weather.credentials
-    required: true
+    # Advisory backup since 2026-10-31 (see ridge).
+    required: false
+    # legacy enforced MEarth's 998.0 rain sentinel ("much more reliable than
+    # wxt510Rain"), so this one stays enforced.
+    enforce_rain: true
     # legacy limits['cloudDate']: utcnow() - 6 min (page updates every 5 min)
     stale_after: 360
     timeout: 10
@@ -129,9 +229,13 @@ sources:
     limits:
       # legacy oktoopen overrides limits['sunAltitude'] to [-90, 6] (both
       # open and close) unless a sunOverride file exists; the 15 deg in
-      # load_config is never used. Geometric altitude here (legacy: PyEphem
-      # apparent, ~0.15 deg higher at 6 deg).
+      # load_config is never used. `altitude` is apparent (refracted), as
+      # legacy's PyEphem altitude was; `altitude_geometric` is logged too.
       altitude: {open: [-90.0, 6.0], close: [-90.0, 6.0]}
+    # Refraction as legacy: ephem.Observer's default pressure and temperature
+    # (legacy never set them). Agrees with PyEphem to 0.002 deg at +6 deg.
+    pressure_hpa: 1010.0
+    temperature_c: 15.0
 
   mearth_weather:
     # legacy getWeatherMearth; disabled there since 2022-10-20 ("MEarth
@@ -147,14 +251,16 @@ sources:
 # ASCOM ObservingConditions members -> source field, in the field's unit
 # (converted to ASCOM units: degC, %, m/s, hPa, mm/h, deg).
 conditions:
-  temperature:    {source: ridge, field: outsideTemp, unit: degC}
-  humidity:       {source: ridge, field: outsideHumidity, unit: percent}
-  dewpoint:       {source: ridge, field: outsideDewPt, unit: degC}
-  pressure:       {source: ridge, field: barometer, unit: inHg}
-  windspeed:      {source: ridge, field: windSpeed, unit: mph}
-  windgust:       {source: ridge, field: windGustSpeed, unit: mph}
-  winddirection:  {source: ridge, field: windDirectionDegrees, unit: deg}
-  rainrate:       {source: ridge, field: wxt510Rain_rate, unit: mm/h,
-                   description: "ridge WXT510 accumulation rate over the rain window"}
-  skytemperature: {source: cloud, field: sky, unit: degC,
-                   description: "first available cloud sensor (MEarth, HAT, MINERVA, Aurora), calibrated"}
+  temperature:    {source: redis, field: temperature, unit: degC}
+  humidity:       {source: redis, field: humidity, unit: percent}
+  dewpoint:       {source: redis, field: dewpoint, unit: degC}
+  pressure:       {source: redis, field: pressure, unit: inHg}
+  windspeed:      {source: redis, field: wind, unit: mph,
+                   description: "site Redis wind, read as km/h (unit unverified)"}
+  windgust:       {source: redis, field: wind_gust, unit: mph,
+                   description: "site Redis wind_gust, read as km/h (unit unverified)"}
+  winddirection:  {source: redis, field: wind_direction, unit: deg}
+  rainrate:       {source: redis, field: rain_intensity, unit: mm/h,
+                   description: "site Redis rain_intensity (WXT510)"}
+  skytemperature: {source: redis, field: sky, unit: degC,
+                   description: "first available Redis cloud sensor (MEarth m_bolt, then Aurora)"}

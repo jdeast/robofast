@@ -46,6 +46,10 @@ class Service:
             raise RuntimeError(f"{self.proc.args} did not start; see {self.log_path}")
         return line
 
+    def log_line(self, text: str) -> str | None:
+        """The first line of the process's log that contains ``text``."""
+        return next((ln for ln in self.log_path.read_text().splitlines() if text in ln), None)
+
     def signal(self, sig: int) -> None:
         self.proc.send_signal(sig)
 

@@ -151,18 +151,23 @@ async def test_sequencer_restart_recovers(omnisim, supervisor, services, truth, 
     old = _lease(supervisor)
     t0 = time.monotonic()
     first.signal(signal.SIGKILL)
-    _sequencer_process(omnisim, supervisor, services, "second")
+    second = _sequencer_process(omnisim, supervisor, services, "second")
     await await_until(truth.closed, BOUND, what="closed")
     closed = time.monotonic() - t0
-    await await_until(lambda: truth.parked() and not truth.exposing(), BOUND, what="parked")
-    parked = time.monotonic() - t0
+    # Parked-and-idle lasts only until the new lease, so use the report (and
+    # the supervisor, which grants nothing until it has read AtPark).
+    await await_until(lambda: second.log_line("startup_cleanup_done"), BOUND, what="cleanup")
+    cleaned_up = time.monotonic() - t0
+    assert "'aborted': True, 'parked': True, 'errors': []" in second.log_line(
+        "startup_cleanup_done"
+    )
     await await_until(lambda: _lease(supervisor)["id"] != old["id"], BOUND, what="new lease")
     recovered = time.monotonic() - t0
     await _observing(truth)
     observing = time.monotonic() - t0
     record_timing(
         closed=closed,
-        parked=parked,
+        cleaned_up=cleaned_up,
         new_lease=recovered,
         observing_again=observing,
         lease_ttl=SAFETY["lease_ttl"],

@@ -276,11 +276,16 @@ async def test_restarted_sequencer_recovers(site):
     lease once the enclosure is closed, and observes again under a new one."""
     sup = site.supervisor()
     old, t0 = await _kill_while_exposing(site, sup.url)
-    site.sequencer_process(sup.url, "second")
+    second = site.sequencer_process(sup.url, "second")
     await wait_until(site.closed, SAFETY["lease_ttl"] + MARGIN, what="closed")
     closed = time.monotonic() - t0
-    await wait_until(site.safe_state, 5, what="parked and camera idle")
+    # Parked-and-idle lasts only until the new lease, so use the report (and
+    # the supervisor, which grants nothing until it has read AtPark).
+    await wait_until(lambda: second.log_line("startup_cleanup_done"), 5, what="cleanup")
     safe = time.monotonic() - t0
+    assert "'aborted': True, 'parked': True, 'errors': []" in second.log_line(
+        "startup_cleanup_done"
+    )
     assert site.cam.exposures_aborted == 1
     await wait_until(lambda: _lease(sup.url)["id"] != old["id"], 10, what="a new lease")
     recovered = time.monotonic() - t0
@@ -291,7 +296,7 @@ async def test_restarted_sequencer_recovers(site):
     assert new["live"] and site.cam.exposures_started == 2
     assert "lease_recovered" in sup.log_path.read_text()
     print(
-        f"sequencer SIGKILL + restart: closed {closed:.2f} s, parked and idle {safe:.2f} s,"
+        f"sequencer SIGKILL + restart: closed {closed:.2f} s, cleaned up {safe:.2f} s,"
         f" new lease {recovered:.2f} s, observing again {observing:.2f} s"
         f" (lease_ttl {SAFETY['lease_ttl']} s, reopen_hold {SAFETY['reopen_hold']} s)"
     )

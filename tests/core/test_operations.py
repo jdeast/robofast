@@ -274,7 +274,8 @@ async def test_example_calibration_plan_and_telescope_options():
     sites = SITES
     plan = load_plan(sites / "calibration.example.json", ["t1"])
     first = await plan.peek("t1")
-    assert first.name == "bias" and not first.light
+    # The spectrograph's calibrations first (taken by t1), then the imager's.
+    assert first.kind == "spectrograph_calibration" and not first.light
     config = load_config(sites / "aqawan1.json")
     config["telescopes"]["t2"].update(filterwheel="127.0.0.1:11122/1", port_action="SelectPort")
     seq, remote = build(config, Timeline())

@@ -696,7 +696,8 @@ async def test_sequencer_service_builds_a_dispatch_plan(tmp_path):
     plan = load_plan(tmp_path / "dispatch.json", ["t1", "t2"])
     seq, remote = build(config, Timeline(), plan=plan)
     try:
-        assert seq.plan is plan and plan._preempt == seq.preempt
+        # aqawan1.json has operator_control: the console's hold wraps the plan.
+        assert seq.plan.inner is plan and plan._preempt == seq.preempt
         assert plan.dropbox == tmp_path / "too-dropbox"
     finally:
         await remote.aclose()

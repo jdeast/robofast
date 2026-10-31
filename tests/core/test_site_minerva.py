@@ -115,7 +115,9 @@ async def test_plans_load(tmp_path):
     plan = load_plan(tmp_path / "dispatch.example.json", ["t1", "t2"])
     assert plan is not None
     plan = load_plan(SITE / "calibration.example.json", ["t1", "t2"])
-    assert (await plan.peek("t1")).name == "bias"
+    first = await plan.peek("t1")
+    assert first.kind == "spectrograph_calibration" and first.calibration[0]["kind"] == "bias"
+    assert (await plan.peek("t2")).name == "bias"
     load_plan(SITE / "targets.example.json", ["t1", "t2"])
     plan_from_config(_json("aqawan1.json")["plan"], ["t1", "t2"])
     load_request_groups(SITE / "requests.example.json")

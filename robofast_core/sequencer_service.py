@@ -58,6 +58,18 @@ and optionally:
   gives the Sun and Moon and the night; ``devices.observingconditions``
   (the weather bridge, only read) the weather keywords; the supervisor's
   status the shutter. Without ``images`` no frame is saved.
+* ``spectrograph`` -- the enclosure's fiber-fed spectrograph
+  (:class:`~robofast_core.devices.kiwispec_service.KiwiSpecRemote`;
+  ``docs/kiwispec.md``, ``docs/rv_night.md``): ``{"url": ...,
+  "telescopes": {"t1": "T1", ...}, "timeout": s, "abort_timeout": s,
+  "data_root": ..., "instrument": "kiwispec"}``. ``telescopes`` maps the
+  enclosure's telescope names to the spectrograph service's (default: the
+  same). Spectrum and spectrograph calibration sidecars go under
+  ``data_root`` (default: ``images.data_root``; relative to the config
+  file), with the barycentric correction for the enclosure's ``site``.
+  Observations of kind ``spectrum`` need it (the dispatch scheduler's
+  ``SPECTRUM`` configurations), as do a calibration plan's ``spectrograph``
+  frames.
 * ``operator_control`` -- a directory: the observer console's pause,
   resume and stop commands come in through it
   (:class:`~robofast_core.console.hold.OperatorHold`, which wraps the plan;
@@ -118,6 +130,7 @@ from robofast_core.lease_client import RemoteSupervisor
 from robofast_core.owner import DeviceOwner
 from robofast_core.plan import PlanProvider, StaticPlan, plan_from_config
 from robofast_core.sequencer import Sequencer, SequencerConfig, TelescopeUnit
+from robofast_core.spectra import SpectrumRecorder
 from robofast_core.timeline import Timeline
 
 log = logging.getLogger(__name__)
@@ -288,6 +301,7 @@ def build(
         imaging.owners = [o for d in aux.values() for o in d.values()]
         if weather is not None:
             imaging.owners.append(weather)
+    spectrograph, spec_names, spectra = spectrograph_from_config(config, base)
     seq = Sequencer(
         config.get("sequencer_name") or config["name"],
         supervisor=remote,
@@ -296,10 +310,65 @@ def build(
         timeline=timeline,
         config=SequencerConfig(**config.get("sequencer", {})),
         imaging=imaging,
+        spectrograph=spectrograph,
+        spectrograph_names=spec_names,
+        spectra=spectra,
     )
     if triggers is not None:
         triggers.bind(seq.registry)
     return seq, remote
+
+
+SPECTROGRAPH_KEYS = {"url", "telescopes", "timeout", "abort_timeout", "data_root", "instrument"}
+
+
+def spectrograph_from_config(
+    config: dict[str, Any], base: Path | None = None
+) -> tuple[Any, dict[str, str], SpectrumRecorder | None]:
+    """The ``spectrograph`` entry (module doc): its client, the telescope
+    name map, and the sidecar writer (None without a data root)."""
+    entry = config.get("spectrograph")
+    if entry is None:
+        return None, {}, None
+    if isinstance(entry, str):
+        entry = {"url": entry}
+    entry = {k: v for k, v in entry.items() if not k.startswith("_")}
+    unknown = set(entry) - SPECTROGRAPH_KEYS
+    if unknown:
+        raise ValueError(f"spectrograph: unknown keys {sorted(unknown)}")
+    if "url" not in entry:
+        raise ValueError("spectrograph: 'url' is required")
+    from robofast_core.devices.kiwispec_service import KiwiSpecRemote
+    from robofast_core.sky import Site  # imports astropy
+
+    remote = KiwiSpecRemote(
+        str(entry["url"]),
+        timeout=float(entry.get("timeout", 10.0)),
+        abort_timeout=float(entry.get("abort_timeout", 45.0)),
+    )
+    names = {str(k): str(v) for k, v in (entry.get("telescopes") or {}).items()}
+    unknown_tels = set(names) - set(telescopes(config))
+    if unknown_tels:
+        raise ValueError(f"spectrograph.telescopes: unknown telescopes {sorted(unknown_tels)}")
+    root = entry.get("data_root") or (config.get("images") or {}).get("data_root")
+    recorder = None
+    if root is not None:
+        site = config.get("site")
+        if not isinstance(site, dict):
+            raise ValueError("spectrograph: the barycentric correction needs the config's 'site'")
+        path = Path(root)
+        if base is not None and not path.is_absolute():
+            path = base / path
+        images = config.get("images") or {}
+        recorder = SpectrumRecorder(
+            path,
+            str(images.get("site", config.get("name", "site"))),
+            Site(float(site["latitude"]), float(site["longitude"]), float(site["elevation"])),
+            instrument=str(entry.get("instrument", "kiwispec")),
+            night_rollover_hour=float(images.get("night_rollover_hour", 12.0)),
+            timezone=images.get("timezone"),
+        )
+    return remote, names, recorder
 
 
 def snapshot(seq: Sequencer, interval: float = 5.0) -> dict[str, Any]:
@@ -331,6 +400,7 @@ def snapshot(seq: Sequencer, interval: float = 5.0) -> dict[str, Any]:
             state = "waiting"
         tels[name] = {
             "state": state,
+            "spectrum": u.spectrum,
             "exposing": u.exposing,
             "consecutive_errors": u.consecutive_errors,
             "current": current.get(name),

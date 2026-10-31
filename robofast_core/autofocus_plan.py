@@ -13,6 +13,8 @@ cleanup (design.md 3.4).
 An autofocus is due on a telescope when (each optional, in this order):
 
 * ``start_of_night`` -- none has succeeded since the sequencer started;
+  (an autofocus is inserted only before an ``expose`` or a ``spectrum``
+  observation, never before another autofocus or a dark frame)
 * ``temperature_change`` -- the registry value ``temperature_value``
   (default the focuser's temperature) has moved more than this (deg C)
   since the last successful autofocus;
@@ -44,6 +46,9 @@ from robofast_core.registry import ValueRegistry
 log = logging.getLogger(__name__)
 
 __all__ = ["AutofocusTriggers", "TriggerConfig"]
+
+#: The observation kinds an autofocus may be inserted before.
+FOCUS_BEFORE = ("expose", "spectrum")
 
 
 @dataclass
@@ -247,7 +252,9 @@ class AutofocusTriggers:
     def _autofocus_for(
         self, telescope: str, nxt: Observation | Idle | None, dry_run: bool = False
     ) -> Observation | None:
-        if not isinstance(nxt, Observation) or not nxt.light or nxt.kind != "expose":
+        # Before light frames and before spectra (legacy rv_control focused
+        # on the target before guiding on the fiber).
+        if not isinstance(nxt, Observation) or not nxt.light or nxt.kind not in FOCUS_BEFORE:
             return None
         reason = self.due(telescope)
         if reason is None:

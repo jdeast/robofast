@@ -685,11 +685,15 @@ class GuiderRemote:
         self._poll: asyncio.Task | None = None
         self.started = False
 
-    async def _call(self, method: str, path: str, body: Any = None) -> dict[str, Any]:
+    async def _call(
+        self, method: str, path: str, body: Any = None, timeout: float | None = None
+    ) -> dict[str, Any]:
         import httpx
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
+            async with httpx.AsyncClient(
+                timeout=timeout or self.timeout, trust_env=False
+            ) as client:
                 r = await client.request(method, self.url + path, json=body)
         except httpx.HTTPError as exc:
             raise GuiderError(f"guider {method} {path}: {type(exc).__name__}: {exc}") from exc
@@ -723,6 +727,18 @@ class GuiderRemote:
         if self.registry is not None:
             self._poll = asyncio.create_task(self._poll_loop(), name=f"guider-poll-{self.scope}")
         return st
+
+    async def locate(self, timeout: float | None = None) -> tuple[float, float]:
+        """Find the fiber with the backlight (``POST /locate``); it becomes
+        the guide target. Raises :class:`GuiderError` (bounded)."""
+        bound = timeout if timeout is not None else self.acquire_timeout
+        try:
+            async with asyncio.timeout(bound):
+                data = await self._call("POST", "/locate", {}, timeout=bound)
+        except TimeoutError as exc:
+            raise GuiderError(f"guider {self.scope}: fiber not located in {bound} s") from exc
+        x, y = data["target"]
+        return float(x), float(y)
 
     async def check(self) -> None:
         """Raise :class:`GuiderError` if the guider gave up (failed) or

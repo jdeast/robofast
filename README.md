@@ -13,3 +13,6 @@ infrastructure.
 
 If you write code to support new hardware, please consider a pull request or sending
 it to me so other users can use (and improve) it.
+
+To see the new core (`robofast_core/`) run a whole simulated MINERVA RV night
+on your machine, see [docs/demo.md](docs/demo.md).

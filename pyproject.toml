@@ -32,9 +32,10 @@ pythonpath = ["."]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 # The simulator tests need OmniSim; run them with `-m alpaca_sim`.
-addopts = "-ra -m 'not alpaca_sim'"
+addopts = "-ra -m 'not alpaca_sim and not e2e'"
 timeout = 120
 markers = [
+    "e2e: the whole simulated night (tests/e2e; docs/demo.md), a few minutes",
     "alpaca_sim: integration test against the ASCOM Alpaca OmniSimulators (needs ROBOFAST_OMNISIM_BIN or ROBOFAST_OMNISIM_ADDRESS)",
 ]
 log_level = "INFO"

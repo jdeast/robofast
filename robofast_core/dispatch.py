@@ -72,7 +72,22 @@ none, so it is never sent to a telescope that would observe through the
 wrong port), and one naming a ``filter`` only for telescopes whose
 ``filters`` (if given) include it. The sequencer then selects them.
 
-Nothing observable now is :class:`~robofast_core.plan.Idle` (ask again in
+Spectra fed by several telescopes
+---------------------------------
+A ``SPECTRUM`` configuration (:mod:`robofast_core.request_model`) is taken
+with the enclosure's fiber-fed spectrograph. The telescope that picks it
+*leads* it: its observation (``kind="spectrum"``) names a ``feed`` -- itself
+plus every other telescope the request allows that is free (not in a visit
+of its own) and passes the hard constraints for it now. Each of those is
+*reserved* for it: when it next asks, it gets the same spectrum as a member
+(``spectrum["leader"]`` names the leader), and an idle one is woken through
+the sequencer's ``preempt`` (policy ``next``, nothing is interrupted). The
+sequencer starts the exposure once the feed is guiding (or after its ready
+timeout, with those that are). Only the leader's report changes the
+request's status; a member's report just ends its reservation, as does the
+leader's report or the leader moving on.
+
+
 ``idle_poll``), not "done": the night may bring a rising target or a ToO.
 The night is over (``None``) once the Sun is above ``max_sun_alt`` and
 rising. :meth:`DispatchScheduler.peek` answers the same question without
@@ -139,7 +154,7 @@ import logging
 import math
 import os
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -312,6 +327,9 @@ class DispatchScheduler:
         #: Decisions, for inspection: (time, telescope, request id or None, score).
         self.decisions: list[tuple[datetime, str, str | None, float]] = []
         self._current: dict[str, _Visit] = {}
+        #: Spectrum feed reservations: member telescope -> (leader, the
+        #: leader's observation).
+        self._members: dict[str, tuple[str, Observation]] = {}
         self._idle: set[str] = set()
         self._too: dict[str, _TooState] = {}
         self._preempt: PreemptCallback | None = None
@@ -337,12 +355,29 @@ class DispatchScheduler:
     async def next_observation(self, telescope: str) -> Observation | Idle | None:
         now = self.clock()
         self._expire(now)
+        member = self._member_observation(telescope)
+        if member is not None:
+            self._idle.discard(telescope)
+            assert member.spectrum is not None
+            lead = self._current[member.spectrum["leader"]]
+            self._record(
+                now,
+                "join",
+                telescope=telescope,
+                request=lead.request.id,
+                config=lead.config.id,
+                leader=member.spectrum["leader"],
+                observation=member.name,
+                spectrum=member.spectrum["id"],
+            )
+            return member
         sky_now = sky.sky_now(self.site, now)
         visit = self._current.get(telescope)
         if visit is not None:
             why = self._continue_check(telescope, visit, now, sky_now)
             if why is None:
                 obs = self._observation(visit)
+                self._feed(telescope, visit, obs, now, sky_now)
                 self._record(
                     now,
                     "continue",
@@ -351,6 +386,7 @@ class DispatchScheduler:
                     config=visit.config.id,
                     observation=obs.name,
                 )
+                self._wake_feed(obs)
                 return obs
             self._abandon(telescope, visit, why, now)
         if sky_now.sun_alt > self.config.max_sun_alt and sky_now.sun_rising:
@@ -380,6 +416,7 @@ class DispatchScheduler:
             ", ".join(f"{k}={v:.3f}" for k, v in best.terms.items()),
         )
         obs = self._observation(visit)
+        self._feed(telescope, visit, obs, now, sky_now)
         self._record(
             now,
             "decision",
@@ -392,12 +429,16 @@ class DispatchScheduler:
             terms=best.terms,
             **self._summary(best, cands),
         )
+        self._wake_feed(obs)
         return obs
 
     async def peek(self, telescope: str) -> Observation | Idle | None:
         """What :meth:`next_observation` would answer now, without handing
         it out, recording it or changing any state."""
         now = self.clock()
+        member = self._member_observation(telescope)
+        if member is not None:
+            return member
         sky_now = sky.sky_now(self.site, now)
         visit = self._current.get(telescope)
         if visit is not None and self._continue_check(telescope, visit, now, sky_now) is None:
@@ -418,10 +459,27 @@ class DispatchScheduler:
         files: list[str] | None = None,
     ) -> None:
         self.history.append((telescope, obs.name, outcome, frames))
+        if obs.spectrum is not None and obs.spectrum.get("leader") not in (None, telescope):
+            # A member of another telescope's spectrum: only its reservation ends.
+            held = self._members.get(telescope)
+            if held is not None and held[1].spectrum is not None:
+                if held[1].spectrum["id"] == obs.spectrum["id"]:
+                    del self._members[telescope]
+            self._record(
+                self.clock(),
+                "member_outcome",
+                telescope=telescope,
+                leader=obs.spectrum["leader"],
+                observation=obs.name,
+                outcome=outcome,
+                frames=frames,
+            )
+            return
         visit = self._current.get(telescope)
         if visit is None or visit.obs is not obs:
             log.warning("%s: report for an observation not handed out: %s", telescope, obs.name)
             return
+        self._release_members(telescope)
         config = visit.config
         self._record(
             self.clock(),
@@ -536,8 +594,9 @@ class DispatchScheduler:
 
     def current(self) -> dict[str, dict[str, Any]]:
         """What each busy telescope is doing: request, configuration,
-        observation and visit start (for status reports)."""
-        return {
+        observation and visit start (for status reports). A telescope
+        feeding another's spectrum shows the leader's, with ``leader``."""
+        out = {
             tel: {
                 "group": v.request.group.id if v.request.group else None,
                 "request": v.request.id,
@@ -548,6 +607,10 @@ class DispatchScheduler:
             }
             for tel, v in self._current.items()
         }
+        for tel, (leader, obs) in self._members.items():
+            if tel not in out and leader in out and obs.name == out[leader]["observation"]:
+                out[tel] = {**out[leader], "leader": leader}
+        return out
 
     def check_toos(self) -> None:
         """Expire ToOs past their deadline; for each one now observable, wake
@@ -791,9 +854,12 @@ class DispatchScheduler:
         sky_now: sky.SkyNow,
         reasons: list[str],
         configs: list[Configuration] | None = None,
+        lead: str | None = None,
     ) -> list[tuple[Configuration, datetime, datetime]]:
         """The non-positional constraints; returns each remaining
-        configuration's planned [start, end]."""
+        configuration's planned [start, end]. ``lead``: the telescope whose
+        spectrum this one would feed (its use of the spectrograph is no
+        obstacle)."""
         if configs is None:
             if req.done:
                 reasons.append("done")
@@ -816,6 +882,11 @@ class DispatchScheduler:
                     and ic.filter not in limits.filters
                 ):
                     reasons.append(f"{telescope} has no filter {ic.filter!r}")
+        if any(c.type == "SPECTRUM" for c in configs):
+            for tel, v in self._current.items():
+                if tel not in (telescope, lead) and v.cfg < len(v.configs):
+                    if v.config.type == "SPECTRUM":
+                        reasons.append(f"spectrograph in use by {tel}")
         too = req.group.too
         if too is not None:
             if now > too.deadline:
@@ -1051,6 +1122,101 @@ class DispatchScheduler:
         if visit.config.status.schedulable:
             visit.config.status = Status.ATTEMPTED
         del self._current[telescope]
+        self._release_members(telescope)
+
+    # -- spectra fed by several telescopes ---------------------------------------
+
+    def _member_observation(self, telescope: str) -> Observation | None:
+        """The spectrum ``telescope`` is reserved to feed, if its leader is
+        still on it (else the stale reservation is dropped)."""
+        held = self._members.get(telescope)
+        if held is None:
+            return None
+        leader, obs = held
+        visit = self._current.get(leader)
+        if visit is None or visit.obs is not obs:
+            del self._members[telescope]
+            return None
+        assert obs.spectrum is not None
+        return replace(obs, spectrum={**obs.spectrum, "leader": leader})
+
+    def _release_members(self, leader: str) -> None:
+        for tel in [t for t, (lead, _) in self._members.items() if lead == leader]:
+            del self._members[tel]
+
+    def _feed(
+        self, telescope: str, visit: _Visit, obs: Observation, now: datetime, sky_now: sky.SkyNow
+    ) -> None:
+        """For a spectrum: the telescopes that feed it with ``telescope`` (the
+        free ones that may take the request now), reserved for it (module
+        doc); :meth:`_wake_feed` then wakes the idle ones."""
+        if obs.spectrum is None:
+            return
+        self._release_members(telescope)
+        req = visit.request
+        busy = set(self._current) | set(self._members)
+        feed = [telescope]
+        for tel in sorted(self.limits):
+            if tel == telescope or tel in busy:
+                continue
+            if any(
+                s.reserved_for == tel and s.reserved_until is not None and now < s.reserved_until
+                for rid, s in self._too.items()
+                if rid != req.id
+            ):
+                continue  # held for a ToO
+            cand = self._evaluate_for_feed(tel, req, visit, now, sky_now, telescope)
+            if cand:
+                feed.append(tel)
+        obs.spectrum["feed"] = feed
+        obs.spectrum["leader"] = telescope
+        for tel in feed[1:]:
+            self._members[tel] = (telescope, obs)
+
+    def _wake_feed(self, obs: Observation) -> None:
+        """Wake the idle members of a spectrum's feed (after the decision is
+        recorded, so a replay meets the wake-ups in the same order)."""
+        if obs.spectrum is None:
+            return
+        for tel in obs.spectrum["feed"][1:]:
+            if tel in self._idle:
+                self._call_preempt(tel, "next", f"feed {obs.spectrum['id']}")
+
+    def _evaluate_for_feed(
+        self,
+        telescope: str,
+        req: Request,
+        visit: _Visit,
+        now: datetime,
+        sky_now: sky.SkyNow,
+        visit_lead: str,
+    ) -> bool:
+        """Whether ``telescope`` passes the hard constraints for the rest of
+        ``visit`` (led by ``visit_lead``) now, as if it took the request."""
+        cand = Candidate(req, False)
+        try:
+            parts = self._precheck(
+                telescope,
+                self.limits[telescope],
+                req,
+                now,
+                sky_now,
+                cand.reasons,
+                visit.configs[visit.cfg :],
+                lead=visit_lead,
+            )
+            if not cand.reasons:
+                rows = [
+                    (c.target.ra_hours, c.target.dec_deg, [t0, t0 + (t1 - t0) / 2, t1])
+                    for c, t0, t1 in parts
+                    if c.light
+                ]
+                self._sky_checks(
+                    self.limits[telescope], cand, parts, self._altitudes(rows), sky_now
+                )
+        except Exception as exc:
+            self._error(now, req, exc, cand)
+        return not cand.reasons
 
     def _new_visit(self, req: Request, now: datetime, score: float) -> _Visit:
         configs = [c for c in req.configurations if c.status.schedulable]
@@ -1067,6 +1233,23 @@ class DispatchScheduler:
         c = visit.config
         ic = c.instrument_configs[visit.ic]
         suffix = f"+{visit.done}" if visit.done else ""
+        if c.type == "SPECTRUM":
+            return Observation(
+                f"{c.target.name} [{c.id}#{visit.ic}{suffix}]",
+                ra_hours=c.target.ra_hours,
+                dec_deg=c.target.dec_deg,
+                exptime=ic.exptime,
+                count=ic.count - visit.done,
+                allow_partial=c.allow_partial,
+                object=c.target.name,
+                kind="spectrum",
+                spectrum={
+                    "id": f"{c.id}#{visit.ic}{suffix}@{visit.started.strftime('%Y%m%dT%H%M%S.%f')}",
+                    "iodine": ic.iodine,
+                    "target_counts": ic.target_counts,
+                    "target": c.target.to_dict(),
+                },
+            )
         if c.type == "AUTO_FOCUS":
             return Observation(
                 f"{c.target.name} [{c.id}#{visit.ic}]",

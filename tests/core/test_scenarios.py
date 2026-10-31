@@ -108,6 +108,7 @@ async def test_s3_stuck_task_is_quarantined_and_never_revived(make_rig, monkeypa
     rig.weather.set_safe(True)
     await asyncio.sleep(1.5)  # far past the hold
     assert seq.quarantined
+    await wait_until(lambda: rig.supervisor.lease.quarantined, 1, what="supervisor told")
     assert rig.timeline.events("cancel_not_acknowledged")
     assert len(rig.timeline.events("observe_start")) == 1
     assert rig.dome_closed()

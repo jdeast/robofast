@@ -1,0 +1,38 @@
+# Example systemd unit for the sequencer of one enclosure (instance %i).
+# Not installed anywhere; copy and adapt. Paths below are placeholders, and
+# the command is the test sequencer until a production entry point exists.
+#
+#   systemctl enable --now robofast-sequencer@enclosure1
+#
+# One unit per enclosure is what keeps a single sequencer per lease holder
+# (--name): a restarted process uses the same name, so it can recover the
+# lease its crashed predecessor left behind (see robofast_core/sequencer.py).
+#
+# On a crash it is restarted after RestartSec. The new process waits for the
+# old lease to lapse (lease_ttl), aborts the exposure and parks, then recovers
+# the lease; the supervisor reopens after its usual checks. Exit status 3
+# (quarantined, or gave up for the night) needs an operator: no restart. If it
+# keeps crashing, systemd stops trying after StartLimitBurst and the
+# supervisor raises its orphaned-lease alarm.
+
+[Unit]
+Description=robofast sequencer (%i)
+After=network-online.target robofast-supervisor@%i.service
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=robofast
+WorkingDirectory=/opt/robofast
+ExecStart=/opt/robofast/venv/bin/python -m robofast_core.testing.run_sequencer --name %i --supervisor http://127.0.0.1:8100 --devices 127.0.0.1:11111
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=3
+# SIGTERM cancels the observation, cleans up (bounded by cancel_ack_timeout
+# and park_timeout) and releases the lease; allow for that before SIGKILL.
+TimeoutStopSec=180
+
+[Install]
+WantedBy=multi-user.target

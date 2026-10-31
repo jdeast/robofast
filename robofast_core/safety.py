@@ -25,6 +25,24 @@ Its loops run under one ``TaskGroup``:
 
 The supervisor holds the dome owner's single *privileged* grant: the owner
 refuses ``OpenShutter``/``CloseShutter`` from anyone else.
+
+Recovering from a sequencer crash
+---------------------------------
+A sequencer that dies holding a lease leaves it revoked (unrenewed) but never
+released, and no new lease is granted while one is outstanding. Only two
+things clear such an *orphan*, and only once it is no longer live and the
+enclosure is confirmed closed:
+
+* :meth:`SafetySupervisor.recover` -- the restarted sequencer (same
+  ``holder``), after it has aborted the exposure and parked;
+* :meth:`SafetySupervisor.clear` -- an operator, logged with their name.
+
+The supervisor never clears an orphan by itself: it cannot know that the
+telescope is safe. After ``orphan_timeout`` it alarms instead. A lease the
+sequencer *quarantined* (its task ignored cancellation) is never recovered,
+only cleared. And with a telescope configured, no lease is granted until the
+telescope reports ``AtPark``, so nothing reopens on a telescope that a crash
+or a failed cleanup left unparked.
 """
 
 from __future__ import annotations
@@ -34,6 +52,7 @@ import enum
 import itertools
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -58,6 +77,10 @@ class Shutter(enum.IntEnum):
 
 class LeaseRevoked(Exception):
     pass
+
+
+class RecoveryRefused(Exception):
+    """The supervisor will not (yet) release this lease; the message says why."""
 
 
 @dataclass
@@ -85,6 +108,9 @@ class SafetyConfig:
     heartbeat_interval: float | None = None
     #: Ping only while the enclosure loop finished a pass within this long.
     heartbeat_max_loop_age: float = 15.0
+    #: Alarm when a revoked lease is still unreleased this long after its
+    #: revocation (its sequencer died and has not been restarted).
+    orphan_timeout: float = 600.0
 
 
 class OpenLease:
@@ -103,6 +129,8 @@ class OpenLease:
         self.granted_at = time.monotonic()
         self.renewed_at = self.granted_at
         self.revoke_reason: str | None = None
+        self.revoked_at: float | None = None
+        self.quarantined = False
         self.revoked = asyncio.Event()
         self.opened = asyncio.Event()
         self.released = asyncio.Event()
@@ -122,12 +150,30 @@ class OpenLease:
     def release(self) -> None:
         self.released.set()
 
+    def quarantine(self) -> None:
+        """Hold the lease on purpose: it may then only be cleared by an operator."""
+        self.quarantined = True
+
     def _revoke(self, reason: str) -> bool:
         if self.revoked.is_set():
             return False
         self.revoke_reason = reason
+        self.revoked_at = time.monotonic()
         self.revoked.set()
         return True
+
+    def state(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "holder": self.holder,
+            "ttl": self.ttl,
+            "live": self.live,
+            "opened": self.opened.is_set(),
+            "revoked": self.revoked.is_set(),
+            "reason": self.revoke_reason,
+            "released": self.released.is_set(),
+            "quarantined": self.quarantined,
+        }
 
     async def wait_open(self) -> None:
         """Return once the supervisor has confirmed the enclosure is open."""
@@ -186,7 +232,7 @@ class SafetySupervisor:
         self._enforced_at: float | None = None
         self._pinged_at: float | None = None
         self.shutter: int | None = None
-        self.alarms: list[str] = []
+        self.alarms: deque[str] = deque(maxlen=100)
 
     # -- public state -----------------------------------------------------
 
@@ -220,6 +266,7 @@ class SafetySupervisor:
             "open_allowed": self.open_allowed(),
             "shutter": None if self.shutter is None else Shutter(self.shutter).name,
             "lease": repr(lease) if lease else None,
+            "orphaned_for": self._orphan_age(now),
             "alarms": list(self.alarms),
             "enforced_ago": None if self._enforced_at is None else now - self._enforced_at,
             "pinged_ago": None if self._pinged_at is None else now - self._pinged_at,
@@ -227,13 +274,33 @@ class SafetySupervisor:
 
     # -- leases -----------------------------------------------------------
 
-    def _can_grant(self) -> bool:
-        prev = self._lease
-        return self.open_allowed() and (prev is None or prev.released.is_set())
+    def outstanding(self) -> OpenLease | None:
+        """The lease that blocks new grants (granted, not yet released), if any."""
+        lease = self._lease
+        return None if lease is None or lease.released.is_set() else lease
+
+    async def lease_status(self) -> dict[str, Any] | None:
+        lease = self.outstanding()
+        return None if lease is None else lease.state()
+
+    async def _telescope_parked(self) -> bool:
+        """True if no telescope is configured, or it reports AtPark (read-only)."""
+        if self._tel is None:
+            return True
+        try:
+            if await self._tel.get("AtPark", timeout=self.config.read_timeout):
+                return True
+            self._alarm("telescope not parked: no lease is granted until it is")
+        except DeviceError as exc:
+            self._alarm(f"cannot confirm the telescope is parked: {exc}")
+        return False
 
     async def request_open(self, holder: str) -> OpenLease:
-        """Wait until opening is allowed and no earlier lease is outstanding."""
-        while not self._can_grant():
+        """Wait until opening is allowed, no earlier lease is outstanding, and
+        the telescope (if configured) is parked."""
+        while not (
+            self.open_allowed() and self.outstanding() is None and await self._telescope_parked()
+        ):
             await asyncio.sleep(min(self.config.poll_interval, 1.0))
         lease = OpenLease(next(self._lease_ids), holder, self.config.lease_ttl)
         self._lease = lease
@@ -245,6 +312,56 @@ class SafetySupervisor:
         lease = self._lease
         if lease is not None and lease._revoke(reason):
             self.timeline.event(self.name, "lease_revoked", lease=lease.id, reason=reason)
+
+    async def recover(self, lease_id: int, holder: str) -> bool:
+        """A restarted sequencer releases its predecessor's lease, after cleanup.
+
+        Refused (:class:`RecoveryRefused`) for another holder's lease, a live
+        or quarantined lease, or while the enclosure is not confirmed closed.
+        Idempotent: True if released now, False if it already was.
+        """
+        lease = self.outstanding()
+        if lease is not None and lease.id == lease_id:
+            if lease.holder != holder:
+                raise RecoveryRefused(f"lease #{lease_id} belongs to {lease.holder!r}")
+            if lease.quarantined:
+                raise RecoveryRefused(
+                    f"lease #{lease_id} is quarantined; an operator must clear it"
+                )
+        return await self._release_stale(lease_id, "lease_recovered")
+
+    async def clear(self, lease_id: int, operator: str, reason: str) -> bool:
+        """An operator releases a dead (or quarantined) lease, having made sure
+        the telescope is safe. Otherwise the same conditions as :meth:`recover`."""
+        released = await self._release_stale(
+            lease_id, "lease_cleared", operator=operator, reason=reason
+        )
+        if released:
+            log.warning("%s: lease #%d cleared by %s: %s", self.name, lease_id, operator, reason)
+        return released
+
+    async def _release_stale(self, lease_id: int, event: str, **detail: Any) -> bool:
+        lease = self._lease
+        if lease is None or lease.id < lease_id:
+            raise RecoveryRefused(f"no lease #{lease_id}")
+        if lease.id > lease_id or lease.released.is_set():
+            return False  # released already (a newer lease implies it)
+        if lease.live:
+            raise RecoveryRefused(f"lease #{lease_id} is live")
+        if await self._shutter_status() != Shutter.CLOSED:
+            raise RecoveryRefused("enclosure not confirmed closed yet")
+        if lease.released.is_set():
+            return False  # a concurrent recover/clear won the race during the read
+        lease.release()
+        self.timeline.event(self.name, event, lease=lease_id, holder=lease.holder, **detail)
+        return True
+
+    def _orphan_age(self, now: float) -> float | None:
+        """How long the outstanding lease has been revoked, if it has been."""
+        lease = self.outstanding()
+        if lease is None or lease.revoked_at is None:
+            return None
+        return now - lease.revoked_at
 
     # -- safety state -----------------------------------------------------
 
@@ -324,6 +441,13 @@ class SafetySupervisor:
         lease = self._lease
         if lease is not None and lease.live and lease.expired(now):
             self._revoke_lease(f"lease not renewed within {lease.ttl} s")
+        orphaned_for = self._orphan_age(now)
+        if lease is not None and orphaned_for is not None and orphaned_for > cfg.orphan_timeout:
+            self._alarm(
+                f"lease #{lease.id} ({lease.holder}) orphaned: unreleased"
+                f" {cfg.orphan_timeout:g} s after revocation; restart its sequencer"
+                " or have an operator clear it"
+            )
         if self._want_open(now):
             await self._ensure_open()
         else:

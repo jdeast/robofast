@@ -52,3 +52,10 @@ def test_overlapping_generations_are_caught():
     tl.event("seq", "cleanup_done", gen=1)
     with pytest.raises(AssertionError, match="not finished"):
         assert_generations_disjoint(tl, "seq")
+
+
+def test_timeline_maxlen_keeps_the_latest_entries():
+    tl = Timeline(maxlen=3)
+    for i in range(5):
+        tl.event("x", "tick", i=i)
+    assert [e.detail["i"] for e in tl.entries()] == [2, 3, 4]

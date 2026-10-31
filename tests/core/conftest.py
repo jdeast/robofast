@@ -54,6 +54,7 @@ FAST_SEQ = dict(
     park_timeout=2.0,
     error_backoff=0.5,
     max_consecutive_errors=2,
+    recover_poll=0.1,
 )
 #: RemoteSupervisor timings for the "remote" lease path.
 FAST_REMOTE = dict(timeout=0.5, poll=0.3, retry=0.1)

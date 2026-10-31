@@ -263,7 +263,7 @@ each run.
   in the enclosure config enables this, and needs its `focuser`.
 * **Requests.** A request configuration with `"type": "AUTO_FOCUS"` (as in
   the LCO OCS) and one light instrument config becomes such an observation
-  (its filter and port; a positive exptime overrides the autofocus
+  (its filter and port; a positive `exposure_time` overrides the autofocus
   exposure time).
 * **Triggers.** `autofocus_triggers` in the enclosure config wraps the plan
   in `AutofocusTriggers`. That inserts an autofocus, on the field, filter

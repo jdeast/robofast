@@ -6,8 +6,9 @@ next observation, and it decides from scratch, RTS2/POCS-style:
 
 1. **Hard constraints** (every one must hold, or the request is excluded):
 
-   * the telescope may take it: it is in the request's ``telescopes`` (if
-     given) and has every configuration's ``instrument``;
+   * the telescope may take it: it is in the request's ``telescopes``
+     (``location.telescope`` or ``extra_params.telescopes``, if given) and
+     has every configuration's ``instrument_type``;
    * the request is schedulable: some configuration is ``PENDING`` or
      ``ATTEMPTED``, and no other telescope is in the middle of it;
    * time: the whole visit (``now`` to ``now + duration``) fits in one of
@@ -20,7 +21,9 @@ next observation, and it decides from scratch, RTS2/POCS-style:
    * for each light configuration, at the start, middle and end of its part
      of the visit: altitude within the telescope's ``[min_alt, max_alt]``,
      airmass at most ``max_airmass``; hour angle within ``[min_ha, max_ha]``
-     at its start and end; and the Moon at least ``min_moon_sep`` away.
+     at its start and end; and the Moon at least ``min_moon_sep`` away
+     (a configuration's ``min_lunar_distance``) and, if the configuration
+     sets ``max_lunar_phase``, at most that fraction illuminated.
      A configuration's ``constraints`` can only tighten these limits.
 
    **An error is not "observable".** An exception while evaluating a request
@@ -38,7 +41,7 @@ next observation, and it decides from scratch, RTS2/POCS-style:
              + w_airmass  * airmass_at_transit / airmass_now
              + w_cadence  * min(1, max(0, (t_since_last - min_interval) / min_interval))
 
-   ``priority`` is the request group's. ``t_left`` is the time until the
+   ``priority`` is the request group's ``ipp_value``. ``t_left`` is the time until the
    target can no longer be observed: it sinks below ``min_alt``, reaches
    ``max_ha``, its window ends, or (a ToO) its deadline passes -- so a
    target about to be lost gets up to ``w_setting`` extra. The airmass term
@@ -116,7 +119,9 @@ a snapshot of the scheduler (requests, state, limits, settings), so
 Targets of opportunity (design.md 3.7.1)
 ----------------------------------------
 :meth:`DispatchScheduler.submit_too` (or a JSON file dropped into
-``too_dropbox``) adds a request group with a ``too`` entry. A ToO ranks
+``too_dropbox``) adds a request group whose ``observation_type`` is
+``RAPID_RESPONSE`` or ``TIME_CRITICAL`` (its ``too``: deadline, policy,
+class; :mod:`robofast_core.request_model`). A ToO ranks
 above every normal request; it is taken only when it passes the hard
 constraints; it stays pending until then, and expires at its deadline. When
 it arrives, and every ``too_poll`` seconds while it waits, the scheduler
@@ -193,6 +198,32 @@ log = logging.getLogger(__name__)
 #: A callback ``(telescope, policy, reason) -> accepted`` (the sequencer's
 #: :meth:`~robofast_core.sequencer.Sequencer.preempt`).
 PreemptCallback = Callable[[str, str, str], bool]
+
+
+_ILLUMINATION: dict[datetime, float] = {}
+
+
+def _moon_illumination(sky_now: sky.SkyNow) -> float:
+    """The Moon's illuminated fraction at ``sky_now.when`` (0 new, 1 full),
+    from its elongation from the Sun; cached per instant (only configurations
+    with ``max_lunar_phase`` need it)."""
+    when = sky_now.when
+    if when not in _ILLUMINATION:
+        from astropy.coordinates import angular_separation, get_body
+        from astropy.time import Time
+
+        try:
+            sun, moon = get_body("sun", Time(when)), sky_now.moon
+            # (Plain angles: the Moon's topocentric GCRS against the Sun's
+            # geocentric differ by under a degree, which is negligible here.)
+            elong = float(angular_separation(moon.ra, moon.dec, sun.ra, sun.dec).to_value("rad"))
+            _ILLUMINATION[when] = (1.0 - math.cos(elong)) / 2.0
+        except Exception as exc:  # a NaN fails the constraint
+            log.error("Moon illumination at %s: %r", when, exc)
+            _ILLUMINATION[when] = math.nan
+        while len(_ILLUMINATION) > 64:
+            _ILLUMINATION.pop(next(iter(_ILLUMINATION)))
+    return _ILLUMINATION[when]
 
 
 @dataclass
@@ -582,7 +613,10 @@ class DispatchScheduler:
         if isinstance(group, dict):
             group = RequestGroup.from_dict(group)
         if group.too is None:
-            raise ValueError(f"request group {group.id!r} has no 'too' entry")
+            raise ValueError(
+                f"request group {group.id!r} is not a ToO (observation_type RAPID_RESPONSE"
+                " or TIME_CRITICAL)"
+            )
         now = self.clock()
         if group.submitted is None:
             group.submitted = now
@@ -867,6 +901,12 @@ class DispatchScheduler:
             return 0, 0
         return ic, done if 0 <= done < c.instrument_configs[ic].count else 0
 
+    def duration(self, c: Configuration) -> float:
+        """The time model's estimate of ``c``'s part of a visit (s): its
+        remaining frames with their readout, and a slew if it has light
+        frames."""
+        return self._duration(c)
+
     def _duration(self, c: Configuration) -> float:
         cfg = self.config
         start, done = self._remaining(c)
@@ -1023,6 +1063,13 @@ class DispatchScheduler:
             moon_limit = max(self.config.min_moon_sep, c.constraints.min_moon_sep or 0.0)
             if not (math.isfinite(sep) and sep >= moon_limit):
                 cand.reasons.append(f"{name}: {sep:.1f} deg from the Moon (limit {moon_limit:g})")
+            phase_limit = c.constraints.max_lunar_phase
+            if phase_limit is not None and phase_limit < 1.0:
+                phase = _moon_illumination(sky_now)
+                if not (math.isfinite(phase) and phase <= phase_limit):
+                    cand.reasons.append(
+                        f"{name}: Moon {phase:.2f} illuminated (limit {phase_limit:g})"
+                    )
 
     def _score(
         self,
@@ -1290,7 +1337,7 @@ class DispatchScheduler:
                     "id": f"{c.id}#{visit.ic}{suffix}@{visit.started.strftime('%Y%m%dT%H%M%S.%f')}",
                     "iodine": ic.iodine,
                     "target_counts": ic.target_counts,
-                    "target": c.target.to_dict(),
+                    "target": c.target.internal(),
                 },
             )
         if c.type == "AUTO_FOCUS":

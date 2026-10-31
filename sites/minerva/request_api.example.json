@@ -10,7 +10,11 @@
     "runs with --plan, that dispatch plan file; the API reads the scheduler's state file and writes the drop box.",
     "Give the enclosure config a status_file (robofast_core/sequencer_service.py) for per-telescope state in GET /status.",
     "data_path_template: where frames are expected to land (no files are served); fields: enclosure, night,",
-    "telescope, group, request, configuration, instrument_config, frame."
+    "telescope, group, request, configuration, instrument_config, frame.",
+    "The API speaks the LCO OCS request language and endpoints under /api (docs/request_language.md), so a TOM",
+    "uses TOM Toolkit's OCSFacility with settings only (docs/tom_facility.md). proposals: what clients may submit",
+    "under (and their TOM form offers); telescope_class: MINERVA's 0.7 m telescopes in OCS terms; site_code: the",
+    "site in /api/telescope_states keys."
   ],
   "listen": "127.0.0.1:8300",
   "tokens": "/etc/robofast/api-tokens.json",
@@ -22,5 +26,8 @@
   "rate_per_minute": 60,
   "rate_burst": 20,
   "validate_step": 900,
-  "data_path_template": "/data/minerva/{night}/{telescope}/{configuration}.{instrument_config}.{frame:04d}.fits"
+  "data_path_template": "/data/minerva/{night}/{telescope}/{configuration}.{instrument_config}.{frame:04d}.fits",
+  "proposals": {"rv-example": {"title": "MINERVA RV survey (example)"}},
+  "telescope_class": "0m7",
+  "site_code": "flwo"
 }

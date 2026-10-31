@@ -30,7 +30,7 @@ async def make_two(omnisim, omnisim2, weather, truth, truth2, request):
     rigs: list[SimRig] = []
     state, server = weather
 
-    def build(*, t1_camera: str | None = None, exptime: float = 60.0) -> SimRig:
+    def build(*, t1_camera: str | None = None, exptime: float = 60.0, plan=None) -> SimRig:
         tl = Timeline()
 
         def owner(name, kind, address, **kw):
@@ -63,7 +63,7 @@ async def make_two(omnisim, omnisim2, weather, truth, truth2, request):
                 TelescopeUnit(n, owners[f"{n}.telescope"], owners[f"{n}.camera"])
                 for n in ("t1", "t2")
             ],
-            plan=lambda: Observation("field", exptime=exptime, count=1000),
+            plan=plan or (lambda: Observation("field", exptime=exptime, count=1000)),
             timeline=tl,
             config=SequencerConfig(**SIM_SEQ),
         )
@@ -138,3 +138,50 @@ async def test_one_camera_hangs_the_other_keeps_observing(
     record_timing(t1_safed=safed)
     rig.weather.update(safe=False)
     await await_until(lambda: truth.closed() and truth2.parked(), BOUND, what="closed, parked")
+
+
+class _ToOPlan:
+    """ "field" forever; once ``too_pending`` is set, one "too" on t1."""
+
+    def __init__(self, exptime: float) -> None:
+        self.exptime = exptime
+        self.too_pending = False
+        self.history: list[tuple[str, str, str, int]] = []
+
+    async def next_observation(self, telescope: str) -> Observation:
+        if telescope == "t1" and self.too_pending:
+            self.too_pending = False
+            return Observation("too", exptime=1.0, count=1)
+        return Observation("field", exptime=self.exptime, count=1000)
+
+    def report(self, telescope: str, obs: Observation, outcome: str, frames: int) -> None:
+        self.history.append((telescope, obs.name, outcome, frames))
+
+
+async def test_preempt_one_telescope_now(make_two, truth, truth2, record_timing):
+    """A ToO preemption ("now") of t1 against real Alpaca devices: t1's
+    exposure is aborted and it starts the ToO without parking; t2 keeps
+    exposing; same lease (design.md 3.7.1)."""
+    plan = _ToOPlan(exptime=30.0)
+    rig = make_two(plan=plan)
+    await _both_observing(rig, truth, truth2)
+    await asyncio.sleep(1.0)
+    tl, seq = rig.timeline, rig.sequencer
+    plan.too_pending = True
+    t0 = time.monotonic()
+    assert seq.preempt("t1", "now", "sim ToO")
+    await wait_until(lambda: tl.events("preempted"), BOUND, what="t1 preempted")
+    preempted = time.monotonic() - t0
+    await wait_until(
+        lambda: any(e.detail["target"] == "too" for e in tl.events("target_start")),
+        60,
+        what="t1 starts the ToO",
+    )
+    too_start = time.monotonic() - t0
+    assert tl.events("preempted")[0].detail["aborted"]
+    assert ("t1", "field", "interrupted", 0) in plan.history
+    assert not await asyncio.to_thread(truth.parked)
+    assert await asyncio.to_thread(truth2.exposing)  # t2's exposure never stopped
+    assert len(tl.events("observe_start")) == 1 and rig.supervisor.lease.live
+    assert not any(h[0] == "t2" and h[2] != "complete" for h in plan.history)
+    record_timing(preempted=preempted, too_target_start=too_start)

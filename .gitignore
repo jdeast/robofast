@@ -10,3 +10,6 @@ __pycache__/
 .venv/
 # Weather-page credentials live outside the repository; never commit any.
 *.credentials
+# Created by running with sites/minerva/dispatch.example.json in place
+/sites/*/dispatch-state.json*
+/sites/*/too-dropbox/

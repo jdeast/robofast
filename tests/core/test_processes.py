@@ -338,7 +338,8 @@ async def test_twin_sequencers_race_to_recover(site):
     await wait_until(lambda: _lease(sup.url)["id"] != old["id"], 15, what="a new lease")
     await wait_until(site.observing, 10, what="observing again")
     assert sup.log_path.read_text().count("lease_recovered") == 1
-    assert _lease(sup.url)["id"] == old["id"] + 1
+    # > old + 1 when one twin's startup cleanup cut the other's first generation short
+    assert _lease(sup.url)["id"] >= old["id"] + 1
     assert all(t.proc.poll() is None for t in twins)
 
 

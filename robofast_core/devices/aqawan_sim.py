@@ -18,11 +18,17 @@ The heartbeat watchdog: ``HEARTBEAT`` restarts a ``heartbeat_timeout``
 countdown that is already expired at power-on. While it is expired the
 shutters may not open (``Success=FALSE, Heartbeat timer expired``), and if it
 runs out with a shutter not closed, the PAC closes sequentially by itself.
-``heartbeat_timeout`` of ``None`` disables the watchdog (for ConformU).
+``heartbeat_timeout`` of ``None`` disables the watchdog (for ConformU). Its
+default, 60 s, is the real PAC's timeout (confirmed by JDE, 2026-10-31); the
+supervisor must ping at least four times per timeout
+(``SafetyConfig.heartbeat_interval`` <= ``heartbeat_timeout``/4, as legacy
+did: "ensure 4 heartbeats before timeout").
 
 Fault injection (thread-safe methods, or ``SIM ...`` lines on the same port
 when it runs as a process): :meth:`set_fault` (an E-stop-like fault: motion
-stops and is refused; ``clearable=False`` survives ``CLEAR_FAULTS``),
+stops and is refused; ``clearable=False`` survives ``CLEAR_FAULTS``;
+``blocks_motion=False`` is a fault that only refuses opening, so a close
+still works),
 :meth:`set_error`, :meth:`set_door`, :meth:`set_op_mode` (``MANUAL`` refuses
 motion), :meth:`set_mode`: ``ok``, ``hang`` (read, never answer), ``silent``
 (close every connection at once), ``garble`` (truncate ``STATUS``), ``slow``
@@ -30,7 +36,11 @@ motion), :meth:`set_mode`: ``ok``, ``hang`` (read, never answer), ``silent``
 
 Status values the legacy code never shows (door states, the meaning of
 ``Heartbeat``, a stopped shutter's state) are guesses: doors ``OPEN``/
-``CLOSED``, ``Heartbeat`` = seconds left, a stopped shutter ``STOPPED``.
+``CLOSED``, ``Heartbeat`` = seconds left, a stopped shutter ``STOPPED``. The
+server does not depend on the last one: any shutter string it does not know
+is ``shutterError``, and it logs the raw string so the real one is learned.
+An E-stop-like fault stops motion here, so a shutter is "closed and faulted" or "stopped
+part-way and faulted"; the server keeps the two apart.
 
 Run it standalone::
 
@@ -102,6 +112,7 @@ class AqawanSim:
         self._hb_deadline: float | None = None  # expired at power-on
         self.fault: str | None = None
         self.fault_clearable = True
+        self.fault_blocks_motion = True
         self.error: str | None = None
         self.doors = {"EntryDoor1": "CLOSED", "EntryDoor2": "CLOSED", "PanelDoor": "CLOSED"}
         self.op_mode = "AUTO"
@@ -131,7 +142,7 @@ class AqawanSim:
                 s.state == "CLOSED" or s.target == "CLOSED" or n == self._then_close
                 for n, s in self._shutters.items()
             )
-            if not moving_closed and self.fault is None:
+            if not moving_closed and not (self.fault and self.fault_blocks_motion):
                 self.watchdog_trips += 1
                 log.warning("sim: heartbeat expired; closing")
                 self._close_sequential(now)
@@ -187,11 +198,14 @@ class AqawanSim:
 
     # -- fault injection --------------------------------------------------------
 
-    def set_fault(self, text: str | None, *, clearable: bool = True) -> None:
+    def set_fault(
+        self, text: str | None, *, clearable: bool = True, blocks_motion: bool = True
+    ) -> None:
         with self._lock:
             self._tick(time.monotonic())
             self.fault, self.fault_clearable = text, clearable
-            if text is not None:
+            self.fault_blocks_motion = blocks_motion
+            if text is not None and blocks_motion:
                 self._stop_all()
 
     def set_error(self, text: str | None) -> None:
@@ -251,7 +265,7 @@ class AqawanSim:
         return ", ".join(f"{k}={v}" for k, v in pairs)
 
     def _motion_refusal(self, now: float, opening: bool) -> str | None:
-        if self.fault:
+        if self.fault and (opening or self.fault_blocks_motion):
             return self.fault
         if self.op_mode != "AUTO":
             return "Enclosure not in AUTO"
@@ -326,6 +340,8 @@ class AqawanSim:
             self.set_fault(rest or None)
         elif what == "LATCHFAULT":
             self.set_fault(rest or "Estop active", clearable=False)
+        elif what == "SOFTFAULT":
+            self.set_fault(rest or "Motor overload", blocks_motion=False)
         elif what == "ERROR":
             self.set_error(rest or None)
         elif what == "DOOR" and len(args) == 3:

@@ -14,7 +14,7 @@ from robofast_core.testing.alpaca_server import FakeAlpacaServer
 from robofast_core.testing.checks import wait_until
 from robofast_core.testing.fakes import FakeDeviceError, FakeDome
 
-HEARTBEAT = dict(heartbeat_interval=0.05, heartbeat_max_loop_age=0.3)
+HEARTBEAT = dict(heartbeat_interval=0.05, heartbeat_timeout=0.4, heartbeat_max_loop_age=0.3)
 
 
 async def test_healthy_supervisor_keeps_the_enclosure_open(make_rig):
@@ -67,8 +67,21 @@ def test_heartbeat_interval_needs_a_heartbeat_device():
             dome=owner,
             safety_monitor=owner,
             timeline=tl,
-            config=SafetyConfig(heartbeat_interval=1.0),
+            config=SafetyConfig(heartbeat_interval=1.0, heartbeat_timeout=60.0),
         )
+
+
+def test_heartbeat_interval_is_checked_against_the_device_timeout():
+    """At least four pings per device timeout (legacy: "ensure 4 heartbeats
+    before timeout"); a config that cannot be checked is rejected too."""
+    assert SafetyConfig(heartbeat_interval=15, heartbeat_timeout=60).heartbeat_interval == 15
+    assert SafetyConfig().heartbeat_interval is None  # no heartbeat device: fine
+    with pytest.raises(ValueError, match="needs heartbeat_timeout"):
+        SafetyConfig(heartbeat_interval=10)
+    with pytest.raises(ValueError, match="4 pings"):
+        SafetyConfig(heartbeat_interval=16, heartbeat_timeout=60)
+    with pytest.raises(ValueError, match="> 0"):
+        SafetyConfig(heartbeat_interval=0, heartbeat_timeout=60)
 
 
 async def test_watchdog_closes_a_dome_without_a_heartbeat():

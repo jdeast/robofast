@@ -24,6 +24,7 @@ import pytest
 
 from robofast_core import (
     DeviceOwner,
+    NotAuthorized,
     Observation,
     SafetyConfig,
     SafetySupervisor,
@@ -53,6 +54,7 @@ from robofast_core.devices.aqawan_server import (
 from robofast_core.devices.aqawan_sim import AqawanSim
 from robofast_core.lease_client import RemoteSupervisor
 from robofast_core.safety import ENCLOSURE_MEMBERS
+from robofast_core.supervisor_service import SupervisorServer
 from robofast_core.testing.alpaca_server import FakeAlpacaServer
 from robofast_core.testing.checks import wait_until
 from robofast_core.testing.fakes import (
@@ -203,12 +205,23 @@ async def test_failed_first_shutter_stops_the_sequence(make_rig):
     ids=["fault", "error", "door", "manual"],
 )
 async def test_open_refused_by_interlocks(make_rig, inject, why):
-    rig = make_rig({"heartbeat_timeout": None})
+    rig = make_rig({"heartbeat_timeout": None}, interlock_doors=["EntryDoor2"])
     inject(rig.sim)
     dome = rig.dome()
     with pytest.raises(InvalidOperationException, match=why):
         await dome.call("OpenShutter")
     assert not [c for c in rig.sim.commands() if c.startswith("OPEN")]
+
+
+async def test_doors_are_not_interlocked_by_default(make_rig):
+    """Door state does not matter for observing (JDE, 2026-10-31)."""
+    assert AqawanConfig().interlock_doors == ()
+    rig = make_rig({"heartbeat_timeout": None})
+    rig.sim.set_door("EntryDoor1", "OPEN")
+    rig.sim.set_door("PanelDoor", "OPEN")
+    dome = rig.dome()
+    await dome.call("OpenShutter")
+    await until_status(dome, OPEN, 5)
 
 
 async def test_close_cancels_an_open_sequence(make_rig):
@@ -224,15 +237,25 @@ async def test_close_cancels_an_open_sequence(make_rig):
     assert "OPEN_SHUTTER_2" not in cmds and cmds.count("CLOSE_SEQUENTIAL") == 1
 
 
-async def test_abortslew_sends_stop(make_rig):
+async def test_abortslew_sends_stop(make_rig, caplog):
+    caplog.set_level("INFO", logger="robofast_core.devices.aqawan_server")
     rig = make_rig({"heartbeat_timeout": None, "open_time": 1.0})
     dome = rig.dome()
     await dome.call("OpenShutter")
     await asyncio.sleep(0.2)
     await dome.call("AbortSlew")
-    assert "STOP" in rig.sim.commands()
+    cmds = rig.sim.commands()
+    assert "STOP" in cmds
+    # STATUS is re-read after STOP, and the (unknown) raw string is logged.
+    assert cmds[cmds.index("STOP") + 1] == "STATUS"
     assert rig.sim.shutter_states()[0] == "STOPPED"
+    assert "after STOP: Shutter1='STOPPED'" in caplog.text
+    assert "unrecognised shutter state Shutter1='STOPPED'" in caplog.text
     await until_status(dome, ERROR, 2)  # neither open nor closed
+    # Logged once per distinct value, not on every poll.
+    await asyncio.sleep(0.3)
+    await dome.get("ShutterStatus")
+    assert caplog.text.count("unrecognised shutter state") == 1
 
 
 async def test_hung_pac_is_bounded(make_rig):
@@ -272,6 +295,112 @@ async def test_actions_and_unimplemented_members(make_rig):
     for member in ("Azimuth", "Altitude"):
         with pytest.raises(NotImplementedException):
             await dome.get(member)
+
+
+async def faults_text(dome, timeout: float = 2.0) -> dict:
+    """The Faults action, once the PAC's fault text has been fetched."""
+    t0 = time.monotonic()
+    while True:
+        f = json.loads(await dome.call("Action", "Faults", ""))
+        if f["faults"] or time.monotonic() - t0 > timeout:
+            return f
+        await asyncio.sleep(0.05)
+
+
+async def test_fault_is_a_separate_axis_from_position(make_rig):
+    """JDE 2026-10-31: "closed and fault" and "open and fault" are different
+    states; only the second is shutterError (so the supervisor closes)."""
+    rig = make_rig({"heartbeat_timeout": None})
+    dome = rig.dome()
+    actions = await dome.get("SupportedActions")
+    assert "Faults" in actions and "ClearFaults" in actions
+    f = json.loads(await dome.call("Action", "Faults", ""))
+    assert f == {
+        "fault": False,
+        "error": False,
+        "faults": None,
+        "errors": None,
+        "shutters": ["CLOSED", "CLOSED"],
+    }
+    # Closed and fault: the position stays closed; the channel says fault.
+    rig.sim.set_fault("Estop active")
+    await asyncio.sleep(0.15)
+    assert await dome.get("ShutterStatus") == CLOSED
+    f = await faults_text(dome)
+    assert f["fault"] is True and "Estop active" in f["faults"]
+    assert f["shutters"] == ["CLOSED", "CLOSED"]
+    with pytest.raises(InvalidOperationException, match="Fault=True"):
+        await dome.call("OpenShutter")
+    # Open and fault: shutterError; the close still goes through.
+    rig.sim.set_fault(None)
+    await asyncio.sleep(0.15)
+    await dome.call("OpenShutter")
+    await until_status(dome, OPEN, 5)
+    rig.sim.set_fault("Motor overload", blocks_motion=False)
+    await until_status(dome, ERROR, 2)
+    f = await faults_text(dome)
+    assert f["fault"] is True and f["shutters"] == ["OPEN", "OPEN"]
+    assert "Motor overload" in f["faults"]
+    await dome.call("CloseShutter")
+    await until_status(dome, CLOSED, 5)  # closed (and still faulted)
+    assert json.loads(await dome.call("Action", "Faults", ""))["fault"] is True
+
+
+async def test_clear_faults_is_privileged_and_needs_the_enclosure_closed(make_rig, caplog):
+    caplog.set_level("INFO", logger="robofast_core.devices.aqawan_server")
+    rig = make_rig({"heartbeat_timeout": None})
+    owner = rig.owner()
+    safety = owner.grant("safety", privileged=True)
+    sequencer = owner.grant("sequencer")
+    with pytest.raises(NotAuthorized):
+        await sequencer.call("Action", "ClearFaults", "sneaky")
+    await safety.call("OpenShutter")
+    await until_status(safety, OPEN, 5)
+    rig.sim.set_fault("Motor overload", blocks_motion=False)
+    with pytest.raises(InvalidOperationException, match="not closed"):
+        await safety.call("Action", "ClearFaults", "jde: testing")
+    assert "CLEAR_FAULTS" not in rig.sim.commands()
+    await safety.call("CloseShutter")
+    await until_status(safety, CLOSED, 5)
+    reply = await safety.call("Action", "ClearFaults", "jde: testing")
+    assert "Success=TRUE" in reply and rig.sim.fault is None
+    cmds = rig.sim.commands()
+    assert cmds.index("CLEAR_FAULTS") < cmds.index("CLEAR_ERRORS")
+    assert "ClearFaults requested (ClientID" in caplog.text and "jde: testing" in caplog.text
+    # A latched fault (an E-stop) is refused by the PAC, and the caller sees why.
+    rig.sim.set_fault("Estop active", clearable=False)
+    with pytest.raises(DriverException, match="Estop active"):
+        await safety.call("Action", "ClearFaults", "jde: again")
+    assert rig.sim.fault == "Estop active"
+
+
+async def test_contrary_motion_after_a_close_shows_at_once(make_rig):
+    """Once the PAC has acknowledged a close, ShutterStatus is the PAC's
+    report again, so a late duplicate OPEN (a re-send executed after the
+    close) shows as opening instead of hiding behind "closing"."""
+    rig = make_rig({"heartbeat_timeout": None, "open_time": 1.0, "close_time": 1.0})
+    dome = rig.dome()
+    await dome.call("OpenShutter")
+    await until_status(dome, OPEN, 5)
+    await dome.call("CloseShutter")
+    await wait_until(lambda: "CLOSING" in rig.sim.shutter_states(), 1, what="closing")
+    await asyncio.sleep(0.15)
+    assert await dome.get("ShutterStatus") == CLOSING  # acknowledged
+    rig.sim.execute("OPEN_SHUTTER_1")  # the late duplicate
+    await asyncio.sleep(0.15)
+    assert await dome.get("ShutterStatus") == OPENING  # within start_grace
+
+
+def test_shipped_configs():
+    """The heartbeat timeout is 60 s (JDE 2026-10-31); the site config pings
+    four times per timeout or more; doors are not interlocked."""
+    assert AqawanSim().heartbeat_timeout == 60.0
+    site = json.loads((ROOT / "sites/minerva/aqawan1.json").read_text())
+    scfg = SafetyConfig(**site["safety"])
+    assert scfg.heartbeat_timeout == 60 and scfg.heartbeat_interval <= 15
+    assert scfg.fault_action == "Faults"
+    deploy = json.loads((ROOT / "deploy/aqawan.example.json").read_text())
+    assert AqawanConfig.from_dict(deploy).interlock_doors == ()
 
 
 async def test_connection_is_per_client(make_rig):
@@ -417,6 +546,7 @@ SUP_SAFETY = {
     "dome_timeout": 4.0,
     "shutter_timeout": 10.0,
     "heartbeat_interval": 0.2,
+    "heartbeat_timeout": 1.5,  # the shortest PAC timeout used below
     "heartbeat_max_loop_age": 1.0,
 }
 
@@ -467,6 +597,130 @@ async def test_supervisor_closes_on_unsafe_weather(make_rig):
     finally:
         run.cancel()
         await asyncio.gather(run, return_exceptions=True)
+
+
+@dataclass
+class SupRig:
+    sup: SafetySupervisor
+    run: asyncio.Task
+    timeline: Timeline
+
+    async def stop(self) -> None:
+        self.run.cancel()
+        await asyncio.gather(self.run, return_exceptions=True)
+
+
+def start_supervisor(rig: Rig, **safety) -> SupRig:
+    tl = Timeline()
+    weather = FakeWeather(safe=True)
+    sm = DeviceOwner("safetymonitor", lambda: FakeSafetyMonitor(weather), tl, default_timeout=0.5)
+    dome = alpaca_owner(
+        "dome",
+        "dome",
+        rig.server.address,
+        tl,
+        default_timeout=4.0,
+        privileged_members=ENCLOSURE_MEMBERS,
+    )
+    rig.owners.append(dome)
+    sup = SafetySupervisor(
+        "safety",
+        dome=dome,
+        safety_monitor=sm,
+        heartbeat=dome,
+        timeline=tl,
+        config=SafetyConfig(**{**SUP_SAFETY, "fault_action": "Faults", **safety}),
+    )
+    return SupRig(sup, asyncio.create_task(sup.run()), tl)
+
+
+def close_commands(sim: AqawanSim) -> int:
+    return sum(c.startswith("CLOSE") for c in sim.commands())
+
+
+async def test_supervisor_open_and_fault_alarms_and_closes(make_rig):
+    rig = make_rig({"heartbeat_timeout": 2.0})
+    s = start_supervisor(rig)
+    try:
+        lease = await asyncio.wait_for(s.sup.request_open("tester"), 10)
+
+        async def renew() -> None:
+            while True:
+                lease.renew()
+                await asyncio.sleep(0.2)
+
+        renewer = asyncio.create_task(renew())
+        await asyncio.wait_for(lease.wait_open(), 15)
+        assert s.sup.fault is None and rig.sim.open()
+        # A fault that still lets the PAC close: the weather is fine and the
+        # lease is renewed, yet the supervisor closes.
+        rig.sim.set_fault("Motor overload", blocks_motion=False)
+        dt = await wait_until(rig.sim.closed, 5, what="closed on a fault")
+        renewer.cancel()
+        assert lease.revoked.is_set() and "Fault" in (lease.revoke_reason or "")
+        assert any(a.startswith("enclosure reports Fault") for a in s.sup.alarms)
+        assert any("FAULT WITH ENCLOSURE NOT CLOSED" in a for a in s.sup.alarms)
+        await wait_until(lambda: "Motor overload" in (s.sup.fault or ""), 2, what="fault text")
+        assert rig.sim.watchdog_trips == 0
+        print(f"open and fault: Aqawan sim closed {dt:.2f} s later")
+        # Closed and still faulted: nothing reopens, and the close is not re-sent.
+        closes = close_commands(rig.sim)
+        await asyncio.sleep(1.0)
+        assert rig.sim.closed() and close_commands(rig.sim) == closes
+        assert not s.sup.open_allowed()
+        # An operator clears it (the enclosure is closed); opening is allowed again.
+        assert "Success=TRUE" in await s.sup.clear_faults("jde", "tested the motor")
+        await wait_until(lambda: s.sup.fault is None, 3, what="fault cleared")
+        assert s.timeline.events("faults_cleared") and s.timeline.events("enclosure_fault_cleared")
+        lease.release()
+        await wait_until(s.sup.open_allowed, 3, what="open allowed")
+    finally:
+        await s.stop()
+
+
+async def test_supervisor_fault_while_closed_only_alarms(make_rig):
+    rig = make_rig({"heartbeat_timeout": 2.0})
+    rig.sim.set_fault("Estop active", clearable=False)
+    s = start_supervisor(rig)
+    server = SupervisorServer(s.sup)
+    try:
+        await wait_until(lambda: (s.sup.fault or "").startswith("enclosure reports"), 3)
+        await asyncio.sleep(1.0)  # many enclosure passes
+        fault_alarms = [a for a in s.sup.alarms if "Fault" in a]
+        assert len(fault_alarms) == 1, s.sup.alarms  # once, not every poll
+        assert not any("NOT CLOSED" in a for a in s.sup.alarms)
+        assert close_commands(rig.sim) == 0 and rig.sim.closed()
+        assert s.sup.status()["fault"] == s.sup.fault and not s.sup.open_allowed()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(s.sup.request_open("tester"), 0.5)
+        # The operator API: a name is required; a refusal is a 409.
+        code, body = await server._respond(
+            "POST", "/faults/clear", b'{"operator": " ", "reason": "x"}'
+        )
+        assert code == 400
+        req = json.dumps({"operator": "jde", "reason": "e-stop reset"}).encode()
+        code, body = await server._respond("POST", "/faults/clear", req)
+        assert code == 409 and "Estop active" in body["error"]
+        rig.sim.fault_clearable = True
+        code, body = await server._respond("POST", "/faults/clear", req)
+        assert code == 200 and "Success=TRUE" in body["reply"]
+        await wait_until(lambda: s.sup.fault is None, 3, what="fault cleared")
+    finally:
+        await s.stop()
+
+
+async def test_supervisor_unreadable_faults_count_as_a_fault(make_rig):
+    rig = make_rig({"heartbeat_timeout": 2.0})
+    s = start_supervisor(rig, fault_action="NoSuchAction")
+    try:
+        await wait_until(lambda: (s.sup.fault or "").startswith("cannot read"), 3)
+        await asyncio.sleep(0.5)
+        assert sum("cannot read enclosure faults" in a for a in s.sup.alarms) == 1
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(s.sup.request_open("tester"), 0.5)
+        assert not any(c.startswith("OPEN") for c in rig.sim.commands())
+    finally:
+        await s.stop()
 
 
 @pytest.mark.parametrize("sig", [signal.SIGKILL, signal.SIGSTOP], ids=["killed", "hung"])

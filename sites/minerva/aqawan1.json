@@ -25,7 +25,9 @@
   "safety": {
     "park_before_close": true,
     "park_wait": 60,
-    "heartbeat_interval": 10
+    "heartbeat_interval": 10,
+    "heartbeat_timeout": 60,
+    "fault_action": "Faults"
   },
   "sequencer_name": "aqawan1-sequencer",
   "command_timeout": 10,

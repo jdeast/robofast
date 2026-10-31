@@ -36,7 +36,19 @@ This client
 * Only the legacy command set (:data:`COMMANDS`) can be sent.
 * Every exchange has a hard deadline (``command_timeout``) covering connect,
   negotiation, re-sends and the reply. Re-sends are bounded
-  (``max_attempts``), and happen only while *nothing* has come back.
+  (``max_attempts``), and happen only while *nothing* has come back, on the
+  same connection. Legacy re-sent "because it was necessary sometimes and
+  didn't seem to hurt" (JDE, 2026-10-31). Why a re-send is safe: every
+  command the server sends names an absolute target (``OPEN_SHUTTER_n``,
+  the closes, ``STOP``, ``LIGHTS_OFF``), is a query, or restarts a timer
+  (``HEARTBEAT``), so a duplicate asks for what is already happening, and
+  the PAC presumably ignores it (*assumed*; the simulator does). The one
+  hazard is a duplicate ``OPEN_SHUTTER_n`` that a slow PAC executes *after*
+  a later close. That is no worse than any other unexpected motion: the
+  server stops reporting "closing" as soon as the PAC has acknowledged the
+  close, so the reopening shows up, and the supervisor re-closes on its
+  next poll. :data:`NO_RESEND` commands (``RESET_PAC``, which is not
+  idempotent) are sent exactly once.
 * A reply ends at the ``#>`` prompt, or, since the prompt is not confirmed,
   after ``idle_end`` seconds of silence once some text has arrived. Bare
   prompts and echoed command lines are skipped.
@@ -110,6 +122,9 @@ COMMANDS = frozenset(
 URGENT = frozenset(
     {"STOP", "CLOSE_SHUTTERS", "CLOSE_SEQUENTIAL", "CLOSE_SHUTTER_1", "CLOSE_SHUTTER_2"}
 )
+
+#: Commands never re-sent: repeating them is not harmless.
+NO_RESEND = frozenset({"RESET_PAC"})
 
 #: Keys the legacy code requires in a STATUS reply (``aqawan.py:147-150``).
 REQUIRED_KEYS = (
@@ -472,6 +487,7 @@ class PACClient:
             writer.write(TERMINAL_TYPE + b"\r\n")
             line = command.encode() + b"\r\n"
             attempts = 0
+            max_attempts = 1 if command in NO_RESEND else self.max_attempts
             sent_at = 0.0
             last_rx = time.monotonic()
             while True:
@@ -480,7 +496,7 @@ class PACClient:
                 if reply is not None and (complete or now - last_rx >= self.idle_end):
                     return reply
                 if reply is None and (attempts == 0 or now - sent_at >= self.resend_after):
-                    if attempts >= self.max_attempts:
+                    if attempts >= max_attempts:
                         raise PACTimeout(f"PAC {command}: no reply after {attempts} attempts")
                     if attempts:
                         self.resends += 1

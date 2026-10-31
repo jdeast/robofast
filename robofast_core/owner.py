@@ -9,7 +9,8 @@ A :class:`DeviceOwner` is the only path to one physical device. It:
 * checks, *immediately before the command is sent*, that the :class:`Grant`
   it was issued under has not been revoked;
 * refuses "privileged" members (e.g. ``CloseShutter``) to anyone but the one
-  privileged grant (the safety supervisor);
+  privileged grant (the safety supervisor); an entry ``"Action:Name"``
+  makes the one Alpaca ``Action("Name", ...)`` privileged;
 * records every command and its outcome in the shared :class:`Timeline`.
 
 Components never hold the device object itself, only a :class:`Grant`.
@@ -158,6 +159,11 @@ class DeviceOwner:
         self.timeline = timeline
         self.default_timeout = default_timeout
         self.privileged_members = frozenset(privileged_members)
+        # "Action:Name" entries make one Alpaca Action privileged (names are
+        # case-insensitive, as Alpaca action names are).
+        self._privileged_actions = frozenset(
+            m.split(":", 1)[1].lower() for m in self.privileged_members if m.startswith("Action:")
+        )
         self._factory = factory
         self._lock = asyncio.Lock()
         self._driver: Any = None
@@ -177,6 +183,13 @@ class DeviceOwner:
             self._privileged_grant = g
             return g
         return Grant(self, holder, False)
+
+    def _is_privileged(self, member: str, args: tuple) -> bool:
+        if member in self.privileged_members:
+            return True
+        return (
+            member == "Action" and bool(args) and str(args[0]).lower() in self._privileged_actions
+        )
 
     # -- execution --------------------------------------------------------
 
@@ -250,7 +263,7 @@ class DeviceOwner:
     ) -> Any:
         if grant.owner is not self:
             raise NotAuthorized(f"{grant!r} is not a grant on {self.name}")
-        if member in self.privileged_members and not grant.privileged:
+        if not grant.privileged and self._is_privileged(member, args):
             self.timeline.command(grant.holder, self.name, member, "not_authorized")
             raise NotAuthorized(f"{grant.holder} may not call {self.name}.{member} (privileged)")
         timeout = self.default_timeout if timeout is None else timeout

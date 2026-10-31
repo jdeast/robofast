@@ -174,9 +174,10 @@ The request API's posture (design.md 3.7):
 
 ## Not done yet
 
-* Alarm delivery off the page (email, chat, a phone call for the 60-inch
-  observer) -- the console shows and acknowledges; design.md 3.8 still lists
-  the notifier.
+* Alarm delivery off the page is the notifier's job (`docs/notifier.md`,
+  built): it reads the same sources and this page's acknowledgements file, so
+  an acknowledgement here stops its escalation. Acknowledging from an email
+  or a chat message is not done.
 * The sequencer's own timeline (only the supervisor's is shown) and a
   per-telescope "upcoming" from the scheduler's look-ahead (the queue is
   shown instead).

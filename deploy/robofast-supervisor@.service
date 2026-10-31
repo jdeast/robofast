@@ -19,9 +19,9 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-User=robofast
-WorkingDirectory=/opt/robofast
-ExecStart=/opt/robofast/venv/bin/python -m robofast_core.supervisor_service --config /etc/robofast/%i.json
+User=robofast-supervisor
+WorkingDirectory=/opt/robofast/current
+ExecStart=/opt/robofast/current/venv/bin/python -m robofast_core.supervisor_service --config /etc/robofast/%i.json
 Restart=always
 RestartSec=2
 # Long enough for the final, bounded CloseShutter.

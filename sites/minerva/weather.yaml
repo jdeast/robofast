@@ -1,0 +1,160 @@
+# MINERVA site weather bridge (robofast_core.weather_bridge).
+#
+#   python -m robofast_core.weather_bridge --config sites/minerva/weather.yaml --shadow
+#
+# Limits are ported from the legacy minerva-control code,
+# minerva_library/env.py (site.load_config openLimits/closeLimits and
+# site.oktoopen), as used on 2026-10-30. "open" limits apply while the
+# bridge's last verdict was not safe (legacy: enclosure closed), "close"
+# limits while it was safe (legacy: enclosure open). Limits are in the
+# source's own units; ObservingConditions values are converted to ASCOM
+# units (see `conditions`). Format: docs/weather_bridge.md.
+#
+# NO CREDENTIALS IN THIS FILE: `credentials_file` names a file (username on
+# line 1, password on line 2, the legacy credentials/webpage.txt format)
+# kept outside the repository, mode 600. `~` and $VARS are expanded.
+
+site:
+  name: minerva
+  # legacy config/site_mtHopkins.ini
+  latitude: 31.680407    # deg N
+  longitude: -110.878977 # deg E
+  elevation: 2316.0      # m
+
+listen: 127.0.0.1:11111
+poll_interval: 60        # s between fetches of every page
+evaluate_interval: 5     # s between evaluations/publishes (staleness, Sun)
+server_stale_after: 60   # Alpaca IsSafe=False if the bridge stops publishing
+max_clock_skew: 120      # s; a reading stamped further in the future is unknown
+# legacy oktoopen: no opening within 1800 s of the last rain (its comment
+# says "1 hour", the code says 1800 s).
+rain_hold: 1800
+
+sources:
+  ridge:
+    type: minerva.ridge
+    url: http://linmax.sao.arizona.edu/weather/weather.cur_cond
+    # Legacy sent the cloud page's credentials here too; the page answers
+    # without them (2026-10-30). Add credentials_file if that changes.
+    required: true
+    # legacy limits['date']: utcnow() - 5 min (but frozen at startup there)
+    stale_after: 300
+    timeout: 10
+    limits:
+      # Units: wind in mph (legacy plotweather.py labels), temperatures in C,
+      # humidity in %, barometer in inHg (22.68 at 2316 m is ~768 hPa, which
+      # matches the standard atmosphere; plotweather's "mbar" label is wrong).
+      windSpeed:            {open: [0.0, 30.0],     close: [0.0, 35.0]}
+      windGustSpeed:        {open: [0.0, 35.0],     close: [0.0, 40.0]}
+      outsideHumidity:      {open: [0.0, 75.0],     close: [0.0, 80.0]}
+      outsideTemp:          {open: [-20.0, 50.0],   close: [-30.0, 60.0]}
+      # The next three are sanity ranges in legacy too (garbage detection).
+      outsideDewPt:         {open: [-100.0, 100.0], close: [-100.0, 100.0]}
+      windDirectionDegrees: {open: [0.0, 360.0],    close: [0.0, 360.0]}
+      barometer:            {open: [0, 2000],       close: [0, 2000]}
+      # Legacy also "limited" wxt510Rain and totalRain, but they are
+      # cumulative totals and the limits were 99999 / 999999 / 100000, so rain
+      # detection was effectively off. They are rain counters below instead.
+    rain_counters:
+      # NEW (not in legacy): rain = the counter rose by >= threshold within
+      # `window` seconds of data time. A decrease is a counter reset.
+      # Units: wxt510Rain in mm (plotweather.py); totalRain unverified (mm
+      # assumed). Legacy disabled wxt510Rain-based rain detection because the
+      # WXT510 impact sensor "can be triggered by wind"; tune the threshold
+      # in shadow mode before relying on it.
+      wxt510Rain: {window: 600, threshold: 0.1}
+      totalRain:  {window: 600, threshold: 0.1}
+
+  cloud:
+    type: minerva.sky_temps
+    url: http://linmax.sao.arizona.edu/temps/sky_temps_now
+    credentials_file: ~/.config/robofast/sao-weather.credentials
+    required: true
+    # legacy limits['cloudDate']: utcnow() - 6 min (page updates every 5 min)
+    stale_after: 360
+    timeout: 10
+    # The page's timestamps are local MST (Arizona has no DST): legacy +7 h.
+    utc_offset_hours: -7
+    # Which sensor each value column is, by total field count (2 date/time
+    # fields first). From legacy getWeather; a count not listed here makes
+    # every cloud sensor unknown instead of shifting columns.
+    layouts:
+      6: [mearth, hat, aurora, minerva]
+      5: [mearth, aurora, minerva]
+      # legacy read column 3 as MEarth, then forced it to "down":
+      # "MEarth disabled as of 2022-02-03".
+      4: [null, aurora]
+    sensors:
+      # Calibration: value = (raw - offset) / scale, compared with limits in
+      # MEarth-equivalent degrees C (legacy cloudScale; it compared raw values
+      # with limit * scale + offset, which is the same test).
+      # missing_values: legacy mapped 0.0 (all sensors) and -999.9 (MEarth)
+      # to 999 = "sensor down"; -999.9 is treated as down for all here.
+      mearth:
+        scale: 1.0
+        offset: 0.0
+        missing_values: [0.0, -999.9]
+        # legacy oktoopen: "MearthCloud reports 998.0 when it's raining"
+        rain_values: [998.0]
+      hat:
+        scale: 0.98378265
+        offset: 1.2899657
+        missing_values: [0.0, -999.9]
+      aurora:
+        # legacy uses raw limits for Aurora (its calibrated form, scale
+        # 0.89876588, offset 6.8789744, is commented out), so no calibration.
+        scale: 1.0
+        offset: 0.0
+        missing_values: [0.0, -999.9]
+      minerva:
+        # likewise raw limits (commented-out calibration: 0.74102145, 0.058437186)
+        scale: 1.0
+        offset: 0.0
+        missing_values: [0.0, -999.9]
+    limits:
+      # legacy openCloudLimit = -40, closeCloudLimit = -38 (calibrated);
+      # Aurora and MINERVA hard-coded raw -32/-31 and -24/-23.
+      mearth:  {open: [-999, -40.0], close: [-999, -38.0]}
+      hat:     {open: [-999, -40.0], close: [-999, -38.0]}
+      aurora:  {open: [-999, -32.0], close: [-999, -31.0]}
+      minerva: {open: [-999, -24.0], close: [-999, -23.0]}
+    groups:
+      # legacy oktoopen: the first sensor that is up decides, in this order;
+      # all down is "not OK to open".
+      sky: [mearth, hat, minerva, aurora]
+
+  sun:
+    type: sun
+    required: true
+    limits:
+      # legacy oktoopen overrides limits['sunAltitude'] to [-90, 6] (both
+      # open and close) unless a sunOverride file exists; the 15 deg in
+      # load_config is never used. Geometric altitude here (legacy: PyEphem
+      # apparent, ~0.15 deg higher at 6 deg).
+      altitude: {open: [-90.0, 6.0], close: [-90.0, 6.0]}
+
+  mearth_weather:
+    # legacy getWeatherMearth; disabled there since 2022-10-20 ("MEarth
+    # weather station down") and the page returned nothing on 2026-10-30.
+    # Kept (disabled, advisory, no limits) so it can be watched in shadow
+    # mode if it returns. Units per legacy: wind km/h, barometer mmHg.
+    enabled: false
+    type: minerva.mearth
+    url: http://mearth.sao.arizona.edu/weather/now
+    required: false
+    stale_after: 600  # legacy rejected data older than 10 min
+
+# ASCOM ObservingConditions members -> source field, in the field's unit
+# (converted to ASCOM units: degC, %, m/s, hPa, mm/h, deg).
+conditions:
+  temperature:    {source: ridge, field: outsideTemp, unit: degC}
+  humidity:       {source: ridge, field: outsideHumidity, unit: percent}
+  dewpoint:       {source: ridge, field: outsideDewPt, unit: degC}
+  pressure:       {source: ridge, field: barometer, unit: inHg}
+  windspeed:      {source: ridge, field: windSpeed, unit: mph}
+  windgust:       {source: ridge, field: windGustSpeed, unit: mph}
+  winddirection:  {source: ridge, field: windDirectionDegrees, unit: deg}
+  rainrate:       {source: ridge, field: wxt510Rain_rate, unit: mm/h,
+                   description: "ridge WXT510 accumulation rate over the rain window"}
+  skytemperature: {source: cloud, field: sky, unit: degC,
+                   description: "first available cloud sensor (MEarth, HAT, MINERVA, Aurora), calibrated"}

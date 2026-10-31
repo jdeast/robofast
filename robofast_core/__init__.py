@@ -28,8 +28,12 @@ The pieces:
 * :mod:`robofast_core.heartbeat_watchdog` -- the enclosure hardware
   heartbeat contract, and a watchdog that adds one to a simulator's dome.
 * :mod:`robofast_core.weather_server` -- a small Alpaca SafetyMonitor +
-  ObservingConditions server (the shape the real site-weather bridge will
-  take), with fault injection for tests.
+  ObservingConditions server, with fault injection for tests.
+* :mod:`robofast_core.weather_bridge` -- the site weather bridge: polls the
+  site's weather pages (:mod:`robofast_core.weather_sources`, site adapters
+  in :mod:`robofast_core.sites`), judges them
+  (:mod:`robofast_core.weather_eval`) and publishes to the weather server;
+  also a shadow mode that only logs (``docs/weather_bridge.md``).
 """
 
 from robofast_core.owner import (

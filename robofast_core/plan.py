@@ -57,6 +57,8 @@ from typing import Any, Protocol
 #: closing or the sequencer stopping (not its fault; worth retrying).
 #: "failed": a device error or a refused slew.
 OUTCOMES = ("complete", "interrupted", "failed")
+#: What an observation does on its target (:attr:`Observation.kind`).
+KINDS = ("expose", "autofocus")
 
 
 @dataclass
@@ -90,6 +92,20 @@ class Observation:
     #: stopped when the observation ends (docs/guider.md). A telescope
     #: without a guider fails such an observation.
     guide: bool = False
+    #: What to do on the target: ``"expose"`` (``count`` frames), or
+    #: ``"autofocus"`` (focus the telescope there: :mod:`robofast_core.autofocus`;
+    #: ``exptime`` and ``count`` come from the telescope's autofocus config).
+    kind: str = "expose"
+    #: For ``kind="autofocus"``: overrides of the telescope's autofocus
+    #: config (e.g. ``{"method": "sweep"}``), and ``{"calibrate": true}``
+    #: for a calibration sweep.
+    autofocus: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in KINDS:
+            raise ValueError(f"observation {self.name!r}: kind {self.kind!r} not in {KINDS}")
+        if self.kind == "autofocus" and not self.light:
+            raise ValueError(f"observation {self.name!r}: an autofocus needs light")
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Observation:

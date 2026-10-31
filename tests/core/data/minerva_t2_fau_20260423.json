@@ -1,0 +1,191 @@
+{
+ "_note": [
+  "MINERVA T2, FAU port (port 1), night n20260423, filter V: the legacy autofocus sweeps.",
+  "hfd_px: robofast_core.starmeasure on each FAU frame (ZWO ASI174, 5.86 um pixels, 0.265 arcsec/px; CDK700 f/6.5); positions are FOCPOS (um).",
+  "legacy_hfr_arcsec: the legacy autorecord's median SExtractor FLUX_RADIUS times the plate scale; legacy_guess and legacy_new are its starting guess and result.",
+  "Derived from the frames for docs/autofocus.md section 9; the frames themselves are not in the repository."
+ ],
+ "plate_scale": 0.265,
+ "pixel_size": 5.86,
+ "f_ratio": 6.5,
+ "sequences": {
+  "0003": {
+   "legacy_guess": 15686.3,
+   "legacy_new": 15816.0,
+   "points": [
+    {
+     "image": 3,
+     "position": 15986.0,
+     "hfd_px": 11.09,
+     "hfd_err_px": 0.23,
+     "stars": 2,
+     "legacy_hfr_arcsec": 1.604575
+    },
+    {
+     "image": 4,
+     "position": 15686.0,
+     "hfd_px": 10.913,
+     "hfd_err_px": 0.458,
+     "stars": 2,
+     "legacy_hfr_arcsec": 1.456705
+    },
+    {
+     "image": 5,
+     "position": 15386.0,
+     "hfd_px": 11.693,
+     "hfd_err_px": 0.787,
+     "stars": 2,
+     "legacy_hfr_arcsec": 1.727535
+    },
+    {
+     "image": 6,
+     "position": 16286.0,
+     "hfd_px": 13.493,
+     "hfd_err_px": 0.465,
+     "stars": 2,
+     "legacy_hfr_arcsec": 1.93662
+    },
+    {
+     "image": 7,
+     "position": 15086.0,
+     "hfd_px": 16.741,
+     "hfd_err_px": 1.87,
+     "stars": 2,
+     "legacy_hfr_arcsec": 2.60707
+    },
+    {
+     "image": 8,
+     "position": 16586.0,
+     "hfd_px": 18.519,
+     "hfd_err_px": 0.683,
+     "stars": 2,
+     "legacy_hfr_arcsec": 2.652385
+    },
+    {
+     "image": 9,
+     "position": 14786.0,
+     "hfd_px": 21.38,
+     "hfd_err_px": 0.487,
+     "stars": 2,
+     "legacy_hfr_arcsec": 3.669455
+    }
+   ]
+  },
+  "0531": {
+   "legacy_guess": 16833.3,
+   "legacy_new": 16517.0,
+   "points": [
+    {
+     "image": 531,
+     "position": 16533.0,
+     "hfd_px": 9.082,
+     "hfd_err_px": 0.818,
+     "stars": 2,
+     "legacy_hfr_arcsec": 1.222975
+    },
+    {
+     "image": 532,
+     "position": 16833.0,
+     "hfd_px": 10.494,
+     "hfd_err_px": 0.746,
+     "stars": 2,
+     "legacy_hfr_arcsec": 1.42252
+    },
+    {
+     "image": 533,
+     "position": 17133.0,
+     "hfd_px": 14.419,
+     "hfd_err_px": 0.188,
+     "stars": 2,
+     "legacy_hfr_arcsec": 1.884415
+    },
+    {
+     "image": 534,
+     "position": 16233.0,
+     "hfd_px": 10.894,
+     "hfd_err_px": 0.629,
+     "stars": 2,
+     "legacy_hfr_arcsec": 1.385685
+    },
+    {
+     "image": 535,
+     "position": 15933.0,
+     "hfd_px": 14.264,
+     "hfd_err_px": 0.339,
+     "stars": 2,
+     "legacy_hfr_arcsec": 1.834065
+    },
+    {
+     "image": 536,
+     "position": 15633.0,
+     "hfd_px": 19.504,
+     "hfd_err_px": 0.421,
+     "stars": 2,
+     "legacy_hfr_arcsec": 2.41733
+    },
+    {
+     "image": 537,
+     "position": 17433.0,
+     "hfd_px": 18.817,
+     "hfd_err_px": 0.858,
+     "stars": 2,
+     "legacy_hfr_arcsec": 2.50266
+    }
+   ]
+  },
+  "0602": {
+   "legacy_guess": 15799.7,
+   "legacy_new": 16399.7,
+   "points": [
+    {
+     "image": 602,
+     "position": 16100.0,
+     "hfd_px": 10.748,
+     "hfd_err_px": 0.537,
+     "stars": 1,
+     "legacy_hfr_arcsec": null
+    },
+    {
+     "image": 603,
+     "position": 15800.0,
+     "hfd_px": 12.631,
+     "hfd_err_px": 0.632,
+     "stars": 1,
+     "legacy_hfr_arcsec": 2.038115
+    },
+    {
+     "image": 604,
+     "position": 15500.0,
+     "hfd_px": 13.448,
+     "hfd_err_px": 0.672,
+     "stars": 1,
+     "legacy_hfr_arcsec": null
+    },
+    {
+     "image": 605,
+     "position": 16100.0,
+     "hfd_px": 9.145,
+     "hfd_err_px": 0.457,
+     "stars": 1,
+     "legacy_hfr_arcsec": 1.441335
+    },
+    {
+     "image": 606,
+     "position": 16400.0,
+     "hfd_px": 8.079,
+     "hfd_err_px": 0.404,
+     "stars": 1,
+     "legacy_hfr_arcsec": 1.278625
+    },
+    {
+     "image": 607,
+     "position": 16700.0,
+     "hfd_px": 11.771,
+     "hfd_err_px": 0.589,
+     "stars": 1,
+     "legacy_hfr_arcsec": 1.85023
+    }
+   ]
+  }
+ }
+}

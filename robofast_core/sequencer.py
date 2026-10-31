@@ -167,13 +167,23 @@ import inspect
 import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+import numpy as np
+
+from robofast_core.autofocus import (
+    Autofocus,
+    AutofocusSetup,
+    FocusStore,
+    publish_result,
+)
+from robofast_core.imagebytes import ImageArray, fits_order
 from robofast_core.imaging import FrameWriteFailed, Imaging, PendingFrame
 from robofast_core.owner import DeviceError, DeviceOwner, Grant, GrantRevoked
 from robofast_core.plan import Idle, Observation, PlanProvider, as_plan
+from robofast_core.registry import ValueRegistry
 from robofast_core.safety import LeaseRevoked, OpenLease, RecoveryRefused, SafetySupervisor
 from robofast_core.timeline import Timeline
 
@@ -183,6 +193,7 @@ __all__ = [
     "GuiderHook",
     "LeaseSource",
     "Observation",
+    "ObservationFailed",
     "Sequencer",
     "SequencerConfig",
     "SlewDenied",
@@ -209,6 +220,11 @@ class _PreemptStuck(Exception):
 
 class _PreemptAbortFailed(DeviceError):
     """A preempted observation stopped, but its abort commands failed."""
+
+
+class ObservationFailed(Exception):
+    """The observation failed but the telescope is fine (an autofocus that
+    found no focus): reported ``failed``, with no error backoff."""
 
 
 class Unsupported(DeviceError):
@@ -289,6 +305,10 @@ class TelescopeUnit:
     port_action: str | None = None
     #: Started for observations with ``guide`` (design.md 3.4, docs/guider.md).
     guider: GuiderHook | None = None
+    #: The focuser the sequencer moves (autofocus), and the autofocus
+    #: setup; both needed for ``kind="autofocus"`` observations.
+    focuser: DeviceOwner | None = None
+    autofocus: AutofocusSetup | None = None
     consecutive_errors: int = field(default=0, init=False)
     #: Gave up for the night after too many errors in a row.
     gave_up: bool = field(default=False, init=False)
@@ -310,6 +330,11 @@ class TelescopeUnit:
     #: ``time.monotonic()`` since when the plan has answered only Idle (None:
     #: it is not idle).
     idle_since: float | None = field(default=None, init=False)
+    #: An autofocus was cut short: the focuser position to return to before
+    #: the next light observation (None: nothing to undo).
+    focus_restore: float | None = field(default=None, init=False)
+    #: Every autofocus result tonight (:class:`~robofast_core.autofocus.AutofocusResult`).
+    autofocus_results: list[Any] = field(default_factory=list, init=False)
 
     @property
     def active(self) -> bool:
@@ -381,6 +406,8 @@ class _Generation:
     idle_release: asyncio.Event = field(default_factory=asyncio.Event)
     #: Filter wheel grants, for the telescopes that have one.
     filterwheels: dict[str, Grant] = field(default_factory=dict)
+    #: Focuser grants, for the telescopes whose focuser the sequencer moves.
+    focusers: dict[str, Grant] = field(default_factory=dict)
     #: Telescopes that left the generation in the middle of a backoff.
     backing_off: set[str] = field(default_factory=set)
     errors: int = 0
@@ -438,6 +465,9 @@ class Sequencer:
         self.slew_guard: SlewGuard = slew_guard or AllowAllSlews()
         #: The frame pipeline (module doc), or None: frames are not saved.
         self.imaging = imaging
+        #: The value registry (the frame pipeline's, else a private one):
+        #: autofocus results and the focus model's inputs.
+        self.registry = imaging.registry if imaging is not None else ValueRegistry()
         self._report_files = _accepts_files(self.plan.report)
         if self.config.abort_policy not in ("abort", "stop"):
             raise ValueError(f"abort_policy {self.config.abort_policy!r}")
@@ -682,7 +712,12 @@ class Sequencer:
         state.filterwheels = {
             u.name: u.filterwheel.grant(holder) for u in units if u.filterwheel is not None
         }
-        fence = (*(g for pair in grants.values() for g in pair), *state.filterwheels.values())
+        state.focusers = {u.name: u.focuser.grant(holder) for u in units if u.focuser is not None}
+        fence = (
+            *(g for pair in grants.values() for g in pair),
+            *state.filterwheels.values(),
+            *state.focusers.values(),
+        )
         self._gen = state
         what = "closed_start" if lease is None else "observe_start"
         self._event(what, gen=gen, telescopes=[u.name for u in units])
@@ -828,6 +863,13 @@ class Sequencer:
                     return
                 except Preempted:
                     self._report(unit, obs, "interrupted", taken)
+                except ObservationFailed as exc:
+                    # Not the telescope's fault: no backoff, no park.
+                    self._report(unit, obs, "failed", taken)
+                    self._event(
+                        "observation_failed", gen=state.gen, telescope=unit.name, error=str(exc)
+                    )
+                    unit.consecutive_errors = 0
                 except _PreemptAbortFailed as exc:
                     self._report(unit, obs, "interrupted", taken)
                     await self._telescope_failed(state, unit, tel, cam, f"preemption: {exc}")
@@ -1115,6 +1157,8 @@ class Sequencer:
             await self._select_port(state, unit, tel, obs.port)
         if obs.filter is not None:
             await self._select_filter(state, unit, obs.filter)
+        if obs.light and unit.focus_restore is not None:
+            await self._restore_focus(state, unit)
         if obs.light:
             assert state.lease is not None
             await tel.set("Tracking", True)
@@ -1134,6 +1178,9 @@ class Sequencer:
                     raise Unsupported(f"{unit.name} has no guider ({obs.name} asks to guide)")
                 await unit.guider.start(dec=dec)
                 self._event("guiding", gen=gen, telescope=unit.name)
+        if obs.kind == "autofocus":
+            await self._autofocus(state, unit, tel, cam, obs, taken)
+            return
         for i in range(obs.count):
             if imaging is not None:
                 imaging.check(unit.name)  # a lost frame stops the telescope first
@@ -1188,6 +1235,158 @@ class Sequencer:
         if imaging is not None and taken:
             # Complete means on disk: the plan records the paths.
             await imaging.flush(unit.name)
+
+    # -- autofocus ----------------------------------------------------------
+
+    def _focus_runner(
+        self,
+        state: _Generation,
+        unit: TelescopeUnit,
+        cam: Grant | None,
+        port: str | None,
+        filter: str | None,
+        extra: dict[str, Any] | None = None,
+        exposer: Any = None,
+    ) -> Autofocus:
+        setup, fg = unit.autofocus, state.focusers.get(unit.name)
+        if setup is None or fg is None:
+            raise Unsupported(f"{unit.name} cannot autofocus (no focuser or autofocus config)")
+        model = setup.model
+        tel_name = unit.name
+
+        def values() -> dict[str, float | None]:
+            snap = self.registry.snapshot()
+            return {name: snap.current(name.replace("{tel}", tel_name)) for name in model.terms}
+
+        return Autofocus(
+            unit.name,
+            setup.config_for(port, filter, extra),
+            fg,
+            cam,
+            exposer=exposer,
+            store=setup.store,
+            key=FocusStore.key(unit.name, port, filter),
+            model=model,
+            values=values,
+            event=lambda what, **kw: self._event(what, gen=state.gen, **kw),
+        )
+
+    async def _read_focuser(self, unit: TelescopeUnit, fg: Grant) -> None:
+        """The focuser's temperature into the registry, for the focus model
+        (best effort: a focuser without one just leaves the term out)."""
+        try:
+            temp = await fg.get("Temperature")
+        except Exception as exc:
+            self.registry.failed(f"{unit.name}.focuser.temperature", repr(exc))
+            return
+        self.registry.publish(
+            f"{unit.name}.focuser.temperature",
+            float(temp),
+            max_age=300.0,
+            unit="C",
+            keyword="FOCTEMP",
+            comment="Focuser temperature",
+        )
+
+    async def _autofocus(
+        self,
+        state: _Generation,
+        unit: TelescopeUnit,
+        tel: Grant,
+        cam: Grant,
+        obs: Observation,
+        taken: list[Any],
+    ) -> None:
+        """Focus ``unit`` on the current field (``obs.kind == "autofocus"``)."""
+        extra = dict(obs.autofocus or {})
+        calibrate = bool(extra.pop("calibrate", False))
+        fg = state.focusers.get(unit.name)
+        if fg is None or unit.autofocus is None:
+            raise Unsupported(f"{unit.name} cannot autofocus (no focuser or autofocus config)")
+        await self._read_focuser(unit, fg)
+        cfg = self.config
+        imaging = self.imaging
+
+        async def expose(exptime: float) -> np.ndarray:
+            if imaging is not None:
+                imaging.check(unit.name)
+            i = len(taken)
+            unit.exposing = True
+            try:
+                host_start = datetime.now(UTC)
+                await cam.call("StartExposure", exptime, True)
+                self._event(
+                    "exposure_started", gen=state.gen, telescope=unit.name, index=i, exptime=exptime
+                )
+                exposure = None
+                if imaging is not None:
+                    exposure = await imaging.exposure_started(
+                        unit.name,
+                        tel,
+                        replace(obs, exptime=exptime),
+                        index=i,
+                        host_start=host_start,
+                        sequencer=self.name,
+                        generation=state.gen,
+                        ids=self._ids(unit.name),
+                    )
+                await self._wait_for(
+                    lambda: cam.get("ImageReady"), bool, exptime + cfg.readout_margin
+                )
+                if exposure is not None:
+                    assert imaging is not None
+                    frame: Any = await imaging.exposure_done(
+                        unit.name, cam, exposure, keep_image=True
+                    )
+                    image, frame.image = frame.image, None
+                else:
+                    frame = i
+                    image = await cam.get("ImageArray", timeout=af.config.download_timeout)
+            finally:
+                unit.exposing = False
+            taken.append(frame)
+            self.frames.append(
+                {
+                    "gen": state.gen,
+                    "telescope": unit.name,
+                    "index": i,
+                    "target": obs.name,
+                    "t": time.monotonic(),
+                    "autofocus": True,
+                    **({"image": frame} if isinstance(frame, PendingFrame) else {}),
+                }
+            )
+            self._event("exposure_complete", gen=state.gen, telescope=unit.name, index=i)
+            data = image.data if isinstance(image, ImageArray) else np.asarray(image)
+            return fits_order(data)
+
+        af = self._focus_runner(state, unit, cam, obs.port, obs.filter, extra, expose)
+        unit.focus_restore = float(await fg.get("Position"))
+        result = await (af.calibrate() if calibrate else af.run())
+        # The run left the focuser at its new focus, or back where it started.
+        unit.focus_restore = None
+        unit.autofocus_results.append(result)
+        publish_result(self.registry, unit.name, result)
+        hook = getattr(self.plan, "autofocus_result", None)
+        if hook is not None:
+            try:
+                hook(unit.name, obs, result.summary())
+            except Exception:
+                log.exception("%s: plan.autofocus_result(%s)", self.name, unit.name)
+        if imaging is not None and taken:
+            await imaging.flush(unit.name)
+        if not result.success:
+            raise ObservationFailed(f"autofocus: {result.message}")
+
+    async def _restore_focus(self, state: _Generation, unit: TelescopeUnit) -> None:
+        """Undo an autofocus that was cut short (the focuser was left defocused)."""
+        target = unit.focus_restore
+        if target is None or state.focusers.get(unit.name) is None:
+            return
+        af = self._focus_runner(state, unit, None, None, None, exposer=_no_exposures)
+        await af.move(target)
+        self._event("focus_restored", gen=state.gen, telescope=unit.name, position=target)
+        unit.focus_restore = None
 
     def _ids(self, telescope: str) -> dict[str, Any]:
         """The plan's request ids for what ``telescope`` is observing (the
@@ -1326,3 +1525,7 @@ async def _wait_any(events: Sequence[asyncio.Event], timeout: float) -> None:
         for w in waiters:
             w.cancel()
         await asyncio.gather(*waiters, return_exceptions=True)
+
+
+async def _no_exposures(exptime: float) -> np.ndarray:
+    raise RuntimeError("no exposures here")

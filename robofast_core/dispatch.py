@@ -1067,6 +1067,19 @@ class DispatchScheduler:
         c = visit.config
         ic = c.instrument_configs[visit.ic]
         suffix = f"+{visit.done}" if visit.done else ""
+        if c.type == "AUTO_FOCUS":
+            return Observation(
+                f"{c.target.name} [{c.id}#{visit.ic}]",
+                ra_hours=c.target.ra_hours,
+                dec_deg=c.target.dec_deg,
+                exptime=ic.exptime,
+                count=1,
+                filter=ic.filter,
+                port=ic.port,
+                object=c.target.name,
+                kind="autofocus",
+                autofocus={"exptime": ic.exptime} if ic.exptime > 0 else None,
+            )
         return Observation(
             f"{c.target.name} [{c.id}#{visit.ic}{suffix}]",
             ra_hours=c.target.ra_hours if ic.light else None,

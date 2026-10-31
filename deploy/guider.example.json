@@ -1,0 +1,38 @@
+{
+  "_note": [
+    "A guider service for one guide camera, run on the computer the camera is plugged into:",
+    "  python -m robofast_core.guider.service --config deploy/guider.example.json",
+    "This example is all simulators (docs/guider.md): a simulated sky and FAU camera, the SX AO",
+    "protocol simulator, a simulated mount and backlight. For T2: camera kind zwo, tiptilt kind sxao",
+    "with its serial port, mount kind alpaca with the telescope's address, backlight kiwispec with the",
+    "KiwiSpec service URL, allow_hardware true AND --hardware -- only with JDE's approval (docs/guider.md,",
+    "Commissioning). Calibrate with POST /calibrate before guiding; results go to calibration_dir."
+  ],
+  "name": "t2-guider",
+  "scope": "t2",
+  "listen": "127.0.0.1:8140",
+  "allow_hardware": false,
+  "port": "fau",
+  "calibration_dir": "guider-calibrations",
+  "camera": {"kind": "sim"},
+  "tiptilt": {"kind": "sxao-sim", "limits": [[-400, 400], [-400, 400]], "travel": 1000},
+  "mount": {"kind": "sim", "method": "offset", "max_offset": 30},
+  "offload": {"threshold": 0.5, "period": 30, "min_pixels": 1.0, "window": 2.0, "settle": 3.0},
+  "backlight": {"sim": true},
+  "guide": {
+    "exposure": 0.02,
+    "roi_size": 48,
+    "acq_exposure": 0.2,
+    "fiber_radius": 3.0,
+    "centroider": {"kind": "annulus"},
+    "gains": {"kp": 0.4, "ki": 0.01, "deadband": 0.05},
+    "capture_radius": 8,
+    "plate_scale": 0.5
+  },
+  "sim": {
+    "star": [340.0, 255.0],
+    "fiber": {"x": 321.5, "y": 239.5, "radius": 3.0},
+    "jitter": {"rms": 0.5, "knee": 1.0, "shake": [[8.0, 0.2]], "drift": [0.02, -0.01]},
+    "tt_matrix": [[0.04, 0.015], [-0.015, 0.04]]
+  }
+}

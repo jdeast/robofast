@@ -1,0 +1,52 @@
+{
+  "_note": [
+    "The alarm notifier (robofast_core/notifier/; docs/notifier.md).",
+    "  python -m robofast_core.notifier --config /etc/robofast/notifier.json --check   # validate",
+    "  python -m robofast_core.notifier --config /etc/robofast/notifier.json --test    # one message per sink",
+    "console: the observer console's config; the notifier reads the same enclosures and the console's",
+    "acknowledgements file (acks), so an observer's ack on the console stops the escalation.",
+    "Secrets live outside the repository, mode 0600, owned by the notifier's user: here they come from",
+    "systemd LoadCredential= (deploy/robofast-notifier.service). Every host, address and recipient is a",
+    "placeholder (example.org, 127.0.0.1)."
+  ],
+  "console": "/etc/robofast/console.json",
+  "console_url": "http://127.0.0.1:8400",
+  "state": "/var/lib/robofast-notifier/state.json",
+  "interval": 10,
+  "clear_after": 120,
+  "escalate_after": 600,
+  "escalate_repeat": 1800,
+  "escalate_level": "critical",
+  "digest_at": "08:00",
+  "timezone": "America/Phoenix",
+  "ignore": ["^sequencer not running \\(status snapshot stale\\)$", "^no sequencer status snapshot$"],
+  "sinks": {
+    "email": {
+      "type": "email",
+      "host": "smtp.example.org",
+      "port": 587,
+      "tls": "starttls",
+      "sender": "robofast@example.org",
+      "to": ["observers@example.org"],
+      "credentials_file": "$CREDENTIALS_DIRECTORY/smtp.json",
+      "min_level": "warning",
+      "on": ["raise", "escalate", "clear", "digest"],
+      "rate": {"max": 20, "window": 3600}
+    },
+    "chat": {
+      "type": "webhook",
+      "url_file": "$CREDENTIALS_DIRECTORY/chat-webhook-url",
+      "min_level": "alarm",
+      "on": ["raise", "escalate", "ack", "clear"],
+      "rate": {"max": 30, "window": 3600}
+    },
+    "page-observer": {
+      "type": "command",
+      "argv": ["/usr/local/bin/page-observer", "--to", "observer-on-duty"],
+      "timeout": 30,
+      "min_level": "critical",
+      "on": ["escalate"],
+      "rate": {"max": 6, "window": 3600}
+    }
+  }
+}

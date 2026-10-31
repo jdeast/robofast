@@ -1,0 +1,50 @@
+# Example systemd unit for the alarm notifier (robofast_core/notifier/,
+# docs/notifier.md). Not installed anywhere; copy and adapt. Paths below are
+# placeholders.
+#
+#   systemctl enable --now robofast-notifier
+#
+# It polls the same status endpoints and files the observer console reads
+# (through the console's own config) and the console's acknowledgements, and
+# sends the alarms by email, chat webhook or a command. It commands nothing
+# and nothing waits for it: stopping it never affects observing, only who
+# hears about an alarm. Its secrets (the SMTP login, the webhook URL) are
+# handed over by LoadCredential=: systemd copies them, readable only by this
+# service, into $CREDENTIALS_DIRECTORY, which the config names. Check the
+# config with
+#
+#   sudo -u robofast-notifier /opt/robofast/current/venv/bin/python -m robofast_core.notifier \
+#       --config /etc/robofast/notifier.json --check
+#
+# (--check and --test run outside the unit cannot see $CREDENTIALS_DIRECTORY;
+# use `systemd-run -p LoadCredential=... ` or point a copy of the config at
+# the source files.)
+
+[Unit]
+Description=robofast alarm notifier
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=robofast-notifier
+# The shared read group (docs/deploy.md): the console's config, the
+# enclosure configs, the sequencer's status snapshot, the console's
+# acknowledgements.
+SupplementaryGroups=robofast
+WorkingDirectory=/opt/robofast/current
+ExecStart=/opt/robofast/current/venv/bin/python -m robofast_core.notifier --config /etc/robofast/notifier.json
+LoadCredential=smtp.json:/etc/robofast/secrets/notifier-smtp.json
+LoadCredential=chat-webhook-url:/etc/robofast/secrets/notifier-chat-webhook-url
+StateDirectory=robofast-notifier
+StateDirectoryMode=0700
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

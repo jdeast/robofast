@@ -362,6 +362,15 @@ mount software where it has them (PWI4 for the CDK700s, per M3 port), and in
 robofast's telescope layer for mounts that don't. The sequencer never sees a
 model.
 
+Where a telescope really points is measured, not assumed (`docs/sky.md`):
+robofast has its own star catalog (Gaia DR3 tiles cached on disk, a
+bundled bright-star list, the WDS), a near-blind plate solver that every
+light frame, acquisition and pointing-model run can use, and TPOINT-style
+pointing-error terms (`robofast_core/pointing.py`) that the sky simulator
+uses as the mount's "true" errors and that a pointing-model fit recovers.
+Solved frames carry their WCS and a photometric zero point, for throughput
+monitoring.
+
 Focus is robofast's own (section 3.4, `docs/autofocus.md`): per telescope,
 M3 port and filter, a calibrated V-curve and a temperature model whose zero
 point follows each measured focus, kept in a JSON store. Focuser units and
@@ -675,7 +684,10 @@ support is often worse. So:
   (autofocus, the guider) run on a synthetic star field
   (`robofast_core/testing/starfield.py`: the pupil image, with its central
   obstruction, convolved with the seeing; jitter, noise, subframes) with
-  known truth.
+  known truth, or on the real sky (`robofast_core/testing/skysim.py`:
+  catalog stars through a mount with TPOINT-style pointing errors, sky
+  brightness from the Sun and Moon, the port's zero point; fixture Gaia
+  tiles, so no catalog is downloaded in CI).
 - **Simulator tier:** the same scenarios against the official ASCOM
   OmniSimulators (pinned, checksum-verified), plus a real FITS frame
   written from OmniSim's camera and read back, and the full-frame download
@@ -831,6 +843,12 @@ Each step is a CI-tested deliverable.
     the enclosure. Alarm delivery (email, chat, a command to page the
     60-inch observer) is built (`docs/notifier.md`). Next: an attended
     night with both.
+
+17. The sky (built; `docs/sky.md`): the Gaia DR3 tile cache and bundled
+    bright stars, a sky simulator with pointing errors, the near-blind
+    plate solver, solved WCS and zero points in every frame. Next: target
+    vetting and catalog-based acquisition, the per-port zero points
+    measured on real frames, a pointing-model builder.
 
 ## 9. Borrowed ideas
 

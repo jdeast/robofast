@@ -383,6 +383,9 @@ class Aggregator:
             alarm("sequencer", "sequencer quarantined (an operator must clear it)", "critical")
         elif snap.get("needs_operator"):
             alarm("sequencer", "sequencer needs an operator", "critical")
+        down = (snap.get("spectrograph") or {}).get("down") if fresh else None
+        if down:
+            alarm("spectrograph", f"spectrograph marked down (no spectra): {down}", "critical")
         values = snap.get("values") if fresh and isinstance(snap.get("values"), dict) else {}
         return {
             "running": fresh,
@@ -391,6 +394,7 @@ class Aggregator:
             "generation": snap.get("generation"),
             "quarantined": snap.get("quarantined"),
             "needs_operator": snap.get("needs_operator"),
+            "spectrograph": snap.get("spectrograph") if fresh else None,
             "telescopes": snap.get("telescopes", {}) if fresh else {},
         }, values
 

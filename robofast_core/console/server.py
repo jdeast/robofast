@@ -81,8 +81,8 @@ COOKIE = "robofast_console"
 MAX_REASON = 500
 #: Operator actions (``POST /console/api/<action>``), and those that must be
 #: confirmed (``"confirm": true`` in the body; the page asks first).
-ACTIONS = ("ack", "pause", "resume", "stop", "clear_lease", "clear_faults")
-CONFIRM = ("stop", "clear_lease", "clear_faults")
+ACTIONS = ("ack", "pause", "resume", "stop", "park", "clear_lease", "clear_faults")
+CONFIRM = ("stop", "park", "clear_lease", "clear_faults")
 
 
 @dataclass
@@ -601,7 +601,7 @@ class Console:
                 raise ApiError(400, "id: the alarm's id")
             return {"id": alarm, **self.acks.add(alarm, operator, reason)}
         enc = self._enclosure(body)
-        if action in ("pause", "resume", "stop"):
+        if action in ("pause", "resume", "stop", "park"):
             return await self._hold(enc, action, operator, reason, body.get("telescope"))
         sup = self.supervisors[enc.name]
         if action == "clear_faults":
@@ -632,6 +632,9 @@ class Console:
         self, enc: ConsoleEnclosure, action: str, operator: str, reason: str, telescope: Any
     ) -> dict[str, Any]:
         whole = telescope is None
+        if action == "park" and whole:
+            # One telescope, now; the whole enclosure is "stop" (which closes).
+            raise ApiError(400, "park: name one telescope (to park them all, stop the enclosure)")
         if not whole and telescope not in enc.telescopes:
             raise ApiError(400, f"telescope: one of {enc.telescopes} (or none: all of them)")
         tels = list(enc.telescopes) if whole else [str(telescope)]
@@ -639,12 +642,12 @@ class Console:
         if enc.control_dir is None:
             if not (action == "stop" and whole):
                 raise ApiError(
-                    409, f"{enc.name} has no operator_control: pause, resume and stop need it"
+                    409, f"{enc.name} has no operator_control: pause, resume, stop and park need it"
                 )
         else:
             cid = send_command(enc.control_dir, action, tels, operator=operator, reason=reason)
             out["command"] = cid
-            if action == "stop" and whole:
+            if (action == "stop" and whole) or action == "park":
                 out["hold_confirmed"] = await self._applied(enc, cid)
         if action == "stop" and whole:
             # Abort and park everything: the supervisor revokes the lease (the

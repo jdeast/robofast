@@ -185,6 +185,39 @@ has passed. The generation's fence also stops any new spectrograph job.
 A preempted leader (policy ``now``) aborts its spectrum; a preempted member
 just drops out.
 
+Spectrograph health
+-------------------
+A spectrum the spectrograph cannot take is never the telescope's error (no
+park, no backoff, no give-up count): :class:`SpectrographBusy` (another job
+holds it -- the other enclosure's, after the service's bounded queue wait)
+is reported ``interrupted`` and nothing is counted; :class:`SpectrographFault`
+(refused, failed, overran, or not answering) is reported ``interrupted`` to
+a plan that has ``set_spectrograph_available`` (else ``failed``) and
+counted. After ``spectrograph_max_failures`` faults in a row the
+spectrograph is marked down (``spectrograph_down``, critical; the status
+snapshot's ``spectrograph.down``), the plan is told, and spectrum and
+spectrograph-calibration observations fail at once without slewing; imaging
+goes on. While down its status is checked every
+``spectrograph_recovery_interval``; a passing check (with
+``spectrograph_auto_recover``) or the operator's :meth:`Sequencer.clear_spectrograph`
+marks it up. docs/rv_night.md.
+
+Operator park
+-------------
+:meth:`Sequencer.request_park` (the observer console's ``park``, through
+:class:`~robofast_core.console.hold.OperatorHold`, which also holds the
+telescope and stops its observation) parks one telescope as soon as it is
+idle, with its own grant: guider stopped, slew aborted, ``Park``. Never the
+roof, the lease or another telescope.
+
+Night names and time stamps
+---------------------------
+``clock`` (:mod:`robofast_core.clock`; default the host's) is the time of
+every night name and stamp the sequencer makes: ``DATE-CMD`` and the frame's
+night, the frame pipeline's ``DATE`` and index, the spectrum's ``night``
+(sent to the spectrograph, which names the raw file with it) and sidecar,
+the autofocus results.
+
 Starting up after a crash
 -------------------------
 The sequencer's ``name`` is its lease holder identity: stable across
@@ -218,7 +251,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any, Protocol
 
 import numpy as np
@@ -229,6 +262,8 @@ from robofast_core.autofocus import (
     FocusStore,
     publish_result,
 )
+from robofast_core.clock import Clock, real_clock
+from robofast_core.devices.kiwispec_client import KiwiSpecBusy, KiwiSpecError
 from robofast_core.imagebytes import ImageArray, fits_order
 from robofast_core.imaging import FrameWriteFailed, Imaging, PendingFrame
 from robofast_core.owner import DeviceError, DeviceOwner, Grant, GrantRevoked
@@ -249,7 +284,9 @@ __all__ = [
     "SequencerConfig",
     "SlewDenied",
     "SlewGuard",
+    "SpectrographBusy",
     "SpectrographError",
+    "SpectrographFault",
     "SpectrographHook",
     "SpectrumFailed",
     "TelescopeUnit",
@@ -286,8 +323,21 @@ class Unsupported(DeviceError):
 
 
 class SpectrographError(Exception):
-    """The spectrograph service refused or failed a job, or did not finish
-    it in time (the leading telescope's ordinary error)."""
+    """The spectrograph could not take a spectrum (module doc, "Spectrograph
+    health"): never the telescope's error."""
+
+
+class SpectrographBusy(SpectrographError):
+    """The spectrograph is busy with another job (this sequencer's, or
+    another enclosure's after the service's bounded queue wait): the
+    observation is reported ``interrupted`` and re-queued; nothing is
+    wrong with the telescope or the spectrograph."""
+
+
+class SpectrographFault(SpectrographError):
+    """The spectrograph service refused or failed a job, did not finish it
+    in time, or did not answer: counted towards marking the spectrograph
+    down, not towards the telescope's give-up."""
 
 
 class SpectrumFailed(Exception):
@@ -345,8 +395,11 @@ class SpectrographHook(Protocol):
         """Start one frame; returns the job (``id``, ``state``)."""
         ...
 
-    async def calibrate(self, frames: list[dict[str, Any]]) -> dict[str, Any]:
-        """Start a calibration sequence; returns the job."""
+    async def calibrate(
+        self, frames: list[dict[str, Any]], night: str | None = None
+    ) -> dict[str, Any]:
+        """Start a calibration sequence (raw files named for ``night``);
+        returns the job."""
         ...
 
     async def job(self, job_id: int, wait: float = 0.0) -> dict[str, Any]:
@@ -359,7 +412,7 @@ class SpectrographHook(Protocol):
         left running."""
         ...
 
-    async def status(self) -> dict[str, Any]: ...
+    async def status(self, refresh: bool = False) -> dict[str, Any]: ...
 
 
 class SlewDenied(Exception):
@@ -435,6 +488,8 @@ class TelescopeUnit:
     autofocus_results: list[Any] = field(default_factory=list, init=False)
     #: The spectrum this telescope leads or feeds (its id), while it does.
     spectrum: str | None = field(default=None, init=False)
+    #: An operator asked to park it now (why; :meth:`Sequencer.request_park`).
+    park_requested: str | None = field(default=None, init=False)
 
     @property
     def active(self) -> bool:
@@ -486,6 +541,18 @@ class SequencerConfig:
     locate_fiber: bool = True
     locate_timeout: float = 60.0
     spectrograph_abort_wait: float = 10.0
+    #: Spectrograph health (module doc): after this many spectrograph
+    #: faults in a row it is marked down (an alarm; no more spectra are
+    #: scheduled, imaging goes on); while down, its status is checked every
+    #: ``spectrograph_recovery_interval`` s and, with
+    #: ``spectrograph_auto_recover``, it is marked up again once a check
+    #: passes (else only the operator's clear does). How long a spectrum
+    #: request waits in the spectrograph service's queue while another
+    #: enclosure holds it (docs/kiwispec.md, "Sharing the spectrograph").
+    spectrograph_max_failures: int = 3
+    spectrograph_recovery_interval: float = 300.0
+    spectrograph_auto_recover: bool = True
+    spectrograph_queue_wait: float = 600.0
 
 
 @dataclass
@@ -566,9 +633,11 @@ class _SpecGate:
         self._check()
         return await self.hook.expose(**frame)
 
-    async def calibrate(self, frames: list[dict[str, Any]]) -> dict[str, Any]:
+    async def calibrate(
+        self, frames: list[dict[str, Any]], night: str | None = None
+    ) -> dict[str, Any]:
         self._check()
-        return await self.hook.calibrate(frames)
+        return await self.hook.calibrate(frames, night=night)
 
 
 @dataclass
@@ -646,6 +715,7 @@ class Sequencer:
         spectrograph: SpectrographHook | None = None,
         spectrograph_names: dict[str, str] | None = None,
         spectra: SpectrumRecorder | None = None,
+        clock: Clock | None = None,
     ) -> None:
         units = list(telescopes)
         if telescope is not None or camera is not None:
@@ -675,6 +745,20 @@ class Sequencer:
         self.spectrograph = spectrograph
         self.spectrograph_names = dict(spectrograph_names or {})
         self.spectra = spectra
+        #: The one clock every night name and time stamp comes from
+        #: (robofast_core.clock): the frames, the sidecars, the spectrograph's
+        #: file names, the autofocus results. Give the dispatch scheduler the
+        #: same one (sequencer_service.build does). Default: the host's.
+        self.clock: Clock = clock or real_clock
+        if imaging is not None:
+            imaging.set_clock(self.clock)
+        if spectra is not None:
+            spectra.clock = self.clock
+        #: Spectrograph health (module doc): faults in a row, and why it is
+        #: down (None: up).
+        self.spectrograph_failures = 0
+        self.spectrograph_down: str | None = None
+        self._spec_recovery: asyncio.Task | None = None
         #: Every spectrum and spectrograph calibration frame taken tonight.
         self.spectrum_records: list[dict[str, Any]] = []
         #: The spectrograph job this sequencer started and has not seen end,
@@ -706,6 +790,9 @@ class Sequencer:
         hook = getattr(self.plan, "set_preempt_callback", None)
         if hook is not None:
             hook(self.preempt)
+        hook = getattr(self.plan, "set_operator_hooks", None)
+        if hook is not None:
+            hook(park=self.request_park, clear_spectrograph=self.clear_spectrograph)
 
     def preempt(self, telescope: str, policy: str, reason: str = "") -> bool:
         """Ask ``telescope`` to stop its current observation (module doc).
@@ -751,6 +838,126 @@ class Sequencer:
         unit.wake.set()
         return True
 
+    def request_park(self, telescope: str, reason: str = "") -> bool:
+        """Park ``telescope`` now (the observer console's ``park``, through
+        :class:`~robofast_core.console.hold.OperatorHold`, which also holds
+        it and stops its observation). Only that mount moves: never the
+        roof, never the lease. Its telescope task parks it as soon as its
+        observation has stopped, with its own grant (so the generation's
+        fence covers it). A telescope that is not observing in a generation
+        is parked already (by its error's cleanup or the enclosure's).
+        Returns whether the request was taken."""
+        unit = self.units.get(telescope)
+        if unit is None:
+            raise ValueError(f"request_park({telescope!r})")
+        gen = self._gen
+        if gen is None or gen.revoked or telescope not in gen.working:
+            self._event(
+                "park_requested",
+                telescope=telescope,
+                reason=reason,
+                pending=False,
+                why="not observing: parked by the last cleanup",
+            )
+            return True
+        unit.park_requested = reason or "operator"
+        self._event("park_requested", telescope=telescope, reason=reason, pending=True)
+        unit.wake.set()
+        return True
+
+    def clear_spectrograph(self, operator: str = "", reason: str = "") -> bool:
+        """The operator's clear of a spectrograph marked down (module doc)."""
+        was = self.spectrograph_down
+        self._spectrograph_up(f"cleared by {operator or 'an operator'}: {reason}")
+        return was is not None
+
+    # -- spectrograph health ------------------------------------------------
+
+    def _spectrograph_ok(self) -> None:
+        self.spectrograph_failures = 0
+
+    def _spectrograph_fault(self, gen: int, telescope: str, error: str) -> None:
+        """A spectrograph fault (not the telescope's): count it; mark the
+        spectrograph down after ``spectrograph_max_failures`` in a row."""
+        self.spectrograph_failures += 1
+        self._event(
+            "spectrograph_error",
+            gen=gen,
+            telescope=telescope,
+            error=error,
+            failures=self.spectrograph_failures,
+            level="warning",
+        )
+        log.error("%s: spectrograph: %s", self.name, error)
+        if (
+            self.spectrograph_down is None
+            and self.spectrograph_failures >= self.config.spectrograph_max_failures
+        ):
+            self._spectrograph_mark_down(
+                f"{self.spectrograph_failures} faults in a row; last: {error}"
+            )
+
+    def _spectrograph_mark_down(self, why: str) -> None:
+        self.spectrograph_down = why
+        self._event("spectrograph_down", why=why, level="critical")
+        log.critical("%s: spectrograph marked down: %s", self.name, why)
+        self._tell_plan_spectrograph(False, why)
+        if self._spec_recovery is None or self._spec_recovery.done():
+            try:
+                self._spec_recovery = asyncio.get_running_loop().create_task(
+                    self._spectrograph_recovery(), name=f"{self.name}-spectrograph-recovery"
+                )
+            except RuntimeError:
+                self._spec_recovery = None  # no loop (a synchronous test)
+
+    def _spectrograph_up(self, why: str) -> None:
+        if self.spectrograph_down is None:
+            return
+        self.spectrograph_down = None
+        self.spectrograph_failures = 0
+        self._event("spectrograph_up", why=why)
+        log.warning("%s: spectrograph up again: %s", self.name, why)
+        self._tell_plan_spectrograph(True, why)
+        task = self._spec_recovery
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+        self._spec_recovery = None
+        for unit in self.units.values():
+            unit.wake.set()  # an idle telescope may lead a spectrum again
+
+    def _tell_plan_spectrograph(self, available: bool, why: str) -> None:
+        hook = getattr(self.plan, "set_spectrograph_available", None)
+        if hook is None:
+            return
+        try:
+            hook(available, why)
+        except Exception:
+            log.exception("%s: plan.set_spectrograph_available", self.name)
+
+    async def _spectrograph_recovery(self) -> None:
+        """While the spectrograph is down: check it every
+        ``spectrograph_recovery_interval`` (its status, read fresh, answers
+        with no alarms and no job stuck); with ``spectrograph_auto_recover``
+        a passing check marks it up."""
+        cfg = self.config
+        while self.spectrograph_down is not None:
+            await asyncio.sleep(cfg.spectrograph_recovery_interval)
+            if self.spectrograph is None:
+                return
+            try:
+                st = await asyncio.wait_for(
+                    self.spectrograph.status(refresh=True), cfg.spectrum_poll + 30.0
+                )
+            except Exception as exc:
+                self._event("spectrograph_check", ok=False, error=repr(exc))
+                continue
+            alarms = list(st.get("alarms") or [])
+            ok = not alarms
+            self._event("spectrograph_check", ok=ok, alarms=alarms[:5])
+            if ok and cfg.spectrograph_auto_recover:
+                self._spectrograph_up("recovery check passed")
+                return
+
     def _event(self, what: str, **detail: Any) -> None:
         self.timeline.event(self.name, what, **detail)
 
@@ -762,6 +969,15 @@ class Sequencer:
     # -- main loop --------------------------------------------------------
 
     async def run(self) -> None:
+        try:
+            await self._run()
+        finally:
+            task = self._spec_recovery
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def _run(self) -> None:
         await self._recover()
         while await self._wait_for_a_telescope():
             if not await self._closed_phase():
@@ -1106,6 +1322,22 @@ class Sequencer:
                     # Its spectrum was taken without it (module doc, "Spectra").
                     self._report(unit, obs, "complete", taken)
                     await self._telescope_failed(state, unit, tel, cam, repr(exc.error))
+                except SpectrographBusy as exc:
+                    # Busy with another job: re-queued, nobody's fault.
+                    self._report(unit, obs, "interrupted", taken)
+                    self._event(
+                        "spectrograph_busy", gen=state.gen, telescope=unit.name, error=str(exc)
+                    )
+                except SpectrographFault as exc:
+                    # The spectrograph's fault, not the telescope's: no park,
+                    # no backoff, no give-up count (module doc). Re-queued
+                    # by a plan that is told when the spectrograph is down;
+                    # failed for one that is not (so it moves on).
+                    told = getattr(self.plan, "set_spectrograph_available", None)
+                    self._report(unit, obs, "interrupted" if told else "failed", taken)
+                    self._spectrograph_fault(state.gen, unit.name, str(exc))
+                    if self.spectrograph_down is None:
+                        await asyncio.sleep(self.config.poll_interval)
                 except _PreemptStuck as exc:
                     self._report(unit, obs, "interrupted", taken)
                     unit.gave_up = True
@@ -1137,6 +1369,8 @@ class Sequencer:
         (module doc): the telescope leaves the generation."""
         if unit.idle_since is None:
             unit.idle_since = time.monotonic()
+        if unit.park_requested is not None:
+            await self._operator_park(state, unit, tel)
         self._event("telescope_idle", gen=state.gen, telescope=unit.name, seconds=idle.seconds)
         if not await tel.get("AtPark") and await tel.get("Tracking"):
             await tel.set("Tracking", False)
@@ -1161,6 +1395,24 @@ class Sequencer:
         log.info("%s: every telescope idle %s: releasing the enclosure", self.name, idle_for)
         state.idle_release.set()
         return True
+
+    async def _operator_park(self, state: _Generation, unit: TelescopeUnit, tel: Grant) -> None:
+        """Park this one telescope now (:meth:`request_park`): its guider is
+        stopped and any slew aborted first. The roof is not touched."""
+        why, unit.park_requested = unit.park_requested, None
+        report = CleanupReport(state.gen, [unit.name])
+        await self._stop_guider(unit.name, report)
+        await self._abort_slew(unit.name, tel, report)
+        await self._park(unit.name, tel, report)
+        self._event(
+            "operator_parked",
+            gen=state.gen,
+            telescope=unit.name,
+            parked=unit.name in report.parked,
+            errors=report.errors,
+            reason=why,
+            level="warning" if report.errors else "info",
+        )
 
     def _idle_release_due(self, state: _Generation, me: TelescopeUnit) -> bool:
         """Every working telescope has been idle for ``idle_release_after``:
@@ -1395,6 +1647,12 @@ class Sequencer:
         self._event("target_start", gen=gen, telescope=unit.name, target=obs.name)
         if obs.light and state.lease is None:
             raise RuntimeError(f"{obs.name}: light frames in a closed generation")
+        if (
+            obs.kind in ("spectrum", "spectrograph_calibration")
+            and self.spectrograph_down is not None
+            and not (obs.spectrum and obs.spectrum.get("leader") not in (None, unit.name))
+        ):
+            raise SpectrographFault(f"the spectrograph is marked down: {self.spectrograph_down}")
         if obs.light and await tel.get("AtPark"):
             await tel.call("Unpark")
         if obs.port is not None:
@@ -1442,7 +1700,7 @@ class Sequencer:
             # "now-after-readout" preemption waits for this exposure.
             unit.exposing = True
             try:
-                host_start = datetime.now(UTC)
+                host_start = self.clock()
                 await cam.call("StartExposure", obs.exptime, obs.light)
                 self._event(
                     "exposure_started", gen=gen, telescope=unit.name, index=i, exptime=obs.exptime
@@ -1521,6 +1779,7 @@ class Sequencer:
             model=model,
             values=values,
             event=lambda what, **kw: self._event(what, gen=state.gen, **kw),
+            clock=self.clock,
         )
 
     async def _read_focuser(self, unit: TelescopeUnit, fg: Grant) -> None:
@@ -1565,7 +1824,7 @@ class Sequencer:
             i = len(taken)
             unit.exposing = True
             try:
-                host_start = datetime.now(UTC)
+                host_start = self.clock()
                 await cam.call("StartExposure", exptime, True)
                 self._event(
                     "exposure_started", gen=state.gen, telescope=unit.name, index=i, exptime=exptime
@@ -1683,6 +1942,23 @@ class Sequencer:
 
     # -- spectra --------------------------------------------------------------------
 
+    def _held(self) -> set[str]:
+        """Telescopes an operator holds now (the plan's ``held``, from
+        :class:`~robofast_core.console.hold.OperatorHold`)."""
+        try:
+            return set(getattr(self.plan, "held", None) or ())
+        except Exception:
+            return set()
+
+    def _night_name(self, when: datetime) -> str | None:
+        """The night ``when`` belongs to (``n<YYYYMMDD>``), as the spectrum
+        sidecars and the frames name it; None with neither."""
+        if self.spectra is not None:
+            return self.spectra.night(when)
+        if self.imaging is not None:
+            return f"n{self.imaging.store.night(when):%Y%m%d}"
+        return None
+
     def _spec_name(self, telescope: str) -> str:
         return self.spectrograph_names.get(telescope, telescope)
 
@@ -1733,10 +2009,14 @@ class Sequencer:
         if state.spectrograph is None:
             raise Unsupported(f"{unit.name}: no spectrograph ({obs.name} is a spectrum)")
         feed = [t for t in obs.spectrum.get("feed") or [] if t in self.units]
+        held = self._held()
         expected = {
             t
             for t in feed
-            if t != unit.name and t in state.working and self.units[t].guider is not None
+            if t != unit.name
+            and t in state.working
+            and t not in held
+            and self.units[t].guider is not None
         }
         session = _Spectrum(sid, obs, unit.name, expected)
         state.spectra[sid] = session
@@ -1898,11 +2178,16 @@ class Sequencer:
         assert obs.spectrum is not None and state.spectrograph is not None
         deadline = time.monotonic() + cfg.spectrum_ready_timeout
         while True:
-            pending = session.expected - set(session.ready) - set(session.dropped)
+            # A member an operator holds now will not come (docs/console.md).
+            held = self._held() - set(session.ready)
+            pending = session.expected - set(session.ready) - set(session.dropped) - held
             remaining = deadline - time.monotonic()
             if not pending or remaining <= 0:
                 break
-            await _wait_any([session.tick], remaining)
+            await _wait_any([session.tick], min(remaining, cfg.spectrum_check_interval))
+        for t in sorted(session.expected & (self._held() - set(session.ready))):
+            session.expected.discard(t)
+            self._event("spectrum_member_held", gen=state.gen, telescope=t, spectrum=session.id)
         missing = sorted(session.expected - set(session.ready) - set(session.dropped))
         if missing:
             self._event(
@@ -1919,7 +2204,7 @@ class Sequencer:
             async with asyncio.timeout(cfg.spectrum_ready_timeout):
                 await self._spec_lock.acquire()
         except TimeoutError as exc:
-            raise SpectrographError("the spectrograph is busy with another job") from exc
+            raise SpectrographBusy("the spectrograph is busy with another job") from exc
         try:
             for i in range(obs.count):
                 policy = unit.preempt_policy
@@ -1949,13 +2234,22 @@ class Sequencer:
             frame["target_counts"] = spec["target_counts"]
         if spec.get("iodine") is not None:
             frame["iodine"] = "in" if spec["iodine"] else "out"
+        asked = self.clock()
+        night = self._night_name(asked)
+        if night is not None:
+            frame["night"] = night
         session.started = True
         exposing = [self.units[t] for t in feeding]
         for u in exposing:
             u.exposing = True
         session.pulse()
         try:
-            job = await state.spectrograph.expose(**frame)
+            try:
+                job = await state.spectrograph.expose(**frame)
+            except KiwiSpecBusy as exc:
+                raise SpectrographBusy(str(exc)) from exc
+            except KiwiSpecError as exc:
+                raise SpectrographFault(f"expose: {exc}") from exc
             job_id = int(job["id"])
             self._spec_job, self._spec_job_owner = job_id, unit.name
             self._event(
@@ -1975,10 +2269,13 @@ class Sequencer:
             for u in exposing:
                 u.exposing = False
             session.pulse()
+        self._spectrograph_ok()
         result = (view.get("results") or [{}])[-1]
         end = session.active()
         stats = await self._guide_stats(feeding)
         record = self._spectrum_record(state, unit, obs, session, result, feeding, end, stats)
+        record["night"] = night
+        record["sequencer_utc"] = asked.isoformat()
         path = self._write_spectrum(record)
         self.frames.append(
             {
@@ -2020,7 +2317,16 @@ class Sequencer:
         assert self.spectrograph is not None
         t0 = time.monotonic()
         while True:
-            view = await self.spectrograph.job(job_id, wait=cfg.spectrum_poll)
+            try:
+                view = await self.spectrograph.job(job_id, wait=cfg.spectrum_poll)
+            except KiwiSpecError as exc:
+                if time.monotonic() - t0 <= bound:
+                    log.warning("%s: spectrograph job %d: %s", self.name, job_id, exc)
+                    await asyncio.sleep(cfg.poll_interval)
+                    continue
+                report = CleanupReport(state.gen, [unit.name])
+                await self._abort_spectrograph(f"not answering: {exc}", report)
+                raise SpectrographFault(f"job {job_id}: {exc}") from exc
             if view.get("state") in ("done", "failed", "aborted"):
                 break
             why = None
@@ -2033,10 +2339,12 @@ class Sequencer:
                 await self._abort_spectrograph(why, report)
                 if session is not None and not session.active():
                     raise SpectrumFailed(f"{session.id}: {why}")
-                raise SpectrographError(f"job {job_id}: {why}")
+                raise SpectrographFault(f"job {job_id}: {why}")
         self._spec_job = self._spec_job_owner = None
+        if view.get("state") == "aborted" and session is not None and not session.active():
+            raise SpectrumFailed(f"{session.id}: every telescope of the feed dropped out")
         if view.get("state") != "done":
-            raise SpectrographError(f"job {job_id} {view.get('state')}: {view.get('error')}")
+            raise SpectrographFault(f"job {job_id} {view.get('state')}: {view.get('error')}")
         return view
 
     async def _guide_stats(self, telescopes: list[str]) -> dict[str, Any]:
@@ -2153,10 +2461,16 @@ class Sequencer:
             async with asyncio.timeout(self.config.spectrum_ready_timeout):
                 await self._spec_lock.acquire()
         except TimeoutError as exc:
-            raise SpectrographError("the spectrograph is busy with another job") from exc
+            raise SpectrographBusy("the spectrograph is busy with another job") from exc
         unit.exposing = True
+        night = self._night_name(self.clock())
         try:
-            job = await state.spectrograph.calibrate(frames)
+            try:
+                job = await state.spectrograph.calibrate(frames, night=night)
+            except KiwiSpecBusy as exc:
+                raise SpectrographBusy(str(exc)) from exc
+            except KiwiSpecError as exc:
+                raise SpectrographFault(f"calibrate: {exc}") from exc
             job_id = int(job["id"])
             self._spec_job, self._spec_job_owner = job_id, unit.name
             self._event(
@@ -2170,6 +2484,7 @@ class Sequencer:
         finally:
             unit.exposing = False
             self._spec_lock.release()
+        self._spectrograph_ok()
         for result in view.get("results") or []:
             record = {
                 "version": 1,
@@ -2182,6 +2497,7 @@ class Sequencer:
                 "dark": result.get("dark"),
                 "exptime": result.get("exptime"),
                 "start_utc": result.get("start_utc"),
+                "night": night,
                 "iodine": result.get("iodine"),
                 "spectrograph": result,
                 "warnings": list(result.get("warnings") or []),
@@ -2265,6 +2581,9 @@ class Sequencer:
                 for g in pair:
                     g.revoke("cleanup done")
         report.duration = time.monotonic() - t0
+        for unit in self.units.values():
+            if unit.park_requested is not None and unit.name in report.parked:
+                unit.park_requested = None  # parked by the cleanup
         self._event(
             f"{what}_done",
             gen=gen,

@@ -386,7 +386,9 @@ function render(doc) {
           : opButton("pause", "pause", {enclosure: name, telescope: t}, "Pause " + t,
               t + " finishes its current exposure, then holds. The roof is not touched.", false),
         opButton("stop now", "stop", {enclosure: name, telescope: t}, "Stop " + t + " now",
-          "Abort " + t + "'s exposure and slew and hold it (it stops tracking; it is parked when the enclosure closes). The roof is not touched.", true)));
+          "Abort " + t + "'s exposure and slew and hold it (it stops tracking; it is parked when the enclosure closes). The roof is not touched.", true),
+        opButton("park now", "park", {enclosure: name, telescope: t}, "Park " + t + " now",
+          "Abort " + t + "'s exposure and slew, hold it and park it now. Only this mount moves: the roof and the other telescopes are not touched. Resume lifts the hold.", true)));
   })));
 
   fill("spectrograph-body", encs.map(([name, e]) => {

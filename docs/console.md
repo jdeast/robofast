@@ -82,6 +82,7 @@ dialog; the destructive ones (marked *confirm*) must also send
 | `pause` | `enclosure`, `telescope` (omit: all) | the telescope finishes the exposure in progress (it is read out and kept), then holds: it stops tracking and stays where it is. **Never touches the roof.** |
 | `resume` | same | lift the hold; the telescope asks its plan afresh. If the enclosure is closed, the sequencer asks the supervisor for a lease as always; the supervisor alone decides when to open |
 | `stop` (*confirm*) | `enclosure`, `telescope` | one telescope: abort its exposure and slew now and hold it (stopped tracking; it is parked when the enclosure next closes; the roof is not touched) |
+| `park` (*confirm*) | `enclosure`, `telescope` (required) | one telescope, now: abort its exposure and slew, hold it, and park it as soon as its observation has stopped (the sequencer's park hook, with that telescope's own grant). **Only that mount moves**: the roof, the lease and the other telescopes are not touched. It stays held and parked until `resume` (which unparks it for its next light observation) |
 | `stop` (*confirm*) | `enclosure` only | the whole enclosure: hold every telescope, then ask the supervisor to close (`POST /close`, which revokes the lease). The sequencer aborts every exposure and parks every telescope as for any revocation, and with no lease the supervisor closes. While held, the sequencer asks for no new lease, so it stays closed until someone resumes |
 | `clear_lease` (*confirm*) | `enclosure` | release a dead (crashed or quarantined) lease once the telescopes are safe: the supervisor's `clear`, with the observer's name (design.md 3.3). Refused while the lease is live |
 | `clear_faults` (*confirm*) | `enclosure` | the enclosure's `ClearFaults` (the supervisor refuses unless it is closed) |
@@ -100,7 +101,17 @@ file into `control/inbox/`, and the wrapper, polling every second, applies it
 through the two hooks every plan has: while a telescope is held its plan
 answers `Idle` (so the sequencer starts nothing on it), and the observation in
 progress is stopped with the sequencer's own `preempt` (`now-after-readout`
-for pause, `now` for stop), reported `interrupted` and re-queued. The wrapper
+for pause, `now` for stop and park), reported `interrupted` and re-queued.
+For `park` the wrapper also calls the sequencer's `request_park` hook: the
+telescope's task parks that mount once it is idle (`operator_parked`
+event); a telescope that is not observing in a generation is already
+parked. The held telescopes are also told to the dispatch scheduler
+(`set_held`), so a held telescope is never reserved to feed a spectrum
+and a leader does not wait for it (`docs/rv_night.md`). The same directory
+takes `clear_spectrograph` (the operator's clear of a spectrograph the
+sequencer marked down), for now from a shell: `python -m
+robofast_core.console.hold CONTROL_DIR clear_spectrograph --operator NAME
+--reason TEXT`. The wrapper
 writes `control/holds.json` (the holds and the commands applied) after every
 poll, which the console shows and an enclosure stop waits for (up to
 `hold_ack_timeout`) before it asks the supervisor to close. Holds are
@@ -169,7 +180,7 @@ The request API's posture (design.md 3.7):
 * The sequencer's own timeline (only the supervisor's is shown) and a
   per-telescope "upcoming" from the scheduler's look-ahead (the queue is
   shown instead).
-* Parking a single stopped telescope at once (it parks when the enclosure
-  next closes); that would need a sequencer hook.
+* A console button for `clear_spectrograph` (the command exists; the
+  console shows the spectrograph marked down as a critical alarm).
 * Guider and spectrograph controls (start, stop, abort) -- by design the
   sequencer drives them; an observer stops the telescope instead.

@@ -278,6 +278,10 @@ async def replay(entries: list[dict[str, Any]]) -> ReplayResult:
                 await sched.submit(e["group"])
         elif kind == "cancel":
             sched.cancel(e["group"])
+        elif kind == "held":
+            sched.set_held(e["telescopes"])
+        elif kind == "spectrograph":
+            sched.set_spectrograph_available(bool(e["available"]), e.get("reason") or "")
         elif kind == "preempt":
             result.compared += 1
             if i not in used:

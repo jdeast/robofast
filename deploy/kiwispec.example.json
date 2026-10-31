@@ -1,0 +1,11 @@
+{
+  "name": "kiwispec",
+  "listen": "127.0.0.1:8130",
+  "spectrograph": {"host": "127.0.0.1", "port": 44445},
+  "camera": {"host": "127.0.0.1", "port": 2055},
+  "allow_hardware": false,
+  "telescopes": ["T1", "T2", "T3", "T4"],
+  "stage_positions": {"in": 11.0, "flat": 68.0, "out": 102.0},
+  "heater_setpoint": 55.0,
+  "readout_time": 22.0
+}

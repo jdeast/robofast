@@ -142,6 +142,9 @@ class PendingFrame:
     index: int
     written: WrittenFrame | None = None
     error: str | None = None
+    #: The downloaded image, kept only when asked (``keep_image``: the
+    #: autofocus measures it); the caller drops it when done.
+    image: ImageArray | None = field(default=None, repr=False)
 
     @property
     def path(self) -> str | None:
@@ -307,7 +310,9 @@ class Imaging:
             telescope=telescope,
             object=obs.object or obs.name,
             obs_name=obs.name,
-            imagetyp=imagetyp(obs.light, obs.exptime, obs.object or obs.name),
+            imagetyp="FOCUS"
+            if obs.kind == "autofocus"
+            else imagetyp(obs.light, obs.exptime, obs.object or obs.name),
             light=obs.light,
             exptime_requested=obs.exptime,
             host_start=host_start,
@@ -325,8 +330,11 @@ class Imaging:
         info.start = self.registry.snapshot(self._scopes(telescope))
         return _Exposure(info, time.monotonic())
 
-    async def exposure_done(self, telescope: str, cam: Grant, exp: _Exposure) -> PendingFrame:
-        """Read the camera's state, download the image, queue it (module doc)."""
+    async def exposure_done(
+        self, telescope: str, cam: Grant, exp: _Exposure, *, keep_image: bool = False
+    ) -> PendingFrame:
+        """Read the camera's state, download the image, queue it (module doc).
+        With ``keep_image`` the returned frame also carries the image."""
         if telescope not in self._camera_static:
             await self._read_batch(telescope, [(cam, CAMERA_STATIC, "camera.")], None)
             self._camera_static.add(telescope)
@@ -367,6 +375,8 @@ class Imaging:
             seconds=round(dt, 4),
         )
         frame = PendingFrame(telescope, exp.info.index)
+        if keep_image:
+            frame.image = image
         writer = self._writer(telescope)
         await writer.queue.put((frame, exp.info, image))
         return frame

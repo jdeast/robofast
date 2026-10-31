@@ -235,11 +235,18 @@ class Configuration:
     #: If interrupted (or failed) part-way, keep the frames taken and take
     #: only the rest; otherwise the configuration is re-taken whole.
     allow_partial: bool = False
+    #: ``EXPOSE`` (take the instrument configs' frames) or ``AUTO_FOCUS``
+    #: (focus the telescope on the target, with the instrument config's
+    #: filter and port; its exptime, if positive, overrides the autofocus
+    #: exposure time). As in the LCO OCS.
+    type: str = "EXPOSE"
+
+    TYPES: ClassVar[tuple[str, ...]] = ("EXPOSE", "AUTO_FOCUS")
 
     @classmethod
     def from_dict(cls, d: Any, what: str) -> Configuration:
         keys = {"id", "target", "instrument", "instrument_configs", "constraints", "status"}
-        keys |= {"failures", "allow_partial"}
+        keys |= {"failures", "allow_partial", "type"}
         _check_keys(d, keys, {"id", "target", "instrument_configs"}, what)
         allow_partial = d.get("allow_partial", False)
         if not isinstance(allow_partial, bool):
@@ -251,6 +258,13 @@ class Configuration:
             status = Status(d.get("status", "PENDING"))
         except ValueError as exc:
             raise ValueError(f"{what}.status: {d.get('status')!r}") from exc
+        ctype = d.get("type", "EXPOSE")
+        if ctype not in cls.TYPES:
+            raise ValueError(f"{what}.type: {ctype!r}; expected one of {cls.TYPES}")
+        if ctype == "AUTO_FOCUS" and (
+            len(ics) != 1 or not isinstance(ics[0], dict) or ics[0].get("light", True) is False
+        ):
+            raise ValueError(f"{what}: an AUTO_FOCUS needs exactly one light instrument config")
         return cls(
             str(d["id"]),
             Target.from_dict(d["target"], f"{what}.target"),
@@ -263,6 +277,7 @@ class Configuration:
             status,
             int(d.get("failures", 0)),
             allow_partial,
+            ctype,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -279,6 +294,8 @@ class Configuration:
             d["failures"] = self.failures
         if self.allow_partial:
             d["allow_partial"] = True
+        if self.type != "EXPOSE":
+            d["type"] = self.type
         return d
 
     @property

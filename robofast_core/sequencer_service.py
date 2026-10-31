@@ -38,8 +38,14 @@ and optionally:
   Alpaca ``Action`` that selects an M3 port, given the port name as its
   parameter; without it, an observation that names a port fails rather than
   use the wrong one).
-* per telescope, ``focuser`` and ``rotator`` (Alpaca devices, only read:
-  their positions go into the FITS headers).
+* per telescope, ``focuser`` and ``rotator`` (Alpaca devices, read for
+  the FITS headers). With an ``autofocus`` entry
+  (:class:`~robofast_core.autofocus.AutofocusSetup`; ``docs/autofocus.md``)
+  the sequencer also moves the focuser, for ``kind="autofocus"``
+  observations.
+* ``autofocus_triggers`` -- insert autofocus observations into the plan
+  (:class:`~robofast_core.autofocus_plan.AutofocusTriggers`): at the start
+  of the night, on a temperature change, on FWHM degradation.
 * ``images`` -- save every frame (:mod:`robofast_core.imaging`;
   ``docs/data.md``): ``{"data_root": "/data", "site": "minerva", ...}``
   with :class:`~robofast_core.imaging.ImagingConfig` fields; a relative
@@ -95,6 +101,8 @@ from pathlib import Path
 from typing import Any
 
 from robofast_core.alpaca import alpaca_owner
+from robofast_core.autofocus import AutofocusSetup
+from robofast_core.autofocus_plan import AutofocusTriggers, TriggerConfig
 from robofast_core.config import device_address, load_config, telescopes
 from robofast_core.imaging import imaging_from_config
 from robofast_core.lease_client import RemoteSupervisor
@@ -109,7 +117,15 @@ log = logging.getLogger(__name__)
 NEEDS_OPERATOR = 3
 
 
-TELESCOPE_KEYS = {"telescope", "camera", "filterwheel", "port_action", "focuser", "rotator"}
+TELESCOPE_KEYS = {
+    "telescope",
+    "camera",
+    "filterwheel",
+    "port_action",
+    "focuser",
+    "rotator",
+    "autofocus",
+}
 
 
 def build_units(
@@ -119,10 +135,12 @@ def build_units(
     *,
     imagebytes: bool = True,
     aux: dict[str, dict[str, DeviceOwner]] | None = None,
+    base: Path | None = None,
 ) -> list[TelescopeUnit]:
     """One :class:`TelescopeUnit` per entry of ``telescopes``. Focusers and
-    rotators (read only, for headers) go into ``aux["focuser"]`` and
-    ``aux["rotator"]`` by telescope name, if ``aux`` is given."""
+    rotators (read for headers) go into ``aux["focuser"]`` and
+    ``aux["rotator"]`` by telescope name, if ``aux`` is given; a telescope
+    with an ``autofocus`` entry also lets the sequencer move its focuser."""
     units = []
     for name, entry in telescopes(config).items():
         if "camera" not in entry:
@@ -149,6 +167,14 @@ def build_units(
         port_action = entry.get("port_action")
         if port_action is not None and (not isinstance(port_action, str) or not port_action):
             raise ValueError(f"telescope {name!r}: port_action must be a non-empty string")
+        autofocus = None
+        if entry.get("autofocus") is not None:
+            if "focuser" not in owners:
+                raise ValueError(f"telescope {name!r}: autofocus needs a focuser")
+            try:
+                autofocus = AutofocusSetup.from_dict(entry["autofocus"], base)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"telescope {name!r}: {exc}") from exc
         units.append(
             TelescopeUnit(
                 name,
@@ -156,6 +182,8 @@ def build_units(
                 owners["camera"],
                 filterwheel=owners.get("filterwheel"),
                 port_action=port_action,
+                focuser=owners.get("focuser") if autofocus is not None else None,
+                autofocus=autofocus,
             )
         )
     if not units:
@@ -190,12 +218,20 @@ def build(
         command_timeout,
         imagebytes=bool(images.get("imagebytes", True)),
         aux=aux,
+        base=base,
     )
     names = [u.name for u in units]
     if plan is None:
         if "plan" not in config:
             raise ValueError("no plan: give the config a 'plan' entry or use --plan")
         plan = plan_from_config(config["plan"], names, base=base)
+    triggers = None
+    if config.get("autofocus_triggers") is not None:
+        focusable = [u.name for u in units if u.autofocus is not None]
+        if not focusable:
+            raise ValueError("autofocus_triggers: no telescope has an autofocus entry")
+        tcfg = TriggerConfig.from_dict(config["autofocus_triggers"])
+        plan = triggers = AutofocusTriggers(plan, tcfg, telescopes=focusable)
     url = config.get("supervisor_url") or f"http://{config.get('listen', '127.0.0.1:8100')}"
     remote = RemoteSupervisor(url, **config.get("lease_client", {}))
     weather = None
@@ -232,6 +268,8 @@ def build(
         config=SequencerConfig(**config.get("sequencer", {})),
         imaging=imaging,
     )
+    if triggers is not None:
+        triggers.bind(seq.registry)
     return seq, remote
 
 

@@ -53,6 +53,7 @@ once after any action) and falls back to polling `/console/api/status`.
 | Spectrograph | busy, job, phase, frame *n* of *m*, exposure progress, target counts, exposure meter, CCD temperature, iodine stage, pressure | KiwiSpec `GET /status` |
 | Plan | the night's plan record, newest first (decisions with score and runner-up count, outcomes, idles, preemptions, ToOs); the pending queue (ToOs first, then priority) | `record` directory of the dispatch plan; the scheduler's state file, read as the request API reads it |
 | Timeline | the supervisor's recent commands and events | supervisor `GET /timeline` |
+| Images | each guider's live frame with the fiber, the centroid and the guide window drawn on it; each telescope's latest saved frame; the spectrograph's latest raw frame (below) | guider `GET /frame`, the frame index, `spectrograph_frames` |
 | Requests | submit, validate or cancel a request group or ToO; list one's own groups | the request API, in process |
 
 Alarms raised: the supervisor's own alarms; an enclosure fault; a quarantined
@@ -66,6 +67,64 @@ its enclosure, source and text, so an acknowledgement sticks to that alarm
 The page works on a phone (one column under 360 px), and has three themes,
 kept in the browser: dark (the default), **red** (red on black, nothing
 else, for a dark control room) and light.
+
+## Images
+
+The **Images** section shows, in the browser (no DS9, no plug-in: it works
+remotely and on a phone):
+
+* a strip of **guider thumbnails**, one per telescope with a `guider`,
+  refreshed at a chosen rate (paused, 0.5, 1, **2** or 4 Hz) while the page
+  is visible, with the target (fiber) circle and cross, the last centroid
+  (an X) and the guide window drawn over the frame. Tap one to open it in
+  the viewer;
+* a **viewer** for any source: the guiders, each telescope's latest saved
+  frame (`imager-<tel>`: the newest line of its nightly frame index under
+  `images.data_root`, docs/data.md) and the spectrograph's latest raw
+  frame (`spectrograph`: the newest `*.fits` in the enclosure entry's
+  `spectrograph_frames` directory, or its newest subdirectory, wherever
+  the spectrograph PC's files land). Scale (zscale, 99.5 %, 99 %,
+  min-max), stretch (linear, asinh, log, sqrt) and resolution (256, 512 or
+  1024 px), zoom (+/- or the wheel), pan (drag), **click for a pixel
+  value** (and its detector position), and **FITS** to download the frame.
+
+The console does the work and the browser gets little: each frame is read
+once however many people watch (a guider at most every
+`image_min_interval`, 0.4 s; files at most every `image_file_poll`, 2 s),
+display limits come from the whole frame (so panning keeps the stretch),
+and each view is binned to the requested size, scaled to 8 bits and sent as
+a PNG with what to draw over it in an `X-Frame` header. An unchanged frame
+costs a `304` and no pixels (ETag). The guider bins on the guide computer
+(`guider_frame_max`, 256 px), so a full acquisition frame does not cross
+the network at full size.
+
+**Bandwidth.** A guiding thumbnail (the 48-pixel guide window) is about
+1.7 kB of PNG plus about 0.6 kB of headers: at 2 Hz, about 5 kB/s
+(40 kbit/s) per guider, measured in `tests/core/test_console_images.py`. A
+512-pixel view of a sky frame is typically 100 to 250 kB, fetched only when
+the frame changes. The page shows the image traffic it is using; pause the
+guiders on a slow link. Images have their own rate limit per token
+(`image_per_minute`, 900; `image_burst`, 60), apart from the page's.
+
+Endpoints (`read` scope): `GET /console/api/images` (the sources),
+`GET /console/api/image/<enclosure>/<source>?max=&scale=&stretch=&x0=&y0=&x1=&y1=`
+(PNG), `GET /console/api/pixel/<enclosure>/<source>?x=&y=` and
+`GET /console/api/fits/<enclosure>/<source>` (the file itself, or a FITS
+copy of a guider frame).
+
+**DS9.** For an observer at a desktop who wants DS9, download the frame
+with the **FITS** link (or a script with a `read` token) and open it; DS9
+is never needed by the console:
+
+```
+curl -s -H "Authorization: Token $TOKEN" -o t1.fits \
+  https://console.example/console/api/fits/aqawan1/imager-t1
+ds9 t1.fits                      # or, to a running DS9: xpaset -p ds9 fits $PWD/t1.fits
+```
+
+(SAMP works the same way: any SAMP client can send DS9 an `image.load.fits`
+message with the downloaded file's `file://` URL; the console itself does
+not speak SAMP, since the browser cannot reach a desktop's SAMP hub.)
 
 ## What an observer can do
 
@@ -273,3 +332,7 @@ The request API's posture (design.md 3.7):
   next closes); that would need a sequencer hook.
 * Guider and spectrograph controls (start, stop, abort) -- by design the
   sequencer drives them; an observer stops the telescope instead.
+* The spectrograph frame needs the raw files where the console can read
+  them (`spectrograph_frames`); the spectrograph PC's own directory is not
+  shared yet. Overlays on the science and spectrograph frames (WCS, order
+  traces) are not drawn.

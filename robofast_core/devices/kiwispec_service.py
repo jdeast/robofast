@@ -205,6 +205,8 @@ class KiwiSpecConfig:
     stage_positions: dict[str, float] = field(
         default_factory=lambda: {"in": 11.0, "flat": 68.0, "out": 102.0}
     )
+    #: Arrived: within this of the target (mm) and stopped (two consecutive
+    #: polls agree to a tenth of it).
     stage_tolerance: float = 0.1
     stage_timeout: float = 60.0  # legacy ctrl_i2stage_move
     stage_poll: float = 1.0
@@ -242,7 +244,7 @@ class KiwiSpecConfig:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> KiwiSpecConfig:
-        d = dict(d)
+        d = {k: v for k, v in d.items() if not k.startswith("_")}  # "_note" etc.
         known = {f.name for f in dataclasses.fields(cls)}
         unknown = set(d) - known
         if unknown:
@@ -447,10 +449,21 @@ class KiwiSpec:
             await self.spec.stage_move_mm(where)
         self.last_stage_request = str(where)
         deadline = time.monotonic() + c.stage_timeout
+        # Arrived = within tolerance AND stopped: two consecutive readings
+        # agree to a tenth of the tolerance. Within tolerance alone is not
+        # enough: a stage still decelerating into place reads "unknown" (the
+        # server names a position only at round(mm, 1)), and that reading
+        # would go into the frame's header.
+        prev: float | None = None
         while True:
             pos = await self.spec.stage_position()
-            if abs(pos.mm - target) <= c.stage_tolerance:
+            if (
+                abs(pos.mm - target) <= c.stage_tolerance
+                and prev is not None
+                and abs(pos.mm - prev) <= c.stage_tolerance / 10
+            ):
                 return pos
+            prev = pos.mm
             if time.monotonic() >= deadline:
                 raise KiwiSpecTimeout(
                     f"iodine stage at {pos.mm} mm, not {where} ({target} mm), after"

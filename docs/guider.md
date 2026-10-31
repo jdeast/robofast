@@ -354,7 +354,10 @@ the camera or the telescope.** The unit has never been commissioned.
    with the service in `open` mode and no tip/tilt.
 3. On sky, in `open` mode: a bright star, `POST /calibrate {"device":
    "tiptilt", "step": ...}` at the FAU port; compare with
-   `from_sx_legacy(0.128, 214.7, plate_scale)` from the legacy config.
+   the legacy seed in `sites/minerva/guider_t2.example.json`
+   (`from_sx_legacy(0.025, 45, 0.265)` from `ao_t2.ini`; `ao_mred.ini`'s
+   0.128 arcsec/step and 214.7 deg belong to the MRED unit -- see
+   `sites/minerva/README.md`, conflict 2).
 4. Closed loop at a low gain (kp 0.2, 10-20 Hz), then raise; watch
    `latency_*`, `residual_rms` and `range_fraction`; calibrate the mount
    (`"device": "mount"`) and enable offloading.

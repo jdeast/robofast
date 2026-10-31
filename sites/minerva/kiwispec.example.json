@@ -1,0 +1,24 @@
+{
+  "_note": [
+    "The KiwiSpec service (docs/kiwispec.md), on the control computer:",
+    "  python -m robofast_core.devices.kiwispec_service --config sites/minerva/kiwispec.example.json",
+    "Addresses are 127.0.0.1 placeholders; ports are the legacy servers' (spectrograph.ini SERVER_PORT, CAMERA_PORT).",
+    "allow_hardware false: see docs/kiwispec.md before turning it on.",
+    "stage_positions (mm): spectrograph_server.ini [I2POSITIONS] (in 11, flat 68, out 102), which the stage server",
+    "moves to; the client's spectrograph.ini lists 145/88/55, the server file's previous values (stale).",
+    "heater_setpoint, heater_tolerance: spectrograph.ini I2SETTEMP, I2TEMPTOL. ccd_format, readout_mode:",
+    "spectrograph.ini [SI_SETTINGS]. telescopes: all four can feed the fiber; T3 and T4 are down (Aqawan 2)."
+  ],
+  "name": "kiwispec",
+  "listen": "127.0.0.1:8130",
+  "spectrograph": {"host": "127.0.0.1", "port": 44445},
+  "camera": {"host": "127.0.0.1", "port": 2055},
+  "allow_hardware": false,
+  "telescopes": ["T1", "T2", "T3", "T4"],
+  "stage_positions": {"in": 11.0, "flat": 68.0, "out": 102.0},
+  "heater_setpoint": 55.0,
+  "heater_tolerance": 0.501,
+  "readout_time": 22.0,
+  "readout_mode": 3,
+  "ccd_format": [50, 2090, 1, 0, 2052, 1]
+}

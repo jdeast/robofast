@@ -613,6 +613,8 @@ broker outage costs only ToOs, never the night.
 
 Per-site YAML: which Alpaca endpoint each device is, enclosure membership,
 timeouts, limits, and policies (the first is `sites/minerva/weather.yaml`).
+`sites/minerva/README.md` maps every MINERVA value to its legacy
+minerva-control `config/*.ini` source and lists the conflicts between them.
 A new site is a new config directory plus any device servers it needs.
 
 ## 4. Windows control PCs

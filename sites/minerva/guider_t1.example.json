@@ -1,0 +1,46 @@
+{
+  "_note": [
+    "The guider service for T1's FAU (docs/guider.md), on the computer the FAU camera is plugged into:",
+    "  python -m robofast_core.guider.service --config sites/minerva/guider_t1.example.json",
+    "Hardware-shaped but locked: allow_hardware is false, so nothing is opened until it is true AND --hardware is given,",
+    "which needs JDE's approval (docs/guider.md, Commissioning). Addresses are 127.0.0.1 placeholders.",
+    "From minerva-control (sites/minerva/README.md has the table): fau_t1.ini -- ZWO ASI174 (the file's",
+    "MANUFACTURER = SBIG is stale), 0.265 arcsec/px, the fiber at (949, 617) (backlit LED 2018-05-31; 0-based",
+    "pixels of the legacy FITS frame: confirm with POST /locate before trusting it), legacy loop gains",
+    "(Loop_params KPx/KIx, Deadband). T1 has no tip/tilt: the mount guides alone (legacy fauguide).",
+    "The FAU is on M3 port 2 (telescope_1.ini [PORT] FAU); 'port' names the calibration, not the port number.",
+    "_legacy_seed_calibrations: the mount's matrix from the plate scale at PA 0 (legacy derotates the FAU to PA 0).",
+    "It is a starting point to compare with POST /calibrate {\"device\": \"mount\"}; it is NOT loaded (keys",
+    "starting with _ are ignored). Copy it to 'calibrations' only to guide before a measured calibration exists."
+  ],
+  "name": "t1-guider",
+  "scope": "t1",
+  "listen": "127.0.0.1:8141",
+  "allow_hardware": false,
+  "port": "fau",
+  "calibration_dir": "/var/lib/robofast/guider-calibrations/t1",
+  "camera": {"kind": "zwo", "index": 0},
+  "mount": {"kind": "alpaca", "address": "127.0.0.1:11121", "number": 0, "method": "offset", "max_offset": 30},
+  "backlight": {"kiwispec": "http://127.0.0.1:8130"},
+  "guide": {
+    "exposure": 1.0,
+    "acq_exposure": 1.0,
+    "roi_size": 64,
+    "target": [949.0, 617.0],
+    "fiber_radius": 3.0,
+    "centroider": {"kind": "annulus"},
+    "gains": {"kp": 0.5, "ki": 0.1, "deadband": 0.0},
+    "capture_radius": 8,
+    "plate_scale": 0.265
+  },
+  "_legacy_seed_calibrations": {
+    "mount": {
+      "matrix": [[-3.773585, 0.0], [0.0, 3.773585]],
+      "units": "arcsec",
+      "plate_scale": 0.265,
+      "pa": 0.0,
+      "parity": 1,
+      "notes": "seed: inv(sky_matrix(0.265, 0, +1)) from fau_t1.ini platescale/rotangle (unverified)"
+    }
+  }
+}

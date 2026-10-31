@@ -18,7 +18,8 @@ Each line is one JSON object with ``t`` (ISO 8601, UTC) and ``kind``:
 * ``continue`` -- the next observation of a visit in progress;
 * ``abandon`` -- a visit dropped mid-way (``why``);
 * ``idle`` -- nothing observable (with ``rejected``); ``night_over``;
-* ``too`` (the request group received), ``cancel``, ``expired``;
+* ``too`` and ``submit`` (the request group received), ``cancel``,
+  ``expired``;
 * ``preempt`` -- a telescope asked to stop for a ToO (``policy``,
   ``accepted``);
 * ``outcome`` -- how an observation ended (``outcome``, ``frames``).
@@ -272,6 +273,9 @@ async def replay(entries: list[dict[str, Any]]) -> ReplayResult:
                 sched.check_toos()
             else:
                 await sched.submit_too(e["group"])
+        elif kind == "submit":
+            if e["group"]["id"] not in sched.groups:  # else in this file's snapshot
+                await sched.submit(e["group"])
         elif kind == "cancel":
             sched.cancel(e["group"])
         elif kind == "preempt":

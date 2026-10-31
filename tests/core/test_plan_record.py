@@ -160,7 +160,7 @@ async def test_replay_from_a_mid_night_restart(tmp_path):
         clock=clock,
         record=PlanRecord(tmp_path / "plans", longitude=LON),
     )
-    again._apply_state(d._state())
+    again.restore_state(d._state())
     await again.next_observation("t2")
     entries = read_record(tmp_path / "plans" / "plan-2026-11-14.jsonl")
     assert [e["kind"] for e in entries].count("snapshot") == 2

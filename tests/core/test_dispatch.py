@@ -604,14 +604,21 @@ async def test_dropbox(tmp_path):
     box = tmp_path / "too"
     box.mkdir()
     d = make([group("a")], too_dropbox=box)
-    (box / "good.json").write_text(json.dumps(group("burst", too=too("next"))))
-    (box / "bad.json").write_text(json.dumps(group("nope")))  # no "too"
+    (box / "1-good.json").write_text(json.dumps(group("burst", too=too("next"))))
+    (box / "2-normal.json").write_text(json.dumps(group("plain")))  # not a ToO: also fine
+    bad = group("nope")
+    del bad["requests"]
+    (box / "3-bad.json").write_text(json.dumps(bad))
+    (box / "4-cancel.json").write_text(json.dumps({"cancel": "plain"}))
+    (box / "5-cancel.json").write_text(json.dumps({"cancel": "unknown"}))
     (box / "partial.json.tmp").write_text("{")
-    assert await d.poll_dropbox() == ["burst"]
-    assert (box / "accepted" / "good.json").exists()
-    assert (box / "rejected" / "bad.json").exists()
-    assert "no 'too' entry" in (box / "rejected" / "bad.json.error").read_text()
+    assert await d.poll_dropbox() == ["burst", "plain", "plain"]
+    assert (box / "accepted" / "1-good.json").exists()
+    assert (box / "rejected" / "3-bad.json").exists()
+    assert "missing ['requests']" in (box / "rejected" / "3-bad.json.error").read_text()
+    assert "unknown request group" in (box / "rejected" / "5-cancel.json.error").read_text()
     assert (box / "partial.json.tmp").exists()  # not a .json: left alone
+    assert d.status("plain-c") is Status.CANCELED
     assert "burst-r" in d.requests
 
 

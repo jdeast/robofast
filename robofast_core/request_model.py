@@ -453,6 +453,9 @@ class RequestGroup:
     priority: float = 1.0
     too: TooSpec | None = None
     submitted: datetime | None = None
+    #: The request-API client that submitted it (its token's name); empty
+    #: for groups from a request file or the drop box.
+    submitter: str = ""
 
     def __post_init__(self) -> None:
         for r in self.requests:
@@ -461,7 +464,7 @@ class RequestGroup:
     @classmethod
     def from_dict(cls, d: Any, what: str | None = None) -> RequestGroup:
         what = what or f"request group {d.get('id') if isinstance(d, dict) else d!r}"
-        keys = {"id", "name", "proposal", "priority", "too", "requests", "submitted"}
+        keys = {"id", "name", "proposal", "priority", "too", "requests", "submitted", "submitter"}
         _check_keys(d, keys, {"id", "requests"}, what)
         reqs = d["requests"]
         if not isinstance(reqs, list) or not reqs:
@@ -474,6 +477,7 @@ class RequestGroup:
             _number(d.get("priority", 1.0), f"{what}.priority", 0.0),
             None if d.get("too") is None else TooSpec.from_dict(d["too"], f"{what}.too"),
             None if d.get("submitted") is None else _time(d["submitted"], f"{what}.submitted"),
+            str(d.get("submitter", "")),
         )
         group.validate(what)
         return group
@@ -502,6 +506,8 @@ class RequestGroup:
             d["too"] = self.too.to_dict()
         if self.submitted is not None:
             d["submitted"] = self.submitted.isoformat()
+        if self.submitter:
+            d["submitter"] = self.submitter
         d["requests"] = [r.to_dict() for r in self.requests]
         return d
 

@@ -1,0 +1,26 @@
+{
+  "_note": [
+    "The request API (robofast_core/request_api.py; docs/design.md 3.7), the one internet-facing service.",
+    "  python -m robofast_core.request_api serve --config sites/minerva/request_api.example.json",
+    "  python -m robofast_core.request_api tokens add --config ... --name my-tom --scope read --scope submit",
+    "It listens on loopback behind a TLS reverse proxy (deploy/nginx-request-api.conf, deploy/Caddyfile.request-api).",
+    "tokens: the hashed tokens file. Keep it outside any repository (the CLI refuses a path inside a git work tree).",
+    "There are no default tokens: until one is added, every request is refused.",
+    "enclosures: each enclosure's config (shared with its supervisor and sequencer) and, when the sequencer",
+    "runs with --plan, that dispatch plan file; the API reads the scheduler's state file and writes the drop box.",
+    "Give the enclosure config a status_file (robofast_core/sequencer_service.py) for per-telescope state in GET /status.",
+    "data_path_template: where frames are expected to land (no files are served); fields: enclosure, night,",
+    "telescope, group, request, configuration, instrument_config, frame."
+  ],
+  "listen": "127.0.0.1:8300",
+  "tokens": "/etc/robofast/api-tokens.json",
+  "audit_log": "/var/log/robofast/request-api-audit.jsonl",
+  "enclosures": {
+    "aqawan1": {"config": "aqawan1.json", "plan": "dispatch.example.json"}
+  },
+  "max_body": 65536,
+  "rate_per_minute": 60,
+  "rate_burst": 20,
+  "validate_step": 900,
+  "data_path_template": "/data/minerva/{night}/{telescope}/{configuration}.{instrument_config}.{frame:04d}.fits"
+}

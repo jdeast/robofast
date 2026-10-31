@@ -1091,6 +1091,7 @@ class DispatchScheduler:
             port=ic.port,
             allow_partial=c.allow_partial,
             object=c.target.name,
+            guide=c.guide and ic.light,
         )
 
     def _observation(self, visit: _Visit) -> Observation:

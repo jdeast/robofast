@@ -190,6 +190,7 @@ from robofast_core.timeline import Timeline
 __all__ = [
     "AllowAllSlews",
     "CleanupReport",
+    "GuiderHook",
     "LeaseSource",
     "Observation",
     "ObservationFailed",
@@ -244,6 +245,25 @@ class LeaseSource(Protocol):
         ...
 
 
+class GuiderHook(Protocol):
+    """A telescope's guider (:class:`~robofast_core.guider.service.GuiderRemote`):
+    started on target for an observation with ``guide``, checked before each
+    exposure, stopped when the observation ends and, first, in every
+    cleanup (before parking)."""
+
+    async def start(self, **params: Any) -> Any:
+        """Acquire and start guiding; raise if it cannot (bounded)."""
+        ...
+
+    async def check(self) -> None:
+        """Raise if the guider has failed since :meth:`start`."""
+        ...
+
+    async def stop(self, reason: str) -> bool:
+        """Stop guiding; bounded, never raises."""
+        ...
+
+
 class SlewDenied(Exception):
     """A :class:`SlewGuard` refused a slew; the message says why."""
 
@@ -283,6 +303,8 @@ class TelescopeUnit:
     camera: DeviceOwner
     filterwheel: DeviceOwner | None = None
     port_action: str | None = None
+    #: Started for observations with ``guide`` (design.md 3.4, docs/guider.md).
+    guider: GuiderHook | None = None
     #: The focuser the sequencer moves (autofocus), and the autofocus
     #: setup; both needed for ``kind="autofocus"`` observations.
     focuser: DeviceOwner | None = None
@@ -959,6 +981,8 @@ class Sequencer:
                 await asyncio.wait({task})
             if task.done() and not task.cancelled():
                 task.exception()  # retrieved: the caller already has its outcome
+            if obs.guide and unit.guider is not None:
+                await unit.guider.stop("observation ended")  # bounded, never raises
 
     async def _stop_observation(
         self,
@@ -1148,12 +1172,20 @@ class Sequencer:
             await tel.call("SlewToCoordinatesAsync", ra, dec)
             await self._wait_for(lambda: tel.get("Slewing"), lambda s: not s, cfg.slew_timeout)
             self._event("on_target", gen=gen, telescope=unit.name, ra=ra, dec=dec)
+            if obs.guide:
+                # Stopped in _observe_preemptible's finally and in cleanup.
+                if unit.guider is None:
+                    raise Unsupported(f"{unit.name} has no guider ({obs.name} asks to guide)")
+                await unit.guider.start(dec=dec)
+                self._event("guiding", gen=gen, telescope=unit.name)
         if obs.kind == "autofocus":
             await self._autofocus(state, unit, tel, cam, obs, taken)
             return
         for i in range(obs.count):
             if imaging is not None:
                 imaging.check(unit.name)  # a lost frame stops the telescope first
+            if obs.guide and obs.light and unit.guider is not None:
+                await unit.guider.check()  # a failed guider is this telescope's error
             # From here until it is read out (downloaded, with imaging), a
             # "now-after-readout" preemption waits for this exposure.
             unit.exposing = True
@@ -1458,6 +1490,11 @@ class Sequencer:
 
     async def _cleanup_telescope(self, name: str, tel: Grant, report: CleanupReport) -> None:
         cfg = self.config
+        unit = self.units.get(name)
+        if unit is not None and unit.guider is not None:
+            # The guide loop moves the mount: stop it before parking.
+            if not await unit.guider.stop("cleanup"):
+                report.errors.append(f"{name}: guider did not confirm stop")
         await self._abort_slew(name, tel, report)
         try:
             if not await tel.get("AtPark"):

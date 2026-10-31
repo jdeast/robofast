@@ -88,6 +88,10 @@ class Observation:
     #: The target's name for FITS ``OBJECT`` and file names (``name`` if None;
     #: the dispatch scheduler's names carry request ids as well).
     object: str | None = None
+    #: Guide while exposing: the telescope's guider is started on target and
+    #: stopped when the observation ends (docs/guider.md). A telescope
+    #: without a guider fails such an observation.
+    guide: bool = False
     #: What to do on the target: ``"expose"`` (``count`` frames), or
     #: ``"autofocus"`` (focus the telescope there: :mod:`robofast_core.autofocus`;
     #: ``exptime`` and ``count`` come from the telescope's autofocus config).

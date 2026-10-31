@@ -46,6 +46,11 @@ and optionally:
 * ``autofocus_triggers`` -- insert autofocus observations into the plan
   (:class:`~robofast_core.autofocus_plan.AutofocusTriggers`): at the start
   of the night, on a temperature change, on FWHM degradation.
+* per telescope, ``guider``: the guider service's URL, or ``{"url": ...,
+  "acquire_timeout": s, "timeout": s, "poll_interval": s}``
+  (:class:`~robofast_core.guider.service.GuiderRemote`; docs/guider.md).
+  Observations with ``guide`` start it on target; cleanup stops it before
+  parking.
 * ``images`` -- save every frame (:mod:`robofast_core.imaging`;
   ``docs/data.md``): ``{"data_root": "/data", "site": "minerva", ...}``
   with :class:`~robofast_core.imaging.ImagingConfig` fields; a relative
@@ -125,6 +130,7 @@ TELESCOPE_KEYS = {
     "focuser",
     "rotator",
     "autofocus",
+    "guider",
 }
 
 
@@ -175,6 +181,13 @@ def build_units(
                 autofocus = AutofocusSetup.from_dict(entry["autofocus"], base)
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"telescope {name!r}: {exc}") from exc
+        guider = None
+        if "guider" in entry:
+            from robofast_core.guider.service import GuiderRemote
+
+            g = entry["guider"]
+            g = {"url": g} if isinstance(g, str) else dict(g)
+            guider = GuiderRemote(g.pop("url"), scope=name, **g)
         units.append(
             TelescopeUnit(
                 name,
@@ -184,6 +197,7 @@ def build_units(
                 port_action=port_action,
                 focuser=owners.get("focuser") if autofocus is not None else None,
                 autofocus=autofocus,
+                guider=guider,
             )
         )
     if not units:
@@ -256,6 +270,9 @@ def build(
         base=base,
     )
     if imaging is not None:
+        for u in units:
+            if u.guider is not None and getattr(u.guider, "registry", 0) is None:
+                u.guider.registry = imaging.registry  # guide values in the headers
         imaging.owners = [o for d in aux.values() for o in d.values()]
         if weather is not None:
             imaging.owners.append(weather)

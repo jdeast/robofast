@@ -235,6 +235,8 @@ class Configuration:
     #: If interrupted (or failed) part-way, keep the frames taken and take
     #: only the rest; otherwise the configuration is re-taken whole.
     allow_partial: bool = False
+    #: Guide on the target while exposing (light frames; docs/guider.md).
+    guide: bool = False
     #: ``EXPOSE`` (take the instrument configs' frames) or ``AUTO_FOCUS``
     #: (focus the telescope on the target, with the instrument config's
     #: filter and port; its exptime, if positive, overrides the autofocus
@@ -246,11 +248,14 @@ class Configuration:
     @classmethod
     def from_dict(cls, d: Any, what: str) -> Configuration:
         keys = {"id", "target", "instrument", "instrument_configs", "constraints", "status"}
-        keys |= {"failures", "allow_partial", "type"}
+        keys |= {"failures", "allow_partial", "guide", "type"}
         _check_keys(d, keys, {"id", "target", "instrument_configs"}, what)
         allow_partial = d.get("allow_partial", False)
         if not isinstance(allow_partial, bool):
             raise ValueError(f"{what}.allow_partial: expected true or false")
+        guide = d.get("guide", False)
+        if not isinstance(guide, bool):
+            raise ValueError(f"{what}.guide: expected true or false")
         ics = d["instrument_configs"]
         if not isinstance(ics, list) or not ics:
             raise ValueError(f"{what}.instrument_configs: expected a non-empty list")
@@ -277,6 +282,7 @@ class Configuration:
             status,
             int(d.get("failures", 0)),
             allow_partial,
+            guide,
             ctype,
         )
 
@@ -294,6 +300,8 @@ class Configuration:
             d["failures"] = self.failures
         if self.allow_partial:
             d["allow_partial"] = True
+        if self.guide:
+            d["guide"] = True
         if self.type != "EXPOSE":
             d["type"] = self.type
         return d

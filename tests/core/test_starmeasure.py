@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -166,3 +168,49 @@ def test_line_and_two_point():
     assert tm.slope_ratio == pytest.approx(-1)
     with pytest.raises(FitError):
         two_point(1, 1, 1, 1, 1, 1, m, 1)
+
+
+# -- real data: MINERVA T2's FAU, 2026-04-23 ------------------------------------------
+
+REAL = Path(__file__).parent / "data" / "minerva_t2_fau_20260423.json"
+
+
+def _sweep(name):
+    seq = json.loads(REAL.read_text())["sequences"][name]
+    p = seq["points"]
+    x = np.array([q["position"] for q in p])
+    h = np.array([q["hfd_px"] for q in p])
+    e = np.array([q["hfd_err_px"] for q in p])
+    return seq, x, h, e
+
+
+@pytest.mark.parametrize("name,tol", [("0003", 60), ("0531", 40), ("0602", 120)])
+def test_real_sweeps_agree_with_the_legacy_focus(name, tol):
+    """Our HFDs of the legacy sweeps, fitted with the hyperbola, land on the
+    legacy result (well inside the ~+-110 um depth of focus at f/6.5)."""
+    seq, x, h, e = _sweep(name)
+    fit = fit_hyperbola(x, h, e)
+    assert abs(fit.x0 - seq["legacy_new"]) < tol
+    # Seeing from the fit: 2-2.4" FWHM that night.
+    assert 1.5 < fit.a / 1.2 * 0.265 < 2.8
+
+
+def test_real_two_point_vcurve_calibrated_on_the_other_sweep():
+    """Calibrate on one sweep, compute from two same-side points of the
+    other: the linear V-curve lands within the depth of focus even though
+    these points are only ~2x the seeing out (the method wants 6x)."""
+    errors = []
+    for cal_name, run_name in (("0531", "0003"), ("0003", "0531")):
+        _, cx, ch, ce = _sweep(cal_name)
+        cfit = fit_hyperbola(cx, ch, ce)
+        _, x, h, e = _sweep(run_name)
+        run = fit_hyperbola(x, h, e)
+        for s in (1, -1):
+            sel = (cx - cfit.x0) * s >= 500
+            line = fit_line(cx[sel], ch[sel], ce[sel])
+            m, off = abs(line.slope), line.zero - cfit.x0
+            pts = np.flatnonzero((x - run.x0) * s >= 500)
+            far_near = pts[np.argsort(-np.abs(x[pts] - run.x0))][:2]
+            focus = np.mean([x[i] - s * h[i] / m for i in far_near]) - off
+            errors.append(focus - run.x0)
+    assert max(abs(v) for v in errors) < 110, errors

@@ -22,7 +22,8 @@ Steps:
    ``region``), ``blended`` (another detection inside the aperture),
    ``faint`` (S/N below ``min_snr``), ``elongated`` (moment ellipticity
    above ``max_ellipticity``; trailed or double stars), ``small`` (fewer
-   than ``min_area`` pixels: hot pixels, cosmic rays).
+   than ``min_area`` pixels, or an HFD under ``min_hfd``: hot pixels,
+   cosmic rays).
 4. **Per star** (the brightest ``max_stars`` survivors), on a cutout around
    the detection, with the local background re-estimated in an annulus:
 
@@ -85,6 +86,9 @@ class MeasureConfig:
     region: tuple[float, float, float, float] | None = None
     #: Measure at most this many (the brightest).
     max_stars: int = 40
+    #: Smallest believable HFD (pixels): sharper sources are hot pixels or
+    #: cosmic rays (rejected as ``small``).
+    min_hfd: float = 1.2
     min_snr: float = 30.0
     max_ellipticity: float = 0.35
     #: Background tile size, pixels.
@@ -558,6 +562,8 @@ def _measure_one(
     fwhm = _moments(np.where(ap, cut, 0.0), cx, cy)
     ell = _ellipticity(np.where(ap, cut, 0.0), cx, cy)
     donut = _donut_edge(sr, sf, radius)
+    if not np.isfinite(hfd) or hfd < cfg.min_hfd:
+        return None, "small"
     if np.isfinite(ell) and ell > cfg.max_ellipticity:
         return None, "elongated"
     star = StarMeasurement(

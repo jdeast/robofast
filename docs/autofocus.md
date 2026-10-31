@@ -213,7 +213,8 @@ know which way the focus moves the focal plane:
 3. Rejection, counted by reason: `saturated` (any aperture pixel at or
    above `measure.saturation`), `edge` (the aperture leaves the image or
    `region`), `blended` (another real source's light reaches the
-   aperture), `faint` (S/N), `elongated` (moment ellipticity), and `small`.
+   aperture), `faint` (S/N), `elongated` (moment ellipticity), and `small`
+   (too few pixels, or an HFD under `min_hfd`: hot pixels and cosmic rays).
 4. Per star: the aperture is shrunk to where the star's light ends (plus
    a margin for the wings), with a local background annulus. The star gets:
    * **HFD** from a sub-pixel growth curve;
@@ -331,7 +332,7 @@ with `-` for any):
 Also in the entry: `model` (above), `store` (the JSON file, relative to
 the config file) and `overrides`.
 
-## 9. Accuracy in simulation
+## 9. Accuracy: simulation and the sky
 
 Tests: `tests/core/test_autofocus.py`, `test_autofocus_sequencer.py`,
 `test_starmeasure.py` (fast tier), and `tests/sim/test_sim_autofocus.py`
@@ -363,6 +364,53 @@ The V-curve's error grows with the seeing. At 4" the near point
 which shows up as a bias of about 15 steps. That is a sixth of the
 tolerance. Raise `blur_ratio` to trade it for larger donuts.
 
+### On the sky: MINERVA T2's FAU, 2026-04-23
+
+`tests/core/data/minerva_t2_fau_20260423.json` holds this night's position
+and HFD tables. They come from the legacy autofocus frames (ZWO ASI174,
+0.265"/px, f/6.5), measured with `starmeasure`. The frames themselves are
+not in the repository.
+
+| Sweep | Legacy guess | Legacy "New" | Hyperbola (ours) | Parabola (ours) | Seeing |
+|---|---|---|---|---|---|
+| 0003-0009 | 15686 | 15816 | 15784 +- 66 | 15762 | 2.3" |
+| 0531-0537 | 16833 | 16517 | 16507 +- 55 | 16528 | 2.0" |
+| 0602-0607 | 15800 | 16400 | 16299 +- 111 | 16285 | 1.9" |
+
+All values are in um. The hyperbola is within 10-100 um of the legacy
+result, inside the +-110 um depth of focus. The 0602 sweep is the weakest:
+it has one usable star and one repeated position that disagrees by 1.6 px.
+
+**The two-point V-curve on these data.** Calibrate on one sweep's arms,
+then compute each arm's focus from the other sweep's two farthest points
+on that side. The results differ from that sweep's own fit by -82, +1,
++87 and -17 um (`test_real_two_point_vcurve...`). That is within the depth
+of focus, but larger than in simulation. The legacy sweeps only reach
++-900 um, which is a blur of about 2x the seeing FWHM, not the 6x the
+V-curve wants. The `hyperbola` two-point variant is off by 500-600 um on
+the same points, which is why `linear` is the default.
+
+The fitted arm slopes, 0.014-0.020 px/um, are below the geometric
+0.0205 px/um (with the obstruction assumed at 0.47). Seeing still
+dominates at these offsets.
+
+So on this FAU the calibration and the runs should go out to about
+1700 um (near) and 2600 um (far), which the defaults derive from
+`max_seeing`.
+
+Other things these frames show:
+
+* The FAU images have a fixed saturated hot pixel. Their values are
+  quantized in steps of 16 ADU (a 12-bit camera).
+* There are only one to three stars per frame, and the brightest is often
+  saturated.
+* In frames 0608-0616 `FOCPOS` stays at 17000 while the HFD drifts from
+  16 to 11 px. The legacy record has `nan` there. Either the focuser was
+  not where the header says, or the guess and step logic repeated the
+  last position.
+
+`min_hfd` (in `measure`) rejects the hot pixels.
+
 ## 10. Differences from the legacy autofocus
 
 * `newauto.py` refitted without the weights in its sigma-clipping loop. Its
@@ -379,8 +427,13 @@ tolerance. Raise `blur_ratio` to trade it for larger donuts.
 
 ## 11. Open questions
 
-1. The CDK700 obstruction, pixel size and focuser `StepSize` as PWI4
-   reports them. Then a calibration per port and filter on the sky.
+1. The CDK700 obstruction and the focuser `StepSize` as PWI4 reports them
+   (the example config takes the plate scales and pixel sizes from
+   minerva-control's `config/*.ini`). Then a calibration per port and
+   filter on the sky, out to about 6x the seeing (section 9).
+5. The legacy record's repeated position in frames 0608-0616 (section 9):
+   check the focuser's reported position against the header on the real
+   system.
 2. The 60-inch's `focal_plane_factor` and the direction of its focus, once
    TCSGO's focus units are confirmed (docs/tcsgo.md).
 3. The legacy focus model's M1 temperature, delta-T and gravity terms need

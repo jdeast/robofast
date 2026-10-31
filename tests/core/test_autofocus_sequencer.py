@@ -364,6 +364,7 @@ async def test_service_builds_autofocus_and_triggers(tmp_path):
 def test_example_autofocus_config_is_valid():
     path = SITES / "minerva" / "autofocus.example.json"
     d = json.loads(path.read_text())
-    setup = AutofocusSetup.from_dict(d["telescopes"]["t1"]["autofocus"])
+    setup = AutofocusSetup.from_dict(d["telescopes"]["t2"]["autofocus"])
     assert setup.config_for("imager", "V").method == "vcurve"
+    assert setup.config_for("fau", "V").optics.pixel_scale == 0.265
     TriggerConfig.from_dict(d["autofocus_triggers"])

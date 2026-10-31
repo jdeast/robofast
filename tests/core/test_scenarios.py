@@ -20,7 +20,7 @@ from robofast_core.testing.checks import (
 
 pytestmark = pytest.mark.parametrize("lease_path", ["local", "remote"])
 
-DEVICES = ("telescope", "camera")
+DEVICES = ("t1.telescope", "t1.camera")
 BOUND = 3.0  # seconds, for the fast fake timings in conftest
 
 
@@ -141,7 +141,7 @@ async def test_s4_camera_hangs_mid_exposure(make_rig):
     report = rig.sequencer.cleanups[0]
     assert report.parked
     assert any("did not complete" in e for e in report.errors), report.errors
-    assert rig.timeline.commands(device="camera", outcome="timeout")
+    assert rig.timeline.commands(device="t1.camera", outcome="timeout")
     assert dt < BOUND
     assert_fenced_after_cancel(rig.timeline, "seq", 1, DEVICES)
 

@@ -1,7 +1,10 @@
 # Example systemd unit for the safety supervisor of one enclosure (instance %i).
 # Not installed anywhere; copy and adapt. Paths below are placeholders.
 #
-#   systemctl enable --now robofast-supervisor@enclosure1
+#   systemctl enable --now robofast-supervisor@aqawan1
+#
+# It reads the enclosure config file that the sequencer reads too
+# (sites/minerva/aqawan1.json is an example).
 #
 # The supervisor starts closed and, on SIGTERM, revokes the lease and closes
 # before it exits. It is restarted on any exit: an enclosure with no
@@ -18,7 +21,7 @@ StartLimitIntervalSec=0
 Type=simple
 User=robofast
 WorkingDirectory=/opt/robofast
-ExecStart=/opt/robofast/venv/bin/python -m robofast_core.supervisor_service --config /etc/robofast/%i/supervisor.json
+ExecStart=/opt/robofast/venv/bin/python -m robofast_core.supervisor_service --config /etc/robofast/%i.json
 Restart=always
 RestartSec=2
 # Long enough for the final, bounded CloseShutter.

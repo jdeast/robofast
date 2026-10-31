@@ -8,7 +8,6 @@ pings it, and it closes the OmniSim dome when the pings stop.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import signal
 import time
@@ -21,7 +20,7 @@ from robofast_core.alpaca import alpaca_owner
 from robofast_core.heartbeat_watchdog import HeartbeatWatchdog
 from robofast_core.lease_client import RemoteSupervisor
 from robofast_core.testing.checks import await_until, wait_until
-from robofast_core.testing.processes import Service, SupervisorProcess
+from robofast_core.testing.processes import SequencerProcess, Service, SupervisorProcess
 
 from .conftest import BOUND, COMMAND_TIMEOUT, SIM_SAFETY, SIM_SEQ
 
@@ -64,8 +63,8 @@ def supervisor(omnisim, weather, watchdog, services, truth, tmp_path):
             "safetymonitor": server.address,
             "observingconditions": server.address,
             "heartbeat": watchdog.address,
-            "telescope": omnisim,
         },
+        "telescopes": {"t1": {"telescope": omnisim, "camera": omnisim}},
         "safety": SAFETY,
     }
     proc = SupervisorProcess(config, tmp_path)
@@ -119,12 +118,17 @@ async def test_supervisor_dies_watchdog_closes(
 
 
 def _sequencer_process(omnisim, supervisor, services, tag: str = "sequencer") -> Service:
-    seq = Service(
-        "robofast_core.testing.run_sequencer",
-        *("--supervisor", supervisor.url, "--devices", omnisim, "--exptime", "60"),
-        *("--config", json.dumps(SEQ), "--remote", json.dumps(REMOTE)),
-        log_path=supervisor.log_path.with_name(f"{tag}.log"),
-    )
+    """The production entry point (robofast_core.sequencer_service)."""
+    config = {
+        "name": "enclosure",
+        "sequencer_name": "seq",
+        "supervisor_url": supervisor.url,
+        "telescopes": {"t1": {"telescope": omnisim, "camera": omnisim}},
+        "sequencer": SEQ,
+        "lease_client": REMOTE,
+        "plan": {"type": "static", "targets": [{"name": "field", "exptime": 60, "count": 1000}]},
+    }
+    seq = SequencerProcess(config, supervisor.log_path.parent, tag)
     services.append(seq)
     return seq
 
@@ -158,7 +162,7 @@ async def test_sequencer_restart_recovers(omnisim, supervisor, services, truth, 
     # the supervisor, which grants nothing until it has read AtPark).
     await await_until(lambda: second.log_line("startup_cleanup_done"), BOUND, what="cleanup")
     cleaned_up = time.monotonic() - t0
-    assert "'aborted': True, 'parked': True, 'errors': []" in second.log_line(
+    assert "'aborted': ['t1'], 'parked': ['t1'], 'errors': []" in second.log_line(
         "startup_cleanup_done"
     )
     await await_until(lambda: _lease(supervisor)["id"] != old["id"], BOUND, what="new lease")

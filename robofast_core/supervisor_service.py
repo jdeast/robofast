@@ -4,14 +4,16 @@ Running the supervisor
 ----------------------
 ::
 
-    python -m robofast_core.supervisor_service --config safety.json
+    python -m robofast_core.supervisor_service --config aqawan1.json
 
-with a config like (device addresses are Alpaca ``host:port``, optionally
-``host:port/N`` for device number N; ``safety`` holds
-:class:`~robofast_core.safety.SafetyConfig` fields)::
+with the enclosure's config file (:mod:`robofast_core.config`; the
+sequencer reads the same one). The supervisor uses these parts of it
+(device addresses are Alpaca ``host:port``, optionally ``host:port/N`` for
+device number N; ``safety`` holds :class:`~robofast_core.safety.SafetyConfig`
+fields)::
 
     {
-      "name": "safety",
+      "name": "aqawan1",
       "listen": "127.0.0.1:8100",
       "devices": {
         "dome": "127.0.0.1:32323",
@@ -19,12 +21,13 @@ with a config like (device addresses are Alpaca ``host:port``, optionally
         "observingconditions": "127.0.0.1:11111",
         "heartbeat": "127.0.0.1:11112"
       },
+      "telescopes": {"t1": {"telescope": "127.0.0.1:11120/0", ...}, ...},
       "safety": {"poll_interval": 5, "reopen_hold": 1200, "lease_ttl": 60,
                  "heartbeat_interval": 2}
     }
 
-``observingconditions``, ``telescope`` (needed for ``park_before_close``; when
-present, no lease is granted unless it reports ``AtPark``) and ``heartbeat``
+``observingconditions``, ``telescopes`` (needed for ``park_before_close``;
+no lease is granted unless every one reports ``AtPark``) and ``heartbeat``
 are optional; with ``heartbeat_interval`` set and no
 ``heartbeat`` entry, the pings go to the dome itself (the normal case; see
 :mod:`robofast_core.heartbeat_watchdog`). The process prints one JSON line,
@@ -80,6 +83,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from robofast_core.alpaca import alpaca_owner
+from robofast_core.config import device_address, load_config, telescopes
 from robofast_core.safety import (
     ENCLOSURE_MEMBERS,
     OpenLease,
@@ -266,11 +270,6 @@ class SupervisorServer:
 # -- the process ------------------------------------------------------------------
 
 
-def _device(spec: str) -> tuple[str, int]:
-    address, _, number = spec.partition("/")
-    return address, int(number or 0)
-
-
 def build(config: dict[str, Any], timeline: Timeline) -> SafetySupervisor:
     """A supervisor wired to the Alpaca devices named in ``config``."""
     devices = config["devices"]
@@ -280,21 +279,34 @@ def build(config: dict[str, Any], timeline: Timeline) -> SafetySupervisor:
     def owner(name: str, kind: str, required: bool = False, **kw: Any):
         if name not in devices and not required:
             return None
-        address, number = _device(devices[name])
+        address, number = device_address(devices[name])
         return alpaca_owner(
             name, kind, address, timeline, number=number, default_timeout=timeout, **kw
         )
 
     heartbeat = None
     if scfg.heartbeat_interval is not None:
-        address, number = _device(devices.get("heartbeat", devices["dome"]))
+        address, number = device_address(devices.get("heartbeat", devices["dome"]))
         heartbeat = alpaca_owner("heartbeat", "dome", address, timeline, number=number)
+    scopes = []
+    for tel_name, entry in telescopes(config).items():
+        address, number = device_address(entry["telescope"])
+        scopes.append(
+            alpaca_owner(
+                f"{tel_name}.telescope",
+                "telescope",
+                address,
+                timeline,
+                number=number,
+                default_timeout=timeout,
+            )
+        )
     return SafetySupervisor(
         config.get("name", "safety"),
         dome=owner("dome", "dome", True, privileged_members=ENCLOSURE_MEMBERS),
         safety_monitor=owner("safetymonitor", "safetymonitor", True),
         observing_conditions=owner("observingconditions", "observingconditions"),
-        telescope=owner("telescope", "telescope"),
+        telescopes=scopes,
         heartbeat=heartbeat,
         timeline=timeline,
         config=scfg,
@@ -319,14 +331,13 @@ async def serve(config: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--config", required=True, help="JSON config file (see module doc)")
+    ap.add_argument("--config", required=True, help="enclosure config file (see module doc)")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args(argv)
     logging.basicConfig(
         level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    with open(args.config) as f:
-        config = json.load(f)
+    config = load_config(args.config)
     try:
         asyncio.run(serve(config))
     except asyncio.CancelledError:

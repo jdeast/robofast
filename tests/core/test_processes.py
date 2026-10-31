@@ -31,7 +31,7 @@ from robofast_core.testing.fakes import (
     FakeTelescope,
     FakeWeather,
 )
-from robofast_core.testing.processes import Service, SupervisorProcess
+from robofast_core.testing.processes import SequencerProcess, Service, SupervisorProcess
 
 from .conftest import FAST_REMOTE, FAST_SAFETY, FAST_SEQ
 
@@ -76,21 +76,31 @@ class Site:
         a = self.server.address
         config = {
             "listen": f"127.0.0.1:{port}",
-            "devices": {"dome": a, "safetymonitor": a, "observingconditions": a, "telescope": a},
+            "devices": {"dome": a, "safetymonitor": a, "observingconditions": a},
+            "telescopes": {"t1": {"telescope": a, "camera": a}},
             "safety": {**SAFETY, **safety},
         }
         proc = SupervisorProcess(config, self.workdir, tag)
         self.services.append(proc)
         return proc
 
-    def sequencer_process(self, url: str, tag: str = "sequencer") -> Service:
-        proc = Service(
-            "robofast_core.testing.run_sequencer",
-            *("--supervisor", url, "--devices", self.server.address, "--exptime", "30"),
-            *("--config", json.dumps(FAST_SEQ)),
-            *("--remote", json.dumps(FAST_REMOTE)),
-            log_path=self.workdir / f"{tag}.log",
-        )
+    def sequencer_process(self, url: str, tag: str = "sequencer", **config) -> Service:
+        """The production sequencer entry point, on one telescope."""
+        a = self.server.address
+        config = {
+            "name": "enclosure",
+            "sequencer_name": "seq",
+            "supervisor_url": url,
+            "telescopes": {"t1": {"telescope": a, "camera": a}},
+            "sequencer": FAST_SEQ,
+            "lease_client": FAST_REMOTE,
+            "plan": {
+                "type": "static",
+                "targets": [{"name": "target", "exptime": 30, "count": 1000}],
+            },
+            **config,
+        }
+        proc = SequencerProcess(config, self.workdir, tag)
         self.services.append(proc)
         return proc
 
@@ -283,7 +293,7 @@ async def test_restarted_sequencer_recovers(site):
     # the supervisor, which grants nothing until it has read AtPark).
     await wait_until(lambda: second.log_line("startup_cleanup_done"), 5, what="cleanup")
     safe = time.monotonic() - t0
-    assert "'aborted': True, 'parked': True, 'errors': []" in second.log_line(
+    assert "'aborted': ['t1'], 'parked': ['t1'], 'errors': []" in second.log_line(
         "startup_cleanup_done"
     )
     assert site.cam.exposures_aborted == 1
@@ -373,3 +383,42 @@ async def test_orphan_alarm_and_operator_clear(site):
         f"orphan alarm {alarmed:.2f} s after SIGKILL"
         f" (lease_ttl {SAFETY['lease_ttl']} s, orphan_timeout {orphan_timeout} s)"
     )
+
+
+# -- the sequencer service's exits ------------------------------------------------
+
+
+async def test_sequencer_service_calibration_plan_finishes(site):
+    """A calibration-only plan: biases and darks, the telescope never
+    unparked; then the lease is released and the process exits 0."""
+    sup = site.supervisor()
+    plan = {"type": "calibration", "biases": 2, "darks": [[0.2, 2]]}
+    seq = site.sequencer_process(sup.url, plan=plan)
+    assert await asyncio.to_thread(seq.proc.wait, 20) == 0
+    assert site.cam.exposures_started == 4
+    assert site.tel.AtPark and not site.tel.Tracking
+    assert seq.log_line("plan_exhausted")
+    assert _lease(sup.url)["released"]
+    await wait_until(site.closed, 2, what="closed after the plan")
+
+
+async def test_sequencer_service_gives_up_needs_operator(site):
+    """Every telescope gave up: exit 3, which systemd does not restart."""
+    site.cam.fail("camera gone")
+    sup = site.supervisor()
+    seq = site.sequencer_process(sup.url)
+    assert await asyncio.to_thread(seq.proc.wait, 20) == 3
+    assert seq.log_line("night_over") and seq.log_line("needs an operator")
+    assert site.tel.AtPark
+    await wait_until(site.closed, 2, what="closed")
+
+
+def test_sequencer_service_bad_config_exits_2(tmp_path):
+    bad = tmp_path / "enclosure.json"
+    bad.write_text(json.dumps({"name": "x", "telescopes": {}, "plan": {"type": "static"}}))
+    proc = Service(
+        "robofast_core.sequencer_service", "--config", str(bad), log_path=tmp_path / "log"
+    )
+    assert proc.proc.wait(20) == 2
+    proc.stop()
+    assert "no telescopes" in proc.log_path.read_text()

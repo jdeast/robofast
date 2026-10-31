@@ -1,0 +1,5 @@
+[
+  {"name": "HD 10700", "ra_hours": 1.7344, "dec_deg": -15.9375, "exptime": 30, "count": 10},
+  {"name": "HD 185144", "ra_hours": 19.5469, "dec_deg": 69.6611, "exptime": 30, "count": 10,
+   "telescopes": ["t2"]}
+]

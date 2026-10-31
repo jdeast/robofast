@@ -142,7 +142,7 @@ async def test_roll_off_parks_before_closing(make_rig):
     rig.weather.set_safe(False)
     await wait_until(rig.dome_closed, 3)
     assert rig.parked()
-    park = rig.timeline.commands(device="telescope", source_prefix="safety", outcome="sent")
+    park = rig.timeline.commands(device="t1.telescope", source_prefix="safety", outcome="sent")
     close = rig.timeline.commands(device="dome", outcome="sent")
     close_t = [e.t for e in close if e.what == "CloseShutter"]
     assert any(e.what == "Park" for e in park)

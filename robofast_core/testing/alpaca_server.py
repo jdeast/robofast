@@ -71,8 +71,8 @@ class _Handler(BaseHTTPRequestHandler):
             form = parse_qs(body, keep_blank_values=True)
             params.update({k.lower(): v[0] for k, v in form.items()})
         parts = [p for p in url.path.lower().split("/") if p]
-        device = self.server.devices.get(parts[2]) if len(parts) == 5 else None
-        if parts[:2] != ["api", "v1"] or parts[3:4] != ["0"] or device is None:
+        device = self.server.devices.get("/".join(parts[2:4])) if len(parts) == 5 else None
+        if parts[:2] != ["api", "v1"] or device is None:
             self._send(400, {"error": f"unknown path {self.path}"})
             return
         ctid = int(params.get("clienttransactionid", 0) or 0)
@@ -103,7 +103,8 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class FakeAlpacaServer(ThreadingHTTPServer):
-    """``devices`` maps a device type (``"dome"``, ...) to its fake, as device 0."""
+    """``devices`` maps a device type (``"dome"``, ...) to its fake, as device
+    0, or ``"type/N"`` (``"telescope/1"``) to device N."""
 
     daemon_threads = True
     allow_reuse_address = True
@@ -116,7 +117,7 @@ class FakeAlpacaServer(ThreadingHTTPServer):
         hang_limit: float = 30.0,
     ) -> None:
         super().__init__((host, port), _Handler)
-        self.devices = dict(devices)
+        self.devices = {k.lower() if "/" in k else f"{k.lower()}/0": d for k, d in devices.items()}
         self.hang_limit = hang_limit
         self._thread: threading.Thread | None = None
 

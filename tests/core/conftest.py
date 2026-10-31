@@ -1,5 +1,8 @@
 """A rig of pure-Python fake devices behind real owners, supervisor and sequencer.
 
+The enclosure holds ``telescopes`` telescope+camera pairs (default 1), named
+``t1``, ``t2``, ...; their owners are ``t1.telescope``, ``t1.camera``, ...
+
 ``lease_path`` selects how the sequencer reaches the supervisor: ``"local"``
 (the in-process object) or ``"remote"`` (the supervisor's HTTP API on a
 loopback port, through :class:`RemoteSupervisor`). A test module
@@ -25,6 +28,7 @@ from robofast_core import (
 )
 from robofast_core.lease_client import RemoteSupervisor
 from robofast_core.safety import ENCLOSURE_MEMBERS
+from robofast_core.sequencer import TelescopeUnit
 from robofast_core.supervisor_service import SupervisorServer
 from robofast_core.testing.fakes import (
     FakeCamera,
@@ -65,8 +69,8 @@ class Rig:
     timeline: Timeline
     weather: FakeWeather
     dome: FakeDome
-    tel: FakeTelescope
-    cam: FakeCamera
+    tels: list[FakeTelescope]
+    cams: list[FakeCamera]
     sm: FakeSafetyMonitor
     oc: FakeObservingConditions
     owners: dict[str, DeviceOwner]
@@ -76,6 +80,14 @@ class Rig:
     server: SupervisorServer | None = None
     remote: RemoteSupervisor | None = None
     tasks: list[asyncio.Task] = field(default_factory=list)
+
+    @property
+    def tel(self) -> FakeTelescope:
+        return self.tels[0]
+
+    @property
+    def cam(self) -> FakeCamera:
+        return self.cams[0]
 
     async def start(self, sequencer: bool = True) -> None:
         self.tasks.append(asyncio.create_task(self.supervisor.run(), name="supervisor"))
@@ -87,7 +99,7 @@ class Rig:
             self.tasks.append(asyncio.create_task(self.sequencer.run(), name="sequencer"))
 
     async def stop(self) -> None:
-        for fake in (self.dome, self.tel, self.cam, self.sm, self.oc):
+        for fake in (self.dome, *self.tels, *self.cams, self.sm, self.oc):
             fake.unhang()
         for t in reversed(self.tasks):
             t.cancel()
@@ -107,14 +119,18 @@ class Rig:
     def dome_open(self) -> bool:
         return self.dome.state() == 0
 
-    def parked(self) -> bool:
-        return self.tel._parked and self.tel._now() >= self.tel._park_until
+    # With ``i``, telescope/camera i only; without, all of them.
+    def parked(self, i: int | None = None) -> bool:
+        tels = self.tels if i is None else [self.tels[i]]
+        return all(t._parked and t._now() >= t._park_until for t in tels)
 
-    def exposing(self) -> bool:
-        return self.cam._state == 2 and self.cam._now() < self.cam._ends
+    def exposing(self, i: int | None = None) -> bool:
+        cams = self.cams if i is None else [self.cams[i]]
+        return all(c._state == 2 and c._now() < c._ends for c in cams)
 
-    def camera_idle(self) -> bool:
-        return self.cam._state == 0
+    def camera_idle(self, i: int | None = None) -> bool:
+        cams = self.cams if i is None else [self.cams[i]]
+        return all(c._state == 0 for c in cams)
 
 
 @pytest.fixture
@@ -136,11 +152,17 @@ async def make_rig(lease_path):
         command_timeout: float = 0.5,
         with_conditions: bool = True,
         heartbeat_timeout: float | None = None,
+        telescopes: int = 1,
+        plan=None,
+        slew_guard=None,
+        supervise_parking: bool = False,
     ) -> Rig:
         tl = Timeline()
         weather = FakeWeather(safe=weather_safe)
         dome = FakeDome(heartbeat_timeout=heartbeat_timeout)
-        tel, cam = FakeTelescope(), FakeCamera()
+        tels = [FakeTelescope() for _ in range(telescopes)]
+        cams = [FakeCamera() for _ in range(telescopes)]
+        names = [f"t{i + 1}" for i in range(telescopes)]
         sm, oc = FakeSafetyMonitor(weather), FakeObservingConditions(weather)
 
         def owner(name, obj, **kw):
@@ -148,8 +170,11 @@ async def make_rig(lease_path):
 
         owners = {
             "dome": owner("dome", dome, privileged_members=ENCLOSURE_MEMBERS),
-            "telescope": owner("telescope", tel),
-            "camera": owner("camera", cam),
+            **{
+                f"{n}.telescope": owner(f"{n}.telescope", t)
+                for n, t in zip(names, tels, strict=True)
+            },
+            **{f"{n}.camera": owner(f"{n}.camera", c) for n, c in zip(names, cams, strict=True)},
             "safetymonitor": owner("safetymonitor", sm),
             "observingconditions": owner("observingconditions", oc),
         }
@@ -159,22 +184,26 @@ async def make_rig(lease_path):
             dome=owners["dome"],
             safety_monitor=owners["safetymonitor"],
             observing_conditions=owners["observingconditions"] if with_conditions else None,
-            telescope=owners["telescope"] if scfg.park_before_close else None,
+            telescopes=[owners[f"{n}.telescope"] for n in names]
+            if scfg.park_before_close or supervise_parking
+            else (),
             heartbeat=owners["dome"] if scfg.heartbeat_interval is not None else None,
             timeline=tl,
             config=scfg,
         )
-        n = iter(range(10**6))
+        k = iter(range(10**6))
         seqr = Sequencer(
             "seq",
             supervisor=sup,
-            telescope=owners["telescope"],
-            camera=owners["camera"],
-            plan=lambda: Observation(f"target{next(n)}", exptime=exptime, count=count),
+            telescopes=[
+                TelescopeUnit(n, owners[f"{n}.telescope"], owners[f"{n}.camera"]) for n in names
+            ],
+            plan=plan or (lambda: Observation(f"target{next(k)}", exptime=exptime, count=count)),
             timeline=tl,
             config=SequencerConfig(**{**FAST_SEQ, **(seq or {})}),
+            slew_guard=slew_guard,
         )
-        rig = Rig(tl, weather, dome, tel, cam, sm, oc, owners, sup, seqr, lease_path)
+        rig = Rig(tl, weather, dome, tels, cams, sm, oc, owners, sup, seqr, lease_path)
         rigs.append(rig)
         return rig
 

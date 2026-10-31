@@ -40,9 +40,10 @@ enclosure is confirmed closed:
 The supervisor never clears an orphan by itself: it cannot know that the
 telescope is safe. After ``orphan_timeout`` it alarms instead. A lease the
 sequencer *quarantined* (its task ignored cancellation) is never recovered,
-only cleared. And with a telescope configured, no lease is granted until the
-telescope reports ``AtPark``, so nothing reopens on a telescope that a crash
-or a failed cleanup left unparked.
+only cleared. And no lease is granted until every configured telescope
+reports ``AtPark`` (an unreadable one counts as unparked, and alarms), so
+nothing reopens on a telescope that a crash or a failed cleanup left
+unparked.
 """
 
 from __future__ import annotations
@@ -53,10 +54,11 @@ import itertools
 import logging
 import time
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from robofast_core.owner import DeviceError, DeviceOwner
+from robofast_core.owner import DeviceError, DeviceOwner, Grant
 from robofast_core.timeline import Timeline
 
 log = logging.getLogger(__name__)
@@ -99,8 +101,8 @@ class SafetyConfig:
     shutter_timeout: float = 120.0
     #: Per-command timeout for the dome.
     dome_timeout: float = 5.0
-    #: Roll-off roofs: wait for the telescope to be parked (or park it
-    #: ourselves) before closing. Domes close immediately.
+    #: Roll-off roofs: wait for the telescopes to be parked (or park them
+    #: ourselves, all at once) before closing. Domes close immediately.
     park_before_close: bool = False
     park_wait: float = 60.0
     #: Seconds between hardware heartbeat pings; ``None`` when the enclosure
@@ -202,7 +204,7 @@ class SafetySupervisor:
         safety_monitor: DeviceOwner,
         timeline: Timeline,
         observing_conditions: DeviceOwner | None = None,
-        telescope: DeviceOwner | None = None,
+        telescopes: Sequence[DeviceOwner] = (),
         heartbeat: DeviceOwner | None = None,
         config: SafetyConfig | None = None,
     ) -> None:
@@ -212,9 +214,9 @@ class SafetySupervisor:
         self._dome = dome.grant(name, privileged=True)
         self._sm = safety_monitor.grant(name)
         self._oc = observing_conditions.grant(name) if observing_conditions else None
-        self._tel = telescope.grant(name) if telescope else None
-        if self.config.park_before_close and self._tel is None:
-            raise ValueError("park_before_close needs a telescope owner")
+        self._tels = [t.grant(name) for t in telescopes]
+        if self.config.park_before_close and not self._tels:
+            raise ValueError("park_before_close needs the telescope owners")
         if (heartbeat is None) != (self.config.heartbeat_interval is None):
             raise ValueError("a heartbeat device and heartbeat_interval go together")
         self._hb = heartbeat.grant(f"{name}/heartbeat") if heartbeat else None
@@ -283,23 +285,38 @@ class SafetySupervisor:
         lease = self.outstanding()
         return None if lease is None else lease.state()
 
-    async def _telescope_parked(self) -> bool:
-        """True if no telescope is configured, or it reports AtPark (read-only)."""
-        if self._tel is None:
+    async def _telescopes_parked(self) -> bool:
+        """True if every configured telescope reports AtPark (read-only, all
+        read at once); otherwise alarm, naming the ones that are not, or
+        cannot be read."""
+        if not self._tels:
             return True
-        try:
-            if await self._tel.get("AtPark", timeout=self.config.read_timeout):
-                return True
-            self._alarm("telescope not parked: no lease is granted until it is")
-        except DeviceError as exc:
-            self._alarm(f"cannot confirm the telescope is parked: {exc}")
-        return False
+
+        async def parked(tel: Grant) -> bool | DeviceError:
+            try:
+                return bool(await tel.get("AtPark", timeout=self.config.read_timeout))
+            except DeviceError as exc:
+                return exc
+
+        states = await asyncio.gather(*(parked(t) for t in self._tels))
+        unparked = [t.owner.name for t, s in zip(self._tels, states, strict=True) if s is False]
+        unknown = [
+            f"{t.owner.name} ({s})"
+            for t, s in zip(self._tels, states, strict=True)
+            if isinstance(s, DeviceError)
+        ]
+        problems = ([f"not parked: {', '.join(unparked)}"] if unparked else []) + (
+            [f"cannot confirm parked: {', '.join(unknown)}"] if unknown else []
+        )
+        if problems:
+            self._alarm(f"telescope {'; '.join(problems)}; no lease is granted until all are")
+        return not problems
 
     async def request_open(self, holder: str) -> OpenLease:
         """Wait until opening is allowed, no earlier lease is outstanding, and
-        the telescope (if configured) is parked."""
+        every configured telescope is parked."""
         while not (
-            self.open_allowed() and self.outstanding() is None and await self._telescope_parked()
+            self.open_allowed() and self.outstanding() is None and await self._telescopes_parked()
         ):
             await asyncio.sleep(min(self.config.poll_interval, 1.0))
         lease = OpenLease(next(self._lease_ids), holder, self.config.lease_ttl)
@@ -487,23 +504,27 @@ class SafetySupervisor:
 
     async def _park_before_close(self) -> None:
         """Roll-off roofs: give the sequencer's cleanup a bounded chance to
-        park, then park ourselves, then close regardless."""
+        park, then park every telescope ourselves (in parallel), then close
+        regardless."""
         cfg = self.config
-        assert self._tel is not None
         lease = self._lease
         if lease is not None and not lease.released.is_set():
             try:
                 await asyncio.wait_for(lease.released.wait(), cfg.park_wait / 2)
             except TimeoutError:
                 self._alarm("sequencer did not finish cleanup before close")
-        try:
-            if not await self._tel.get("AtPark"):
-                await self._tel.call("Park", timeout=cfg.park_wait / 2)
+
+        async def park(tel: Grant) -> None:
+            try:
                 async with asyncio.timeout(cfg.park_wait / 2):
-                    while not await self._tel.get("AtPark"):
-                        await asyncio.sleep(0.2)
-        except (DeviceError, TimeoutError) as exc:
-            self._alarm(f"telescope not confirmed parked before close: {exc!r}")
+                    if not await tel.get("AtPark"):
+                        await tel.call("Park", timeout=cfg.park_wait / 2)
+                        while not await tel.get("AtPark"):
+                            await asyncio.sleep(0.2)
+            except (DeviceError, TimeoutError) as exc:
+                self._alarm(f"{tel.owner.name} not confirmed parked before close: {exc!r}")
+
+        await asyncio.gather(*(park(t) for t in self._tels))
         self._parked_for_close = True
 
     async def _ensure_open(self) -> None:

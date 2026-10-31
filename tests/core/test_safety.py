@@ -196,3 +196,44 @@ async def test_orphaned_lease_alarms_and_stays_closed(make_rig):
     assert lease.revoked_at is not None and alarm.t - lease.revoked_at >= 0.5
     assert rig.dome_closed() and not lease.released.is_set()
     assert rig.supervisor.status()["orphaned_for"] >= 0.5
+
+
+async def test_shutter_error_while_open_closes_and_holds(make_rig):
+    rig = make_rig(safety=dict(shutter_error_backoff=60.0))
+    await rig.start(sequencer=False)
+    lease = await _open(rig)
+    rig.dome.status_override = 4  # shutterError while it should be open
+    await asyncio.wait_for(lease.revoked.wait(), 1)
+    assert "shutter in error" in lease.revoke_reason
+    await wait_until(lambda: rig.timeline.first_event("close_commanded"), 1, what="close sent")
+    rig.dome.status_override = None
+    await wait_until(rig.dome_closed, 1, what="dome closed")
+    lease.release()
+    assert not rig.supervisor.open_allowed()  # held for shutter_error_backoff
+    assert rig.supervisor.status()["shutter_hold_for"] > 50
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(rig.supervisor.request_open("again"), 0.5)
+
+
+async def test_unreadable_shutter_closes_only_after_grace(make_rig):
+    rig = make_rig(safety=dict(shutter_unreadable_grace=0.5))
+    await rig.start(sequencer=False)
+    lease = await _open(rig)
+    t0 = time.monotonic()
+    rig.dome.status_override = "dome server unreachable"
+    await asyncio.wait_for(lease.revoked.wait(), 2)
+    assert time.monotonic() - t0 >= 0.5
+    assert "unreadable" in lease.revoke_reason
+
+
+async def test_one_unreadable_shutter_read_is_tolerated(make_rig):
+    rig = make_rig(safety=dict(shutter_unreadable_grace=0.5))
+    await rig.start(sequencer=False)
+    lease = await _open(rig)
+    rig.dome.status_override = "blip"
+    await asyncio.sleep(0.15)
+    rig.dome.status_override = None
+    for _ in range(7):  # no sequencer here: renew by hand (lease_ttl 1 s)
+        lease.renew()
+        await asyncio.sleep(0.1)
+    assert lease.live and rig.dome_open()

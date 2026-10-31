@@ -125,6 +125,9 @@ class NightSettings:
     #: How long T2's mount stays unresponsive, and then paused by the console.
     fault_duration: float = 3.0
     pause: float = 3.0
+    #: The observer console (docs/console.md) on this loopback port during
+    #: the night (0: any free port); None: no console.
+    console_port: int | None = 0
     #: Bound on the whole night (real seconds), as a safety net.
     timeout: float = 600.0
 
@@ -230,6 +233,8 @@ class Outcome:
     t_end: float = 0.0
     reopen_hold: float = 0.0
     errors: list[str] = field(default_factory=list)
+    #: What the observer console answered during the night (endpoint -> facts).
+    console: dict[str, Any] = field(default_factory=dict)
 
     @property
     def runtime(self) -> float:
@@ -766,6 +771,8 @@ class SimulatedNight:
         )
         seq = self._build("night", entry, plan=plan)
         plan.bind(seq.registry)
+        if s.console_port is not None:
+            await self._start_console()
         self.dispatch = dispatch
         director = asyncio.create_task(self._direct(seq), name="director")
         try:
@@ -792,6 +799,72 @@ class SimulatedNight:
         for f in sorted((self.out / "plans").glob("*.jsonl")):
             self.outcome.plan_record += read_record(f)
         return self.outcome
+
+    # -- the observer console --------------------------------------------------------
+
+    async def _start_console(self) -> None:
+        """The observer console on the night's services, for people to watch
+        (its URL and where its operator token is are printed) and for the
+        checks."""
+        from robofast_core.api_auth import TokenStore
+        from robofast_core.console.server import (
+            Console,
+            ConsoleConfig,
+            ConsoleHttpServer,
+            build_enclosures,
+        )
+
+        store = TokenStore(self.out / "console-tokens.json")
+        token = store.add("demo", ["read", "operator"])[1]
+        tfile = self.out / "console-token.txt"
+        tfile.write_text(token + "\n")
+        os.chmod(tfile, 0o600)
+        cfg = ConsoleConfig(
+            listen=f"127.0.0.1:{self.s.console_port}",
+            tokens=str(self.out / "console-tokens.json"),
+            audit_log=str(self.out / "console-audit.jsonl"),
+            acks=str(self.out / "console-acks.json"),
+            cache=0.5,
+            refresh=1.0,
+            sky_cache=2.0,
+        )
+        spec = {"aqawan1": {"config": "sequencer-night.json", "spectrograph": self.kiwispec_url}}
+        encs = build_enclosures(spec, self.out)
+        self.console = Console(encs, store, config=cfg, clock=self.clock)
+        self.console_server = await ConsoleHttpServer(
+            self.console, port=int(self.s.console_port or 0)
+        ).start()
+        self._stack.push_async_callback(self.console.aclose)
+        self._stack.push_async_callback(self.console_server.stop)
+        self.console_token = token
+        self._note(f"observer console: {self.console_server.url} (token in {tfile})")
+
+    async def _probe_console(self) -> None:
+        """Read the console as an observer would (outcome.console)."""
+        c = self.outcome.console
+        server = getattr(self, "console_server", None)
+        if server is None:
+            return
+        async with httpx.AsyncClient(base_url=server.url, trust_env=False, timeout=20) as http:
+            auth = {"Authorization": f"Token {self.console_token}"}
+            r = await http.get("/console/api/status", headers=auth)
+            st = r.json()["enclosures"]["aqawan1"] if r.status_code == 200 else {}
+            c["status"] = {
+                "code": r.status_code,
+                "shutter": (st.get("enclosure") or {}).get("shutter"),
+                "telescopes": sorted(st.get("telescopes") or {}),
+            }
+            r = await http.get("/console/api/sky", headers=auth)
+            sk = r.json()["enclosures"]["aqawan1"] if r.status_code == 200 else {}
+            c["sky"] = {
+                "code": r.status_code,
+                "targets": [t["name"] for t in sk.get("targets", [])],
+            }
+            r = await http.get("/console/api/log?after=0", headers=auth)
+            entries = r.json().get("entries", []) if r.status_code == 200 else []
+            c["log"] = {"code": r.status_code, "sources": sorted({e["source"] for e in entries})}
+            r = await http.get("/console/api/image/aqawan1/guider-t1?max=128", headers=auth)
+            c["guider_image"] = {"code": r.status_code, "bytes": len(r.content)}
 
     # -- the director ---------------------------------------------------------------
 
@@ -829,6 +902,11 @@ class SimulatedNight:
             n_open = len(tl.events("observe_start"))
             await self._until(lambda: len(tl.events("observe_start")) > n_open, 60, "reopen")
             self._note("reopened")
+            try:
+                await self._probe_console()
+                self._note(f"console: {self.outcome.console}")
+            except Exception as exc:
+                self.outcome.errors.append(f"console probe: {exc!r}")
             # A target of opportunity, once a spectrum has been taken again.
             n_done = len(tl.events("spectrum_done"))
             await self._until(lambda: len(tl.events("spectrum_done")) > n_done, 60, "a spectrum")
@@ -991,6 +1069,16 @@ def check(o: Outcome) -> list[str]:
         fin = [e for e in done if e.detail["spectrum"] == sid]
         if not fin or fin[0].detail["telescopes_end"] != ["t1"]:
             bad.append(f"the spectrum t2 dropped out of did not finish with t1: {fin}")
+    con = o.console
+    if con:
+        if con.get("status", {}).get("code") != 200 or con["status"]["telescopes"] != ["t1", "t2"]:
+            bad.append(f"the console's status: {con.get('status')}")
+        if not con.get("sky", {}).get("targets"):
+            bad.append(f"the console's sky has no targets: {con.get('sky')}")
+        if not {"supervisor", "sequencer"} <= set(con.get("log", {}).get("sources", [])):
+            bad.append(f"the console's log: {con.get('log')}")
+        if con.get("guider_image", {}).get("code") != 200:
+            bad.append(f"the console's guider image: {con.get('guider_image')}")
     if not any(c == "console: resume t2" for _, c in o.script):
         bad.append("the console never paused and resumed t2")
     bad += console_park_problems(o)
@@ -1195,6 +1283,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--scale", type=float, default=NightSettings.scale, help="scheduler clock speed-up"
     )
+    ap.add_argument(
+        "--console-port",
+        type=int,
+        default=0,
+        help="loopback port for the observer console during the night (0: any; -1: none)",
+    )
     ap.add_argument("--log-level", default="WARNING")
     args = ap.parse_args(argv)
     logging.basicConfig(
@@ -1203,7 +1297,8 @@ def main(argv: list[str] | None = None) -> int:
     for h in logging.getLogger().handlers:  # the per-run log files get INFO
         h.setLevel(args.log_level)
     out = Path(args.out)
-    outcome = asyncio.run(simulate(out, NightSettings(scale=args.scale)))
+    port = None if args.console_port < 0 else args.console_port
+    outcome = asyncio.run(simulate(out, NightSettings(scale=args.scale, console_port=port)))
     print(summary(outcome))
     problems = check(outcome)
     for p in problems:

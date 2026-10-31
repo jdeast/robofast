@@ -88,7 +88,7 @@ async def test_plan_from_config(tmp_path):
     plan = plan_from_config({"type": "calibration", "biases": 1}, ["t1"])
     assert await _drain(plan, "t1") == ["bias"]
     with pytest.raises(ValueError, match="plan type"):
-        plan_from_config({"type": "dispatch"}, ["t1"])
+        plan_from_config({"type": "lookahead"}, ["t1"])
     # --plan: a bare list is a static plan
     assert await _drain(load_plan(tmp_path / "targets.json", ["t1"]), "t1") == ["a"]
 

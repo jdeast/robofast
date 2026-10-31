@@ -1,0 +1,15 @@
+{
+  "_note": "A target-of-opportunity request group (docs/design.md 3.7.1). Write it elsewhere, then rename it into the dispatch plan's too_dropbox. Policies: next, now-after-readout, now.",
+  "id": "too-example-1",
+  "name": "Example transient follow-up",
+  "proposal": "too-example",
+  "priority": 10,
+  "too": {"deadline": "2026-11-15T12:00:00Z", "policy": "now-after-readout", "priority_class": 1},
+  "requests": [
+    {"id": "too-example-1-r", "telescopes": ["t1", "t2"],
+     "configurations": [
+       {"id": "too-example-1-c", "instrument": "imager",
+        "target": {"name": "AT 2026example", "ra_hours": 3.5, "dec_deg": 24.1},
+        "instrument_configs": [{"exptime": 120, "count": 5, "filter": "rp"}]}]}
+  ]
+}

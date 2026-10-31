@@ -33,10 +33,14 @@ and optionally:
   cameras (s; default 5).
 
 ``sequencer`` holds :class:`~robofast_core.sequencer.SequencerConfig` fields.
-``plan`` is a plan entry (:func:`robofast_core.plan.plan_from_config`): a
-static target list or a calibration-only plan. ``--plan FILE`` replaces it
-with the entry in FILE, or, if FILE holds a JSON list, with a static plan of
-those targets.
+``plan`` is a plan entry (:func:`robofast_core.plan.plan_from_config`): the
+dispatch scheduler (``{"type": "dispatch", ...}``, see
+:func:`robofast_core.dispatch.dispatch_from_config`;
+``sites/minerva/dispatch.example.json``), a static target list or a
+calibration-only plan. ``--plan FILE`` replaces it with the entry in FILE,
+or, if FILE holds a JSON list, with a static plan of those targets. A plan
+with a background task (the dispatch scheduler's ToO drop box) runs it
+alongside the sequencer.
 
 Signals and exit status
 -----------------------
@@ -145,11 +149,17 @@ async def run(seq: Sequencer, remote: RemoteSupervisor) -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, task.cancel)
+    # A plan's background task (the dispatch scheduler's ToO intake), if any.
+    serve = getattr(seq.plan, "serve", None)
+    background = asyncio.create_task(serve(), name="plan-serve") if serve else None
     try:
         await seq.run()
     except asyncio.CancelledError:
         pass  # a signal: run() cleaned up and released the lease on its way out
     finally:
+        if background is not None:
+            background.cancel()
+            await asyncio.gather(background, return_exceptions=True)
         await remote.aclose()
         for unit in seq.units.values():
             unit.telescope.close()

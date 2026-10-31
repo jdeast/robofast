@@ -197,13 +197,16 @@ class PlanProvider(Protocol):
     def report(self, telescope: str, obs: Observation, outcome: str, frames: int) -> None: ...
 ```
 
-`None` means nothing more for that telescope tonight; outcomes are
-`complete`, `interrupted` (the enclosure closed, or the sequencer stopped)
-and `failed` (a device error or a refused slew). The dispatch scheduler
-(section 3.7) will implement it; for now there is a static target list and
-a calibration-only plan (bias and dark frames, telescope parked; they still
-run under an open lease). The night ends, and the process exits, when every
-telescope's plan is done or it gave up.
+`None` means nothing more for that telescope tonight; an `Idle(seconds)`
+means nothing to do now (the telescope stops tracking, stays where it is,
+and asks again after `seconds` or when woken by a preemption); outcomes are
+`complete`, `interrupted` (the enclosure closed, the sequencer stopped, or
+a target of opportunity preempted it) and `failed` (a device error or a
+refused slew). The dispatch scheduler (section 3.7) implements it; there is
+also a static target list and a calibration-only plan (bias and dark
+frames, telescope parked; they still run under an open lease). The night
+ends, and the process exits, when every telescope's plan is done or it gave
+up.
 
 **Entry point.** `python -m robofast_core.sequencer_service --config
 <enclosure.json>` builds the owners, the lease client and the plan from the
@@ -260,16 +263,136 @@ model.
 
 ### 3.7 Planning and the request API
 
-- Requests are modelled the LCO OCS way (RequestGroup → Request →
-  Configuration → InstrumentConfig, with status per configuration). A small
-  authenticated REST API accepts, validates, reports and cancels requests.
-  A TOM Toolkit facility module can sit on it later.
-- The first scheduler is a **dispatch scheduler** (priority, a
-  time-dependent bonus, and hard constraints: altitude, Moon separation,
-  twilight), RTS2/POCS-style. Queues for targets of opportunity and manual
-  observations come ahead of it.
-- The night's plan is written as JSON, so it can be inspected and replayed.
-- An interrupted observation is marked failed and the night re-planned.
+- **Requests** are modelled the LCO OCS way
+  (`robofast_core/request_model.py`): RequestGroup (who, priority, ToO or
+  not) → Request (windows, allowed telescopes, cadence) → Configuration (one
+  target, one instrument type, optional tighter constraints, a status) →
+  InstrumentConfig (exposure time, count, filter). Status per
+  configuration: PENDING, ATTEMPTED, COMPLETED, FAILED (after
+  `max_attempts` failed attempts; interruptions do not count), EXPIRED,
+  CANCELED. A request with a cadence (`min_interval`, `max_per_night`) is
+  *standing*: it returns to PENDING after each visit, as MINERVA's RV
+  targets do. Requests load from JSON files, validated with errors that
+  name the entry; `from_legacy_csv` converts a legacy MINERVA target
+  spreadsheet export. A small authenticated REST API (accept, validate,
+  report, cancel) comes next; a TOM Toolkit facility module can sit on it
+  later.
+- The scheduler is a **dispatch scheduler** (`robofast_core/dispatch.py`),
+  RTS2/POCS-style: whenever a telescope is free it evaluates every request
+  for that telescope *now*. Hard constraints first: the telescope's
+  instruments and the request's allowed telescopes; time windows (the
+  whole visit must fit); cadence and nightly maximum; Sun altitude
+  (twilight); and, at the start, middle and end of each configuration's
+  part of the visit, altitude within the telescope's limits, airmass, hour
+  angle limits and Moon separation. A configuration's constraints can only
+  tighten the telescope's and site's. **An exception while evaluating a
+  request excludes that request and is logged; a NaN fails its
+  constraint**: nothing defaults to observable (the legacy scheduler read
+  but never applied its altitude and Moon limits, and gave a target whose
+  window computation raised a 100-year window). Then the score:
+
+  ```
+  score = priority
+        + w_setting * max(0, 1 - t_left / setting_horizon)
+        + w_airmass * airmass_at_transit / airmass_now
+        + w_cadence * min(1, max(0, (t_since_last - min_interval) / min_interval))
+  ```
+
+  `t_left` is the time until the target is lost (below its altitude limit,
+  past its hour-angle limit, its window's end, or a ToO's deadline); all
+  three bonuses lie in [0, 1], weights default to 1 and `setting_horizon`
+  to 2 h. Ranking is by priority class (ToOs above normal requests), then
+  score, then id, so decisions are reproducible. Positions come from
+  astropy, vectorized over all requests (one decision over a few hundred
+  configurations takes tens of milliseconds), with IERS downloads turned
+  off so a decision never waits on the network.
+- A **visit** (a request's configurations in order, one observation per
+  instrument config) is re-checked against the hard constraints between its
+  observations and abandoned if it no longer passes or a ToO outranks it.
+  `interrupted` re-queues the configuration (ATTEMPTED), `failed` counts an
+  attempt. Status, completed-visit history (for cadence and nightly counts)
+  and received ToOs persist in a JSON state file, written atomically after
+  each change, so a restart neither repeats a completed one-shot nor breaks
+  a cadence; a corrupt file is moved aside with an error.
+- Configured as the enclosure's plan entry, `{"type": "dispatch", "site":
+  ..., "requests": ..., "telescopes": {...limits...}, ...}`
+  (`sites/minerva/dispatch.example.json`).
+- Still to come: the night's decisions written as a JSON plan, for
+  inspection and replay; filter and M3-port selection in the sequencer (the
+  model carries them); a look-ahead scheduler if dispatch proves myopic.
+
+#### 3.7.1 Targets of opportunity
+
+A target of opportunity (ToO) can arrive at any time and may have to
+interrupt an observation in progress, on one telescope, without disturbing
+the others or the enclosure's lease. A Rubin alert followed up within
+minutes is the motivating case.
+
+**The request.** A ToO is a request group with a `too` entry: a
+`deadline` (latest start), a `priority_class` (an integer ≥ 1; normal
+requests are class 0) and an interrupt `policy`. The request's
+`telescopes` says which telescopes may take it. It arrives through
+`DispatchScheduler.submit_too()` (in process) or as a JSON file renamed
+into the plan's `too_dropbox` directory (moved to `accepted/` or to
+`rejected/` with an `.error` file saying why). The REST API (section 3.7)
+will call `submit_too()` too. ToOs are kept in the scheduler's state file,
+so a restart does not lose one.
+
+**Eligibility.** A ToO is taken only when it passes the same hard
+constraints as any request, on a telescope allowed to take it. Until then
+it stays pending; past its deadline, unstarted, it is EXPIRED. The
+scheduler re-checks waiting ToOs when one arrives and every `too_poll`
+seconds (a target that rises, a Moon that sets, a telescope that frees up).
+
+**Choosing what to interrupt.** For an observable ToO the scheduler wakes
+an idle eligible telescope if there is one (nothing is interrupted).
+Otherwise, for `now-after-readout` and `now`, it preempts the eligible
+telescope whose current visit ranks lowest, if that is below the ToO's
+class, and reserves the ToO for it for `reserve_timeout` (so another
+telescope finishing first does not take it from under the one that was just
+interrupted). An equal-class ToO never interrupts another: it is next.
+
+**The policies,** carried out by `Sequencer.preempt(telescope, policy)`:
+
+| Policy | Where the current observation stops | Measured on fakes |
+|---|---|---|
+| `next` | not at all: the ToO is the telescope's next observation | when the observation ends |
+| `now-after-readout` | at the next exposure boundary: the exposure in progress finishes, is read out and counted; if none is in progress (slewing), at once | the rest of the exposure (0.66 s with 0.7 s left) |
+| `now` | at once: cancel, abort the exposure and any slew | 1 ms to stopped; ToO's slew starts 60 ms after submission |
+
+The interrupted observation is reported `interrupted`, so it is re-queued.
+The telescope is not parked: the ToO is a slew away.
+
+**Mechanism.** Each observation runs as its own child task of its
+telescope's task, so one telescope's observation can be cancelled while the
+others carry on under the same lease and grants. The stop is bounded and
+follows the cleanup rules: cancel the task, wait at most
+`cancel_ack_timeout`, then abort the exposure if the camera is not idle and
+any slew, with that telescope's generation grants. A task that ignores
+cancellation gets that telescope's grants revoked (fencing it alone) and the
+telescope gives up for the night (alarm); a failed abort is that
+telescope's error (abort, park, back off).
+
+**Safety wins.** `preempt()` is refused unless a generation is running with
+its lease unrevoked and the telescope is working in it (not in a weather
+hold, a backoff, or given up). If the lease is revoked while a preemption is
+in progress, the generation's fence makes the preemption's own commands
+fail and its cancel reaches the telescope task; the generation's cleanup
+(abort and park everything, with fresh grants) runs exactly as it would
+have. A ToO that arrives during a weather hold waits; after the reopen the
+telescopes ask the plan afresh and take it first, unless its deadline has
+passed.
+
+**Alert brokers, later.** No broker client yet, only the hook. A small
+separate process will subscribe to a broker that filters the Rubin alert
+stream (ANTARES, Fink, Lasair, ALeRCE, ...) or take triggers from a TOM
+(TOM Toolkit's facility interface, via the REST API), apply the site's own
+filter (brightness, declination, a human in the loop or not), and turn each
+accepted alert into a ToO request group: coordinates, a deadline from the
+science case, a class and a policy. It submits it through the REST API or
+the drop box, and reads its status back for the broker or TOM. Broker
+credentials and alert filtering stay out of the control processes; a
+broker outage costs only ToOs, never the night.
 
 ### 3.8 State, telemetry and alarms
 
@@ -334,7 +457,11 @@ support is often worse. So:
   with the enclosure open, and its restart and recovery; supervisor crash
   (heartbeat closes); two telescopes in one enclosure (both abort, park and
   close; one's camera hangs or keeps failing while the other observes on; a
-  refused slew; stale grants refused on each). OmniSim serves one telescope
+  refused slew; stale grants refused on each); targets of opportunity (each
+  interrupt policy stops the right telescope at the right point while the
+  other observes on; a ToO during a weather hold; one that never becomes
+  observable and expires; preemption racing a lease revocation; repeated
+  ToOs; an observation that ignores the preemption). OmniSim serves one telescope
   and camera, so the simulator tier runs a second OmniSim for the second
   pair.
 - `master` requires the `test` gate check.
@@ -360,6 +487,14 @@ support is often worse. So:
 | `heartbeat_interval` | none | supervisor ping period; at most `heartbeat_timeout`/4, or the config is rejected |
 | `heartbeat_timeout` | none | the enclosure's own heartbeat timeout (Aqawan PAC: 60 s, confirmed); required with `heartbeat_interval` |
 | `fault_action` | none | the dome's read-only fault channel (Aqawan: `Faults`); any fault alarms and blocks opening, and a fault with the enclosure not closed closes it |
+| `min_alt`, `max_alt` | 21°, 83° | per-telescope altitude limits (legacy MINALT, MAXALT) |
+| `max_sun_alt` | -12° | observe light frames only with the Sun below this (legacy HORIZON) |
+| `min_moon_sep` | 10° | Moon separation limit (legacy MINMOONSEP) |
+| `w_setting`, `w_airmass`, `w_cadence` | 1, 1, 1 | dispatch score weights (section 3.7) |
+| `setting_horizon` | 2 h | a target lost within this gets a setting bonus |
+| `idle_poll` | 60 s | with nothing observable, ask again this often |
+| `too_poll` | 10 s | re-check waiting ToOs and the drop box this often |
+| `reserve_timeout` | 60 s | a ToO is held for the telescope it preempted this long |
 
 ## 7. Open decisions
 
@@ -396,7 +531,9 @@ Each step is a CI-tested deliverable.
 7. Shadow mode: robofast's supervisor runs read-only alongside the legacy
    system and logs what it *would* have done, for comparison.
 8. One telescope, attended nights, then robotic; then the rest of MINERVA.
-9. Request API and dispatch scheduler; then MEarth (collision checker).
+9. Dispatch scheduler, request model and target-of-opportunity interrupts
+   (built; sections 3.7, 3.7.1); next the request API; then MEarth
+   (collision checker).
 10. **Done:** several telescopes per enclosure (section 3.5) and the
     production sequencer entry point with its plan-provider interface.
 

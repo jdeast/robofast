@@ -16,3 +16,7 @@ it to me so other users can use (and improve) it.
 
 To see the new core (`robofast_core/`) run a whole simulated MINERVA RV night
 on your machine, see [docs/demo.md](docs/demo.md).
+
+To deploy it on a control host (users, systemd units, secrets, firewall,
+time, backups, upgrades), see [docs/deploy.md](docs/deploy.md); for alarm
+notifications by email, chat or a pager hook, [docs/notifier.md](docs/notifier.md).

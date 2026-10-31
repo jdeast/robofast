@@ -19,8 +19,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=robofast-console
-WorkingDirectory=/opt/robofast
-ExecStart=/opt/robofast/venv/bin/python -m robofast_core.console serve --config /etc/robofast/console.json
+WorkingDirectory=/opt/robofast/current
+ExecStart=/opt/robofast/current/venv/bin/python -m robofast_core.console serve --config /etc/robofast/console.json
 Restart=always
 RestartSec=5
 NoNewPrivileges=yes

@@ -52,12 +52,12 @@ OnSuccess=robofast-calibrations@%i.service
 
 [Service]
 Type=simple
-User=robofast
-WorkingDirectory=/opt/robofast
-Environment=PY=/opt/robofast/venv/bin/python CONFIG=/etc/robofast/%i.json CALIB=/etc/robofast/%i-calibration.json
+User=robofast-sequencer
+WorkingDirectory=/opt/robofast/current
+Environment=PY=/opt/robofast/current/venv/bin/python CONFIG=/etc/robofast/%i.json CALIB=/etc/robofast/%i-calibration.json
 ExecStartPre=-/bin/sh -c '"$$PY" -m robofast_core.when --config "$$CONFIG" --sun-above 0 --check && exec "$$PY" -m robofast_core.sequencer_service --config "$$CONFIG" --plan "$$CALIB"'
-ExecStartPre=/opt/robofast/venv/bin/python -m robofast_core.when --config ${CONFIG} --sun-below -6
-ExecStart=/opt/robofast/venv/bin/python -m robofast_core.sequencer_service --config ${CONFIG}
+ExecStartPre=/opt/robofast/current/venv/bin/python -m robofast_core.when --config ${CONFIG} --sun-below -6
+ExecStart=/opt/robofast/current/venv/bin/python -m robofast_core.sequencer_service --config ${CONFIG}
 # The calibrations and the wait for the Sun take hours.
 TimeoutStartSec=infinity
 Restart=on-failure

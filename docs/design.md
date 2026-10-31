@@ -591,8 +591,12 @@ broker outage costs only ToOs, never the night.
   lost frame stops its telescope with an alarm.
 - Alarms (email or chat) for: quarantine, give-up, shutter not reaching the
   commanded state, safety supervisor or heartbeat failures. The observer
-  console shows and acknowledges them; delivery off the page is still to
-  come.
+  console shows and acknowledges them; the notifier
+  (`robofast_core/notifier/`, `docs/notifier.md`), its own process, polls
+  the same sources through the console's aggregator and sends them by
+  email, chat webhook or a command (to page an observer): per-sink minimum
+  level, deduplication, rate limits, escalation until acknowledged on the
+  console, a daily digest. The safety processes do not know it exists.
 - **The observer console** (`robofast_core/console/`, `docs/console.md`):
   one web page, its own small process, for the observer on site (the FLWO
   60-inch runs as attended automation) and the people watching MINERVA.
@@ -635,6 +639,8 @@ broker outage costs only ToOs, never the night.
 - Alpaca has no authentication: device traffic stays on an isolated network.
   Only the request API and the observer console face outward (both on
   loopback behind a TLS proxy, with tokens).
+- Deployment on a control host (users and groups, units, layout, secrets,
+  firewall, time sync, backups, upgrades and rollback): `docs/deploy.md`.
 
 ### 3.10 Configuration
 
@@ -821,8 +827,9 @@ Each step is a CI-tested deliverable.
     part of an enclosure, alarms with acknowledgement, and the operator
     actions (pause, resume, stop, close, clear a dead lease or faults,
     requests and ToOs), authenticated and audited, tested to never open
-    the enclosure. Next: alarm delivery (email, chat, a call for the
-    60-inch observer), then an attended night with it.
+    the enclosure. Alarm delivery (email, chat, a command to page the
+    60-inch observer) is built (`docs/notifier.md`). Next: an attended
+    night with both.
 
 ## 9. Borrowed ideas
 

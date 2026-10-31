@@ -98,6 +98,13 @@ their good ideas instead (section 9).
 - **Non-Alpaca instruments** (the spectrograph, iodine cell, exposure meter)
   follow the same pattern: one owning service, a small typed HTTP API, a
   simulator. Not a parallel framework.
+  KiwiSpec is the first (`robofast_core/devices/kiwispec_service.py`,
+  `docs/kiwispec.md`): it alone talks to the spectrograph PC's legacy server
+  and SI camera server, runs one job at a time with every step bounded,
+  terminates on exposure-meter counts and reports the flux-weighted
+  midpoint, and gives the sequencer's cleanup a bounded abort that never
+  raises. Like the Aqawan server, it refuses a non-loopback PC without
+  `allow_hardware` in the config and `--hardware`.
 - Vendor extras that Alpaca lacks (PWI4 M3 port selection, fans, pointing
   models) use Alpaca `Action()` or a typed side channel per device client.
 - **robofast ships its own small asyncio Alpaca client.** alpyca serializes
@@ -654,6 +661,10 @@ Each step is a CI-tested deliverable.
    alert-broker client; then MEarth (collision checker).
 10. **Done:** several telescopes per enclosure (section 3.5) and the
     production sequencer entry point with its plan-provider interface.
+11. KiwiSpec spectrograph service, its clients for the legacy spectrograph
+    PC and a protocol-faithful simulator (built; `docs/kiwispec.md`, with
+    open questions); next, spectra in the sequencer (`docs/kiwispec.md`
+    section 4), then the service against the real PC, attended.
 
 ## 9. Borrowed ideas
 

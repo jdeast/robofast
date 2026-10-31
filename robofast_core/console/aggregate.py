@@ -606,10 +606,10 @@ class Aggregator:
                     {
                         "id": gid,
                         "intake": d.get("intake"),
-                        "priority": d.get("priority"),
-                        "too": d.get("too") is not None,
+                        "priority": d.get("ipp_value"),
+                        "too": d.get("observation_type", "NORMAL") != "NORMAL",
                         "submitter": d.get("submitter"),
-                        "submitted": d.get("submitted"),
+                        "submitted": d.get("created"),
                         "cancel_pending": d.get("cancel_pending", False),
                     }
                 )

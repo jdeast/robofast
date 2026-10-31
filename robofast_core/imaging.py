@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -107,6 +108,12 @@ class ImagingConfig:
     sky_interval: float = 60.0
     #: Per telescope: :class:`~robofast_core.fits_writer.Optics` fields.
     telescopes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Measure each light frame's star FWHM (the central ``fwhm_box``
+    #: pixels; needs the telescope's plate_scale) into ``{tel}.image.fwhm``,
+    #: for the autofocus FWHM trigger; it stays current ``fwhm_max_age`` s.
+    measure_fwhm: bool = False
+    fwhm_box: int = 1024
+    fwhm_max_age: float = 1800.0
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> ImagingConfig:
@@ -548,6 +555,8 @@ class Imaging:
                     file=written.relpath,
                     seconds=round(time.monotonic() - t0, 4),
                 )
+                if self.config.measure_fwhm and info.imagetyp == "LIGHT":
+                    await self._publish_fwhm(telescope, info, image)
             except Exception as exc:
                 frame.error = f"{type(exc).__name__}: {exc}"
                 w.failed = w.failed or frame.error
@@ -559,6 +568,31 @@ class Imaging:
             finally:
                 del image
                 w.queue.task_done()
+
+    async def _publish_fwhm(self, telescope: str, info: FrameInfo, image: ImageArray) -> None:
+        """The frame's median star FWHM as ``{tel}.image.fwhm`` (arcsec): what
+        the autofocus FWHM trigger watches. Never fails the frame."""
+        scale = info.optics.plate_scale if info.optics is not None else None
+        if not scale:
+            return
+        binning = 1
+        if info.end is not None:
+            binning = int(info.end.current(f"{telescope}.camera.binx", 1) or 1)
+        try:
+            m = await asyncio.to_thread(_central_fwhm, image, self.config.fwhm_box)
+        except Exception as exc:
+            log.warning("%s: FWHM measurement failed: %r", telescope, exc)
+            return
+        if m is None:
+            return
+        fwhm, n = m
+        self.registry.publish(
+            f"{telescope}.image.fwhm",
+            round(fwhm * binning * scale, 3),
+            max_age=self.config.fwhm_max_age,
+            unit="arcsec",
+            comment=f"Median star FWHM of the last frame ({n} stars)",
+        )
 
     def _alarm(self, telescope: str, message: str) -> None:
         log.critical("%s: %s", telescope, message)
@@ -598,3 +632,19 @@ def imaging_from_config(
         weather=weather,
         supervisor=supervisor,
     )
+
+
+def _central_fwhm(image: ImageArray, box: int) -> tuple[float, int] | None:
+    """Median FWHM (binned px) of the stars in the central ``box`` pixels."""
+    from robofast_core.imagebytes import fits_order
+    from robofast_core.starmeasure import measure
+
+    data = fits_order(image.data)
+    if data.ndim != 2:
+        return None
+    ny, nx = data.shape
+    y0, x0 = max(0, (ny - box) // 2), max(0, (nx - box) // 2)
+    m = measure(data[y0 : y0 + box, x0 : x0 + box])
+    if m.n == 0 or not math.isfinite(m.fwhm):
+        return None
+    return m.fwhm, m.n

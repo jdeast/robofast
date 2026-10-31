@@ -92,7 +92,7 @@ async def test_start_of_night_autofocus_then_the_field(make_rig):
 async def test_autofocus_frames_are_saved_and_later_frames_carry_af_keywords(make_rig, tmp_path):
     plan = AutofocusTriggers(StaticPlan([FIELD], ["t1"]))
     rig, _ = focus_rig(make_rig, plan)
-    imaging = attach(rig, tmp_path)
+    imaging = attach(rig, tmp_path, measure_fwhm=True)
     rig.sequencer.registry = imaging.registry
     plan.bind(imaging.registry)
     await run_night(rig, imaging, timeout=60)
@@ -103,6 +103,10 @@ async def test_autofocus_frames_are_saved_and_later_frames_carry_af_keywords(mak
     assert light["AFMETHOD"] == "vcurve" and light["AFOK"] is True
     assert abs(light["AFFOCUS"] - TRUE_FOCUS) < tolerance(2.0)
     assert light["AFNEXP"] == 2
+    # The pipeline measured the light frames' FWHM for the FWHM trigger (in
+    # the header config's 0.6"/px; the scene's stars are 2 px FWHM).
+    fwhm = imaging.registry.get("t1.image.fwhm")
+    assert fwhm.unit == "arcsec" and fwhm.value == pytest.approx(2.0 * 0.6, rel=0.12)
 
 
 async def test_a_failed_autofocus_is_not_the_telescopes_fault(make_rig):

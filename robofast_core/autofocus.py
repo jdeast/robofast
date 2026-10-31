@@ -14,11 +14,10 @@ sizes measured on one known side of it, instead of searched for:
   the two arms' slopes and where each arm's line crosses zero relative to
   the best focus, and stores them (:class:`FocusStore`). Each run then
   takes **two exposures** on the calibrated side, ``far`` and ``near``
-  offsets from the predicted focus (both far enough that the blur, not the
-  seeing, sets the size, and farther than the prediction can be wrong, so
-  the side is known), and solves the arm's hyperbola through them for the
-  zero crossing and the seeing at once
-  (:func:`~robofast_core.focusfit.two_point`): the seeing drops out.
+  offsets from the predicted focus (both far enough, a blur of 6x the
+  worst seeing's FWHM, that the seeing hardly changes the HFD of the
+  donut, and farther than the prediction can be wrong, so the side is
+  known), and computes ``focus = x - side * HFD / slope`` from each.
   The secant slope between the two points must match the calibrated slope
   (``slope_tolerance``); if it is reversed the stars were on the *other*
   side (the prediction was off by more than the offsets), and the run is

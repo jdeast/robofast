@@ -248,6 +248,21 @@ ordinary error of that telescope) rather than observe through the wrong
 one; the dispatch scheduler already keeps such requests off it (section
 3.7).
 
+**Autofocus.** An observation of `kind="autofocus"` (or a request
+configuration of type `AUTO_FOCUS`) focuses its telescope on its field,
+through its filter and port: the lease, the slew, the grants (the focuser's
+is fenced with the others) and the cleanup are the usual ones
+(`robofast_core/autofocus.py`, `docs/autofocus.md`). The default method takes
+two exposures far out on one known side of focus, where the star's size is
+set by the optics and not the seeing, and computes the focus from a
+calibrated V-curve slope; a donut method needs one, a sweep nine. A focus
+that cannot be measured is reported `failed` without a backoff (the
+telescope observes on at its old focus); one cut short is undone before the
+telescope's next light observation. `autofocus_triggers` inserts them at
+the start of the night, after a temperature change, or when the image
+pipeline's FWHM degrades. The temperature model only predicts where to
+start; each measured focus re-anchors it.
+
 **Evening start, morning end.** The sequencer process runs one night.
 `deploy/robofast-sequencer@.timer` starts its unit every afternoon; the
 unit takes evening calibrations (closed) while the Sun is up, waits with
@@ -325,6 +340,13 @@ The telescope layer hides the mount type. Pointing models live with the
 mount software where it has them (PWI4 for the CDK700s, per M3 port), and in
 robofast's telescope layer for mounts that don't. The sequencer never sees a
 model.
+
+Focus is robofast's own (section 3.4, `docs/autofocus.md`): per telescope,
+M3 port and filter, a calibrated V-curve and a temperature model whose zero
+point follows each measured focus, kept in a JSON store. Focuser units and
+direction are configuration (`um_per_step`, `focal_plane_factor`, `side`),
+and the calibration checks them against the optics, since the TCSGO manual
+may be wrong about the 60-inch's focus.
 
 ### 3.7 Planning and the request API
 
@@ -533,7 +555,10 @@ broker outage costs only ToOs, never the night.
   task reads the weather bridge's ObservingConditions (read-only), the
   shutter and weather verdict from the supervisor's status, and the Sun
   and Moon (astropy). The site and the software version (`git describe`)
-  are static. The header builder snapshots the registry at exposure start
+  are static. The autofocus publishes its last result
+  (`<tel>.autofocus.*`: `AFFOCUS`, `AFMETHOD`, `AFOK`, ...) and, with
+  `images.measure_fwhm`, the pipeline each light frame's star FWHM
+  (`<tel>.image.fwhm`, for the autofocus trigger). The header builder snapshots the registry at exposure start
   and end. A value past its maximum age, or one whose last read failed, is
   written undefined and marked `STALE` with its old value, never as
   current. The sequencer's status snapshot includes the registry.
@@ -591,11 +616,16 @@ support is often worse. So:
 ## 5. Testing and CI
 
 - **Fast tier:** pure-Python fakes and an in-process weather server; unit
-  tests plus the scenario suite. Python 3.12-3.14.
+  tests plus the scenario suite. Python 3.12-3.14. Image-based features
+  (autofocus, the guider) run on a synthetic star field
+  (`robofast_core/testing/starfield.py`: the pupil image, with its central
+  obstruction, convolved with the seeing; jitter, noise, subframes) with
+  known truth.
 - **Simulator tier:** the same scenarios against the official ASCOM
   OmniSimulators (pinned, checksum-verified), plus a real FITS frame
   written from OmniSim's camera and read back, and the full-frame download
-  time in both transfer modes (published with the other timings).
+  time in both transfer modes (published with the other timings), and the
+  autofocus moving OmniSim's focuser.
 - **Conformance:** ConformU against every Alpaca server robofast ships.
 - **Scenario suite** (grows with each bug found in the field): weather unsafe
   mid-exposure; feed erroring, hanging, or frozen at "safe"; recovery and
@@ -655,6 +685,10 @@ support is often worse. So:
 | `images.weather_max_age` | 300 s | a weather value older than this is written as stale |
 | `images.flush_timeout` | 120 s | bound on waiting for a telescope's frames to be written |
 | `images.compress` | off | Rice-compress integer frames (`.fits.fz`) |
+| `autofocus.method` | `vcurve` | two exposures on one side of focus; `donut` (one), `sweep` (nine) (`docs/autofocus.md`) |
+| `autofocus.blur_ratio`, `far_ratio` | 6, 1.5 | the near point's blur over the worst seeing FWHM (`max_seeing` 4"); far over near offset |
+| `autofocus.slope_tolerance` | 0.2 | a two-point slope this far off the calibration falls back to a sweep |
+| `autofocus_triggers` | start of night; 1 C; 1.5x FWHM | when to focus; a failed autofocus waits `retry_after` (30 min) |
 
 ## 7. Open decisions
 
@@ -666,7 +700,9 @@ support is often worse. So:
 3. Where the legacy `robofast/` package's useful parts (YAML configs, HAL
    knowledge for Aqawan, APC PDU, IRF90, Paramount, DFM) move, and when
    `robofast_core` becomes `robofast`.
-4. Temperatures the CDK700 focus model needs when PWI4 doesn't report them.
+4. Temperatures the CDK700 focus model needs when PWI4 doesn't report them
+   (the autofocus model uses the focuser's temperature until the primary's
+   and the ambient are in the registry; `docs/autofocus.md` section 11).
 
 ## 8. Roadmap
 
@@ -719,6 +755,13 @@ Each step is a CI-tested deliverable.
     full-frame download over ASCOM Remote on a control PC (step 6), the
     plate scales and position angles of each telescope, and a guider/FAU
     image path.
+14. Autofocus (built; `docs/autofocus.md`): star measurement, the V-curve,
+    donut and sweep methods with a calibration per telescope, port and
+    filter, the temperature model, `AUTO_FOCUS` requests and the night's
+    triggers, tested on a simulated star field and OmniSim's focuser. Next:
+    the CDK700 optics and focuser units from PWI4, a calibration on the sky
+    per port and filter, and the 60-inch's focus once TCSGO's units are
+    confirmed.
 
 ## 9. Borrowed ideas
 

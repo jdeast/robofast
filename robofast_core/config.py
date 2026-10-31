@@ -11,8 +11,11 @@ example; its shape::
       "name": "aqawan1",                          # the enclosure
       "listen": "127.0.0.1:8100",                 # the supervisor's API
       "devices": {"dome": "...", "safetymonitor": "...", ...},
+      "site": {"latitude": ..., "longitude": ..., "elevation": ...},
       "telescopes": {
-        "t1": {"telescope": "host:port/N", "camera": "host:port/N"},
+        "t1": {"telescope": "host:port/N", "camera": "host:port/N",
+               "filterwheel": "host:port/N",      # optional
+               "port_action": "..."},             # optional: M3 port Action
         "t2": {...}
       },
       "safety": {...SafetyConfig fields...},
@@ -21,6 +24,8 @@ example; its shape::
 
 A device address is Alpaca ``host:port``, optionally ``host:port/N`` for
 device number N. Telescope names are the names the plan and the logs use.
+``site`` is where the enclosure is (deg north, deg east, m), for
+:mod:`robofast_core.when`; a dispatch plan entry carries its own.
 
 The format is JSON. A file ending in ``.yaml`` or ``.yml`` is read as YAML
 if PyYAML is installed (it is not yet a core dependency).
@@ -58,7 +63,8 @@ def device_address(spec: str) -> tuple[str, int]:
 
 
 def telescopes(config: dict[str, Any]) -> dict[str, dict[str, str]]:
-    """The enclosure's telescopes: name -> {"telescope": spec, "camera": spec}."""
+    """The enclosure's telescopes: name -> {"telescope": spec, "camera": spec,
+    ...}."""
     entries = config.get("telescopes") or {}
     for name, entry in entries.items():
         if not isinstance(entry, dict) or "telescope" not in entry:

@@ -5,7 +5,7 @@
     RequestGroup            who asked, how important, ToO or not
       Request               one schedulable unit: windows, telescopes, cadence
         Configuration       one target with one instrument, with a status
-          InstrumentConfig  exposure time, count, filter
+          InstrumentConfig  exposure time, count, filter, M3 port
 
 The dispatch scheduler (:mod:`robofast_core.dispatch`) picks a *Request* and
 executes its configurations in order, one :class:`InstrumentConfig` per
@@ -186,15 +186,19 @@ class Constraints:
 class InstrumentConfig:
     exptime: float
     count: int = 1
-    #: Passed through to the observation; filter and port selection are not
-    #: executed by the sequencer yet.
+    #: Filter name, selected on the telescope's filter wheel by the
+    #: sequencer; a telescope whose limits list ``filters`` without it is
+    #: not eligible.
     filter: str | None = None
     #: False for darks and biases (shutter closed, telescope not moved).
     light: bool = True
+    #: M3 port, selected by the sequencer through the telescope's port
+    #: action; only telescopes whose limits list it in ``ports`` are eligible.
+    port: str | None = None
 
     @classmethod
     def from_dict(cls, d: Any, what: str) -> InstrumentConfig:
-        _check_keys(d, {"exptime", "count", "filter", "light"}, {"exptime"}, what)
+        _check_keys(d, {"exptime", "count", "filter", "light", "port"}, {"exptime"}, what)
         count = d.get("count", 1)
         if isinstance(count, bool) or not isinstance(count, int) or count < 1:
             raise ValueError(f"{what}.count: expected a positive integer, got {count!r}")
@@ -203,6 +207,7 @@ class InstrumentConfig:
             count,
             None if d.get("filter") is None else str(d["filter"]),
             bool(d.get("light", True)),
+            None if d.get("port") is None else str(d["port"]),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -211,6 +216,8 @@ class InstrumentConfig:
             d["filter"] = self.filter
         if not self.light:
             d["light"] = False
+        if self.port is not None:
+            d["port"] = self.port
         return d
 
 
@@ -225,11 +232,18 @@ class Configuration:
     status: Status = Status.PENDING
     #: Failed attempts so far (interruptions do not count).
     failures: int = 0
+    #: If interrupted (or failed) part-way, keep the frames taken and take
+    #: only the rest; otherwise the configuration is re-taken whole.
+    allow_partial: bool = False
 
     @classmethod
     def from_dict(cls, d: Any, what: str) -> Configuration:
         keys = {"id", "target", "instrument", "instrument_configs", "constraints", "status"}
-        _check_keys(d, keys | {"failures"}, {"id", "target", "instrument_configs"}, what)
+        keys |= {"failures", "allow_partial"}
+        _check_keys(d, keys, {"id", "target", "instrument_configs"}, what)
+        allow_partial = d.get("allow_partial", False)
+        if not isinstance(allow_partial, bool):
+            raise ValueError(f"{what}.allow_partial: expected true or false")
         ics = d["instrument_configs"]
         if not isinstance(ics, list) or not ics:
             raise ValueError(f"{what}.instrument_configs: expected a non-empty list")
@@ -248,6 +262,7 @@ class Configuration:
             Constraints.from_dict(d.get("constraints"), f"{what}.constraints"),
             status,
             int(d.get("failures", 0)),
+            allow_partial,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -262,6 +277,8 @@ class Configuration:
             d["constraints"] = self.constraints.to_dict()
         if self.failures:
             d["failures"] = self.failures
+        if self.allow_partial:
+            d["allow_partial"] = True
         return d
 
     @property

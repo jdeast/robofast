@@ -394,17 +394,18 @@ async def test_orphan_alarm_and_operator_clear(site):
 
 
 async def test_sequencer_service_calibration_plan_finishes(site):
-    """A calibration-only plan: biases and darks, the telescope never
-    unparked; then the lease is released and the process exits 0."""
+    """A calibration-only plan: biases and darks with the enclosure closed
+    (no lease is ever requested), the telescope never unparked; then the
+    process exits 0."""
     sup = site.supervisor()
     plan = {"type": "calibration", "biases": 2, "darks": [[0.2, 2]]}
     seq = site.sequencer_process(sup.url, plan=plan)
     assert await asyncio.to_thread(seq.proc.wait, 20) == 0
     assert site.cam.exposures_started == 4
     assert site.tel.AtPark and not site.tel.Tracking
-    assert seq.log_line("plan_exhausted")
-    assert _lease(sup.url)["released"]
-    await wait_until(site.closed, 2, what="closed after the plan")
+    assert seq.log_line("closed_start") and seq.log_line("plan_exhausted")
+    assert _lease(sup.url) is None  # never asked for
+    assert site.closed() and site.dome.opens == 0
 
 
 async def test_sequencer_service_gives_up_needs_operator(site):

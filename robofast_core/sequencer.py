@@ -79,6 +79,51 @@ commands fail with :class:`GrantRevoked`, the generation cancel reaches the
 telescope task, and the generation's cleanup (abort and park, with fresh
 grants) runs exactly as without the preemption.
 
+Idle telescopes release the enclosure
+-------------------------------------
+A telescope whose plan answers :class:`~robofast_core.plan.Idle` stops
+tracking and stays where it is, with the enclosure open: for a short wait
+(a target about to rise, a gap between visits) that is cheaper than closing
+and reopening, and an idle telescope cannot track into a limit. Once *every*
+telescope still working in the generation has been idle for
+``idle_release_after`` (default 15 min), the generation ends cleanly: the
+telescopes leave it, the usual cleanup parks them, the lease is released
+and the supervisor closes. The sequencer then waits in its closed phase.
+
+The closed phase (no lease)
+---------------------------
+Before every lease the sequencer asks the plan what each telescope would do
+now -- ``plan.peek(telescope)`` if the plan has it (no state changes), else
+``next_observation``, whose answer is then held as that telescope's next
+observation -- and:
+
+* if any telescope has light work, it requests a lease (the supervisor's
+  reopen hold applies as usual);
+* else, if some telescope has dark frames (``light=False``: biases, darks),
+  it takes them with the enclosure closed, in a *closed generation*: grants
+  and telescope tasks as usual, but no lease; a telescope leaves it as soon
+  as its next observation is not a dark frame, and the cleanup at its end
+  is the usual one;
+* else, if every telescope is idle, it waits (the shortest ``Idle``, or
+  until :meth:`Sequencer.preempt` wakes a telescope, e.g. for a ToO) and asks
+  again;
+* when no telescope has anything more tonight, :meth:`Sequencer.run`
+  returns.
+
+Dark frames that a plan hands out during an open generation are taken
+there (the enclosure is open for another telescope's light work anyway).
+
+Filters and M3 ports
+--------------------
+An observation may name a ``filter`` and a ``port``. The filter is looked up
+in the telescope's filter wheel's ``Names`` and the wheel moved to it (bounded
+by ``filter_timeout``); the port is selected with the telescope's Alpaca
+``Action(port_action, port)`` (PWI4-based CDK700s; bounded by
+``port_timeout``). A telescope without a filter wheel, or without a
+``port_action``, fails an observation that names one (an ordinary error of
+that telescope), so nothing is ever observed through the wrong filter or
+port.
+
 Starting up after a crash
 -------------------------
 The sequencer's ``name`` is its lease holder identity: stable across
@@ -126,6 +171,7 @@ __all__ = [
     "SlewDenied",
     "SlewGuard",
     "TelescopeUnit",
+    "Unsupported",
 ]
 
 log = logging.getLogger(__name__)
@@ -146,6 +192,10 @@ class _PreemptStuck(Exception):
 
 class _PreemptAbortFailed(DeviceError):
     """A preempted observation stopped, but its abort commands failed."""
+
+
+class Unsupported(DeviceError):
+    """An observation needs a filter or M3 port this telescope cannot select."""
 
 
 class LeaseSource(Protocol):
@@ -191,12 +241,16 @@ class AllowAllSlews:
 class TelescopeUnit:
     """One telescope and its camera, as the sequencer drives them.
 
-    The fields after ``camera`` are the sequencer's per-night state.
+    ``filterwheel`` is optional; ``port_action`` is the telescope's Alpaca
+    ``Action`` that selects an M3 port (None: it cannot). The fields after
+    them are the sequencer's per-night state.
     """
 
     name: str
     telescope: DeviceOwner
     camera: DeviceOwner
+    filterwheel: DeviceOwner | None = None
+    port_action: str | None = None
     consecutive_errors: int = field(default=0, init=False)
     #: Gave up for the night after too many errors in a row.
     gave_up: bool = field(default=False, init=False)
@@ -215,6 +269,9 @@ class TelescopeUnit:
     exposing: bool = field(default=False, init=False)
     #: Waiting out an :class:`~robofast_core.plan.Idle`.
     idle: bool = field(default=False, init=False)
+    #: ``time.monotonic()`` since when the plan has answered only Idle (None:
+    #: it is not idle).
+    idle_since: float | None = field(default=None, init=False)
 
     @property
     def active(self) -> bool:
@@ -243,6 +300,13 @@ class SequencerConfig:
     #: At startup, how often to re-check a predecessor's lease or retry its
     #: recovery.
     recover_poll: float = 1.0
+    #: When every telescope of the generation has been idle this long, end
+    #: the generation (park, release the lease) and wait without a lease
+    #: (module doc); None: never.
+    idle_release_after: float | None = 900.0
+    #: Bounds on a filter wheel move and on an M3 port selection.
+    filter_timeout: float = 60.0
+    port_timeout: float = 60.0
 
 
 @dataclass
@@ -268,15 +332,25 @@ class _Generation:
     """Shared state of one generation's telescope tasks."""
 
     gen: int
-    lease: OpenLease
+    #: None for a closed generation (dark frames, no lease).
+    lease: OpenLease | None
     #: Telescopes observing (not finished, given up, or waiting out a backoff).
     working: set[str]
     #: Set once ``working`` is empty: the generation is over.
     idle: asyncio.Event = field(default_factory=asyncio.Event)
+    #: Set when every working telescope has been idle for
+    #: ``idle_release_after``: they all leave the generation.
+    idle_release: asyncio.Event = field(default_factory=asyncio.Event)
+    #: Filter wheel grants, for the telescopes that have one.
+    filterwheels: dict[str, Grant] = field(default_factory=dict)
     #: Telescopes that left the generation in the middle of a backoff.
     backing_off: set[str] = field(default_factory=set)
     errors: int = 0
     revoked: bool = False
+
+    @property
+    def closed(self) -> bool:
+        return self.lease is None
 
     def leave(self, telescope: str) -> None:
         self.working.discard(telescope)
@@ -361,7 +435,9 @@ class Sequencer:
             why = "quarantined"
         elif gen is None:
             why = "no generation (enclosure closed)"
-        elif gen.revoked or gen.lease.revoked.is_set():
+            # In the closed phase: make the telescope ask its plan again now.
+            unit.wake.set()
+        elif gen.revoked or (gen.lease is not None and gen.lease.revoked.is_set()):
             why = "lease revoked"
         elif telescope not in gen.working:
             why = "telescope not working (backoff, done or gave up)"
@@ -397,6 +473,10 @@ class Sequencer:
     async def run(self) -> None:
         await self._recover()
         while await self._wait_for_a_telescope():
+            if not await self._closed_phase():
+                if self.quarantined:
+                    return
+                continue
             lease = await self.supervisor.request_open(self.name)
             self.generation += 1
             gen = None
@@ -432,6 +512,91 @@ class Sequencer:
             await asyncio.sleep(wait)
         return True
 
+    # -- the closed phase ---------------------------------------------------
+
+    async def _closed_phase(self) -> bool:
+        """Ask the plan, without a lease, what each telescope would do now
+        (module doc). True: some telescope has light work; request a lease.
+        False: dark frames were taken, telescopes finished or went into a
+        backoff, or an idle wait ended; the caller re-evaluates."""
+        now = time.monotonic()
+        ready = [u for u in self.units.values() if u.active and u.retry_at <= now]
+        if not ready:
+            return False
+        for u in ready:
+            u.wake.clear()
+        answers: dict[str, Observation | Idle] = {}
+        for u in ready:
+            answer = await self._peek(u)
+            if answer is not None:
+                answers[u.name] = answer
+        if any(isinstance(a, Observation) and a.light for a in answers.values()):
+            return True
+        darks = [self.units[n] for n, a in answers.items() if isinstance(a, Observation)]
+        if darks:
+            self.generation += 1
+            await self._run_generation(self.generation, None, darks)
+            return False
+        idle = [a.seconds for a in answers.values() if isinstance(a, Idle)]
+        if idle:
+            seconds = max(0.0, min(idle))
+            self._event("closed_idle", seconds=seconds, telescopes=sorted(answers))
+            await _wait_any([self.units[n].wake for n in answers], seconds)
+        return False
+
+    async def _peek(self, unit: TelescopeUnit) -> Observation | Idle | None:
+        """What ``unit``'s plan would do now, with no generation running.
+        None: nothing more tonight (the unit is finished), or a plan error
+        (the unit backs off, or gives up)."""
+        try:
+            answer, taken = await asyncio.wait_for(self._ask_peek(unit), self.config.plan_timeout)
+        except Exception as exc:
+            self._closed_error(unit, f"planning: {exc!r}")
+            return None
+        if taken and isinstance(answer, Observation):
+            self._give_back(unit, answer)
+        if answer is None:
+            unit.finished = True
+            self._event("telescope_done", gen=None, telescope=unit.name)
+        return answer
+
+    async def _ask_peek(self, unit: TelescopeUnit) -> tuple[Observation | Idle | None, bool]:
+        """``plan.peek``, or, for a plan without it, ``next_observation``.
+        Also returns whether the answer was taken from the plan (then an
+        observation must be observed or given back)."""
+        peek = getattr(self.plan, "peek", None)
+        if peek is not None:
+            return await peek(unit.name), False
+        return await self.plan.next_observation(unit.name), True
+
+    def _give_back(self, unit: TelescopeUnit, obs: Observation) -> None:
+        """Return an observation taken but not started (reported
+        ``interrupted`` with no frames, so the plan re-queues it): the next
+        generation asks the plan afresh rather than act on a stale answer."""
+        self._event("observation_returned", telescope=unit.name, target=obs.name)
+        self._report(unit, obs, "interrupted", [])
+
+    def _closed_error(self, unit: TelescopeUnit, error: str) -> None:
+        """A plan error with no generation running: nothing to make safe."""
+        cfg = self.config
+        unit.consecutive_errors += 1
+        self._event(
+            "telescope_error",
+            gen=None,
+            telescope=unit.name,
+            error=error,
+            errors=unit.consecutive_errors,
+        )
+        log.error("%s: %s: %s", self.name, unit.name, error)
+        if unit.consecutive_errors >= cfg.max_consecutive_errors:
+            unit.gave_up = True
+            self._event(
+                "giving_up", telescope=unit.name, errors=unit.consecutive_errors, level="critical"
+            )
+        else:
+            unit.retry_at = time.monotonic() + cfg.error_backoff
+            self._event("telescope_backoff", telescope=unit.name, seconds=cfg.error_backoff)
+
     async def _recover(self) -> None:
         """Clean up after a crashed predecessor before the first lease (see
         the module doc)."""
@@ -462,22 +627,36 @@ class Sequencer:
             await asyncio.sleep(self.config.lease_renew_interval)
             lease.renew()
 
-    async def _run_generation(self, gen: int, lease: OpenLease) -> _Generation:
-        units = [u for u in self.units.values() if u.active]
-        holder = f"{self.name}/observe#{gen}"
+    async def _run_generation(
+        self, gen: int, lease: OpenLease | None, units: list[TelescopeUnit] | None = None
+    ) -> _Generation:
+        """One generation: under ``lease``, or, with None, a closed one (dark
+        frames only, for ``units``)."""
+        if units is None:
+            units = [u for u in self.units.values() if u.active]
+        holder = f"{self.name}/{'closed' if lease is None else 'observe'}#{gen}"
         grants = {u.name: (u.telescope.grant(holder), u.camera.grant(holder)) for u in units}
-        fence = tuple(g for pair in grants.values() for g in pair)
         state = _Generation(gen, lease, {u.name for u in units})
+        state.filterwheels = {
+            u.name: u.filterwheel.grant(holder) for u in units if u.filterwheel is not None
+        }
+        fence = (*(g for pair in grants.values() for g in pair), *state.filterwheels.values())
         self._gen = state
-        self._event("observe_start", gen=gen, telescopes=[u.name for u in units])
+        what = "closed_start" if lease is None else "observe_start"
+        self._event(what, gen=gen, telescopes=[u.name for u in units])
         task = asyncio.create_task(
             self._observe_all(state, units, grants), name=f"{self.name}-observe-{gen}"
         )
-        renew = asyncio.create_task(self._renew(lease), name=f"{self.name}-renew-{gen}")
-        revoked = asyncio.create_task(lease.revoked.wait())
+        waits: set[asyncio.Future] = {task}
+        renew = revoked = None
+        if lease is not None:
+            renew = asyncio.create_task(self._renew(lease), name=f"{self.name}-renew-{gen}")
+            revoked = asyncio.create_task(lease.revoked.wait())
+            waits.add(revoked)
         try:
-            await asyncio.wait({task, revoked}, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
             if not task.done():
+                assert lease is not None
                 await self._cancel_observe(gen, task, fence, lease.revoke_reason)
             else:
                 exc = None if task.cancelled() else task.exception()
@@ -485,6 +664,8 @@ class Sequencer:
                     outcome = "error"
                 elif state.revoked:
                     outcome = "revoked"  # stopped at lease.wait_open()
+                elif state.idle_release.is_set():
+                    outcome = "idle"
                 else:
                     outcome = "error" if state.errors else "complete"
                 self._event(
@@ -492,9 +673,10 @@ class Sequencer:
                 )
         finally:
             self._gen = None  # no preemption from here on
-            for t in (renew, revoked):
+            helpers = [t for t in (renew, revoked) if t is not None]
+            for t in helpers:
                 t.cancel()
-            await asyncio.gather(renew, revoked, return_exceptions=True)
+            await asyncio.gather(*helpers, return_exceptions=True)
             if not task.done():  # we ourselves are being cancelled
                 await self._cancel_observe(gen, task, fence, "sequencer stopping")
             for g in fence:
@@ -544,30 +726,53 @@ class Sequencer:
         cancellation): its errors are its own (module doc)."""
         try:
             while await self._wait_out_backoff(state, unit):
+                if state.idle_release.is_set():
+                    return  # every telescope idle: the generation is ending
                 # A preemption asked for before this point is served by the
                 # plan's answer (a ToO is already queued there).
                 unit.preempt_policy = None
                 unit.wake.clear()
                 try:
-                    obs = await asyncio.wait_for(
-                        self.plan.next_observation(unit.name), self.config.plan_timeout
-                    )
+                    obs = None
+                    if state.closed:
+                        # Dark frames only: leave as soon as the next is not one.
+                        nxt, taken = await asyncio.wait_for(
+                            self._ask_peek(unit), self.config.plan_timeout
+                        )
+                        if not (isinstance(nxt, Observation) and not nxt.light):
+                            if taken and isinstance(nxt, Observation):
+                                self._give_back(unit, nxt)
+                            return
+                        if taken:
+                            obs = nxt
+                    if obs is None:
+                        obs = await asyncio.wait_for(
+                            self.plan.next_observation(unit.name), self.config.plan_timeout
+                        )
                 except Exception as exc:
                     await self._telescope_failed(state, unit, tel, cam, f"planning: {exc!r}")
                     continue
                 if obs is None:
                     unit.finished = True
+                    unit.idle_since = None
                     self._event("telescope_done", gen=state.gen, telescope=unit.name)
                     return
                 if isinstance(obs, Idle):
+                    if state.closed:
+                        return  # the plan changed its mind since the peek
                     try:
-                        await self._idle(state, unit, tel, obs)
+                        if await self._idle(state, unit, tel, obs):
+                            return  # every telescope idle: release the enclosure
                     except (LeaseRevoked, GrantRevoked):
                         state.revoked = True
                         return
                     except Exception as exc:
                         await self._telescope_failed(state, unit, tel, cam, f"idle: {exc!r}")
                     continue
+                unit.idle_since = None
+                if state.closed and obs.light:
+                    self._give_back(unit, obs)  # the plan changed its mind
+                    return
                 taken: list[int] = []
                 try:
                     await self._observe_preemptible(state, unit, tel, cam, obs, taken)
@@ -599,19 +804,52 @@ class Sequencer:
             unit.idle = unit.exposing = False
             state.leave(unit.name)
 
-    async def _idle(self, state: _Generation, unit: TelescopeUnit, tel: Grant, idle: Idle) -> None:
+    async def _idle(self, state: _Generation, unit: TelescopeUnit, tel: Grant, idle: Idle) -> bool:
         """Wait out an :class:`Idle`: stop tracking (so an idle telescope
-        cannot track into a limit), stay put, until woken or timed out."""
+        cannot track into a limit), stay put, until woken or timed out.
+        True if every telescope has now been idle for ``idle_release_after``
+        (module doc): the telescope leaves the generation."""
+        if unit.idle_since is None:
+            unit.idle_since = time.monotonic()
         self._event("telescope_idle", gen=state.gen, telescope=unit.name, seconds=idle.seconds)
         if not await tel.get("AtPark") and await tel.get("Tracking"):
             await tel.set("Tracking", False)
+        wait = max(0.0, idle.seconds)
+        after = self.config.idle_release_after
+        if after is not None:
+            release_in = unit.idle_since + after - time.monotonic()
+            if release_in > 0:
+                wait = min(wait, release_in)
         unit.idle = True
         try:
-            await asyncio.wait_for(unit.wake.wait(), max(0.0, idle.seconds))
-        except TimeoutError:
-            pass
+            await _wait_any([unit.wake, state.idle_release], wait)
         finally:
             unit.idle = False
+        if state.idle_release.is_set():
+            return True
+        if not self._idle_release_due(state, unit):
+            return False
+        now = time.monotonic()
+        idle_for = {n: round(now - (self.units[n].idle_since or now), 1) for n in state.working}
+        self._event("idle_release", gen=state.gen, idle_for=idle_for)
+        log.info("%s: every telescope idle %s: releasing the enclosure", self.name, idle_for)
+        state.idle_release.set()
+        return True
+
+    def _idle_release_due(self, state: _Generation, me: TelescopeUnit) -> bool:
+        """Every working telescope has been idle for ``idle_release_after``:
+        ``me`` (just back from its wait) and every other one (waiting now)."""
+        after = self.config.idle_release_after
+        if after is None or state.closed:
+            return False
+        now = time.monotonic()
+        for name in state.working:
+            u = self.units[name]
+            if u is not me and not u.idle:
+                return False
+            if u.idle_since is None or now - u.idle_since < after:
+                return False
+        return True
 
     async def _observe_preemptible(
         self,
@@ -811,9 +1049,16 @@ class Sequencer:
         cfg = self.config
         gen = state.gen
         self._event("target_start", gen=gen, telescope=unit.name, target=obs.name)
+        if obs.light and state.lease is None:
+            raise RuntimeError(f"{obs.name}: light frames in a closed generation")
+        if obs.light and await tel.get("AtPark"):
+            await tel.call("Unpark")
+        if obs.port is not None:
+            await self._select_port(state, unit, tel, obs.port)
+        if obs.filter is not None:
+            await self._select_filter(state, unit, obs.filter)
         if obs.light:
-            if await tel.get("AtPark"):
-                await tel.call("Unpark")
+            assert state.lease is not None
             await tel.set("Tracking", True)
             await state.lease.wait_open()
             ra, dec = obs.ra_hours, obs.dec_deg
@@ -854,6 +1099,30 @@ class Sequencer:
             if policy in ("now-after-readout", "now") and i + 1 < obs.count:
                 self._record_preemption(state, unit, policy, aborted=False)
                 raise Preempted(policy)
+
+    async def _select_port(
+        self, state: _Generation, unit: TelescopeUnit, tel: Grant, port: str
+    ) -> None:
+        if unit.port_action is None:
+            raise Unsupported(f"{unit.name} cannot select M3 port {port!r} (no port_action)")
+        await tel.call("Action", unit.port_action, port, timeout=self.config.port_timeout)
+        self._event("port_selected", gen=state.gen, telescope=unit.name, port=port)
+
+    async def _select_filter(self, state: _Generation, unit: TelescopeUnit, name: str) -> None:
+        fw = state.filterwheels.get(unit.name)
+        if fw is None:
+            raise Unsupported(f"{unit.name} has no filter wheel (filter {name!r})")
+        names = list(await fw.get("Names"))
+        if name not in names:
+            raise Unsupported(f"{unit.name}: no filter {name!r} in {names}")
+        position = names.index(name)
+        if await fw.get("Position") != position:
+            await fw.set("Position", position)
+            # Position reads -1 while the wheel moves.
+            await self._wait_for(
+                lambda: fw.get("Position"), lambda p: p == position, self.config.filter_timeout
+            )
+        self._event("filter_selected", gen=state.gen, telescope=unit.name, filter=name)
 
     # -- cleanup ----------------------------------------------------------
 
@@ -924,3 +1193,16 @@ class Sequencer:
             report.parked.append(name)
         except (DeviceError, TimeoutError) as exc:
             report.errors.append(f"{name}: telescope park: {exc!r}")
+
+
+async def _wait_any(events: Sequence[asyncio.Event], timeout: float) -> None:
+    """Wait until any of ``events`` is set, or for ``timeout`` seconds."""
+    if any(e.is_set() for e in events):
+        return
+    waiters = [asyncio.ensure_future(e.wait()) for e in events]
+    try:
+        await asyncio.wait(waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for w in waiters:
+            w.cancel()
+        await asyncio.gather(*waiters, return_exceptions=True)

@@ -61,12 +61,33 @@ re-scored.
 Reports (:meth:`DispatchScheduler.report`): ``complete`` advances the visit
 (and, at its end, records it in the history); ``interrupted`` marks the
 configuration ``ATTEMPTED`` and drops the visit, so it is re-queued; ``failed``
-counts towards ``max_attempts`` (then ``FAILED``).
+counts towards ``max_attempts`` (then ``FAILED``). An interrupted or failed
+observation is re-taken whole, unless its configuration has
+``allow_partial``: then the frames already taken are kept (in the state
+file), and the next visit takes only the rest of that configuration.
+
+Filters and M3 ports are hard constraints too: a configuration naming a
+``port`` is only for telescopes whose limits list it in ``ports`` (default:
+none, so it is never sent to a telescope that would observe through the
+wrong port), and one naming a ``filter`` only for telescopes whose
+``filters`` (if given) include it. The sequencer then selects them.
 
 Nothing observable now is :class:`~robofast_core.plan.Idle` (ask again in
 ``idle_poll``), not "done": the night may bring a rising target or a ToO.
 The night is over (``None``) once the Sun is above ``max_sun_alt`` and
-rising.
+rising. :meth:`DispatchScheduler.peek` answers the same question without
+handing anything out (the sequencer asks it while the enclosure is closed).
+
+The nightly plan record
+-----------------------
+With ``record`` set (a :class:`~robofast_core.plan_record.PlanRecord`), every
+answer and report is written as one JSON line, one file per night: each
+decision with its score terms, the best runners-up and the top rejected
+candidates with the constraints they failed; idle answers with what was
+rejected; visits continued or abandoned; ToOs received and cancelled;
+preemptions; outcomes. The first line a process writes to a night's file is
+a snapshot of the scheduler (requests, state, limits, settings), so
+:func:`robofast_core.plan_record.replay` can re-run the night's decisions.
 
 Targets of opportunity (design.md 3.7.1)
 ----------------------------------------
@@ -118,13 +139,14 @@ import logging
 import math
 import os
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from robofast_core import sky
 from robofast_core.plan import Idle, Observation
+from robofast_core.plan_record import PlanRecord
 from robofast_core.request_model import (
     Configuration,
     Request,
@@ -161,6 +183,11 @@ class TelescopeLimits:
     #: Hour angle limits, hours.
     min_ha: float = -12.0
     max_ha: float = 12.0
+    #: M3 ports it can select (the sequencer's ``port_action``); a
+    #: configuration naming another port is not for this telescope.
+    ports: list[str] = field(default_factory=list)
+    #: Its filters; None: not checked here (the sequencer checks the wheel).
+    filters: list[str] | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any], what: str) -> TelescopeLimits:
@@ -197,6 +224,8 @@ class DispatchConfig:
     reserve_timeout: float = 60.0
     #: Completed visits kept per request in the state file.
     history_size: int = 200
+    #: Runners-up and rejected candidates written per decision in the record.
+    record_top_n: int = 5
 
 
 @dataclass
@@ -227,6 +256,8 @@ class _Visit:
     started: datetime
     cfg: int = 0
     ic: int = 0
+    #: Frames of the current instrument config already taken (allow_partial).
+    done: int = 0
     obs: Observation | None = None
     priority_class: int = 0
     score: float = 0.0
@@ -261,6 +292,7 @@ class DispatchScheduler:
         too_dropbox: str | Path | None = None,
         clock: Callable[[], datetime] | None = None,
         allow_iers_download: bool = False,
+        record: PlanRecord | None = None,
     ) -> None:
         if not allow_iers_download:
             sky.offline_iers()
@@ -283,6 +315,11 @@ class DispatchScheduler:
         self._idle: set[str] = set()
         self._too: dict[str, _TooState] = {}
         self._preempt: PreemptCallback | None = None
+        #: allow_partial progress: configuration id -> (instrument config,
+        #: frames of it taken).
+        self._progress: dict[str, tuple[int, int]] = {}
+        #: The nightly plan record (module doc), or None.
+        self.record = record
         #: Normal groups added at run time (:meth:`submit`); kept in the state.
         self._submitted: set[str] = set()
         #: Completed observations by configuration id (for data pointers).
@@ -303,24 +340,35 @@ class DispatchScheduler:
         sky_now = sky.sky_now(self.site, now)
         visit = self._current.get(telescope)
         if visit is not None:
-            obs = self._continue(telescope, visit, now, sky_now)
-            if obs is not None:
+            why = self._continue_check(telescope, visit, now, sky_now)
+            if why is None:
+                obs = self._observation(visit)
+                self._record(
+                    now,
+                    "continue",
+                    telescope=telescope,
+                    request=visit.request.id,
+                    config=visit.config.id,
+                    observation=obs.name,
+                )
                 return obs
+            self._abandon(telescope, visit, why, now)
         if sky_now.sun_alt > self.config.max_sun_alt and sky_now.sun_rising:
             self._idle.discard(telescope)
             log.info(
                 "%s: the Sun is up (%.1f deg) and rising: night over", telescope, sky_now.sun_alt
             )
+            self._record(now, "night_over", telescope=telescope, sun_alt=sky_now.sun_alt)
             return None
-        best = self._best(telescope, now, sky_now)
+        best, cands = self._best(telescope, now, sky_now)
         if best is None:
             self._idle.add(telescope)
             self.decisions.append((now, telescope, None, -math.inf))
+            self._record(now, "idle", telescope=telescope, **self._summary(None, cands))
             return Idle(self.config.idle_poll, "nothing observable")
         self._idle.discard(telescope)
         req = best.request
-        configs = [c for c in req.configurations if c.status.schedulable]
-        visit = _Visit(req, configs, now, priority_class=req.group.priority_class, score=best.score)
+        visit = self._new_visit(req, now, best.score)
         self._current[telescope] = visit
         self._too.pop(req.id, None)
         self.decisions.append((now, telescope, req.id, best.score))
@@ -331,7 +379,35 @@ class DispatchScheduler:
             best.score,
             ", ".join(f"{k}={v:.3f}" for k, v in best.terms.items()),
         )
-        return self._observation(visit)
+        obs = self._observation(visit)
+        self._record(
+            now,
+            "decision",
+            telescope=telescope,
+            request=req.id,
+            config=visit.config.id,
+            observation=obs.name,
+            priority_class=req.group.priority_class,
+            score=best.score,
+            terms=best.terms,
+            **self._summary(best, cands),
+        )
+        return obs
+
+    async def peek(self, telescope: str) -> Observation | Idle | None:
+        """What :meth:`next_observation` would answer now, without handing
+        it out, recording it or changing any state."""
+        now = self.clock()
+        sky_now = sky.sky_now(self.site, now)
+        visit = self._current.get(telescope)
+        if visit is not None and self._continue_check(telescope, visit, now, sky_now) is None:
+            return self._make_observation(visit)
+        if sky_now.sun_alt > self.config.max_sun_alt and sky_now.sun_rising:
+            return None
+        best, _ = self._best(telescope, now, sky_now)
+        if best is None:
+            return Idle(self.config.idle_poll, "nothing observable")
+        return self._make_observation(self._new_visit(best.request, now, best.score))
 
     def report(self, telescope: str, obs: Observation, outcome: str, frames: int) -> None:
         self.history.append((telescope, obs.name, outcome, frames))
@@ -340,6 +416,16 @@ class DispatchScheduler:
             log.warning("%s: report for an observation not handed out: %s", telescope, obs.name)
             return
         config = visit.config
+        self._record(
+            self.clock(),
+            "outcome",
+            telescope=telescope,
+            request=visit.request.id,
+            config=config.id,
+            observation=obs.name,
+            outcome=outcome,
+            frames=frames,
+        )
         if outcome == "complete":
             done = self.observed.setdefault(config.id, [])
             done.append(
@@ -352,19 +438,27 @@ class DispatchScheduler:
                 }
             )
             del done[: -self.config.history_size]
-            visit.ic += 1
+            visit.ic, visit.done = visit.ic + 1, 0
             if visit.ic >= len(config.instrument_configs):
+                self._progress.pop(config.id, None)
                 visit.cfg, visit.ic = visit.cfg + 1, 0
                 if config.status.schedulable:  # not if canceled meanwhile
                     config.status = Status.ATTEMPTED if visit.request.standing else Status.COMPLETED
                 if visit.cfg >= len(visit.configs):
                     self._visit_done(telescope, visit)
+                else:
+                    self._enter_config(visit)
+            elif config.allow_partial:
+                self._progress[config.id] = (visit.ic, 0)
             visit.obs = None
         else:
+            if config.allow_partial:
+                self._progress[config.id] = (visit.ic, visit.done + max(0, frames))
             if outcome == "failed" and config.status.schedulable:
                 config.failures += 1
                 if config.failures >= visit.request.max_attempts:
                     config.status = Status.FAILED
+                    self._progress.pop(config.id, None)
                     log.error(
                         "%s: %s failed %d times: FAILED", telescope, config.id, config.failures
                     )
@@ -387,6 +481,7 @@ class DispatchScheduler:
         if group.submitted is None:
             group.submitted = now
         self._add(group)
+        self._record(now, "too", group=group.to_dict())
         log.warning(
             "ToO %s received: class %d, policy %s, deadline %s",
             group.id,
@@ -410,6 +505,7 @@ class DispatchScheduler:
             group.submitted = self.clock()
         self._add(group)
         self._submitted.add(group.id)
+        self._record(self.clock(), "submit", group=group.to_dict())
         log.info("request group %s received (%s)", group.id, group.submitter or "no submitter")
         self._save_state()
         return group.id
@@ -417,13 +513,14 @@ class DispatchScheduler:
     def cancel(self, group_id: str) -> None:
         """Cancel every schedulable configuration of a group (KeyError if
         unknown). An observation in progress finishes; its visit then ends
-        (:meth:`_continue`)."""
+        (:meth:`_continue_check`)."""
         group = self.groups.get(group_id)
         if group is None:
             raise KeyError(f"unknown request group {group_id!r}")
         for c in group.configurations():
             if c.status.schedulable:
                 c.status = Status.CANCELED
+        self._record(self.clock(), "cancel", group=group_id)
         log.warning("request group %s canceled", group_id)
         self._save_state()
 
@@ -503,8 +600,16 @@ class DispatchScheduler:
             accepted = bool(self._preempt(telescope, policy, reason))
         except Exception:
             log.exception("preempt(%s, %s)", telescope, policy)
-            return False
+            accepted = False
         log.warning("%s: preempt (%s) for %s: %s", telescope, policy, reason, accepted)
+        self._record(
+            self.clock(),
+            "preempt",
+            telescope=telescope,
+            policy=policy,
+            reason=reason,
+            accepted=accepted,
+        )
         return accepted
 
     async def serve(self) -> None:
@@ -641,9 +746,24 @@ class DispatchScheduler:
                 result.append([math.nan] * len(times))
         return result
 
+    def _remaining(self, c: Configuration) -> tuple[int, int]:
+        """Where a new visit starts in ``c``: (instrument config, frames of it
+        already taken); (0, 0) unless ``allow_partial`` progress is kept."""
+        if not c.allow_partial or c.id not in self._progress:
+            return 0, 0
+        ic, done = self._progress[c.id]
+        if not (0 <= ic < len(c.instrument_configs)):
+            return 0, 0
+        return ic, done if 0 <= done < c.instrument_configs[ic].count else 0
+
     def _duration(self, c: Configuration) -> float:
         cfg = self.config
-        frames = sum(ic.count * (ic.exptime + cfg.frame_overhead) for ic in c.instrument_configs)
+        start, done = self._remaining(c)
+        frames = sum(
+            (ic.count - (done if i == start else 0)) * (ic.exptime + cfg.frame_overhead)
+            for i, ic in enumerate(c.instrument_configs)
+            if i >= start
+        )
         return frames + (cfg.slew_overhead if c.light else 0.0)
 
     def _in_progress(self, req: Request) -> str | None:
@@ -677,6 +797,15 @@ class DispatchScheduler:
         for c in configs:
             if c.instrument not in limits.instruments:
                 reasons.append(f"{telescope} has no {c.instrument}")
+            for ic in c.instrument_configs:
+                if ic.port is not None and ic.port not in limits.ports:
+                    reasons.append(f"{telescope} cannot select port {ic.port!r}")
+                if (
+                    ic.filter is not None
+                    and limits.filters is not None
+                    and ic.filter not in limits.filters
+                ):
+                    reasons.append(f"{telescope} has no filter {ic.filter!r}")
         too = req.group.too
         if too is not None:
             if now > too.deadline:
@@ -823,24 +952,52 @@ class DispatchScheduler:
             raise ValueError(f"score is not finite: {terms}")
         cand.score, cand.terms = score, terms
 
-    def _best(self, telescope: str, now: datetime, sky_now: sky.SkyNow) -> Candidate | None:
-        cands = [c for c in self.evaluate(telescope, now, sky_now) if c.ok]
-        if not cands:
-            return None
-        cands.sort(key=_rank)
-        return cands[0]
+    def _best(
+        self, telescope: str, now: datetime, sky_now: sky.SkyNow
+    ) -> tuple[Candidate | None, list[Candidate]]:
+        """The best candidate (or None), and every candidate evaluated."""
+        cands = self.evaluate(telescope, now, sky_now)
+        ok = sorted((c for c in cands if c.ok), key=_rank)
+        return (ok[0] if ok else None), cands
 
-    def _continue(
+    def _summary(self, best: Candidate | None, cands: list[Candidate]) -> dict[str, Any]:
+        """The runners-up and the top rejected candidates, for the record."""
+        n = self.config.record_top_n
+        ok = sorted((c for c in cands if c.ok and c is not best), key=_rank)
+        rejected = [c for c in cands if not c.ok and c.reasons != ["done"]]
+        rejected.sort(
+            key=lambda c: (-c.request.group.priority_class, -c.request.group.priority, c.request.id)
+        )
+        return {
+            "runners_up": [
+                {"request": c.request.id, "score": c.score, "terms": c.terms} for c in ok[:n]
+            ],
+            "rejected": [
+                {
+                    "request": c.request.id,
+                    "priority": c.request.group.priority,
+                    "priority_class": c.request.group.priority_class,
+                    "reasons": c.reasons,
+                }
+                for c in rejected[:n]
+            ],
+            "candidates": len(cands),
+            "observable": sum(1 for c in cands if c.ok),
+        }
+
+    def _record(self, when: datetime, kind: str, **fields: Any) -> None:
+        if self.record is not None:
+            self.record.write(when, kind, fields, snapshot=self.snapshot)
+
+    def _continue_check(
         self, telescope: str, visit: _Visit, now: datetime, sky_now: sky.SkyNow
-    ) -> Observation | None:
-        """The visit's next observation, if its remainder still passes the
-        hard constraints and no ToO outranks it; else abandon it."""
+    ) -> str | None:
+        """Why the visit must be abandoned (its remainder no longer passes the
+        hard constraints, or a ToO outranks it); None: continue it."""
         req = visit.request
         why = None
         if any(c.status == Status.CANCELED for c in visit.configs[visit.cfg :]):
-            log.info("%s: abandoning %s mid-visit: canceled", telescope, req.id)
-            del self._current[telescope]
-            return None
+            return "canceled"
         outranked = [
             r
             for r in self.requests.values()
@@ -873,25 +1030,47 @@ class DispatchScheduler:
                 self._error(now, req, exc, cand)
             if cand.reasons:
                 why = "; ".join(cand.reasons)
-        if why is None:
-            return self._observation(visit)
+        return why
+
+    def _abandon(self, telescope: str, visit: _Visit, why: str, now: datetime) -> None:
+        req = visit.request
         log.info("%s: abandoning %s mid-visit: %s", telescope, req.id, why)
+        self._record(
+            now, "abandon", telescope=telescope, request=req.id, config=visit.config.id, why=why
+        )
         if visit.config.status.schedulable:
             visit.config.status = Status.ATTEMPTED
         del self._current[telescope]
-        return None
 
-    def _observation(self, visit: _Visit) -> Observation:
+    def _new_visit(self, req: Request, now: datetime, score: float) -> _Visit:
+        configs = [c for c in req.configurations if c.status.schedulable]
+        visit = _Visit(req, configs, now, priority_class=req.group.priority_class, score=score)
+        self._enter_config(visit)
+        return visit
+
+    def _enter_config(self, visit: _Visit) -> None:
+        """Start the visit's current configuration where its kept
+        allow_partial progress says (else at its beginning)."""
+        visit.ic, visit.done = self._remaining(visit.config)
+
+    def _make_observation(self, visit: _Visit) -> Observation:
         c = visit.config
         ic = c.instrument_configs[visit.ic]
-        obs = Observation(
-            f"{c.target.name} [{c.id}#{visit.ic}]",
+        suffix = f"+{visit.done}" if visit.done else ""
+        return Observation(
+            f"{c.target.name} [{c.id}#{visit.ic}{suffix}]",
             ra_hours=c.target.ra_hours if ic.light else None,
             dec_deg=c.target.dec_deg if ic.light else None,
             exptime=ic.exptime,
-            count=ic.count,
+            count=ic.count - visit.done,
             light=ic.light,
+            filter=ic.filter,
+            port=ic.port,
+            allow_partial=c.allow_partial,
         )
+
+    def _observation(self, visit: _Visit) -> Observation:
+        obs = self._make_observation(visit)
         visit.obs = obs
         return obs
 
@@ -901,6 +1080,8 @@ class DispatchScheduler:
         hist = self.visits.setdefault(req.id, [])
         hist.append(visit.started)
         del hist[: -self.config.history_size]
+        for c in req.configurations:
+            self._progress.pop(c.id, None)
         if req.standing:
             for c in req.configurations:
                 if c.status.schedulable:
@@ -917,6 +1098,7 @@ class DispatchScheduler:
                     if c.status.schedulable:
                         c.status = Status.EXPIRED
                 log.warning("%s expired", req.id)
+                self._record(now, "expired", request=req.id)
                 self._save_state()
 
     # -- bookkeeping -------------------------------------------------------------
@@ -950,6 +1132,7 @@ class DispatchScheduler:
                 if c.status != Status.PENDING or c.failures
             },
             "toos": [g.to_dict() for g in self.groups.values() if g.too is not None],
+            "progress": {k: list(v) for k, v in self._progress.items()},
             "submitted": [
                 g.to_dict()
                 for g in self.groups.values()
@@ -957,6 +1140,40 @@ class DispatchScheduler:
             ],
             "observed": {k: v for k, v in self.observed.items() if v},
         }
+
+    def snapshot(self) -> dict[str, Any]:
+        """Everything a replay needs to rebuild this scheduler as it is now
+        (requests with their status, state, limits, settings)."""
+        return {
+            "site": {
+                "latitude": self.site.latitude,
+                "longitude": self.site.longitude,
+                "elevation": self.site.elevation,
+            },
+            "telescopes": {t: asdict(lim) for t, lim in self.limits.items()},
+            "config": asdict(self.config),
+            "groups": [g.to_dict() for g in self.groups.values()],
+            "state": self._state(),
+        }
+
+    @classmethod
+    def from_snapshot(
+        cls, snap: dict[str, Any], *, clock: Callable[[], datetime] | None = None, **kw: Any
+    ) -> DispatchScheduler:
+        """A scheduler rebuilt from :meth:`snapshot` (no state file)."""
+        sched = cls(
+            [RequestGroup.from_dict(g) for g in snap["groups"]],
+            sky.Site(**snap["site"]),
+            {
+                t: TelescopeLimits.from_dict(d, f"telescopes.{t}")
+                for t, d in snap["telescopes"].items()
+            },
+            config=DispatchConfig(**snap["config"]),
+            clock=clock,
+            **kw,
+        )
+        sched.restore_state(snap["state"])
+        return sched
 
     def _save_state(self) -> None:
         if self.state_path is None:
@@ -1000,6 +1217,7 @@ class DispatchScheduler:
             k: (Status(v["status"]), int(v.get("failures", 0)))
             for k, v in data.get("configurations", {}).items()
         }
+        progress = {k: (int(v[0]), int(v[1])) for k, v in data.get("progress", {}).items()}
         observed = data.get("observed", {})
         if not isinstance(observed, dict) or not all(
             isinstance(v, list) for v in observed.values()
@@ -1007,6 +1225,7 @@ class DispatchScheduler:
             raise ValueError("'observed': expected {configuration id: [records]}")
         self.visits = visits
         self.observed = {k: list(v) for k, v in observed.items()}
+        self._progress = progress
         for g in toos + submitted:
             if g.id in self.groups:
                 continue
@@ -1044,9 +1263,16 @@ def dispatch_from_config(
           "legacy_csv": "targets.csv",        # optional: legacy target list too
           "state": "/var/lib/robofast/aqawan1-dispatch.json",   # optional
           "too_dropbox": "/var/lib/robofast/too",                # optional
+          "record": {"dir": "/var/lib/robofast/plans",            # optional
+                     "night_rollover_hour": 12, "timezone": "America/Phoenix"},
           "telescopes": {"t1": {"instruments": ["spectrograph"], "min_alt": 21}},
           ...DispatchConfig fields (max_sun_alt, w_setting, idle_poll, ...)
         }
+
+    ``record`` (the nightly plan record, :class:`PlanRecord`) is a
+    directory, or ``{"dir": ..., "name": ..., "night_rollover_hour": ...,
+    "timezone": ...}``; without a time zone a night's date is reckoned in
+    the site's mean solar time.
 
     Relative paths are relative to ``base`` (the config file's directory).
     Every telescope of the enclosure gets limits (default
@@ -1077,6 +1303,19 @@ def dispatch_from_config(
         groups += from_legacy_csv(_resolve(config.pop("legacy_csv"), base))
     state = config.pop("state", None)
     dropbox = config.pop("too_dropbox", None)
+    record = config.pop("record", None)
+    if isinstance(record, str):
+        record = {"dir": record}
+    if record is not None:
+        if not isinstance(record, dict) or "dir" not in record:
+            raise ValueError("dispatch plan: 'record' must be a directory or {'dir': ...}")
+        record = dict(record)
+        record_dir = _resolve(record.pop("dir"), base)
+        record.setdefault("longitude", site_obj.longitude)
+        try:
+            record = PlanRecord(record_dir, **record)
+        except TypeError as exc:
+            raise ValueError(f"dispatch plan: record: {exc}") from exc
     known = {f.name for f in fields(DispatchConfig)}
     bad = set(config) - known
     if bad:
@@ -1091,4 +1330,5 @@ def dispatch_from_config(
         state=None if state is None else _resolve(state, base),
         too_dropbox=None if dropbox is None else _resolve(dropbox, base),
         clock=clock,
+        record=record,
     )

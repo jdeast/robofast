@@ -9,11 +9,12 @@ python -m pip install --group test              # once (pip >= 25.1)
 python -m robofast_core.testing.rv_night --out /tmp/rv-night
 ```
 
-It takes about two minutes. It prints the night's events as they happen,
+It takes about four minutes. It prints the night's events as they happen,
 then a summary of every spectrum, the request statuses at dawn, the roof
 moves, and the result of every check. It exits with status 0 only if every
 check passed. `--scale` sets the speed of the scheduler's clock (default
-400 simulated seconds per real second). The CI job `e2e` runs the same
+200 simulated seconds per real second; faster leaves a slow
+machine too little night for every target). The CI job `e2e` runs the same
 night (`python -m pytest -m e2e tests/e2e`) and uploads its output
 directory as the `rv-night` artifact.
 
@@ -34,8 +35,8 @@ gives every process its time: the scheduler, the sequencer (FITS times and
 directories, sidecars, autofocus results, the plan record) and the KiwiSpec
 service (raw file names, exposure start times). It runs at real speed for
 the evening calibrations (from half an hour before the night), then from
-evening twilight on 2026-11-09 (new Moon) 400 times faster than real time,
-so the Sun, the targets and dawn pass in about two minutes, and at real
+evening twilight on 2026-11-09 (new Moon) 200 times faster than real time,
+so the Sun, the targets and dawn pass in about four minutes, and at real
 speed again for the morning calibrations. Exposures, holds and timeouts
 run in real seconds, shortened. The whole night is `n20261109` everywhere.
 

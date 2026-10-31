@@ -107,8 +107,10 @@ TRUE_FOCUS = 20000.0
 class NightSettings:
     """What the night is made of (all times real seconds unless said)."""
 
-    #: Simulated seconds per real second for the scheduler's clock.
-    scale: float = 400.0
+    #: Simulated seconds per real second for the scheduler's clock. 200, not
+    #: faster: exposures, slews and readouts take real seconds, and on a
+    #: slow CI runner at 400 the night ran out before every target was done.
+    scale: float = 200.0
     start: datetime = DEFAULT_START
     #: RV spectra: maximum exposure time; the exposure meter's count rate
     #: (counts/s) and one target that ends on counts.
@@ -975,7 +977,13 @@ def check(o: Outcome) -> list[str]:
             bad.append(f"{e['config']} interrupted and never re-observed")
 
     # T2's fault: dropped from a spectrum that T1 finished.
-    t2_drops = [e for e in ev(night, "spectrum_dropped") if e.detail["telescope"] == "t2"]
+    # (A drop because the lease was revoked -- the bad weather, when it
+    # falls in a spectrum t2 fed -- is not the mount fault.)
+    t2_drops = [
+        e
+        for e in ev(night, "spectrum_dropped")
+        if e.detail["telescope"] == "t2" and "GrantRevoked" not in str(e.detail.get("error"))
+    ]
     if not t2_drops:
         bad.append("t2 never dropped out")
     else:

@@ -85,7 +85,9 @@ dialog; the destructive ones (marked *confirm*) must also send
 | `park` (*confirm*) | `enclosure`, `telescope` (required) | one telescope, now: abort its exposure and slew, hold it, and park it as soon as its observation has stopped (the sequencer's park hook, with that telescope's own grant). **Only that mount moves**: the roof, the lease and the other telescopes are not touched. It stays held and parked until `resume` (which unparks it for its next light observation) |
 | `stop` (*confirm*) | `enclosure` only | the whole enclosure: hold every telescope, then ask the supervisor to close (`POST /close`, which revokes the lease). The sequencer aborts every exposure and parks every telescope as for any revocation, and with no lease the supervisor closes. While held, the sequencer asks for no new lease, so it stays closed until someone resumes |
 | `clear_lease` (*confirm*) | `enclosure` | release a dead (crashed or quarantined) lease once the telescopes are safe: the supervisor's `clear`, with the observer's name (design.md 3.3). Refused while the lease is live |
-| `clear_faults` (*confirm*) | `enclosure` | the enclosure's `ClearFaults` (the supervisor refuses unless it is closed) |
+| `clear_spectrograph` (*confirm*) | `enclosure` | the sequencer takes spectra again after it marked the spectrograph down (through `operator_control`; the spectrograph panel shows up/down, the failures and who waits in its queue) |
+| `clear_faults` (*confirm*) | `enclosure` | the enclosure's `ClearFaults` (the supervisor refuses unless it is closed); also releases an emergency close latch |
+| `emergency_close` (*confirm*) | `enclosure` (omit: all), `direct`, `reason` (optional) | close now, by any path that answers (below). Never rate limited |
 
 Requests and ToOs go through the request API's own code
 (`/console/api/v1/...` is `/api/v1/...` for the signed-in observer): the same
@@ -109,9 +111,9 @@ parked. The held telescopes are also told to the dispatch scheduler
 (`set_held`), so a held telescope is never reserved to feed a spectrum
 and a leader does not wait for it (`docs/rv_night.md`). The same directory
 takes `clear_spectrograph` (the operator's clear of a spectrograph the
-sequencer marked down), for now from a shell: `python -m
-robofast_core.console.hold CONTROL_DIR clear_spectrograph --operator NAME
---reason TEXT`. The wrapper
+sequencer marked down): the console's `clear_spectrograph` action, or from
+a shell `python -m robofast_core.console.hold CONTROL_DIR clear_spectrograph
+--operator NAME --reason TEXT`. The wrapper
 writes `control/holds.json` (the holds and the commands applied) after every
 poll, which the console shows and an enclosure stop waits for (up to
 `hold_ack_timeout`) before it asks the supervisor to close. Holds are
@@ -124,6 +126,102 @@ Holding every telescope of an open enclosure for the sequencer's
 `idle_release_after` ends the generation as for any idle period: the
 telescopes park, the lease is released and the supervisor closes.
 
+## Emergency close
+
+A red **EMERGENCY CLOSE** button sits at the left of the header on every
+page (operators only; it stays in view while scrolling, and on a phone).
+One press opens a dialog that says what will happen to each enclosure; one
+more (**CLOSE NOW**) does it. A reason is optional. For each enclosure (all
+of them, or the one chosen in the dialog), in this order:
+
+1. **Hold every telescope** (`stop`, through `operator_control`), so the
+   sequencer asks for no new lease and the supervisor does not simply
+   reopen. Not waited for: closing comes first.
+2. **Ask the safety supervisor** (`POST /close`; the lease is revoked, the
+   sequencer aborts and parks, the supervisor closes; on a roll-off roof
+   with `park_before_close` it parks the telescopes first, bounded by
+   `park_wait`).
+3. **If the supervisor does not answer within `emergency_timeout`**
+   (2 s), or answers with an error, close **through the dome's emergency
+   channel**: `PUT /robofast/v1/emergency_close` on the dome server, with a
+   bearer token (`robofast_core/emergency.py`). The dialog's *skip the
+   supervisor* box goes straight to this step (for a supervisor that
+   answers but whose close does not happen).
+
+Every emergency close is audited (the console's audit log, and on the dome
+server its own `emergency_close.log`) and raised as an alarm: `critical`
+when it went to the dome or failed, `alarm` through the supervisor. The
+answer says which path closed each enclosure; the action fails (502) if any
+enclosure's close was not accepted.
+
+### The dome's close-only channel
+
+The supervisor stays the single owner of the enclosure for opening: the
+dome server's emergency endpoint takes no parameters and does one thing,
+the enclosure's own `CloseShutter`. It needs a token whose SHA-256 is in
+the dome server's config; nothing else on that server changes, and the
+console's client (`close_dome`) has no other call. After an emergency close
+the enclosure is **latched shut**: the dome reports it on its fault channel
+(`Action("Faults")`), so the supervisor, once back, alarms and will not
+open, and the dome itself refuses `OpenShutter` until `ClearFaults` (the
+console's `clear_faults`, through the supervisor, which the dome accepts
+only with both shutters closed). The latch is in the dome's log, so a
+restart of the dome server keeps it.
+
+Set it up (Aqawan; the TCSGO server for the 60-inch has no such channel
+yet):
+
+```
+python -m robofast_core.emergency token         # {"token": ..., "sha256": ...}
+```
+
+The token goes in a file only the console's user can read (mode 600; the
+console refuses anything looser), the hash in the dome server's config:
+
+```
+"emergency_close": {"token_sha256": ["<sha256>"],
+                    "log": "/var/log/robofast/aqawan1-emergency.jsonl"}
+```
+
+and the console's enclosure entry names the file:
+
+```
+"aqawan1": {"config": "aqawan1.json",
+            "emergency_close": {"token_file": "/etc/robofast/aqawan1-emergency.token",
+                                "fallback": "dome"}}
+```
+
+The console must be able to reach the dome server's address
+(`devices.dome` in the enclosure config): the same host, or the control
+network.
+
+### Emergency close and park-before-close
+
+On a roll-off roof the supervisor parks the telescopes before it closes
+(`park_before_close`). **The dome channel does not wait for parking**: if
+the supervisor is not answering, nothing is there to park them, and the
+roof closes over the telescopes wherever they point. The dialog says so.
+Each enclosure chooses with `emergency_close.fallback`:
+
+* `"dome"` (the default when a `token_file` is given): close through the
+  dome. This is the default because the channel is used only when the
+  supervisor is not answering, and then the enclosure closes without
+  parking anyway: the Aqawan PAC's own heartbeat watchdog closes it 60 s
+  after the supervisor's pings stop. The emergency channel only brings that
+  forward by up to a minute, at an observer's deliberate request. It is also
+  design.md 7.1's choice for a park that fails (rain on the optics is worse
+  than an unlikely roof contact), and MINERVA's roll-off roofs clear the
+  telescopes' park positions in any case (aqawan1's T1 and T2 cannot
+  collide).
+* `"none"`: report the failure and alarm; do not touch the dome. For an
+  enclosure where a closing roof can strike an unparked telescope (until
+  its mechanical clearance is confirmed). The observer must then close at
+  the enclosure's own panel.
+
+Without an `emergency_close` entry an enclosure has no fallback (`"none"`).
+None of this replaces the hardware E-stop or the enclosure's local
+controls.
+
 ## The console cannot open the roof
 
 Opening happens only one way: the safety supervisor opens when the weather
@@ -132,7 +230,9 @@ console can do none of that. It reaches the supervisor through
 `SupervisorClient`, whose whole list is `GET /status`, `GET /timeline`,
 `POST /close`, `POST /faults/clear` and `POST /leases/{token}/clear`; it
 refuses anything else before sending it (requesting, renewing or recovering a
-lease included). It never sends the lease token to the browser. A test runs
+lease included). It never sends the lease token to the browser. Its only
+other way to an enclosure is the dome's emergency channel, which can only
+close (above). A test runs
 every action against a real supervisor and sequencer and checks that the
 shutter never opened while held, even with the weather safe and the reopen
 hold long past, that a `resume` in unsafe weather opened nothing, and that
@@ -157,8 +257,8 @@ The request API's posture (design.md 3.7):
 * **No secrets in the page.** The observer pastes their token once; the
   answer sets an `HttpOnly`, `SameSite=Strict` session cookie (`Secure` when
   TLS ends here, or with `cookie_secure: true` behind a proxy) and gives the
-  page a CSRF token, kept only in memory. The lease token never leaves the
-  console process.
+  page a CSRF token, kept only in memory. The lease token and the emergency
+  token never leave the console process.
 * **CSRF.** Every state-changing call needs the cookie and an `X-CSRF-Token`
   header matching the session, a same-origin `Origin` when the browser sends
   one, and a JSON body (a form post is refused). A script may instead send
@@ -181,7 +281,5 @@ The request API's posture (design.md 3.7):
 * The sequencer's own timeline (only the supervisor's is shown) and a
   per-telescope "upcoming" from the scheduler's look-ahead (the queue is
   shown instead).
-* A console button for `clear_spectrograph` (the command exists; the
-  console shows the spectrograph marked down as a critical alarm).
 * Guider and spectrograph controls (start, stop, abort) -- by design the
   sequencer drives them; an observer stops the telescope instead.

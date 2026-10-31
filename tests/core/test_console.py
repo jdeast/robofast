@@ -370,6 +370,7 @@ async def test_unreachable_services_are_alarms_not_errors(make_console):
         "holds": {},
         "holds_updated": None,
         "operator_control": True,
+        "emergency": {"fallback": "none", "park_before_close": False},
     }
     assert s["weather"]["bridge"] == {"reachable": False} and s["weather"]["safe"] is None
     assert s["spectrograph"] == {"reachable": False}

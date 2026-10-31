@@ -62,6 +62,14 @@ Members
   (only if ``interlock_doors`` names them) a door that is not ``CLOSED``.
   Door state does not matter for observing (JDE, 2026-10-31), so the default
   interlocks no doors.
+* ``PUT /robofast/v1/emergency_close`` (not Alpaca; only with an
+  ``emergency_close`` config entry) is the observer console's close-only
+  channel for when the safety supervisor does not answer
+  (:mod:`robofast_core.emergency`): a bearer token whose SHA-256 is in the
+  config, then ``CloseShutter`` and nothing else. It does not wait for the
+  telescopes to park. The close is latched: ``Faults`` reports it (so the
+  supervisor alarms and will not open) and ``OpenShutter`` is refused until
+  ``ClearFaults``; each close and clear is logged to ``emergency_close.log``.
 * No azimuth, altitude, park, home or slaving: those members raise
   ``NotImplementedException``; the ``Can*`` flags say so.
 
@@ -122,6 +130,8 @@ from robofast_core.devices.aqawan_pac import (
     PACTimeout,
     check_pac_address,
 )
+from robofast_core.emergency import PATH as EMERGENCY_PATH
+from robofast_core.emergency import EmergencyConfig, EmergencyGate, parse_body
 
 log = logging.getLogger(__name__)
 
@@ -189,10 +199,13 @@ class AqawanConfig:
     require_auto: bool = True
     #: UDP port for Alpaca discovery (32227 is standard); None: off.
     discovery_port: int | None = None
+    #: The emergency close channel (:mod:`robofast_core.emergency`):
+    #: ``{"token_sha256": [hex, ...], "log": path}``; None: no such channel.
+    emergency_close: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> AqawanConfig:
-        d = dict(d)
+        d = {k: v for k, v in d.items() if not k.startswith("_")}  # "_note" keys
         names = {f.name for f in dataclasses.fields(cls)}
         unknown = set(d) - names
         if unknown:
@@ -205,6 +218,7 @@ class AqawanConfig:
             if key in d:
                 d[key] = tuple(d[key])
         cfg = cls(pac=PACConfig(**pac), **d)
+        EmergencyConfig.from_dict(cfg.emergency_close)  # validated here
         if sorted(cfg.open_order) != [1, 2]:
             raise ValueError("open_order must be [1, 2] or [2, 1]")
         if cfg.close_command not in ("CLOSE_SEQUENTIAL", "CLOSE_SHUTTERS"):
@@ -236,9 +250,13 @@ def aggregate(status: PACStatus, *, sequence: bool, failed: str | None) -> int:
 class Aqawan:
     """The enclosure logic over a :class:`PACClient`. Runs on one event loop."""
 
-    def __init__(self, pac: PACClient, config: AqawanConfig) -> None:
+    def __init__(
+        self, pac: PACClient, config: AqawanConfig, gate: EmergencyGate | None = None
+    ) -> None:
         self.pac = pac
         self.config = config
+        #: The emergency close channel and its latch (None: not configured).
+        self.gate = gate
         self._status: PACStatus | None = None
         self._status_at = -1e9
         self._status_lock = asyncio.Lock()
@@ -308,13 +326,21 @@ class Aqawan:
     async def faults(self) -> dict[str, Any]:
         """The fault channel: Fault/Error flags, the PAC's text, the shutters."""
         st = await self.status()
-        return {
-            "fault": st.fault,
+        faults = self._pac_text["GET_FAULTS"] if st.fault else None
+        latched = None if self.gate is None else self.gate.describe()
+        if latched is not None:
+            # An emergency close is latched as a fault (robofast_core.emergency).
+            faults = latched if faults is None else f"{faults}; {latched}"
+        out = {
+            "fault": st.fault or latched is not None,
             "error": st.error,
-            "faults": self._pac_text["GET_FAULTS"] if st.fault else None,
+            "faults": faults,
             "errors": self._pac_text["GET_ERRORS"] if st.error else None,
             "shutters": list(st.shutters),
         }
+        if self.gate is not None:
+            out["emergency_close"] = self.gate.latched
+        return out
 
     async def clear_faults(self, note: str) -> str:
         """Operator only (privileged at the owner): clear the PAC's faults and
@@ -335,6 +361,8 @@ class Aqawan:
             replies = [await self.pac.action(c) for c in ("CLEAR_FAULTS", "CLEAR_ERRORS")]
         finally:
             self._invalidate()
+        if self.gate is not None and self.gate.clear(note or "ClearFaults"):
+            replies.append("emergency close latch cleared")
         st = await self.status(max_age=0)
         log.warning("after ClearFaults: PAC Fault=%s Error=%s", st.fault, st.error)
         return "; ".join(replies)
@@ -374,6 +402,9 @@ class Aqawan:
     # -- commands -----------------------------------------------------------
 
     def _refusal(self, st: PACStatus) -> str | None:
+        latched = None if self.gate is None else self.gate.describe()
+        if latched is not None:
+            return f"{latched} (ClearFaults, with the enclosure closed, releases it)"
         if st.fault or st.error:
             return f"PAC reports Fault={st.fault} Error={st.error}"
         for door in self.config.interlock_doors:
@@ -551,6 +582,7 @@ NOT_IMPLEMENTED_PUT = frozenset(
     }
 )
 ACTIONS = ("Heartbeat", "Status", "Faults", "GetFaults", "GetErrors", "ClearFaults")
+MAX_BODY = 1 << 16
 UINT32_MAX = 2**32 - 1
 
 
@@ -617,11 +649,25 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             # PUT form parameter names are case-sensitive (Alpaca spec).
             n = int(self.headers.get("Content-Length") or 0)
-            body = self.rfile.read(n).decode("utf-8", "replace") if n else ""
+            if n > MAX_BODY:
+                self._send(413, "request body too large", "text/plain")
+                self.close_connection = True
+                return
+            raw = self.rfile.read(n) if n else b""
+            body = raw.decode("utf-8", "replace")
             params = {k: v[0] for k, v in parse_qs(body, keep_blank_values=True).items()}
         parts = [p for p in url.path.split("/") if p]
         lower = [p.lower() for p in parts]
         srv = self.server
+        if url.path.rstrip("/") == EMERGENCY_PATH:
+            if self.command != "PUT":
+                self._send(405, {"ok": False, "error": "PUT only"})
+                return
+            code, answer = srv.emergency_close(
+                self.headers.get("Authorization"), raw, self.client_address[0]
+            )
+            self._send(code, answer)
+            return
         if lower[:1] == ["management"] and self.command == "GET":
             ctid = _uint32(params.get("clienttransactionid"))
             value = srv.management(lower[1:])
@@ -705,7 +751,8 @@ class AqawanServer(ThreadingHTTPServer):
             max_attempts=p.max_attempts,
             idle_end=p.idle_end,
         )
-        return Aqawan(pac, self.config)
+        ecfg = EmergencyConfig.from_dict(self.config.emergency_close)
+        return Aqawan(pac, self.config, None if ecfg is None else EmergencyGate(ecfg))
 
     def _run_sync(self, coro: Awaitable[Any]) -> Any:
         if not self._loop_thread.is_alive():
@@ -751,6 +798,32 @@ class AqawanServer(ThreadingHTTPServer):
             raise AlpacaException(DRIVER_ERROR, str(exc)) from None
         except concurrent.futures.CancelledError:
             raise AlpacaException(DRIVER_ERROR, f"{what}: cancelled") from None
+
+    # -- the emergency close channel (robofast_core.emergency) ------------------------
+
+    def emergency_close(
+        self, authorization: str | None, body: bytes, peer: str
+    ) -> tuple[int, dict[str, Any]]:
+        """Close, for a holder of an emergency token; latch it. Nothing on
+        this path can open."""
+        gate = self.aqawan.gate
+        if gate is None:
+            return 404, {"ok": False, "error": "no emergency close channel configured"}
+        if not gate.authorized(authorization):
+            log.warning("emergency close from %s refused: bad or missing token", peer)
+            return 401, {"ok": False, "error": "not authorized"}
+        who = parse_body(body)
+        try:
+            self._call(self.aqawan.close, "EmergencyClose")
+        except AlpacaException as exc:
+            gate.record({**who, "peer": peer, "ok": False, "error": str(exc)})
+            return 502, {"ok": False, "error": f"close failed: {exc}"}
+        entry = gate.record({**who, "peer": peer, "ok": True})
+        try:
+            shutter = self._call(self.aqawan.shutter_status, "ShutterStatus")
+        except AlpacaException:
+            shutter = None
+        return 200, {"ok": True, "closing": True, "shutter": shutter, "latched": entry}
 
     # -- management ---------------------------------------------------------------
 

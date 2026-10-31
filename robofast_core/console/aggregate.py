@@ -99,6 +99,16 @@ class ConsoleEnclosure:
     #: The request API's view of the dispatch scheduler (queue, submit,
     #: cancel), if the plan is a dispatch plan with a state file and drop box.
     requests: Any = None
+    #: The dome server (``http://host:port``), from ``devices.dome``.
+    dome_url: str | None = None
+    #: The emergency close channel (robofast_core.emergency): the file
+    #: holding the token, and what to do when the supervisor does not
+    #: answer: ``"dome"`` (close directly, without waiting for the
+    #: telescopes to park) or ``"none"`` (report the failure only).
+    emergency_token_file: Path | None = None
+    emergency_fallback: str = "none"
+    #: The enclosure parks its telescopes before closing (a roll-off roof).
+    park_before_close: bool = False
 
     @classmethod
     def from_spec(
@@ -107,7 +117,7 @@ class ConsoleEnclosure:
         """``spec``: the enclosure config's path, or ``{"config": path,
         "plan"?: path, "spectrograph"?: url, "weather"?: url}``."""
         spec = {"config": spec} if isinstance(spec, str) else dict(spec)
-        unknown = set(spec) - {"config", "plan", "spectrograph", "weather"}
+        unknown = set(spec) - {"config", "plan", "spectrograph", "weather", "emergency_close"}
         if unknown:
             raise ValueError(f"enclosure {name}: unknown keys {sorted(unknown)}")
         cpath = _resolve(spec["config"], base)
@@ -150,6 +160,26 @@ class ConsoleEnclosure:
                 name, config, plan, config_base=cbase, plan_base=pbase, clock=clock
             )
         sf, oc = config.get("status_file"), config.get("operator_control")
+        dome = (config.get("devices") or {}).get("dome")
+        em = spec.get("emergency_close")
+        token_file, fallback = None, "none"
+        if em is not None:
+            if not isinstance(em, dict) or set(em) - {"token_file", "fallback"}:
+                raise ValueError(
+                    f"enclosure {name}: emergency_close: {{'token_file': path, "
+                    f"'fallback': 'dome'|'none'}}"
+                )
+            fallback = str(em.get("fallback", "dome"))
+            if fallback not in ("dome", "none"):
+                raise ValueError(f"enclosure {name}: emergency_close.fallback: 'dome' or 'none'")
+            if "token_file" in em:
+                token_file = _resolve(em["token_file"], base)
+            elif fallback == "dome":
+                raise ValueError(
+                    f"enclosure {name}: emergency_close: fallback 'dome' needs a token_file"
+                )
+            if fallback == "dome" and not isinstance(dome, str):
+                raise ValueError(f"enclosure {name}: emergency_close: no devices.dome to close")
         return cls(
             name=name,
             supervisor_url=(
@@ -166,6 +196,10 @@ class ConsoleEnclosure:
             record_dir=record_dir,
             record_name=record_name,
             requests=requests,
+            dome_url=f"http://{device_address(dome)[0]}" if isinstance(dome, str) else None,
+            emergency_token_file=token_file,
+            emergency_fallback=fallback,
+            park_before_close=bool((config.get("safety") or {}).get("park_before_close")),
         )
 
 
@@ -254,6 +288,10 @@ class Aggregator:
         enclosure["holds"] = holds
         enclosure["holds_updated"] = (holds_doc or {}).get("time")
         enclosure["operator_control"] = enc.control_dir is not None
+        enclosure["emergency"] = {
+            "fallback": enc.emergency_fallback,
+            "park_before_close": enc.park_before_close,
+        }
         tels = {}
         for t in enc.telescopes:
             tels[t] = self._telescope_view(t, seq, values, holds.get(t), guider.get(t), alarm)
@@ -512,6 +550,8 @@ class Aggregator:
             "stage": reading("stage"),
             "spec_pressure": reading("spec_pressure"),
             "led_on": spec.get("led_on"),
+            # Who waits for the spectrograph (its shared queue).
+            "queue": [q for q in spec.get("queue") or [] if isinstance(q, dict)],
             "backlight_on": spec.get("backlight_on"),
         }
 

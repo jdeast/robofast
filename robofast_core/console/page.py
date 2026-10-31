@@ -79,6 +79,16 @@ button.emergency { background: var(--bad); color: var(--bg); border-color: var(-
 #emergency-dialog { border: 2px solid var(--bad); }
 #emergency-dialog h3 { color: var(--bad); }
 #em-text, #em-result { white-space: pre-line; }
+.strip { display: flex; flex-wrap: wrap; gap: 8px; }
+.thumb { display: flex; flex-direction: column; align-items: center; gap: 2px; cursor: pointer;
+  background: none; border: 1px solid var(--line); padding: 4px; min-height: 0; }
+.thumb canvas { width: 150px; height: 150px; background: #000; image-rendering: pixelated; }
+#img-canvas { width: 100%; max-width: 900px; display: block; background: #000; touch-action: none;
+  cursor: crosshair; image-rendering: pixelated; margin-top: 6px; }
+.actions select, .actions label { font-size: 14px; }
+a.button { display: inline-flex; align-items: center; padding: 8px 12px; min-height: 40px;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--btn); color: var(--text);
+  text-decoration: none; }
 label.check { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
 label.check input { width: auto; }
 .hidden { display: none !important; }
@@ -112,6 +122,34 @@ BODY = """
   <section id="weather"><h2>Weather</h2><div id="weather-body"></div></section>
   <section id="enclosure"><h2>Enclosure</h2><div id="enclosure-body"></div></section>
   <section id="telescopes" class="wide"><h2>Telescopes</h2><div id="telescope-body"></div></section>
+  <section id="images" class="wide"><h2>Images</h2>
+    <div class="actions">
+      <label>guiders <select id="img-rate" aria-label="guider refresh rate">
+        <option value="0">paused</option><option value="0.5">0.5 Hz</option>
+        <option value="1">1 Hz</option><option value="2" selected>2 Hz</option>
+        <option value="4">4 Hz</option></select></label>
+      <span id="img-rate-note" class="dim"></span>
+    </div>
+    <div id="guider-strip" class="strip"></div>
+    <div class="actions">
+      <select id="img-source" aria-label="image source"></select>
+      <select id="img-scale" aria-label="scale">
+        <option value="zscale">zscale</option><option value="99.5">99.5%</option>
+        <option value="99">99%</option><option value="minmax">min-max</option></select>
+      <select id="img-stretch" aria-label="stretch">
+        <option value="linear">linear</option><option value="asinh">asinh</option>
+        <option value="log">log</option><option value="sqrt">sqrt</option></select>
+      <select id="img-max" aria-label="resolution">
+        <option value="256">256 px</option><option value="512" selected>512 px</option>
+        <option value="1024">1024 px</option></select>
+      <button id="img-zin" type="button" aria-label="zoom in">+</button>
+      <button id="img-zout" type="button" aria-label="zoom out">&minus;</button>
+      <button id="img-fit" type="button">fit</button>
+      <a id="img-fits" class="button" download>FITS</a>
+    </div>
+    <canvas id="img-canvas" width="512" height="512" aria-label="image"></canvas>
+    <div id="img-info" class="mono dim"></div>
+  </section>
   <section id="spectrograph"><h2>Spectrograph</h2><div id="spectrograph-body"></div></section>
   <section id="plan"><h2>Plan</h2><div id="plan-body"></div></section>
   <section id="timeline" class="wide"><h2>Timeline</h2>
@@ -279,6 +317,7 @@ function signedIn(s) {
   $("who").textContent = s.name + (s.can.operate ? " (operator)" : " (read only)");
   $("requests").classList.toggle("hidden", !s.requests);
   connect();
+  loadImageSources();
 }
 $("signin-go").addEventListener("click", async () => {
   const token = $("token").value.trim();
@@ -511,6 +550,186 @@ $("em-go").addEventListener("click", async () => {
     $("em-go").disabled = false;
   }
 });
+
+// -- images ---------------------------------------------------------------------------
+// Frames are scaled on the server (PNG); each guider thumbnail is fetched at
+// the chosen rate while the page is visible, the viewer when its source
+// changes (ETag: an unchanged frame costs a 304 and no pixels).
+const imgState = {sources: [], thumbs: {}, view: null, timer: null, busy: {}, bytes: 0, since: Date.now()};
+async function fetchFrame(enc, src, params, etag) {
+  const q = new URLSearchParams(params).toString();
+  const r = await fetch("/console/api/image/" + encodeURIComponent(enc) + "/" + encodeURIComponent(src) + "?" + q,
+    {credentials: "same-origin", headers: etag ? {"If-None-Match": etag} : {}});
+  if (r.status === 304) return {same: true};
+  if (r.status === 401) { signedOut(); return null; }
+  if (!r.ok) { let e = null; try { e = (await r.json()).error; } catch (x) { /* no JSON */ } return {error: e || String(r.status)}; }
+  const blob = await r.blob();
+  imgState.bytes += blob.size;
+  let meta = {};
+  try { meta = JSON.parse(r.headers.get("X-Frame") || "{}"); } catch (e) { /* none */ }
+  return {bitmap: await createImageBitmap(blob), meta, etag: r.headers.get("ETag")};
+}
+function drawOverlays(ctx, meta, sx, sy, ox, oy) {
+  const o = meta.overlays || {};
+  const X = (x) => (x - ox) * sx, Y = (y) => (y - oy) * sy;
+  ctx.lineWidth = Math.max(1, (window.devicePixelRatio || 1));
+  const css = getComputedStyle(document.documentElement);
+  if (o.window) { ctx.strokeStyle = css.getPropertyValue("--dim"); ctx.strokeRect(X(o.window.x0), Y(o.window.y0), (o.window.x1 - o.window.x0) * sx, (o.window.y1 - o.window.y0) * sy); }
+  if (o.target) {
+    ctx.strokeStyle = css.getPropertyValue("--ok");
+    const x = X(o.target.x + 0.5), y = Y(o.target.y + 0.5), r = Math.max(3, o.target.r * sx);
+    ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x - 2 * r, y); ctx.lineTo(x - r, y); ctx.moveTo(x + r, y); ctx.lineTo(x + 2 * r, y);
+    ctx.moveTo(x, y - 2 * r); ctx.lineTo(x, y - r); ctx.moveTo(x, y + r); ctx.lineTo(x, y + 2 * r); ctx.stroke();
+  }
+  if (o.star) {
+    ctx.strokeStyle = css.getPropertyValue("--warn");
+    const x = X(o.star.x + 0.5), y = Y(o.star.y + 0.5);
+    ctx.beginPath(); ctx.moveTo(x - 5, y - 5); ctx.lineTo(x + 5, y + 5); ctx.moveTo(x + 5, y - 5); ctx.lineTo(x - 5, y + 5); ctx.stroke();
+  }
+}
+async function loadImageSources() {
+  const r = await call("GET", "/console/api/images");
+  if (!r.ok) return;
+  const all = [];
+  for (const [enc, list] of Object.entries(r.data.sources || {})) for (const s of list) all.push({...s, enc});
+  imgState.sources = all;
+  const multi = Object.keys(r.data.sources || {}).length > 1;
+  const label = (s) => (multi ? s.enc + " / " : "") + s.label;
+  $("images").classList.toggle("hidden", all.length === 0);
+  fill("img-source", all.map((s, i) => h("option", {value: String(i)}, label(s))));
+  fill("guider-strip", all.filter((s) => s.kind === "guider").map((s) => {
+    const c = h("canvas", {width: 150, height: 150});
+    const cap = h("span", {class: "dim mono"}, label(s));
+    imgState.thumbs[s.enc + "/" + s.id] = {canvas: c, cap, etag: null};
+    return h("button", {type: "button", class: "thumb", title: "open in the viewer",
+      onclick: () => { $("img-source").value = String(all.indexOf(s)); setView(); }}, c, cap);
+  }));
+  if (all.length) setView();
+  scheduleImages();
+}
+async function refreshThumb(s) {
+  const key = s.enc + "/" + s.id, t = imgState.thumbs[key];
+  if (!t || imgState.busy[key]) return;
+  imgState.busy[key] = true;
+  try {
+    const f = await fetchFrame(s.enc, s.id, {max: 128, scale: "zscale", stretch: "linear"}, t.etag);
+    if (!f || f.same) return;
+    if (f.error) { t.cap.textContent = s.label + ": " + f.error; return; }
+    t.etag = f.etag;
+    const ctx = t.canvas.getContext("2d");
+    ctx.imageSmoothingEnabled = false;
+    const [w, hh] = [f.bitmap.width, f.bitmap.height], k = Math.min(150 / w, 150 / hh);
+    ctx.clearRect(0, 0, 150, 150);
+    ctx.drawImage(f.bitmap, 0, 0, w * k, hh * k);
+    const reg = f.meta.region || [0, 0, w, hh], sx = k * w / (reg[2] - reg[0]);
+    drawOverlays(ctx, f.meta, sx, sx, reg[0], reg[1]);
+    t.cap.textContent = s.label + " · " + fmt(f.meta.state) + " · #" + fmt(f.meta.count);
+  } catch (e) { t.cap.textContent = s.label + ": " + e; }
+  finally { imgState.busy[key] = false; }
+}
+function scheduleImages() {
+  if (imgState.timer) clearInterval(imgState.timer);
+  imgState.timer = null;
+  const rate = parseFloat($("img-rate").value);
+  if (!(rate > 0)) { $("img-rate-note").textContent = "paused"; return; }
+  imgState.timer = setInterval(() => {
+    if (!session || document.visibilityState !== "visible" || $("main").classList.contains("hidden")) return;
+    for (const s of imgState.sources) if (s.kind === "guider") refreshThumb(s);
+    const v = imgState.view;
+    if (v && (v.src.kind === "guider" || Date.now() - v.checked > 5000)) refreshView();
+    const secs = (Date.now() - imgState.since) / 1000;
+    if (secs > 10) {
+      $("img-rate-note").textContent = "~" + (imgState.bytes / 1024 / secs).toFixed(1) + " kB/s";
+      imgState.bytes = 0; imgState.since = Date.now();
+    }
+  }, 1000 / rate);
+}
+$("img-rate").addEventListener("change", scheduleImages);
+function setView() {
+  const s = imgState.sources[parseInt($("img-source").value, 10)];
+  if (!s) return;
+  imgState.view = {src: s, region: null, shape: null, meta: null, etag: null, checked: 0};
+  $("img-fits").href = "/console/api/fits/" + encodeURIComponent(s.enc) + "/" + encodeURIComponent(s.id);
+  refreshView();
+}
+for (const id of ["img-source"]) $(id).addEventListener("change", setView);
+for (const id of ["img-scale", "img-stretch", "img-max"]) $(id).addEventListener("change", () => { if (imgState.view) { imgState.view.etag = null; refreshView(); } });
+async function refreshView() {
+  const v = imgState.view;
+  if (!v || v.busy) return;
+  v.busy = true;
+  try {
+    const params = {max: $("img-max").value, scale: $("img-scale").value, stretch: $("img-stretch").value};
+    if (v.region) Object.assign(params, {x0: v.region[0], y0: v.region[1], x1: v.region[2], y1: v.region[3]});
+    const f = await fetchFrame(v.src.enc, v.src.id, params, v.etag);
+    v.checked = Date.now();
+    if (!f || f.same) return;
+    if (f.error) { $("img-info").textContent = f.error; return; }
+    v.etag = f.etag; v.meta = f.meta; v.shape = f.meta.shape; v.bitmap = f.bitmap;
+    drawView();
+  } finally { v.busy = false; }
+}
+function drawView() {
+  const v = imgState.view, c = $("img-canvas");
+  if (!v || !v.bitmap) return;
+  const m = v.meta, reg = m.region, rw = reg[2] - reg[0], rh = reg[3] - reg[1];
+  const dpr = window.devicePixelRatio || 1, cssW = c.clientWidth || 512;
+  c.width = Math.round(cssW * dpr);
+  c.height = Math.round(Math.min(c.width * rh / rw, 1.2 * window.innerHeight * dpr));
+  const ctx = c.getContext("2d");
+  ctx.imageSmoothingEnabled = false;
+  const k = Math.min(c.width / rw, c.height / rh);
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, c.width, c.height);
+  ctx.drawImage(v.bitmap, 0, 0, rw * k, rh * k);
+  v.k = k;
+  drawOverlays(ctx, m, k, k, reg[0], reg[1]);
+  $("img-info").textContent = [m.file || (m.telescope ? m.telescope + " guider" : ""), m.object, m.state,
+    m.exposure !== undefined ? "exp " + fmt(m.exposure) + " s" : null, m.date_obs || m.utc_end,
+    m.shape ? m.shape[0] + "×" + m.shape[1] : null, "bin " + m.binning + (m.view_binning > 1 ? " (shown ÷" + m.view_binning + ")" : ""), m.scale + "/" + m.stretch].filter(Boolean).join(" · ");
+}
+function zoom(f, cx, cy) {
+  const v = imgState.view;
+  if (!v || !v.shape) return;
+  const [W, H] = v.shape, reg = v.region || [0, 0, W, H];
+  const rw = reg[2] - reg[0], rh = reg[3] - reg[1];
+  const nw = Math.max(8, Math.min(W, Math.round(rw / f))), nh = Math.max(8, Math.min(H, Math.round(rh / f)));
+  const mx = cx ?? (reg[0] + rw / 2), my = cy ?? (reg[1] + rh / 2);
+  const x0 = Math.max(0, Math.min(W - nw, Math.round(mx - nw / 2))), y0 = Math.max(0, Math.min(H - nh, Math.round(my - nh / 2)));
+  v.region = (nw >= W && nh >= H) ? null : [x0, y0, x0 + nw, y0 + nh];
+  v.etag = null;
+  refreshView();
+}
+$("img-zin").addEventListener("click", () => zoom(2));
+$("img-zout").addEventListener("click", () => zoom(0.5));
+$("img-fit").addEventListener("click", () => { if (imgState.view) { imgState.view.region = null; imgState.view.etag = null; refreshView(); } });
+function framePoint(ev) {
+  const v = imgState.view, c = $("img-canvas"), rect = c.getBoundingClientRect();
+  if (!v || !v.meta || !v.k) return null;
+  const dpr = c.width / rect.width, reg = v.meta.region;
+  return [reg[0] + (ev.clientX - rect.left) * dpr / v.k, reg[1] + (ev.clientY - rect.top) * dpr / v.k];
+}
+let drag = null;
+$("img-canvas").addEventListener("pointerdown", (ev) => { drag = {x: ev.clientX, y: ev.clientY, p: framePoint(ev)}; });
+$("img-canvas").addEventListener("pointerup", async (ev) => {
+  const d = drag; drag = null;
+  const v = imgState.view;
+  if (!d || !v || !v.shape) return;
+  const moved = Math.hypot(ev.clientX - d.x, ev.clientY - d.y);
+  const p = framePoint(ev);
+  if (!p || !d.p) return;
+  if (moved > 6) {  // drag: pan
+    const [W, H] = v.shape, reg = v.region || [0, 0, W, H], rw = reg[2] - reg[0], rh = reg[3] - reg[1];
+    const x0 = Math.max(0, Math.min(W - rw, Math.round(reg[0] - (p[0] - d.p[0])))), y0 = Math.max(0, Math.min(H - rh, Math.round(reg[1] - (p[1] - d.p[1]))));
+    v.region = (rw >= W && rh >= H) ? null : [x0, y0, x0 + rw, y0 + rh];
+    v.etag = null; refreshView(); return;
+  }
+  const x = Math.floor(p[0]), y = Math.floor(p[1]);
+  const r = await call("GET", "/console/api/pixel/" + encodeURIComponent(v.src.enc) + "/" + encodeURIComponent(v.src.id) + "?x=" + x + "&y=" + y);
+  if (r.ok) $("img-info").textContent = "x " + x + ", y " + y + (r.data.detector ? " (detector " + r.data.detector.map((q) => q.toFixed(1)).join(", ") + ")" : "") + ": " + fmt(r.data.value, 1);
+});
+$("img-canvas").addEventListener("wheel", (ev) => { ev.preventDefault(); const p = framePoint(ev); zoom(ev.deltaY < 0 ? 2 : 0.5, p && p[0], p && p[1]); }, {passive: false});
+window.addEventListener("resize", drawView);
 
 // -- requests --------------------------------------------------------------------------
 function show(r) { $("rq-out").textContent = JSON.stringify(r.data, null, 1); }

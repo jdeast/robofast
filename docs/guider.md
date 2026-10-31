@@ -272,6 +272,11 @@ needed only on a guide computer with real devices. The API and the config
 are in the module docstring. In short:
 
 - `GET /status`, `GET /telemetry?n=`, `GET /values`;
+- `GET /frame?max=N`: the last frame the camera took (the guide window, or
+  an acquisition frame), binned on the guide computer to at most N pixels a
+  side, compressed, with the target (fiber) and its radius, the last
+  centroid and the guide window to draw over it. Display only: the
+  observer console's guider thumbnails (docs/console.md, "Images");
 - `POST /start` (`target`, `mode`, `exposure`, `dec`), `/stop`, `/mode`
   (`closed`, or `open`: measure only, for commissioning), `/target` (moves
   the setpoint, keeps the controller's state), `/gains`, `/roi`,

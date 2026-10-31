@@ -109,6 +109,12 @@ class ConsoleEnclosure:
     emergency_fallback: str = "none"
     #: The enclosure parks its telescopes before closing (a roll-off roof).
     park_before_close: bool = False
+    #: Where the sequencer saves frames (``images.data_root`` and ``site``;
+    #: docs/data.md), and where the spectrograph's raw frames land
+    #: (``spectrograph_frames`` in the console's entry): the image viewer.
+    images_root: Path | None = None
+    images_site: str = "site"
+    spectrograph_frames: Path | None = None
 
     @classmethod
     def from_spec(
@@ -117,7 +123,14 @@ class ConsoleEnclosure:
         """``spec``: the enclosure config's path, or ``{"config": path,
         "plan"?: path, "spectrograph"?: url, "weather"?: url}``."""
         spec = {"config": spec} if isinstance(spec, str) else dict(spec)
-        unknown = set(spec) - {"config", "plan", "spectrograph", "weather", "emergency_close"}
+        unknown = set(spec) - {
+            "config",
+            "plan",
+            "spectrograph",
+            "weather",
+            "emergency_close",
+            "spectrograph_frames",
+        }
         if unknown:
             raise ValueError(f"enclosure {name}: unknown keys {sorted(unknown)}")
         cpath = _resolve(spec["config"], base)
@@ -161,6 +174,7 @@ class ConsoleEnclosure:
             )
         sf, oc = config.get("status_file"), config.get("operator_control")
         dome = (config.get("devices") or {}).get("dome")
+        images = config.get("images") if isinstance(config.get("images"), dict) else {}
         em = spec.get("emergency_close")
         token_file, fallback = None, "none"
         if em is not None:
@@ -200,6 +214,13 @@ class ConsoleEnclosure:
             emergency_token_file=token_file,
             emergency_fallback=fallback,
             park_before_close=bool((config.get("safety") or {}).get("park_before_close")),
+            images_root=None
+            if not images.get("data_root")
+            else _resolve(images["data_root"], cbase),
+            images_site=str(images.get("site", "site")),
+            spectrograph_frames=None
+            if spec.get("spectrograph_frames") is None
+            else _resolve(spec["spectrograph_frames"], base),
         )
 
 

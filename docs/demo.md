@@ -9,11 +9,12 @@ python -m pip install --group test              # once (pip >= 25.1)
 python -m robofast_core.testing.rv_night --out /tmp/rv-night
 ```
 
-It takes about two minutes. It prints the night's events as they happen,
+It takes about four minutes. It prints the night's events as they happen,
 then a summary of every spectrum, the request statuses at dawn, the roof
 moves, and the result of every check. It exits with status 0 only if every
 check passed. `--scale` sets the speed of the scheduler's clock (default
-400 simulated seconds per real second). The CI job `e2e` runs the same
+200 simulated seconds per real second; faster leaves a slow
+machine too little night for every target). The CI job `e2e` runs the same
 night (`python -m pytest -m e2e tests/e2e`) and uploads its output
 directory as the `rv-night` artifact.
 
@@ -30,8 +31,8 @@ directory as the `rv-night` artifact.
 | sequencer | the real sequencer service (`sequencer_service.build` and `run`) on `aqawan1.json`. It runs three times, as `deploy/robofast-sequencer@.service` does: evening calibrations, the night (the dispatch plan of `dispatch.example.json`, with autofocus triggers and the console's `operator_control`), and morning calibrations |
 
 The scheduler's clock starts in evening twilight on 2026-11-09 (new Moon)
-and runs 400 times faster than real time. The Sun, the targets and dawn
-therefore pass in about two minutes. Exposures, holds and timeouts run in
+and runs 200 times faster than real time. The Sun, the targets and dawn
+therefore pass in about four minutes. Exposures, holds and timeouts run in
 real seconds, shortened. FITS times and file names use the wall clock.
 
 ## The night

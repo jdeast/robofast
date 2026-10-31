@@ -100,8 +100,10 @@ TRUE_FOCUS = 20000.0
 class NightSettings:
     """What the night is made of (all times real seconds unless said)."""
 
-    #: Simulated seconds per real second for the scheduler's clock.
-    scale: float = 400.0
+    #: Simulated seconds per real second for the scheduler's clock. 200, not
+    #: faster: exposures, slews and readouts take real seconds, and on a
+    #: slow CI runner at 400 the night ran out before every target was done.
+    scale: float = 200.0
     start: datetime = DEFAULT_START
     #: RV spectra: maximum exposure time; the exposure meter's count rate
     #: (counts/s) and one target that ends on counts.

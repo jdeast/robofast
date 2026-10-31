@@ -960,7 +960,13 @@ def check(o: Outcome) -> list[str]:
             bad.append(f"{e['config']} interrupted and never re-observed")
 
     # T2's fault: dropped from a spectrum that T1 finished.
-    t2_drops = [e for e in ev(night, "spectrum_dropped") if e.detail["telescope"] == "t2"]
+    # (A drop because the lease was revoked -- the bad weather, when it
+    # falls in a spectrum t2 fed -- is not the mount fault.)
+    t2_drops = [
+        e
+        for e in ev(night, "spectrum_dropped")
+        if e.detail["telescope"] == "t2" and "GrantRevoked" not in str(e.detail.get("error"))
+    ]
     if not t2_drops:
         bad.append("t2 never dropped out")
     else:

@@ -30,10 +30,15 @@ directory as the `rv-night` artifact.
 | KiwiSpec | the spectrograph PC simulator and the real KiwiSpec service (`kiwispec_service`, a child process) |
 | sequencer | the real sequencer service (`sequencer_service.build` and `run`) on `aqawan1.json`. It runs three times, as `deploy/robofast-sequencer@.service` does: evening calibrations, the night (the dispatch plan of `dispatch.example.json`, with autofocus triggers and the console's `operator_control`), and morning calibrations |
 
-The scheduler's clock starts in evening twilight on 2026-11-09 (new Moon)
-and runs 200 times faster than real time. The Sun, the targets and dawn
-therefore pass in about four minutes. Exposures, holds and timeouts run in
-real seconds, shortened. FITS times and file names use the wall clock.
+One simulated clock (`clock.json` in `--out`, `robofast_core/clock.py`)
+gives every process its time: the scheduler, the sequencer (FITS times and
+directories, sidecars, autofocus results, the plan record) and the KiwiSpec
+service (raw file names, exposure start times). It runs at real speed for
+the evening calibrations (from half an hour before the night), then from
+evening twilight on 2026-11-09 (new Moon) 200 times faster than real time,
+so the Sun, the targets and dawn pass in about four minutes, and at real
+speed again for the morning calibrations. Exposures, holds and timeouts
+run in real seconds, shortened. The whole night is `n20261109` everywhere.
 
 ## The night
 
@@ -62,7 +67,10 @@ real seconds, shortened. FITS times and file names use the wall clock.
    made safe and backs off. T1 finishes the spectrum alone. The fault
    clears, and T2 comes back.
 8. **The observer console** pauses T2 (an operator hold through
-   `operator_control`) for a few seconds and then resumes it.
+   `operator_control`) for a few seconds and then resumes it; T1 leads
+   spectra alone meanwhile (a held telescope is not reserved). Then it
+   parks T2 alone at once (`park`: only T2's mount moves; the roof stays
+   open and T1 goes on) and resumes it again.
 9. **The imaging field**: an imaging request for T1 only, in a window in
    the middle of the night. T1 images it while T2 leads spectra alone.
 10. **Dawn**: the scheduler ends the night once the Sun is above -12 deg
@@ -76,8 +84,9 @@ real seconds, shortened. FITS times and file names use the wall clock.
 | `sequencer-night.log` | the sequencer's timeline: `spectrum_session`, `spectrum_joined`, `guiding`, `spectrum_started` (with the telescopes feeding it), `spectrum_dropped`, `spectrum_done`, `cancel_requested`, `spectrograph_aborted`, `cleanup_done`, ... |
 | `sequencer-evening.log`, `sequencer-morning.log` | the calibrations (`spectrograph_calibration_done`; no `observe_start`, so no lease) |
 | `supervisor.log` | the supervisor: weather verdicts, the lease, `close_commanded`, the heartbeat |
-| `plans/plan-2026-11-09.jsonl` | the nightly plan record (the simulated night): every decision with its score, `join`s, outcomes, the ToO, the preemptions. `python -m robofast_core.plan_record FILE` lists it; add `--replay` to re-run the decisions. The autofocus results are stamped with the wall clock, so they land in a second file named after today's night |
+| `plans/plan-2026-11-09.jsonl` | the nightly plan record: every decision with its score, `join`s, `held` entries, outcomes, the autofocus results, the ToO, the preemptions. `python -m robofast_core.plan_record FILE` lists it; add `--replay` to re-run the decisions |
 | `dispatch-state.json` | request statuses and the data pointers of every completed observation |
+| `clock.json` | the simulated clock's current phase (start, scale, origin) |
 | `data/minerva/kiwispec/n*/` | one JSON sidecar per spectrum and calibration frame: the telescopes, who dropped out, guide statistics, the flux-weighted midpoint, `barycentric` (BJD_TDB and the RV correction), and the index `*.spectra.jsonl` (`docs/rv_night.md`) |
 | `data/minerva/t1/n*/`, `data/minerva/t2/n*/` | FITS frames (autofocus, the imaging field, the imager calibrations) and the frame index (`docs/data.md`) |
 | `aqawan1-control/holds.json`, `aqawan1-control/done/` | the console's commands and the holds |
@@ -93,10 +102,12 @@ prints every check that failed:
   before each telescope's first spectrum, at least three spectra fed by
   both telescopes, the imaging field on disk, every request (the ToO
   included) `COMPLETED` at dawn, the night ended by dawn, no telescope
-  given up;
+  given up; one night name (`n20261109`) for every directory, file,
+  sidecar, raw spectrum and plan record;
 * **the interruptions**: the lease revoked for weather, the spectrum
   aborted and reported `interrupted`, then observed again; T2 dropped out
-  of a spectrum that T1 finished; the console paused and resumed T2;
+  of a spectrum that T1 finished; the console paused and resumed T2, and
+  parked T2 alone (T2 parked, T1 not, no roof command meanwhile);
 * **safety invariants**: the roof never opens while the weather is unsafe
   or within the reopen hold after it clears; no spectrum starts unless
   every telescope it lists is guiding; in every cleanup, every abort (the

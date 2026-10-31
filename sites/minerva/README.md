@@ -123,9 +123,23 @@ used it (`fau_t2.ini` USETIPTILT = False, and `imager_server_t2.ini` has
 | Value | Legacy source |
 |---|---|
 | ports 44445 (spectrograph), 2055 (SI camera) | `spectrograph.ini` SERVER_PORT, CAMERA_PORT |
-| iodine stage in 11, flat 68, out 102 mm | `spectrograph_server.ini` `[I2POSITIONS]` |
+| iodine stage positions: **read from the live server**, not configured (see below) | the live `spectrograph_server.ini` `[I2POSITIONS]` on the spectrograph PC |
 | iodine heater 55.0 C +/- 0.501 | `spectrograph.ini` I2SETTEMP, I2TEMPTOL |
 | SI format (50, 2090, 1, 0, 2052, 1), readout mode 3 | `spectrograph.ini` `[SI_SETTINGS]` |
+
+**The iodine stage's positions** (JDE, 2026-10-31). The live
+`spectrograph_server.ini` on the spectrograph PC is authoritative. The two
+legacy files disagree (the client's `spectrograph.ini` says in 145, flat
+88, out 55; the server's says in 11, flat 68, out 102) because the stage's
+home sensor once died and the motor and sensor were swapped at the wire
+level, which flipped the positions. So robofast hard-codes neither: the
+KiwiSpec service moves the stage **by name** (the server resolves the
+name with its own live ini) and learns the millimetres from the server's
+own `i2stage_get_pos` replies (`/status` `stage_positions_live`).
+`kiwispec.example.json` therefore has `"stage_positions": null`. Set it
+only as a cross-check, and only with values **confirmed on the
+spectrograph PC** before any hardware use: a configured value that
+disagrees with the live server raises an alarm (`docs/kiwispec.md`).
 
 ### Weather (`weather.yaml`)
 
@@ -134,18 +148,18 @@ Its limits and their sources are commented in the file itself
 
 ## Conflicts and unknowns, for JDE
 
-1. **FAU manufacturer.** `fau_t1.ini`-`fau_t4.ini` say MANUFACTURER = SBIG
-   but MODEL = 'ZWO ASI 174'. Their BADPIX masks
-   (`SBIG_SN_11411badpixelmask.fits`) are for an SBIG detector, not the
-   ASI174. Chosen: ZWO ASI174 (it matches the 1936 x 1216 subframe and the
-   0.265 arcsec/px scale). The bad-pixel masks are not used.
-2. **T2 AO step size.** `ao_t2.ini` has no ARCSEC_PER_STEP, so today's
+1. **FAU cameras.** Settled (JDE, 2026-10-31): ZWO ASI174 on every FAU.
+   (History: the FAU cameras were originally of another make and were
+   replaced by the ASI174; robofast carries nothing of the old cameras.)
+2. **T2 AO step size.** Never calibrated (JDE, 2026-10-31): commissioning
+   will measure it (`docs/guider.md`, Commissioning). The legacy
+   candidates, for comparison only: `ao_t2.ini` has no ARCSEC_PER_STEP, so today's
    `ao.py` cannot load it. It has PLATESCALE = 40, commented "steps/pixel",
    which the pre-2019 `ao.py` multiplied by arcseconds (so steps per
    arcsec). The candidates are 1/40 = 0.025 arcsec/step (how the code used
    it, **chosen** for the seed), 0.265/40 = 0.0066 arcsec/step (the comment,
-   with today's FAU scale; the file dates from 2016, when the FAU was an
-   SBIG), and `ao_mred.ini`'s 0.128 arcsec/step with ROTOFFSET 214.7, which
+   with today's FAU scale; the file dates from 2016, before the ASI174),
+   and `ao_mred.ini`'s 0.128 arcsec/step with ROTOFFSET 214.7, which
    `docs/guider.md` (Commissioning) cites for T2 although it belongs to the
    MRED telescope's unit. ROTOFFSET 45 is also unmeasured. Measure them.
    The AO is disabled.
@@ -154,13 +168,14 @@ Its limits and their sources are commented in the file itself
    the earlier robofast autofocus example ("FLI CG230"). Chosen: Apogee
    Aspen CG230.
 4. **T2 imager cooling.** `imager_t2.ini` SETTEMP = +5 C (MAXCOOLING 40)
-   against -50 C on the Andors. This looks like a workaround for weak
-   cooling. It is copied as is: confirm it.
-5. **Iodine stage positions.** `spectrograph.ini` (client) says in 145,
-   flat 88, out 55. `spectrograph_server.ini` (the server that moves the
-   stage) says 11, 68, 102, and its comments keep 145/88/55 as the previous
-   values. Chosen: the server's (also robofast's default). `docs/kiwispec.md`
-   open question 4 still asks whether they are current.
+   against -50 C on the Andors. Confirmed correct (JDE, 2026-10-31).
+5. **Iodine stage positions.** Explained (JDE, 2026-10-31): the live
+   server's values are correct; the client's `spectrograph.ini` (145/88/55)
+   and the server's `spectrograph_server.ini` (11/68/102) disagree because
+   the stage's motor and sensor were swapped at the wire level after its
+   home sensor died, flipping the positions. robofast reads the positions
+   from the live server (above, "The iodine stage's positions") and
+   hard-codes neither.
 6. **Maximum altitude.** `scheduler.ini` MAXALT = 83, but
    `cdk700.acquireTarget` refuses only above 85. Chosen: 83 for dispatch;
    85 is recorded as `acquire_max_alt`.
@@ -188,7 +203,7 @@ Its limits and their sources are commented in the file itself
     2026-03-03).
 14. **Fiber pixel orientation**: see "Pixel positions" above. T2's live
     XFIBER/YFIBER carry the same "2016-12-20" comment as the commented-out
-    SBIG-era values, so their date is unknown.
+    older values, so their date is unknown.
 15. **Imager pointing centre**: T1's (984, 1048) is not the chip centre.
     robofast's approximate WCS puts CRPIX at the chip centre, about 40 px
     (25 arcsec) off for T1.

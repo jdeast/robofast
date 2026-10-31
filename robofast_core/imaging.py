@@ -44,6 +44,7 @@ import asyncio
 import logging
 import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -288,6 +289,12 @@ class Imaging:
         self.written: list[WrittenFrame] = []
         #: Download timings: (telescope, transfer, bytes, seconds).
         self.downloads: list[tuple[str, str, int, float]] = []
+
+    def set_clock(self, clock: Callable[[], datetime]) -> None:
+        """Stamp frames (``DATE``, the index) and compute the Sun and Moon
+        with ``clock`` (the sequencer's; :mod:`robofast_core.clock`)."""
+        self.store.clock = clock
+        self.telemetry.clock = clock
 
     # -- the sequencer's calls -------------------------------------------------
 

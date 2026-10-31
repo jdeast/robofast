@@ -12,7 +12,10 @@ one JSON file per raw frame, in robofast's data tree::
     <data_root>/<site>/<spectrograph>/n<YYYYMMDD>/<raw file name>.json
     <data_root>/<site>/<spectrograph>/n<YYYYMMDD>/n<YYYYMMDD>.<spectrograph>.spectra.jsonl
 
-The night is the local date of the evening (as for frames, docs/data.md).
+The night is the local date of the evening (as for frames, docs/data.md),
+by the sequencer's clock when the exposure was asked for (the record's
+``night``; :mod:`robofast_core.clock`), the same night that names the raw
+file on the spectrograph PC.
 The index gets one line per sidecar. Sidecars are written atomically and
 never overwritten (a second record for the same raw file gets ``.1``,
 ``.2``, ... before ``.json``).
@@ -45,11 +48,14 @@ import json
 import logging
 import math
 import os
+import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from robofast_core.clock import real_clock
 from robofast_core.plan_record import night_of
 
 if TYPE_CHECKING:  # astropy is imported only when a spectrum is recorded
@@ -58,6 +64,8 @@ if TYPE_CHECKING:  # astropy is imported only when a spectrum is recorded
 __all__ = ["SpectrumRecorder", "barycentric", "propagate"]
 
 log = logging.getLogger(__name__)
+
+_NIGHT = re.compile(r"n\d{8}")
 
 #: Julian years per day.
 _YEAR_DAYS = 365.25
@@ -144,6 +152,9 @@ class SpectrumRecorder:
     instrument: str = "kiwispec"
     night_rollover_hour: float = 12.0
     timezone: str | None = None
+    #: The sequencer's clock (:mod:`robofast_core.clock`): the night when a
+    #: record does not name one, and ``written``.
+    clock: Callable[[], datetime] = real_clock
 
     def __post_init__(self) -> None:
         self.data_root = Path(self.data_root)
@@ -188,13 +199,17 @@ class SpectrumRecorder:
 
     def write(self, record: dict[str, Any]) -> Path:
         """Write ``record`` (a spectrum's metadata; must have ``file``, the
-        raw file name, and ``start_utc`` or the current time is used for the
-        night) as a sidecar, add it to the index, return the sidecar's path
-        relative to ``data_root``. Never overwrites."""
+        raw file name) as a sidecar, add it to the index, return the
+        sidecar's path relative to ``data_root``. Never overwrites. The
+        night is ``record["night"]`` (``n<YYYYMMDD>``, set by the sequencer
+        from its clock when the exposure was asked for), else the night of
+        ``start_utc``, else of the clock now."""
         raw = str(record.get("file") or "unknown")
-        when = record.get("start_utc")
-        when_dt = datetime.fromisoformat(when) if when else datetime.now(UTC)
-        d = self.directory(when_dt)
+        night = record.get("night")
+        if not (isinstance(night, str) and _NIGHT.fullmatch(night)):
+            when = record.get("start_utc")
+            night = self.night(datetime.fromisoformat(when) if when else self.clock())
+        d = self.data_root / self.site_name / self.instrument / night
         d.mkdir(parents=True, exist_ok=True)
         stem = raw.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
         data = json.dumps(_clean(record), indent=1, default=_json_default, allow_nan=False)
@@ -217,7 +232,7 @@ class SpectrumRecorder:
             break
         _fsync_dir(d)
         rel = final.relative_to(self.data_root)
-        index = d / f"{self.night(when_dt)}.{self.instrument}.spectra.jsonl"
+        index = d / f"{night}.{self.instrument}.spectra.jsonl"
         line = {
             "sidecar": str(rel),
             "file": raw,
@@ -227,7 +242,7 @@ class SpectrumRecorder:
             "start_utc": record.get("start_utc"),
             "exptime": record.get("exptime"),
             "bjd_tdb": (record.get("barycentric") or {}).get("bjd_tdb"),
-            "written": datetime.now(UTC).isoformat(),
+            "written": self.clock().isoformat(),
         }
         with open(index, "a") as f:
             f.write(json.dumps(_clean(line), default=_json_default) + "\n")

@@ -138,6 +138,12 @@ class SafetyConfig:
     #: with booleans ``fault`` and ``error`` (the Aqawan server's
     #: ``"Faults"``); ``None`` for a dome without one.
     fault_action: str | None = None
+    #: While the enclosure should be open, a shutter reporting ``ERROR``
+    #: (immediately) or unreadable for this long revokes the lease, closes,
+    #: and blocks reopening for ``shutter_error_backoff`` seconds, so a
+    #: broken shutter is not cycled every reopen hold.
+    shutter_unreadable_grace: float = 15.0
+    shutter_error_backoff: float = 1800.0
 
     def __post_init__(self) -> None:
         hb, timeout = self.heartbeat_interval, self.heartbeat_timeout
@@ -265,6 +271,8 @@ class SafetySupervisor:
         self._fault: str | None = "not read yet" if self._faults else None
         self._fault_kind: object = "not read yet"  # (fault, error), or why unknown
         self._fault_escalated = False
+        self._shutter_bad_since: float | None = None
+        self._shutter_hold_until: float | None = None
 
         self._safe = False
         self._reason = "startup (no weather read yet)"
@@ -301,6 +309,7 @@ class SafetySupervisor:
         return (
             self._safe
             and self._fault is None
+            and (self._shutter_hold_until is None or now >= self._shutter_hold_until)
             and self._safe_since is not None
             and now - self._safe_since >= self.config.reopen_hold
         )
@@ -318,6 +327,11 @@ class SafetySupervisor:
             "reason": self._reason,
             "open_allowed": self.open_allowed(),
             "fault": self._fault,
+            "shutter_hold_for": (
+                None
+                if self._shutter_hold_until is None or now >= self._shutter_hold_until
+                else self._shutter_hold_until - now
+            ),
             "shutter": None if self.shutter is None else Shutter(self.shutter).name,
             "lease": repr(lease) if lease else None,
             "orphaned_for": self._orphan_age(now),
@@ -653,14 +667,15 @@ class SafetySupervisor:
         assert lease is not None
         status = await self._shutter_status()
         now = time.monotonic()
+        if status is None or status == Shutter.ERROR:
+            self._shutter_failed(status, now)
+            return
+        self._shutter_bad_since = None
         if status == Shutter.OPEN:
             self._opening_since = None
             if not lease.opened.is_set():
                 lease.opened.set()
                 self.timeline.event(self.name, "enclosure_open", lease=lease.id)
-            return
-        if status is None or status == Shutter.ERROR:
-            self._alarm(f"not opening: shutter status {status!r}")
             return
         if status == Shutter.CLOSING:
             return  # let it finish; reopen on a later tick if still wanted
@@ -678,6 +693,31 @@ class SafetySupervisor:
             return
         self._opening_since = time.monotonic()
         self.timeline.event(self.name, "open_commanded", lease=lease.id)
+
+    def _shutter_failed(self, status: int | None, now: float) -> None:
+        """The shutter is in error, or unreadable, while it should be open.
+
+        Fail closed: an error revokes the lease at once; an unreadable shutter
+        after ``shutter_unreadable_grace`` (one failed read is not enough).
+        Either way reopening is blocked for ``shutter_error_backoff``.
+        """
+        cfg = self.config
+        if self._shutter_bad_since is None:
+            self._shutter_bad_since = now
+        if status is None and now - self._shutter_bad_since < cfg.shutter_unreadable_grace:
+            return
+        if status is None:
+            reason = f"shutter unreadable for {now - self._shutter_bad_since:.0f} s"
+        else:
+            reason = "shutter in error"
+        self._alarm(
+            f"{reason} while open was wanted; closing, no reopen for"
+            f" {cfg.shutter_error_backoff:g} s"
+        )
+        self._shutter_hold_until = now + cfg.shutter_error_backoff
+        self._shutter_bad_since = None
+        self._revoke_lease(reason)
+        self._wake.set()
 
     async def _enclosure_loop(self) -> None:
         while True:

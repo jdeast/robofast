@@ -118,9 +118,16 @@ class FakeDome(FakeDevice):
                 return self._target
             return 2 if self._target == 0 else 3
 
+    #: Test hook: what ShutterStatus reports instead of the real state, an
+    #: int (e.g. 4 = shutterError) or a str (raise that as a device error).
+    status_override: int | str | None = None
+
     @property
     def ShutterStatus(self) -> int:
-        return self.state()
+        override = self.status_override
+        if isinstance(override, str):
+            raise FakeDeviceError(override)
+        return self.state() if override is None else override
 
     def _move(self, target: int) -> None:
         with self._lock:

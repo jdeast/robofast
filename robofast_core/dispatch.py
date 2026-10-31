@@ -317,6 +317,7 @@ class DispatchScheduler:
         clock: Callable[[], datetime] | None = None,
         allow_iers_download: bool = False,
         record: PlanRecord | None = None,
+        vetter: Any = None,
     ) -> None:
         if not allow_iers_download:
             sky.offline_iers()
@@ -357,6 +358,10 @@ class DispatchScheduler:
         #: Why the spectrograph is down (:meth:`set_spectrograph_available`),
         #: or None: while it is down no SPECTRUM configuration is scheduled.
         self.spectrograph_down: str | None = None
+        #: Target vetting at intake (:class:`robofast_core.vetting.Vetter`,
+        #: docs/sky.md), and its results by group id.
+        self.vetter = vetter
+        self.vetting: dict[str, list[dict[str, Any]]] = {}
         for g in groups:
             self._add(g)
         if self.state_path is not None:
@@ -586,6 +591,7 @@ class DispatchScheduler:
         now = self.clock()
         if group.submitted is None:
             group.submitted = now
+        self._vet(group, now)
         self._add(group)
         self._record(now, "too", group=group.to_dict())
         log.warning(
@@ -609,12 +615,59 @@ class DispatchScheduler:
             return await self.submit_too(group)
         if group.submitted is None:
             group.submitted = self.clock()
+        self._vet(group, self.clock())
         self._add(group)
         self._submitted.add(group.id)
         self._record(self.clock(), "submit", group=group.to_dict())
         log.info("request group %s received (%s)", group.id, group.submitter or "no submitter")
         self._save_state()
         return group.id
+
+    def _vet(self, group: RequestGroup, now: datetime) -> None:
+        """Vet a group at intake (docs/sky.md): the result goes into the plan
+        record; a flag the vetting config rejects raises ValueError (the
+        group is refused, and the drop box files the reason)."""
+        if self.vetter is None:
+            return
+        try:
+            results = self.vetter.vet_group(group, now)
+        except Exception as exc:  # vetting never blocks intake by accident
+            log.error("vetting %s failed: %r", group.id, exc)
+            return
+        found = [r.as_dict() for r in results]
+        self.vetting[group.id] = found
+        self._record(now, "vetting", group=group.id, results=found)
+        for r in results:
+            for f in r.flags:
+                log.log(
+                    logging.ERROR if f.severity == "error" else logging.WARNING,
+                    "vetting %s %s %s: %s",
+                    group.id,
+                    r.target,
+                    f.code,
+                    f.message,
+                )
+        bad = [
+            f"{r.target} [{r.port}] {f.code}: {f.message}"
+            for r in results
+            for f in r.flags
+            if f.severity == "error"
+        ]
+        if bad:
+            raise ValueError("vetting: " + "; ".join(bad))
+
+    def acquisition(self, group_id: str, target: str) -> dict[str, Any] | None:
+        """What vetting said about acquiring ``target`` (FAU port)."""
+        for r in self.vetting.get(group_id, []):
+            if r["port"].split("/")[-1] == "fau" and r["target"].startswith(target):
+                codes = [f["code"] for f in r["flags"]]
+                return {"unambiguous": bool(r["unambiguous"]), "flags": codes}
+        return None
+
+    def _acquisition_entry(self, visit: _Visit, c: Configuration) -> dict[str, Any]:
+        group = visit.request.group
+        acq = None if group is None else self.acquisition(group.id, c.target.name)
+        return {} if acq is None else {"acquisition": acq}
 
     def cancel(self, group_id: str) -> None:
         """Cancel every schedulable configuration of a group (KeyError if
@@ -1291,6 +1344,7 @@ class DispatchScheduler:
                     "iodine": ic.iodine,
                     "target_counts": ic.target_counts,
                     "target": c.target.to_dict(),
+                    **self._acquisition_entry(visit, c),
                 },
             )
         if c.type == "AUTO_FOCUS":
@@ -1521,6 +1575,7 @@ def dispatch_from_config(
           "record": {"dir": "/var/lib/robofast/plans",            # optional
                      "night_rollover_hour": 12, "timezone": "America/Phoenix"},
           "telescopes": {"t1": {"instruments": ["spectrograph"], "min_alt": 21}},
+          "vetting": "sky.json",          # optional: target vetting (docs/sky.md)
           ...DispatchConfig fields (max_sun_alt, w_setting, idle_poll, ...)
         }
 
@@ -1558,6 +1613,16 @@ def dispatch_from_config(
         groups += from_legacy_csv(_resolve(config.pop("legacy_csv"), base))
     state = config.pop("state", None)
     dropbox = config.pop("too_dropbox", None)
+    vetting = config.pop("vetting", None)
+    vetter = None
+    if vetting is not None:
+        from robofast_core.vetting import Vetter
+
+        if isinstance(vetting, str):
+            vpath = _resolve(vetting, base)
+            vetter = Vetter.from_config(json.loads(vpath.read_text()), base=vpath.parent)
+        else:
+            vetter = Vetter.from_config(vetting, base=base)
     record = config.pop("record", None)
     if isinstance(record, str):
         record = {"dir": record}
@@ -1586,4 +1651,5 @@ def dispatch_from_config(
         too_dropbox=None if dropbox is None else _resolve(dropbox, base),
         clock=clock,
         record=record,
+        vetter=vetter,
     )

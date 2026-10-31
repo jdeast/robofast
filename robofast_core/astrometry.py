@@ -124,7 +124,9 @@ def detect_stars(
     ``threshold`` times the smoothed noise grouped into 8-connected pieces
     (:mod:`robofast_core.starmeasure`'s labelling); flux-weighted centroids.
     Pieces under four pixels (hot pixels, cosmic rays) are dropped;
-    saturated stars are kept (their centroids are still good)."""
+    saturated stars are kept (their centroids are still good), and pieces
+    whose peak is far sharper than a star (hot pixels, cosmic rays) are
+    dropped."""
     from robofast_core.starmeasure import _runs
 
     img = np.asarray(image, dtype=np.float32)
@@ -167,7 +169,19 @@ def detect_stars(
     area = np.bincount(inv, minlength=ids.size)
     sx = np.bincount(inv, weights=w * pc, minlength=ids.size)
     sy = np.bincount(inv, weights=w * pr, minlength=ids.size)
-    ok = (area >= 4) & (tot > 0)
+    # Hot pixels and cosmic rays: a peak far sharper than any star (its
+    # four neighbours under a fifth of it; a star sampled at FWHM >= 1.5 px
+    # keeps them above ~0.3).
+    raw = resid[pr, pc].astype(float)
+    order_px = np.lexsort((raw, inv))
+    last = np.r_[np.nonzero(np.diff(inv[order_px]))[0], len(order_px) - 1]
+    top = order_px[last]  # each piece's brightest pixel (pieces in id order)
+    yy, xx = pr[top], pc[top]
+    pad = np.pad(resid, 1, mode="edge")
+    neigh = (pad[yy, xx + 1] + pad[yy + 2, xx + 1] + pad[yy + 1, xx] + pad[yy + 1, xx + 2]) / 4.0
+    peak = resid[yy, xx]
+    sharp = (peak > 5 * noise) & (neigh < 0.2 * peak)
+    ok = (area >= 4) & (tot > 0) & ~sharp
     order = np.argsort(-tot[ok], kind="stable")[:max_stars]
     tot, sx, sy = tot[ok][order], sx[ok][order], sy[ok][order]
     return Detections(
@@ -196,7 +210,7 @@ class SolverConfig:
     flip: bool | None = None
     #: Brightest detections and catalog stars used for matching.
     max_stars: int = 40
-    max_catalog: int = 120
+    max_catalog: int = 400
     #: Fewest matched stars for a solution (module doc), and the fewest as
     #: a fraction of the stars that should match (the fewer of the
     #: detections and the catalog stars that land on the image): a chance
@@ -294,8 +308,11 @@ def _describe(cd: np.ndarray) -> tuple[float, float, bool]:
     return scale, pa % 360.0, flip
 
 
-def _triangles(x: np.ndarray, y: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
-    """Triangles of each point with pairs of its ``k`` nearest neighbours:
+def _triangles(
+    x: np.ndarray, y: np.ndarray, k: int, full: int = 0
+) -> tuple[np.ndarray, np.ndarray]:
+    """Triangles of each point with pairs of its ``k`` nearest neighbours
+    (every triangle when there are no more than ``full`` points):
     vertex indices (n, 3), ordered so vertex i is opposite the i-th
     shortest side, and the sorted side lengths (n, 3)."""
     n = len(x)
@@ -303,14 +320,21 @@ def _triangles(x: np.ndarray, y: np.ndarray, k: int) -> tuple[np.ndarray, np.nda
         return np.zeros((0, 3), int), np.zeros((0, 3))
     d = np.hypot(x[:, None] - x[None, :], y[:, None] - y[None, :])
     np.fill_diagonal(d, np.inf)
-    kk = min(k, n - 1)
-    nn = np.argsort(d, axis=1)[:, :kk]
-    tri = set()
-    for i in range(n):
-        for a in range(kk):
-            for b in range(a + 1, kk):
-                tri.add(tuple(sorted((i, int(nn[i, a]), int(nn[i, b])))))
-    t = np.array(sorted(tri), dtype=int)
+    if n <= full:
+        # Few stars: every triangle (a faint neighbour missing from one list
+        # must not hide the triangles of the bright ones).
+        from itertools import combinations
+
+        t = np.array(list(combinations(range(n), 3)), dtype=int)
+    else:
+        kk = min(k, n - 1)
+        nn = np.argsort(d, axis=1)[:, :kk]
+        tri = set()
+        for i in range(n):
+            for a in range(kk):
+                for b in range(a + 1, kk):
+                    tri.add(tuple(sorted((i, int(nn[i, a]), int(nn[i, b])))))
+        t = np.array(sorted(tri), dtype=int)
     # Side opposite each vertex.
     p = np.stack([x[t], y[t]], axis=-1)  # (m, 3, 2)
     opp = np.stack(
@@ -482,7 +506,7 @@ def solve_near(
     area_img = nx * ny
     area_cat = math.pi * (radius * 3600.0 / scale) ** 2
     n_img = min(len(det), c.max_stars)
-    n_cat = int(min(len(stars), max(c.max_catalog, 1.5 * n_img * area_cat / area_img), 400))
+    n_cat = int(min(len(stars), max(2.0 * n_img * area_cat / area_img, 10), c.max_catalog))
     cat_xy = np.stack([cu, cv], axis=1)
     img = det.take(n_img)
     img_xy = np.stack([img.x - cx, img.y - cy], axis=1)
@@ -625,8 +649,10 @@ def _triangle_match(
     scale: float,
     t0: float,
 ) -> tuple[np.ndarray, np.ndarray, str, bool] | None:
-    ti, si = _triangles(img_xy[:, 0], img_xy[:, 1], 5)
-    tc, sc = _triangles(cat_xy[:, 0], cat_xy[:, 1], 6)
+    few = len(img_xy) <= 12
+    ti, si = _triangles(img_xy[:, 0], img_xy[:, 1], 5, full=12)
+    # With few detections, every triangle of the brightest catalog stars.
+    tc, sc = _triangles(cat_xy[:, 0], cat_xy[:, 1], 6, full=40 if few else 0)
     if not len(ti) or not len(tc):
         return None
     # Sides agree within the scale tolerance plus centroid noise (px).

@@ -65,7 +65,9 @@ All under ``/api/v1`` (a trailing slash is ignored):
 * ``POST /requestgroups/validate`` (``submit`` or ``too``) -- the same checks
   without submitting, plus a dry run over the coming night on a coarse grid:
   which telescopes could start each request, when, and the commonest reasons
-  why not.
+  why not; and, when the plan has ``vetting``, what the star catalog says
+  about each target (``vetting``, ``warnings``; flags the site rejects make
+  the group invalid; docs/sky.md).
 * ``GET /requestgroups`` (``read``) -- this client's groups (``admin``: all),
   ``?state=`` and ``?limit=`` filter.
 * ``GET /requestgroups/{id}`` (``read``) -- one group, with each
@@ -740,8 +742,36 @@ class RequestApi:
             "id": group.id,
             "enclosure": enc.name,
         }
+        loop = asyncio.get_running_loop()
+        vetter = getattr(enc.view(), "vetter", None) if not problems else None
+        if vetter is not None:
+            # Target vetting (docs/sky.md): warnings, and errors for the
+            # flags the site rejects (the scheduler's intake would refuse).
+            try:
+                results = await asyncio.wait_for(
+                    loop.run_in_executor(self._pool, vetter.vet_group, group, self.clock()),
+                    self.config.validate_budget,
+                )
+            except Exception as exc:
+                out["vetting"] = {"error": f"vetting unavailable: {exc!r}"}
+            else:
+                out["vetting"] = [r.as_dict() for r in results]
+                out["warnings"] = [
+                    f"{r.target} [{r.port}] {f.code}: {f.message}"
+                    for r in results
+                    for f in r.flags
+                    if f.severity != "error"
+                ]
+                rejected = [
+                    f"{r.target} [{r.port}] {f.code}: {f.message}"
+                    for r in results
+                    for f in r.flags
+                    if f.severity == "error"
+                ]
+                if rejected:
+                    problems += rejected
+                    out["valid"] = False
         if not problems:
-            loop = asyncio.get_running_loop()
             deadline = time.monotonic() + self.config.validate_budget
             out["dry_run"] = await loop.run_in_executor(
                 self._pool, dry_run, enc, group, self.clock(), self.config, deadline

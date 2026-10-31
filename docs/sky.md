@@ -211,11 +211,62 @@ mount's pointing offset), and the registry `{tel}.image.zp`,
 `{tel}.image.wcs_rms`, `wcs_offset_arcsec`, `wcs_pa`. A failure keeps the
 mount WCS (`WCSSRC = 'mount'`), adds `WCSFAIL`, and never costs the frame.
 
-## 7. What is left
+## 7. Target vetting (`robofast_core/vetting.py`)
 
-- Measured plate scales, PAs and parities for each MINERVA port; the
-  zero points from real frames (section 4).
+Before a target is ever observed, `vet(catalog, name, ra, dec, port)` looks
+at its field through one port (the FAU with the target on the fiber, or the
+imager) and flags: `twin`/`companion`/`blend` (catalog stars within
+`companion_radius` and `companion_dmag`), `wds_companion` (a WDS pair at the
+target: Gaia misses the closest and brightest pairs), `not_brightest` (a
+star within `brightest_margin` of the target's brightness in the
+acquisition search box), `saturates`, `too_faint` (S/N at the port's
+exposure, from its photometry), `few_stars` (too few to plate solve),
+`high_proper_motion`, `fiber_contamination` (another star inside the
+guider's capture radius), `not_in_catalog`, `catalog_unavailable`.
+`VettingResult.unambiguous` says whether "take the brightest star" would
+take the target.
+
+Wiring: the dispatch plan's `vetting` entry (inline, or a file:
+`sites/minerva/sky.example.json`) makes the scheduler vet every group at
+intake (`submit`, ToOs, the drop box): flags are logged and written to the
+plan record (`"vetting"`), and a flag listed in `reject` refuses the group
+(the drop box files the reason under `rejected/`). The request API's
+`POST /requestgroups/validate` returns `vetting` and `warnings`, and a
+rejecting flag makes the group invalid. A spectrum's observation carries
+`spectrum["acquisition"] = {"unambiguous", "flags"}` to the guider.
+
+## 8. Acquisition that a twin cannot fool
+
+The guider's `select: "catalog"` (`robofast_core/guider/identify.py`)
+plate-solves each acquisition frame near the target and takes the detected
+star within `identify_tolerance` pixels of the target's catalog position;
+the sequencer sends the target (`target_radec`) and vetting's
+`unambiguous` with `POST /start`, and the guider service needs `catalog`
+and `solver` in its config. Without a solution (clouds, too few stars) it
+falls back to the brightest star only if vetting found the field
+unambiguous; otherwise the acquisition fails with "target not identified".
+`tests/core/test_vetting.py` runs it on nu Draconis (G 4.79 and 4.84, 62
+arcsec apart, both in the FAU): the brightest-star acquisition puts nu1 on
+the fiber when nu2 was asked for, the catalog acquisition puts nu2 there.
+
+## 9. Measured on MINERVA
+
+From the legacy T2 FAU autofocus frames of n20260423 (read-only; the frames
+are not in the repository), solved with robofast's solver (the header
+RA/Dec are JNow, precessed to ICRS first): plate scale 0.2655 arcsec/px,
+the image **mirrored** (east right with north up), PA 99-106 deg on that
+night, solution rms 0.17-0.32 arcsec with 5-13 Gaia stars; zero point **G =
+19.70 +- 0.10 for 1 ADU/s** (stored 16-bit ADU; 5 frames). Details and the
+efficiency-chain comparison: `sites/minerva/README.md` (photometry).
+Detection rejects the ASI174's many hot pixels by their sharpness.
+
+## 10. What is left
+
+- Measured plate scales, PAs and parities for each MINERVA port (T2's FAU:
+  section 9); the imagers' and T1's FAU zero points; the ASI174's e-/ADU.
 - A pointing-model builder on top of `pointing.fit` and the solver.
 - astrometry.net index files on the control hosts, if a blind fallback is
   wanted.
-- The Gaia cache filled for the target list on each host.
+- The Gaia cache filled for the target list on each host; `select:
+  "catalog"` turned on in the guider configs once the FAU parity and the
+  solver are confirmed on the sky.

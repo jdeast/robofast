@@ -193,7 +193,10 @@ rotation: calibrate per port, and recalibrate if the rotator angle changes.
    off, and centroids the brightest blob; that pixel becomes the target.
    Or configure `guide.target`.
 2. **Acquire**: a wide frame (`acq_roi`, `acq_exposure`); the star nearest
-   the target (or the brightest, `select`). Farther than `capture_radius`
+   the target (or the brightest, `select`; or, with `select: "catalog"`,
+   the star at the target's catalog position in a plate solve of the
+   frame, which a near-equal neighbour cannot fool: docs/sky.md section 8).
+   Farther than `capture_radius`
    pixels: offset the mount through its calibration, wait `coarse_settle`,
    repeat (up to `coarse_iterations`). A distance that grows is the legacy
    "acquisition not converging" alarm (usually a wrong mount calibration

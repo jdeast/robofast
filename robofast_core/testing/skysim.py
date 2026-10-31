@@ -34,6 +34,7 @@ mount, for the star-field cameras of the simulated night) and
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -42,11 +43,13 @@ from typing import Any
 
 import numpy as np
 
-from robofast_core.catalog import Catalog, Stars, _tan, _untan, decimal_year
+from robofast_core.catalog import Catalog, CatalogUnavailable, Stars, _tan, _untan, decimal_year
 from robofast_core.photometry import PortPhotometry, SkyConditions, sky_brightness
 from robofast_core.pointing import PointingModel, altaz_to_hadec, hadec_to_altaz
 from robofast_core.testing.focus_sim import FocusScene
 from robofast_core.testing.starfield import Detector, Frame, SimOptics, Star, render
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "SkyCamera",
@@ -362,6 +365,15 @@ class SkyFocusScene(FocusScene):
         exposure = self.effective_exposure if self.effective_exposure is not None else duration
         ra = float(self.mount.RightAscension) * 15.0
         dec = float(self.mount.Declination)
+        try:
+            self.sky.field_stars(*self.sky.true_pointing(ra, dec, self.clock()), self.clock())
+        except CatalogUnavailable as exc:
+            # No catalog for this field: an empty sky (and say so), not an
+            # exception inside the camera.
+            log.warning("sky simulator: %s; rendering an empty field", exc)
+            self.last_truth = {"error": str(exc)}
+            ny, nx = roi[3] // binning, roi[2] // binning
+            return np.full((ny, nx), int(self.detector.bias), dtype=np.int32)
         frame = self.sky.render(
             ra,
             dec,

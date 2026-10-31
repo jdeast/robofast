@@ -127,6 +127,10 @@ class NightSettings:
     pause: float = 3.0
     #: Bound on the whole night (real seconds), as a safety net.
     timeout: float = 600.0
+    #: Opt-in: the imagers see the real sky (docs/sky.md) from this Gaia
+    #: tile cache (offline: fields it lacks render empty) instead of a
+    #: random star field.
+    sky_catalog: str | None = None
 
 
 def _recording_telescope(name: str, events: list[tuple[float, str, str]]) -> Any:
@@ -349,13 +353,38 @@ class SimulatedNight:
         for i, name in enumerate(NAMES):
             mount = _recording_telescope(name, self.outcome.mount_events)
             foc = SimFocuser(position=round(TRUE_FOCUS + 250 * (1 if i == 0 else -1)))
-            cam = StarfieldCamera(foc, _scene(31 + i))
+            scene = _scene(31 + i) if self.s.sky_catalog is None else self._sky_scene(mount, i)
+            cam = StarfieldCamera(foc, scene)
             cam.clock = self.clock
             self.telescopes[name] = Telescope(name, mount, cam, foc)
             devices[f"telescope/{i}"] = mount
             devices[f"camera/{i}"] = cam
         self.alpaca = FakeAlpacaServer(devices, hang_limit=10).start()
         self._stack.callback(self.alpaca.stop)
+
+    def _sky_scene(self, mount: Any, i: int) -> FocusScene:
+        """The real sky through ``mount`` (opt-in, ``sky_catalog``)."""
+        from robofast_core.catalog import catalog_at
+        from robofast_core.photometry import PortPhotometry
+        from robofast_core.testing.skysim import SkyCamera, SkyFocusScene, SkyScene
+
+        assert self.s.sky_catalog is not None
+        # Offline: fill the cache first (scripts/build_catalog.py); a field it
+        # does not cover renders empty (a fetch would stall the camera).
+        catalog = catalog_at(self.s.sky_catalog)
+        det = Detector(shape=(512, 512))
+        camera = SkyCamera(
+            (512, 512), PIXEL_SCALE, detector=det, pixel_size=PIXEL_SIZE, f_ratio=F_RATIO
+        )
+        sky = SkyScene(
+            catalog,
+            camera,
+            PortPhotometry(band="V", efficiency={"all": 0.4}),
+            site=(MINERVA.latitude, MINERVA.longitude),
+            seeing=2.0,
+            seed=31 + i,
+        )
+        return SkyFocusScene(sky, mount, self.clock, true_focus=TRUE_FOCUS, effective_exposure=1.0)
 
     async def _start_spectrograph(self) -> None:
         self.kiwi_sim = await KiwiSpecSim(
@@ -1206,6 +1235,9 @@ def main(argv: list[str] | None = None) -> int:
         "--scale", type=float, default=NightSettings.scale, help="scheduler clock speed-up"
     )
     ap.add_argument("--log-level", default="WARNING")
+    ap.add_argument(
+        "--sky", metavar="CACHE_DIR", help="imagers see the real sky from this Gaia tile cache"
+    )
     args = ap.parse_args(argv)
     logging.basicConfig(
         level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -1213,7 +1245,7 @@ def main(argv: list[str] | None = None) -> int:
     for h in logging.getLogger().handlers:  # the per-run log files get INFO
         h.setLevel(args.log_level)
     out = Path(args.out)
-    outcome = asyncio.run(simulate(out, NightSettings(scale=args.scale)))
+    outcome = asyncio.run(simulate(out, NightSettings(scale=args.scale, sky_catalog=args.sky)))
     print(summary(outcome))
     problems = check(outcome)
     for p in problems:

@@ -1005,3 +1005,29 @@ def test_the_example_config_loads(tmp_path):
     assert encs["aqawan1"].telescopes == ["t1", "t2"]
     assert encs["aqawan1"].dropbox == tmp_path / "too-dropbox"
     assert os.path.isabs(config.tokens)
+
+
+async def test_validate_vets_targets_against_the_catalog(api):
+    """With ``vetting`` in the plan, validate reports what the catalog says
+    (docs/sky.md): warnings, and errors for the flags the site rejects."""
+    data = ROOT / "tests" / "core" / "data" / "catalog"
+    enc = api.app.enclosures["aqawan1"]
+    enc.plan["vetting"] = {
+        "catalog": {"cache_dir": str(data), "fetch": False},
+        "reject": ["not_brightest"],
+        "ports": {"imager": {"shape": [1024, 1024], "plate_scale": 0.61, "exposure": 1.0}},
+    }
+    enc._view = None
+    g = group("nu2dra", telescopes=["t1"])
+    # nu2 Draconis, 62 arcsec from its near-twin nu1 (J2016 Gaia position).
+    g["requests"][0]["configurations"][0]["target"].update(
+        {"name": "nu2 Dra", "ra_hours": 263.04518678 / 15.0, "dec_deg": 55.18448602}
+    )
+    out = (await api.post("tom", "/requestgroups/validate", g)).json()
+    assert not out["valid"]
+    assert any("not_brightest" in e for e in out["errors"])
+    assert out["vetting"][0]["match"]["g"] == pytest.approx(4.84, abs=0.01)
+    enc.plan["vetting"]["reject"] = []
+    enc._view = None
+    out = (await api.post("tom", "/requestgroups/validate", g)).json()
+    assert out["valid"] and any("not_brightest" in w for w in out["warnings"])

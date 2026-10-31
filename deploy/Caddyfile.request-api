@@ -1,0 +1,24 @@
+# Example Caddy site for the request API (robofast_core/request_api.py),
+# the alternative to deploy/nginx-request-api.conf. Caddy obtains and renews
+# the certificate itself. The host name is a placeholder.
+#
+# Only /api/* and /healthz are forwarded, to the API on loopback; the
+# supervisor's API and the Alpaca devices stay on the control network.
+
+api.observatory.example {
+	request_body {
+		max_size 64KB
+	}
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8300 {
+			header_up X-Real-IP {remote_host}
+		}
+	}
+	handle /healthz {
+		reverse_proxy 127.0.0.1:8300
+	}
+	handle {
+		respond 404
+	}
+	header Strict-Transport-Security "max-age=31536000"
+}

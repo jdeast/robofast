@@ -274,9 +274,7 @@ model.
   *standing*: it returns to PENDING after each visit, as MINERVA's RV
   targets do. Requests load from JSON files, validated with errors that
   name the entry; `from_legacy_csv` converts a legacy MINERVA target
-  spreadsheet export. A small authenticated REST API (accept, validate,
-  report, cancel) comes next; a TOM Toolkit facility module can sit on it
-  later.
+  spreadsheet export.
 - The scheduler is a **dispatch scheduler** (`robofast_core/dispatch.py`),
   RTS2/POCS-style: whenever a telescope is free it evaluates every request
   for that telescope *now*. Hard constraints first: the telescope's
@@ -314,6 +312,44 @@ model.
   and received ToOs persist in a JSON state file, written atomically after
   each change, so a restart neither repeats a completed one-shot nor breaks
   a cadence; a corrupt file is moved aside with an error.
+- The **request API** (`robofast_core/request_api.py`) is the only
+  internet-facing surface; the supervisor's API and Alpaca stay on the
+  control network. A small REST API over JSON, in its own process, on
+  loopback behind a TLS reverse proxy (`deploy/` has nginx and Caddy
+  examples; it refuses a non-loopback address without TLS unless told
+  `--insecure-bind`). Under `/api/v1`: submit a request group, submit a
+  ToO, validate (the same checks, plus a dry run of the scheduler's hard
+  constraints over the coming night on a coarse grid: which telescopes
+  could start each request, when, and the commonest reasons why not), list
+  and get groups with each configuration's status, cancel, the enclosures'
+  status (weather verdict, shutter, lease and faults from the supervisor;
+  each telescope's state and current observation from a status snapshot the
+  sequencer writes), and data pointers for completed observations (paths
+  only, from a configured template; no files served).
+  **Authentication** (`robofast_core/api_auth.py`): a token per client,
+  stored only as a salted HMAC-SHA256 in a tokens file outside any
+  repository, compared in constant time; scopes `read`, `submit`, `too`,
+  `admin`; a client sees and cancels only its own groups; per-token and
+  per-address (failed attempts) rate limits; every POST is written to an
+  append-only audit log. No default tokens: `python -m
+  robofast_core.request_api tokens add --name ... --scope ...` prints a
+  new one once. The HTTP layer is plain asyncio (no new dependency):
+  bounded request line, headers and body, timeouts, a connection limit, no
+  chunked bodies, JSON errors without stack traces.
+  **Intake.** The API never writes the scheduler's state. A submission or
+  cancellation is a file renamed into the plan's drop box, taken in by the
+  scheduler (in the sequencer process) in order every `too_poll` seconds
+  through `submit()`, `submit_too()` and `cancel()`; status is read back
+  from the scheduler's state file, which also keeps the groups submitted at
+  run time and a record of each completed observation. So the scheduler
+  stays the one source of truth, a submission made while the sequencer is
+  down waits in the drop box, and the internet-facing process holds no
+  channel into the control processes beyond that directory. A group is
+  `QUEUED`, `ACCEPTED`, `REJECTED` (with the scheduler's reason) or
+  `CANCELED` (withdrawn while queued). Canceling an accepted group cancels
+  every configuration not yet finished; an observation in progress
+  finishes, then its visit ends. `docs/tom_facility.md` sketches a TOM
+  Toolkit facility module on these endpoints.
 - Configured as the enclosure's plan entry, `{"type": "dispatch", "site":
   ..., "requests": ..., "telescopes": {...limits...}, ...}`
   (`sites/minerva/dispatch.example.json`).
@@ -334,9 +370,9 @@ requests are class 0) and an interrupt `policy`. The request's
 `telescopes` says which telescopes may take it. It arrives through
 `DispatchScheduler.submit_too()` (in process) or as a JSON file renamed
 into the plan's `too_dropbox` directory (moved to `accepted/` or to
-`rejected/` with an `.error` file saying why). The REST API (section 3.7)
-will call `submit_too()` too. ToOs are kept in the scheduler's state file,
-so a restart does not lose one.
+`rejected/` with an `.error` file saying why). The request API (section
+3.7, `POST /api/v1/toos`) writes into the same drop box. ToOs are kept in
+the scheduler's state file, so a restart does not lose one.
 
 **Eligibility.** A ToO is taken only when it passes the same hard
 constraints as any request, on a telescope allowed to take it. Until then
@@ -402,7 +438,11 @@ broker outage costs only ToOs, never the night.
   (RTS2).
 - Alarms (email or chat) for: quarantine, give-up, shutter not reaching the
   commanded state, safety supervisor or heartbeat failures.
-- Status and control go through the API, never through files.
+- Status and control go through the APIs, never through files, with one
+  deliberate exception: the request API reaches the dispatch scheduler only
+  through its drop box (in) and state file (out), and the sequencer's
+  status snapshot (`status_file`), so the internet-facing process has no
+  network path into the control processes (section 3.7).
 
 ### 3.9 Processes and communication
 
@@ -533,9 +573,10 @@ Each step is a CI-tested deliverable.
 7. Shadow mode: robofast's supervisor runs read-only alongside the legacy
    system and logs what it *would* have done, for comparison.
 8. One telescope, attended nights, then robotic; then the rest of MINERVA.
-9. Dispatch scheduler, request model and target-of-opportunity interrupts
-   (built; sections 3.7, 3.7.1); next the request API; then MEarth
-   (collision checker).
+9. Dispatch scheduler, request model, target-of-opportunity interrupts
+   and the authenticated request API (built; sections 3.7, 3.7.1); next a
+   TOM Toolkit facility module (`docs/tom_facility.md`) and an alert-broker
+   client; then MEarth (collision checker).
 10. **Done:** several telescopes per enclosure (section 3.5) and the
     production sequencer entry point with its plan-provider interface.
 

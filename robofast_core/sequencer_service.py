@@ -31,6 +31,10 @@ and optionally:
   keyword arguments (``timeout``, ``poll``, ``retry``).
 * ``command_timeout`` -- default per-command timeout for the telescopes and
   cameras (s; default 5).
+* ``status_file`` -- write a status snapshot (:func:`snapshot`) to this
+  JSON file every ``status_interval`` seconds (default 5), atomically. The
+  request API (:mod:`robofast_core.request_api`) reads it; a snapshot older
+  than its ``max_age`` means the sequencer is not running.
 
 ``sequencer`` holds :class:`~robofast_core.sequencer.SequencerConfig` fields.
 ``plan`` is a plan entry (:func:`robofast_core.plan.plan_from_config`): the
@@ -61,8 +65,11 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import signal
 import sys
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -142,7 +149,72 @@ def build(
     return seq, remote
 
 
-async def run(seq: Sequencer, remote: RemoteSupervisor) -> None:
+def snapshot(seq: Sequencer, interval: float = 5.0) -> dict[str, Any]:
+    """The sequencer's state for status pages: per telescope ``state``
+    (``observing``, ``idle``, ``backoff``, ``gave_up``, ``finished`` or
+    ``waiting`` -- for the enclosure to open), whether it is exposing, and
+    what it is observing (from a plan with ``current()``, the dispatch
+    scheduler). Stamped with the time and a ``max_age`` (design.md 3.8)."""
+    current_fn = getattr(seq.plan, "current", None)
+    try:
+        current = current_fn() if current_fn is not None else {}
+    except Exception:
+        log.exception("plan.current()")
+        current = {}
+    now = time.monotonic()
+    tels = {}
+    for name, u in seq.units.items():
+        if u.gave_up:
+            state = "gave_up"
+        elif u.finished:
+            state = "finished"
+        elif u.retry_at > now:
+            state = "backoff"
+        elif u.idle:
+            state = "idle"
+        elif name in current or u.exposing:
+            state = "observing"
+        else:
+            state = "waiting"
+        tels[name] = {
+            "state": state,
+            "exposing": u.exposing,
+            "consecutive_errors": u.consecutive_errors,
+            "current": current.get(name),
+        }
+    return {
+        "time": datetime.now(UTC).isoformat(),
+        "max_age": 3 * interval,
+        "sequencer": seq.name,
+        "generation": seq.generation,
+        "quarantined": seq.quarantined,
+        "needs_operator": seq.needs_operator,
+        "telescopes": tels,
+    }
+
+
+def write_snapshot(seq: Sequencer, path: Path, interval: float = 5.0) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(snapshot(seq, interval)))
+        os.replace(tmp, path)
+    except OSError:
+        log.exception("could not write the status snapshot %s", path)
+
+
+async def _publish(seq: Sequencer, path: Path, interval: float) -> None:
+    while True:
+        write_snapshot(seq, path, interval)
+        await asyncio.sleep(interval)
+
+
+async def run(
+    seq: Sequencer,
+    remote: RemoteSupervisor,
+    *,
+    status_file: str | Path | None = None,
+    status_interval: float = 5.0,
+) -> None:
     """Run until the plan is done, an operator is needed, or a signal."""
     task = asyncio.current_task()
     assert task is not None
@@ -151,15 +223,23 @@ async def run(seq: Sequencer, remote: RemoteSupervisor) -> None:
         loop.add_signal_handler(sig, task.cancel)
     # A plan's background task (the dispatch scheduler's ToO intake), if any.
     serve = getattr(seq.plan, "serve", None)
-    background = asyncio.create_task(serve(), name="plan-serve") if serve else None
+    background = [asyncio.create_task(serve(), name="plan-serve")] if serve else []
+    if status_file is not None:
+        background.append(
+            asyncio.create_task(
+                _publish(seq, Path(status_file), status_interval), name="status-snapshot"
+            )
+        )
     try:
         await seq.run()
     except asyncio.CancelledError:
         pass  # a signal: run() cleaned up and released the lease on its way out
     finally:
-        if background is not None:
-            background.cancel()
-            await asyncio.gather(background, return_exceptions=True)
+        for t in background:
+            t.cancel()
+        await asyncio.gather(*background, return_exceptions=True)
+        if status_file is not None:
+            write_snapshot(seq, Path(status_file), status_interval)  # the final state
         await remote.aclose()
         for unit in seq.units.values():
             unit.telescope.close()
@@ -182,7 +262,17 @@ def main(argv: list[str] | None = None) -> None:
         seq, remote = build(config, tl, plan=plan, base=Path(args.config).parent)
     except (OSError, ValueError, TypeError, KeyError) as exc:
         ap.error(f"{args.config}: {exc!r}")
-    asyncio.run(run(seq, remote))
+    status_file = config.get("status_file")
+    if status_file is not None:
+        status_file = Path(args.config).parent / status_file
+    asyncio.run(
+        run(
+            seq,
+            remote,
+            status_file=status_file,
+            status_interval=float(config.get("status_interval", 5.0)),
+        )
+    )
     if seq.needs_operator:
         log.critical(
             "%s: needs an operator (quarantined=%s, gave up: %s)",

@@ -13,3 +13,5 @@ __pycache__/
 # Created by running with sites/minerva/dispatch.example.json in place
 /sites/*/dispatch-state.json*
 /sites/*/too-dropbox/
+# Request-API tokens (hashed, but still) live outside the repository.
+*tokens*.json

@@ -1,0 +1,33 @@
+# Example systemd unit for the observer console (robofast_core/console/,
+# docs/console.md). Not installed anywhere; copy and adapt. Paths below are
+# placeholders.
+#
+#   systemctl enable --now robofast-console
+#
+# It listens on 127.0.0.1; anyone else reaches it through the TLS reverse
+# proxy (the request API's examples in deploy/, on the console's port, with
+# response buffering off for its event stream). It reads the services'
+# status, writes only the operator_control command directories, the request
+# drop boxes, its acknowledgements and its audit log, and can ask a
+# supervisor to close but never to open. Stopping it never affects observing.
+
+[Unit]
+Description=robofast observer console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=robofast-console
+WorkingDirectory=/opt/robofast
+ExecStart=/opt/robofast/venv/bin/python -m robofast_core.console serve --config /etc/robofast/console.json
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/robofast /var/log/robofast
+
+[Install]
+WantedBy=multi-user.target

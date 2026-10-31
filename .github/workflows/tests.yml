@@ -43,7 +43,7 @@ jobs:
           python -m pip install --upgrade "pip>=25.1"
           python -m pip install --group test
       - name: Run unit tests
-        run: python -m pytest -m "not alpaca_sim" --durations=10
+        run: python -m pytest -m "not alpaca_sim and not e2e" --durations=10
 
   # Integration tier: the same scenarios against the official ASCOM Alpaca
   # OmniSimulators (Linux x64 build, pinned and checksum-verified).
@@ -137,6 +137,37 @@ jobs:
             ${{ runner.temp }}/conformu-tcsgo
           if-no-files-found: warn
 
+  # End to end: a whole simulated MINERVA RV night (docs/demo.md) on
+  # simulators and fakes, the scheduler's clock compressed: calibrations,
+  # autofocus, spectra fed by two telescopes, imaging, bad weather, a ToO,
+  # a mount fault, the console's pause and resume, dawn. Its outputs (logs,
+  # plan record, sidecars, FITS) are uploaded.
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade "pip>=25.1"
+          python -m pip install --group test
+      - name: Run the simulated night
+        env:
+          ROBOFAST_E2E_OUT: ${{ runner.temp }}/rv-night
+        run: python -m pytest -m e2e -v -s --durations=0 tests/e2e
+      - name: Upload the night's outputs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: rv-night
+          path: ${{ runner.temp }}/rv-night
+          if-no-files-found: warn
+
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -160,7 +191,7 @@ jobs:
   test:
     name: test
     if: always()
-    needs: [pytest, alpaca-sim, conformu, lint]
+    needs: [pytest, alpaca-sim, conformu, e2e, lint]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any required job did not succeed
@@ -168,8 +199,10 @@ jobs:
           echo "pytest:     ${{ needs.pytest.result }}"
           echo "alpaca-sim: ${{ needs.alpaca-sim.result }}"
           echo "conformu:   ${{ needs.conformu.result }}"
+          echo "e2e:        ${{ needs.e2e.result }}"
           echo "lint:       ${{ needs.lint.result }}"
           test "${{ needs.pytest.result }}" = "success"
           test "${{ needs.alpaca-sim.result }}" = "success"
           test "${{ needs.conformu.result }}" = "success"
+          test "${{ needs.e2e.result }}" = "success"
           test "${{ needs.lint.result }}" = "success"

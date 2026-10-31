@@ -342,10 +342,12 @@ async def test_service_builds_autofocus_and_triggers(tmp_path):
         assert unit.focuser is not None and unit.autofocus is not None
         assert unit.autofocus.store.path == tmp_path / "focus_t1.json"
         assert seq.units["t2"].autofocus is None
-        assert isinstance(seq.plan, AutofocusTriggers)
-        assert seq.plan.registry is seq.registry
-        assert seq.plan.config.temperature_change == 0.5
-        assert seq.plan._only == {"t1"}
+        # aqawan1.json has operator_control: the console's hold wraps the triggers.
+        triggers = seq.plan.inner
+        assert isinstance(triggers, AutofocusTriggers)
+        assert triggers.registry is seq.registry
+        assert triggers.config.temperature_change == 0.5
+        assert triggers._only == {"t1"}
     finally:
         await remote.aclose()
     t1["autofocus"]["method"] = "guess"

@@ -24,8 +24,12 @@ effect at the next request.
 
 Scopes: ``read`` (status, list and get request groups, data pointers),
 ``submit`` (submit, validate, cancel normal request groups), ``too`` (submit,
-validate, cancel targets of opportunity), ``admin`` (everything, any
-client's groups).
+validate, cancel targets of opportunity), ``operator`` (the observer
+console's actions: acknowledge alarms, pause, resume and stop telescopes,
+ask the enclosure to close, clear a dead lease or the enclosure's faults;
+:mod:`robofast_core.console`), ``admin`` (everything, any client's groups).
+Observers get named tokens (``--name alice --scope read,operator,submit,too``)
+so the audit log says who did what.
 
 Checking a token costs the same whether its id exists or not, and the
 secret's hash is compared with :func:`hmac.compare_digest`.
@@ -49,7 +53,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCOPES = ("read", "submit", "too", "admin")
+SCOPES = ("read", "submit", "too", "operator", "admin")
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,63}")
 _TOKEN_RE = re.compile(r"rft_([0-9a-f]{12})_([A-Za-z0-9_-]{43})")
 #: Hashed when the token's id is unknown, so that path costs the same.

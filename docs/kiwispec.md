@@ -269,23 +269,19 @@ no midpoint.
 | camera restart mid-exposure | the job fails at once; the next exposure reconnects |
 | camera hung during an abort | `/abort` returns after `abort_timeout` with `ended: false`; the job is cancelled, the camera connection dropped, the claim released |
 
-## 4. Next step: spectra in the sequencer
+## 4. Spectra in the sequencer
 
-Not in this change (the sequencer is being extended in parallel). The plan:
-
-1. A spectroscopic observation names its telescopes, `exptime` (maximum),
-   `target_counts`, iodine in/out and the object; the sequencer's telescope
-   tasks acquire and guide on the fiber (FAU) as today for imaging, with the
-   backlight (`POST /backlight`) for fiber location.
-2. One spectrum is shared by several telescopes, so the spectrograph is an
-   enclosure-level resource: the sequencer takes it for the observation
-   (one `POST /expose` with the telescopes that acquired), and the
-   telescopes that drop out (cloud, guiding lost) are reported, not
-   silently included.
-3. The sequencer's cleanup -- weather unsafe, lease revoked, preemption --
-   calls `KiwiSpecRemote.abort(reason)` alongside its camera aborts. It is
-   bounded and never raises, so the park and close go on regardless.
-4. Calibrations (`POST /calibrate`) run in the closed-roof calibration slot.
+Done: `docs/rv_night.md`. In short, a `SPECTRUM` request is fed by every
+free telescope it allows. Each one acquires the target, locates the fiber
+with the backlight (`POST /backlight` through its guider) and guides. The
+leading telescope takes the spectrum (`POST /expose` with the telescopes
+that are guiding), and a telescope that drops out is reported in the
+spectrum's sidecar, not silently included. Every cleanup calls
+`KiwiSpecRemote.abort` before parking. Calibrations (`POST /calibrate`)
+run in the closed-roof calibration plan. Robofast's metadata goes into a
+sidecar file; the raw frame is never rewritten (question 10 below:
+robofast does not rely on `write_header_done`'s in-place update for
+anything it records itself).
 
 ## 5. Questions for JDE
 

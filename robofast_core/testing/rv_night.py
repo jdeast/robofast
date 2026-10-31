@@ -63,6 +63,7 @@ import numpy as np
 from robofast_core import sky
 from robofast_core.autofocus import AutofocusSetup, FocusModel, FocusStore
 from robofast_core.autofocus_plan import AutofocusTriggers, TriggerConfig
+from robofast_core.console.hold import send_command
 from robofast_core.devices.aqawan_server import AqawanConfig, AqawanServer
 from robofast_core.devices.aqawan_sim import AqawanSim
 from robofast_core.devices.kiwispec_sim import KiwiSpecSim, SimConfig
@@ -112,8 +113,9 @@ class NightSettings:
     bad_weather: float = 2.0
     #: Bad weather arrives during this spectrum (counted from the night's start).
     weather_during_spectrum: int = 2
-    #: How long T2's mount stays unresponsive.
+    #: How long T2's mount stays unresponsive, and then paused by the console.
     fault_duration: float = 3.0
+    pause: float = 3.0
     #: Bound on the whole night (real seconds), as a safety net.
     timeout: float = 600.0
 
@@ -840,6 +842,16 @@ class SimulatedNight:
             await asyncio.sleep(s.fault_duration)
             self.telescopes["t2"].mount.unfail()
             self._note("T2 mount fault cleared")
+            # The observer console pauses T2 for a while, then resumes it.
+            await asyncio.sleep(1.0)
+            control = self.out / "aqawan1-control"
+            send_command(control, "pause", ["t2"], operator="demo", reason="check the FAU")
+            self._note("console: pause t2")
+            await self._until(lambda: "t2" in _holds(control), 30, "t2 held")
+            await asyncio.sleep(s.pause)
+            send_command(control, "resume", ["t2"], operator="demo", reason="FAU fine")
+            self._note("console: resume t2")
+            await self._until(lambda: "t2" not in _holds(control), 30, "t2 resumed")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -851,6 +863,13 @@ class SimulatedNight:
     @staticmethod
     def _both(tl: Timeline) -> list[Any]:
         return [e for e in tl.events("spectrum_started") if len(e.detail["telescopes"]) == 2]
+
+
+def _holds(control: Path) -> dict[str, Any]:
+    try:
+        return json.loads((control / "holds.json").read_text()).get("holds") or {}
+    except (OSError, ValueError):
+        return {}
 
 
 def _tag(night: SimulatedNight, seq: Sequencer) -> str:
@@ -947,6 +966,8 @@ def check(o: Outcome) -> list[str]:
         fin = [e for e in done if e.detail["spectrum"] == sid]
         if not fin or fin[0].detail["telescopes_end"] != ["t1"]:
             bad.append(f"the spectrum t2 dropped out of did not finish with t1: {fin}")
+    if not any(c == "console: resume t2" for _, c in o.script):
+        bad.append("the console never paused and resumed t2")
     if any(u.gave_up for u in o.runs["night"].units.values()):
         bad.append("a telescope gave up for the night")
     if not ev(night, "plan_exhausted"):
@@ -1078,7 +1099,8 @@ def summary(o: Outcome) -> str:
     lines.append(
         "requests at dawn: " + ", ".join(f"{k} {v}" for k, v in sorted(o.statuses.items()))
     )
-    lines.append(f"dome: {[c for _, c in o.dome_log]}")
+    moves = [c for _, c in o.dome_log if c.startswith(("OPEN", "CLOSE"))]
+    lines.append(f"roof: {' '.join(moves)}")
     return "\n".join(lines)
 
 
@@ -1104,6 +1126,8 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
+    for h in logging.getLogger().handlers:  # the per-run log files get INFO
+        h.setLevel(args.log_level)
     out = Path(args.out)
     outcome = asyncio.run(simulate(out, NightSettings(scale=args.scale)))
     print(summary(outcome))

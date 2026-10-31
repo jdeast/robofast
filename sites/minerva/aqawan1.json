@@ -13,7 +13,9 @@
     "site: Mt. Hopkins (minerva-control site_mtHopkins.ini), for python -m robofast_core.when (start the night at a Sun altitude; deploy/robofast-sequencer@.service).",
     "A telescope may also name a filterwheel (an Alpaca FilterWheel) and a port_action (its Alpaca Action that selects an M3 port), and a focuser and rotator (read only, for the FITS headers).",
     "images: every frame is saved under data_root (docs/data.md); the optics give an approximate WCS. plate_scale (arcsec per unbinned imager pixel) from minerva-control imager_t1.ini/imager_t2.ini PLATESCALE; aperture and focal length from the legacy FITS headers (control.py APTDIA, FOCALLEN). position_angle 0 (north up, east left) assumes PWI4 derotates the imager port to PA 0 as legacy did (sites/minerva/README.md: rotator offsets).",
-    "T3 and T4 are in Aqawan 2 (down) and are not listed here; their values are in instruments.json, disabled."
+    "T3 and T4 are in Aqawan 2 (down) and are not listed here; their values are in instruments.json, disabled.",
+    "status_file: the sequencer's status snapshot (request API and observer console read it); operator_control: the console's pause/resume/stop directory (docs/console.md). Relative to this file here; use /var/lib/robofast in production.",
+    "spectrograph: the KiwiSpec service (kiwispec.example.json listens on 8130); its telescopes are named T1, T2 (docs/rv_night.md). Spectrum sidecars go under images.data_root."
   ],
   "name": "aqawan1",
   "listen": "127.0.0.1:8100",
@@ -51,5 +53,8 @@
       "t2": {"plate_scale": 0.679, "position_angle": 0.0, "flip": false, "aperture": 700.0, "focal_length": 4560.0}
     }
   },
+  "spectrograph": {"url": "http://127.0.0.1:8130", "telescopes": {"t1": "T1", "t2": "T2"}},
+  "status_file": "aqawan1-status.json",
+  "operator_control": "aqawan1-control",
   "plan": {"type": "calibration", "biases": 10, "darks": [[60, 5]]}
 }

@@ -32,9 +32,10 @@ pythonpath = ["."]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 # The simulator tests need OmniSim; run them with `-m alpaca_sim`.
-addopts = "-ra -m 'not alpaca_sim'"
+addopts = "-ra -m 'not alpaca_sim and not e2e'"
 timeout = 120
 markers = [
+    "e2e: the whole simulated night (tests/e2e; docs/demo.md), a few minutes",
     "alpaca_sim: integration test against the ASCOM Alpaca OmniSimulators (needs ROBOFAST_OMNISIM_BIN or ROBOFAST_OMNISIM_ADDRESS)",
 ]
 log_level = "INFO"
@@ -51,3 +52,7 @@ select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "RUF"]
 # ASYNC109/110: explicit timeout parameters and poll loops are the design
 # (Alpaca is a polling protocol; every await gets its own bound).
 ignore = ["RUF001", "RUF002", "RUF003", "ASYNC109", "ASYNC110"]
+
+[tool.ruff.lint.per-file-ignores]
+# The console page's inline JavaScript and CSS (no build step, docs/console.md).
+"robofast_core/console/page.py" = ["E501"]

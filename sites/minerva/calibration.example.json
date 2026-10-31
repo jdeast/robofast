@@ -3,9 +3,19 @@
     "Calibration frames for the evening and morning runs of deploy/robofast-sequencer@.service:",
     "  python -m robofast_core.sequencer_service --config aqawan1.json --plan calibration.example.json",
     "Every frame is dark (light false), so the sequencer never requests a lease: the enclosure stays",
-    "closed and the telescopes parked (docs/design.md 3.4). The process exits when they are done."
+    "closed and the telescopes parked (docs/design.md 3.4). The process exits when they are done.",
+    "spectrograph: KiwiSpec calibrations through the KiwiSpec service (the enclosure config's spectrograph",
+    "entry), taken by spectrograph_telescope (default the first): biases and darks as true dark frames, ThAr and",
+    "fiber flats as light frames (docs/rv_night.md). The counts follow legacy specCalib's dusk and dawn sets",
+    "loosely; adjust them to the reduction pipeline's needs."
   ],
   "type": "calibration",
   "biases": 10,
-  "darks": [[60, 5], [300, 3]]
+  "darks": [[60, 5], [300, 3]],
+  "spectrograph": [
+    {"kind": "bias", "exptime": 0, "n": 11},
+    {"kind": "dark", "exptime": 300, "n": 3},
+    {"kind": "thar", "exptime": 1, "n": 5},
+    {"kind": "fiberflat", "exptime": 1, "n": 11}
+  ]
 }

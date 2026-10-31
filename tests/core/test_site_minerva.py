@@ -42,6 +42,7 @@ COVERED = {
     "aqawan1.json",
     "autofocus.example.json",
     "calibration.example.json",
+    "console.example.json",
     "dispatch.example.json",
     "guider_t1.example.json",
     "guider_t2.example.json",
@@ -132,6 +133,23 @@ def test_request_api_config_loads(tmp_path):
     (tmp_path / "api.json").write_text(json.dumps(cfg))
     _, spec, base = load_api_config(tmp_path / "api.json")
     assert build_enclosures(spec, base)["aqawan1"].telescopes == ["t1", "t2"]
+
+
+def test_console_config_loads(tmp_path):
+    from robofast_core.console.server import build_enclosures, load_console_config
+
+    for name in ("aqawan1.json", "dispatch.example.json", "requests.example.json"):
+        shutil.copy(SITE / name, tmp_path / name)
+    cfg = _json("console.example.json")
+    for key in ("tokens", "audit_log", "acks"):
+        cfg[key] = str(tmp_path / f"{key}.json")
+    (tmp_path / "console.json").write_text(json.dumps(cfg))
+    config, spec, base = load_console_config(tmp_path / "console.json")
+    enc = build_enclosures(spec, base)["aqawan1"]
+    assert enc.telescopes == ["t1", "t2"] and enc.requests is not None
+    assert enc.spectrograph_url == "http://127.0.0.1:8130"
+    assert enc.weather_url == "http://127.0.0.1:11111"  # the safety monitor's server
+    assert config.listen.startswith("127.0.0.1:")
 
 
 def test_weather_config_loads():

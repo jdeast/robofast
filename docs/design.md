@@ -166,6 +166,11 @@ The only component allowed to open or close an enclosure
   itself, since it cannot know the telescope is safe; after
   `orphan_timeout` it alarms. A lease the sequencer quarantined is never
   recovered, only cleared.
+- **Operators can close, never open.** `POST /close` (the observer
+  console's enclosure stop, `docs/console.md`) revokes the lease, logged
+  with the operator's name and reason; the sequencer cleans up as for any
+  revocation and the enclosure closes. There is no operator open: opening
+  happens only by the policy above.
 - **Park before reopen.** No lease is granted until every telescope in the
   enclosure reports `AtPark` (read-only checks, all at once). One that is
   unparked or cannot be read raises an alarm naming it, and nothing is
@@ -457,7 +462,7 @@ may be wrong about the 60-inch's focus.
   **Authentication** (`robofast_core/api_auth.py`): a token per client,
   stored only as a salted HMAC-SHA256 in a tokens file outside any
   repository, compared in constant time; scopes `read`, `submit`, `too`,
-  `admin`; a client sees and cancels only its own groups; per-token and
+  `operator` (the observer console's actions, section 3.8), `admin`; a client sees and cancels only its own groups; per-token and
   per-address (failed attempts) rate limits; every POST is written to an
   append-only audit log. No default tokens: `python -m
   robofast_core.request_api tokens add --name ... --scope ...` prints a
@@ -585,12 +590,33 @@ broker outage costs only ToOs, never the night.
   atomic, never overwritten, checksummed, UTC from the camera, and a
   lost frame stops its telescope with an alarm.
 - Alarms (email or chat) for: quarantine, give-up, shutter not reaching the
-  commanded state, safety supervisor or heartbeat failures.
+  commanded state, safety supervisor or heartbeat failures. The observer
+  console shows and acknowledges them; delivery off the page is still to
+  come.
+- **The observer console** (`robofast_core/console/`, `docs/console.md`):
+  one web page, its own small process, for the observer on site (the FLWO
+  60-inch runs as attended automation) and the people watching MINERVA.
+  Live by server-sent events: weather (verdict, reasons, key values,
+  would-close rain), enclosure (shutter, faults, lease, heartbeat, holds),
+  each telescope (state, observation, alt/az, focus, guiding, last frame),
+  the spectrograph (job, progress, exposure meter), the plan record and
+  queue, alarms and the supervisor's timeline, all read from the services'
+  status APIs and files. With an `operator` token an observer acknowledges
+  alarms, pauses, resumes or stops a telescope or the enclosure, clears a
+  dead lease or the faults, and submits or cancels requests (through the
+  request API's code); every action is authenticated, CSRF-protected,
+  rate-limited and audited with who and why. Pause, resume and stop reach
+  the sequencer only through a command directory that a plan wrapper in the
+  sequencer process reads (`operator_control`; holds answer `Idle`, the
+  observation in progress is preempted). It can ask the supervisor to
+  close; it can never open or get around it.
 - Status and control go through the APIs, never through files, with one
   deliberate exception: the request API reaches the dispatch scheduler only
   through its drop box (in) and state file (out), and the sequencer's
   status snapshot (`status_file`), so the internet-facing process has no
-  network path into the control processes (section 3.7).
+  network path into the control processes (section 3.7). The observer
+  console's pause, resume and stop use the same pattern: a command
+  directory in (`operator_control`), a holds file out.
 
 ### 3.9 Processes and communication
 
@@ -607,7 +633,8 @@ broker outage costs only ToOs, never the night.
 - No message bus (pyobs's XMPP and Rockit's Pyro were both costs in the
   evaluations).
 - Alpaca has no authentication: device traffic stays on an isolated network.
-  Only the request API faces outward.
+  Only the request API and the observer console face outward (both on
+  loopback behind a TLS proxy, with tokens).
 
 ### 3.10 Configuration
 
@@ -789,6 +816,13 @@ Each step is a CI-tested deliverable.
     the CDK700 optics and focuser units from PWI4, a calibration on the sky
     per port and filter, and the 60-inch's focus once TCSGO's units are
     confirmed.
+
+16. Observer console (built; `docs/console.md`): live status for every
+    part of an enclosure, alarms with acknowledgement, and the operator
+    actions (pause, resume, stop, close, clear a dead lease or faults,
+    requests and ToOs), authenticated and audited, tested to never open
+    the enclosure. Next: alarm delivery (email, chat, a call for the
+    60-inch observer), then an attended night with it.
 
 ## 9. Borrowed ideas
 

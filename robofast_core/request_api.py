@@ -46,8 +46,10 @@ incident id and answered 500 with only that id, never a stack trace.
 
 **Authentication** (:mod:`robofast_core.api_auth`): ``Authorization: Token
 <token>`` (or ``Bearer``), per-client tokens hashed at rest, scopes
-``read``/``submit``/``too``/``admin``, per-token rate limits, and an audit
-log line for every POST (including refused ones).
+``read``/``submit``/``too``/``operator``/``admin`` (``operator`` is for the
+observer console, :mod:`robofast_core.console`; this API grants nothing to
+it), per-token rate limits, and an audit log line for every POST (including
+refused ones).
 
 Endpoints
 ---------
@@ -500,6 +502,24 @@ class RequestApi:
         if not path.startswith(PREFIX + "/") and path != PREFIX:
             raise ApiError(404, "not found")
         client = self._authenticate(req, addr)
+        return await self.call(client, req.method, req.target, req.body, audit)
+
+    async def call(
+        self,
+        client: TokenRecord,
+        method: str,
+        target: str,
+        body: bytes = b"",
+        audit: dict[str, Any] | None = None,
+    ) -> Response:
+        """One endpoint for an already authenticated ``client`` (the observer
+        console calls this with its session's token record): rate limit,
+        route, scopes. ``audit`` (if given) collects the audit fields; the
+        caller writes it. Raises :class:`ApiError`."""
+        url = urlsplit(target)
+        path = unquote(url.path)
+        if not path.startswith(PREFIX + "/") and path != PREFIX:
+            raise ApiError(404, "not found")
         if audit is not None:
             audit.update(client=client.name, token_id=client.id)
         parts = [p for p in path[len(PREFIX) :].split("/") if p]
@@ -510,7 +530,7 @@ class RequestApi:
             raise ApiError(
                 429, "rate limit exceeded", headers={"Retry-After": str(max(1, round(wait)))}
             )
-        route, gid = self._route(req.method, parts)
+        route, gid = self._route(method, parts)
         if gid is not None and audit is not None:
             audit["group"] = gid
         if route == "whoami":
@@ -524,13 +544,13 @@ class RequestApi:
             )
         if route == "submit":
             self._need(client, "submit")
-            return self._submit(client, req.body, query, too=False, audit=audit)
+            return self._submit(client, body, query, too=False, audit=audit)
         if route == "too":
             self._need(client, "too")
-            return self._submit(client, req.body, query, too=True, audit=audit)
+            return self._submit(client, body, query, too=True, audit=audit)
         if route == "validate":
             self._need(client, "submit", "too")
-            return await self._validate(client, req.body, query)
+            return await self._validate(client, body, query)
         if route == "list":
             self._need(client, "read")
             return self._list(client, query)

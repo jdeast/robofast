@@ -58,6 +58,10 @@ and optionally:
   gives the Sun and Moon and the night; ``devices.observingconditions``
   (the weather bridge, only read) the weather keywords; the supervisor's
   status the shutter. Without ``images`` no frame is saved.
+* ``operator_control`` -- a directory: the observer console's pause,
+  resume and stop commands come in through it
+  (:class:`~robofast_core.console.hold.OperatorHold`, which wraps the plan;
+  ``docs/console.md``). Relative to the config file.
 * ``status_file`` -- write a status snapshot (:func:`snapshot`) to this
   JSON file every ``status_interval`` seconds (default 5), atomically. The
   request API (:mod:`robofast_core.request_api`) reads it; a snapshot older
@@ -246,6 +250,14 @@ def build(
             raise ValueError("autofocus_triggers: no telescope has an autofocus entry")
         tcfg = TriggerConfig.from_dict(config["autofocus_triggers"])
         plan = triggers = AutofocusTriggers(plan, tcfg, telescopes=focusable)
+    if config.get("operator_control") is not None:
+        # The observer console's pause/resume/stop (docs/console.md).
+        from robofast_core.console.hold import OperatorHold
+
+        control = Path(config["operator_control"])
+        if base is not None and not control.is_absolute():
+            control = base / control
+        plan = OperatorHold(plan, names, control)
     url = config.get("supervisor_url") or f"http://{config.get('listen', '127.0.0.1:8100')}"
     remote = RemoteSupervisor(url, **config.get("lease_client", {}))
     weather = None

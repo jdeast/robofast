@@ -97,6 +97,14 @@ table.targets th, table.targets td { padding: 3px 6px; border-top: 1px solid var
 table.targets th:first-child, table.targets td:first-child { text-align: left; }
 table.targets tr.now td { font-weight: 700; }
 .tablewrap { overflow-x: auto; flex: 1 1 320px; }
+#log-list { max-height: 420px; overflow: auto; font-family: ui-monospace, monospace; font-size: 12.5px; }
+#log-list li { padding: 2px 0; }
+#log-list .lv-critical, #log-list .lv-alarm { color: var(--bad); }
+#log-list .lv-warning { color: var(--warn); }
+.src { display: inline-block; min-width: 7em; color: var(--accent); }
+.chips { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 13px; }
+.chips label { display: inline-flex; gap: 4px; align-items: center; }
+.chips input { width: auto; }
 label.check { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
 label.check input { width: auto; }
 .hidden { display: none !important; }
@@ -130,6 +138,17 @@ BODY = """
   <section id="weather"><h2>Weather</h2><div id="weather-body"></div></section>
   <section id="enclosure"><h2>Enclosure</h2><div id="enclosure-body"></div></section>
   <section id="telescopes" class="wide"><h2>Telescopes</h2><div id="telescope-body"></div></section>
+  <section id="log" class="wide"><h2>Log</h2>
+    <div class="actions">
+      <input id="log-search" placeholder="search" aria-label="search the log" class="grow">
+      <select id="log-level" aria-label="level">
+        <option value="info">everything</option><option value="warning">warnings and up</option>
+        <option value="alarm">alarms only</option></select>
+      <button id="log-pause" type="button">pause</button>
+    </div>
+    <div id="log-sources" class="chips"></div>
+    <ul class="list" id="log-list"></ul>
+  </section>
   <section id="sky" class="wide"><h2>Sky</h2><div id="sky-body"></div></section>
   <section id="images" class="wide"><h2>Images</h2>
     <div class="actions">
@@ -345,6 +364,7 @@ function connect() {
     stream = new EventSource("/console/api/events");
     stream.addEventListener("status", (ev) => { setConn("live", "ok"); render(JSON.parse(ev.data)); });
     stream.addEventListener("signed-out", () => signedOut());
+    stream.addEventListener("log", (ev) => addLog(JSON.parse(ev.data)));
     stream.onerror = () => {
       setConn("reconnecting", "warn");
       if (stream && stream.readyState === EventSource.CLOSED) { stream = null; startPolling(); }
@@ -356,6 +376,8 @@ function startPolling() {
   const poll = async () => {
     const r = await call("GET", "/console/api/status");
     if (r.ok) { setConn("polling", "ok"); render(r.data); } else setConn("no data", "bad");
+    const l = await call("GET", "/console/api/log?after=" + logState.last);
+    if (l.ok) addLog(l.data.entries || []);
   };
   poll();
   pollTimer = setInterval(poll, 5000);
@@ -559,6 +581,45 @@ $("em-go").addEventListener("click", async () => {
     $("em-result").textContent = "NOT CLOSED: " + ((r.data && r.data.error) || r.status);
     $("em-go").disabled = false;
   }
+});
+
+// -- the log ----------------------------------------------------------------------------
+const LEVELS = ["info", "warning", "alarm", "critical"];
+const logState = {entries: [], last: 0, paused: false, held: 0, off: new Set()};
+function logGroup(src) { return /-guider$/.test(src) ? "guiders" : /^t\d/.test(src) ? "telescopes" : src; }
+function addLog(list) {
+  for (const e of list) if (e.id > logState.last) { logState.entries.push(e); logState.last = e.id; }
+  if (logState.entries.length > 2000) logState.entries.splice(0, logState.entries.length - 2000);
+  if (logState.paused) { logState.held += list.length; $("log-pause").textContent = "resume (" + logState.held + " new)"; return; }
+  drawLog();
+}
+function drawLog() {
+  const q = $("log-search").value.trim().toLowerCase(), min = LEVELS.indexOf($("log-level").value);
+  const groups = [...new Set(logState.entries.map((e) => logGroup(e.source)))].sort();
+  const have = [...$("log-sources").querySelectorAll("input")].map((i) => i.value);
+  if (groups.join() !== have.join()) {
+    fill("log-sources", groups.map((g) => h("label", {}, h("input", {type: "checkbox", value: g,
+      checked: !logState.off.has(g), onchange: (ev) => { ev.target.checked ? logState.off.delete(g) : logState.off.add(g); drawLog(); }}), g)));
+  }
+  const multi = new Set(logState.entries.map((e) => e.enclosure).filter(Boolean)).size > 1;
+  const rows = [];
+  for (let i = logState.entries.length - 1; i >= 0 && rows.length < 500; i--) {
+    const e = logState.entries[i];
+    if (LEVELS.indexOf(e.level) < min || logState.off.has(logGroup(e.source))) continue;
+    if (q && !(e.text + " " + e.source + " " + e.enclosure).toLowerCase().includes(q)) continue;
+    rows.push(h("li", {class: "lv-" + e.level},
+      h("span", {class: "dim"}, (e.time || "").slice(11, 19) + " "), multi && e.enclosure ? e.enclosure + " " : "",
+      h("span", {class: "src"}, e.source), " ", e.text));
+  }
+  fill("log-list", rows.length ? rows : [h("li", {class: "dim"}, "nothing (yet)")]);
+}
+$("log-search").addEventListener("input", drawLog);
+$("log-level").addEventListener("change", drawLog);
+$("log-pause").addEventListener("click", () => {
+  logState.paused = !logState.paused;
+  logState.held = 0;
+  $("log-pause").textContent = logState.paused ? "resume" : "pause";
+  if (!logState.paused) drawLog();
 });
 
 // -- the sky ---------------------------------------------------------------------------

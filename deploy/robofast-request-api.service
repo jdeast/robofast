@@ -1,0 +1,38 @@
+# Example systemd unit for the request API (robofast_core/request_api.py).
+# Not installed anywhere; copy and adapt. Paths below are placeholders.
+#
+#   systemctl enable --now robofast-request-api
+#
+# It listens on 127.0.0.1 behind a TLS reverse proxy
+# (deploy/nginx-request-api.conf or deploy/Caddyfile.request-api). It reads
+# each enclosure's config and the dispatch scheduler's state file, and writes
+# only the scheduler's drop box and its own audit log, so it runs as its own
+# user with write access to just those. Tokens are managed with
+#
+#   sudo -u robofast-api /opt/robofast/venv/bin/python -m robofast_core.request_api \
+#       tokens add --config /etc/robofast/request_api.json --name my-tom --scope read --scope submit
+#
+# Stopping or restarting it never affects observing: submissions made while
+# it is down simply cannot be made; queued ones are already in the drop box.
+
+[Unit]
+Description=robofast request API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=robofast-api
+WorkingDirectory=/opt/robofast
+ExecStart=/opt/robofast/venv/bin/python -m robofast_core.request_api serve --config /etc/robofast/request_api.json
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# The drop boxes and the audit log; everything else is read-only.
+ReadWritePaths=/var/lib/robofast /var/log/robofast
+
+[Install]
+WantedBy=multi-user.target

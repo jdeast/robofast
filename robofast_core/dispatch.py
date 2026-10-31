@@ -86,13 +86,28 @@ looks for a telescope that can take it now:
 * with policy ``next`` nothing is interrupted: the first eligible telescope
   to finish its observation takes it.
 
+Submissions and the drop box
+----------------------------
+:meth:`DispatchScheduler.submit` adds any request group at run time (a ToO
+goes through :meth:`~DispatchScheduler.submit_too`). The drop box is the
+scheduler's intake from other processes (the request API,
+:mod:`robofast_core.request_api`, and operators): each ``*.json`` file is a
+request group (ToO or not), or ``{"cancel": "<group id>"}``; files are taken
+in name order. :meth:`~DispatchScheduler.cancel` marks every schedulable
+configuration ``CANCELED``; an observation in progress finishes, and its
+visit then ends.
+
 State
 -----
 With ``state`` set, the per-configuration status, the history of completed
-visits (for cadence and nightly counts) and the ToOs received are kept in
-that JSON file (written atomically after every change), so they survive a
-restart. A corrupt file is moved aside (``*.corrupt-<time>``) with an error
-logged, and the scheduler starts from the request file alone.
+visits (for cadence and nightly counts), the groups received at run time
+(ToOs and submissions) and a record of each completed observation (for data
+pointers) are kept in that JSON file (written atomically after every
+change), so they survive a restart. A corrupt file is moved aside
+(``*.corrupt-<time>``) with an error logged, and the scheduler starts from
+the request file alone. Other processes may read it
+(:meth:`DispatchScheduler.restore_state` applies one to a scheduler built
+from the same plan entry) but never write it.
 """
 
 from __future__ import annotations
@@ -268,6 +283,10 @@ class DispatchScheduler:
         self._idle: set[str] = set()
         self._too: dict[str, _TooState] = {}
         self._preempt: PreemptCallback | None = None
+        #: Normal groups added at run time (:meth:`submit`); kept in the state.
+        self._submitted: set[str] = set()
+        #: Completed observations by configuration id (for data pointers).
+        self.observed: dict[str, list[dict[str, Any]]] = {}
         for g in groups:
             self._add(g)
         if self.state_path is not None:
@@ -322,15 +341,27 @@ class DispatchScheduler:
             return
         config = visit.config
         if outcome == "complete":
+            done = self.observed.setdefault(config.id, [])
+            done.append(
+                {
+                    "time": self.clock().isoformat(),
+                    "telescope": telescope,
+                    "observation": obs.name,
+                    "instrument_config": visit.ic,
+                    "frames": frames,
+                }
+            )
+            del done[: -self.config.history_size]
             visit.ic += 1
             if visit.ic >= len(config.instrument_configs):
                 visit.cfg, visit.ic = visit.cfg + 1, 0
-                config.status = Status.ATTEMPTED if visit.request.standing else Status.COMPLETED
+                if config.status.schedulable:  # not if canceled meanwhile
+                    config.status = Status.ATTEMPTED if visit.request.standing else Status.COMPLETED
                 if visit.cfg >= len(visit.configs):
                     self._visit_done(telescope, visit)
             visit.obs = None
         else:
-            if outcome == "failed":
+            if outcome == "failed" and config.status.schedulable:
                 config.failures += 1
                 if config.failures >= visit.request.max_attempts:
                     config.status = Status.FAILED
@@ -367,12 +398,49 @@ class DispatchScheduler:
         self.check_toos()
         return group.id
 
+    async def submit(self, group: RequestGroup | dict[str, Any]) -> str:
+        """Add a request group (a ToO goes to :meth:`submit_too`); returns
+        its id. Raises :class:`ValueError` if it is invalid or an id is
+        taken. Kept in the state file."""
+        if isinstance(group, dict):
+            group = RequestGroup.from_dict(group)
+        if group.too is not None:
+            return await self.submit_too(group)
+        if group.submitted is None:
+            group.submitted = self.clock()
+        self._add(group)
+        self._submitted.add(group.id)
+        log.info("request group %s received (%s)", group.id, group.submitter or "no submitter")
+        self._save_state()
+        return group.id
+
     def cancel(self, group_id: str) -> None:
-        """Cancel every schedulable configuration of a group."""
-        for c in self.groups[group_id].configurations():
+        """Cancel every schedulable configuration of a group (KeyError if
+        unknown). An observation in progress finishes; its visit then ends
+        (:meth:`_continue`)."""
+        group = self.groups.get(group_id)
+        if group is None:
+            raise KeyError(f"unknown request group {group_id!r}")
+        for c in group.configurations():
             if c.status.schedulable:
                 c.status = Status.CANCELED
+        log.warning("request group %s canceled", group_id)
         self._save_state()
+
+    def current(self) -> dict[str, dict[str, Any]]:
+        """What each busy telescope is doing: request, configuration,
+        observation and visit start (for status reports)."""
+        return {
+            tel: {
+                "group": v.request.group.id if v.request.group else None,
+                "request": v.request.id,
+                "configuration": v.config.id if v.cfg < len(v.configs) else None,
+                "observation": None if v.obs is None else v.obs.name,
+                "started": v.started.isoformat(),
+                "priority_class": v.priority_class,
+            }
+            for tel, v in self._current.items()
+        }
 
     def check_toos(self) -> None:
         """Expire ToOs past their deadline; for each one now observable, wake
@@ -453,15 +521,23 @@ class DispatchScheduler:
             await asyncio.sleep(self.config.too_poll)
 
     async def poll_dropbox(self) -> list[str]:
-        """Submit every ``*.json`` file in the drop box as a ToO, then move it
-        to ``accepted/`` or ``rejected/`` (with a ``.error`` file saying
-        why). Writers must create the file atomically (write elsewhere, then
-        rename into the drop box). Returns the accepted group ids."""
+        """Take in every ``*.json`` file in the drop box, in name order: a
+        ToO (a request group with a ``too`` entry; :meth:`submit_too`),
+        another request group (:meth:`submit`) or ``{"cancel": "<group
+        id>"}`` (:meth:`cancel`); then move it to ``accepted/`` or
+        ``rejected/`` (with a ``.error`` file saying why). Writers must
+        create the file atomically (write elsewhere, then rename into the
+        drop box). Returns the accepted group ids (the canceled ones too)."""
         assert self.dropbox is not None
         accepted = []
         for path in sorted(self.dropbox.glob("*.json")):
             try:
-                gid = await self.submit_too(json.loads(path.read_text()))
+                data = json.loads(path.read_text())
+                if isinstance(data, dict) and "cancel" in data:
+                    gid = str(data["cancel"])
+                    self.cancel(gid)
+                else:
+                    gid = await self.submit(data)
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 log.error("ToO file %s rejected: %s", path.name, exc)
                 dest = self.dropbox / "rejected"
@@ -761,6 +837,10 @@ class DispatchScheduler:
         hard constraints and no ToO outranks it; else abandon it."""
         req = visit.request
         why = None
+        if any(c.status == Status.CANCELED for c in visit.configs[visit.cfg :]):
+            log.info("%s: abandoning %s mid-visit: canceled", telescope, req.id)
+            del self._current[telescope]
+            return None
         outranked = [
             r
             for r in self.requests.values()
@@ -870,6 +950,12 @@ class DispatchScheduler:
                 if c.status != Status.PENDING or c.failures
             },
             "toos": [g.to_dict() for g in self.groups.values() if g.too is not None],
+            "submitted": [
+                g.to_dict()
+                for g in self.groups.values()
+                if g.too is None and g.id in self._submitted
+            ],
+            "observed": {k: v for k, v in self.observed.items() if v},
         }
 
     def _save_state(self) -> None:
@@ -887,17 +973,7 @@ class DispatchScheduler:
         if not self.state_path.exists():
             return
         try:
-            data = json.loads(self.state_path.read_text())
-            if not isinstance(data, dict) or data.get("version") != 1:
-                raise ValueError("not a version-1 scheduler state")
-            visits = {
-                k: [datetime.fromisoformat(t) for t in v] for k, v in data.get("visits", {}).items()
-            }
-            toos = [RequestGroup.from_dict(g) for g in data.get("toos", [])]
-            configs = {
-                k: (Status(v["status"]), int(v.get("failures", 0)))
-                for k, v in data.get("configurations", {}).items()
-            }
+            self.restore_state(json.loads(self.state_path.read_text()))
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
             aside = self.state_path.with_name(
                 f"{self.state_path.name}.corrupt-{self.clock().strftime('%Y%m%dT%H%M%S')}"
@@ -907,10 +983,40 @@ class DispatchScheduler:
                 "scheduler state %s unreadable (%r); moved to %s", self.state_path, exc, aside
             )
             return
+
+    def restore_state(self, data: Any) -> None:
+        """Apply a saved state (the state file's JSON) to this scheduler.
+        Raises (ValueError, TypeError, KeyError, AttributeError) without
+        changing anything if it cannot be parsed. A saved group whose ids
+        clash with the request file's is skipped, with an error logged."""
+        if not isinstance(data, dict) or data.get("version") != 1:
+            raise ValueError("not a version-1 scheduler state")
+        visits = {
+            k: [datetime.fromisoformat(t) for t in v] for k, v in data.get("visits", {}).items()
+        }
+        toos = [RequestGroup.from_dict(g) for g in data.get("toos", [])]
+        submitted = [RequestGroup.from_dict(g) for g in data.get("submitted", [])]
+        configs = {
+            k: (Status(v["status"]), int(v.get("failures", 0)))
+            for k, v in data.get("configurations", {}).items()
+        }
+        observed = data.get("observed", {})
+        if not isinstance(observed, dict) or not all(
+            isinstance(v, list) for v in observed.values()
+        ):
+            raise ValueError("'observed': expected {configuration id: [records]}")
         self.visits = visits
-        for g in toos:
-            if g.id not in self.groups:
+        self.observed = {k: list(v) for k, v in observed.items()}
+        for g in toos + submitted:
+            if g.id in self.groups:
+                continue
+            try:
                 self._add(g)
+            except ValueError as exc:
+                log.error("saved request group %s not restored: %s", g.id, exc)
+                continue
+            if g.too is None:
+                self._submitted.add(g.id)
         for g in self.groups.values():
             for c in g.configurations():
                 if c.id in configs:

@@ -442,6 +442,48 @@ def _wcs(
     _card(h, "WCSSRC", "mount", "WCS from mount pointing (not solved)")
 
 
+#: The approximate WCS's cards (replaced by a solved WCS).
+WCS_KEYS = (
+    "WCSAXES",
+    "CTYPE1",
+    "CTYPE2",
+    "CUNIT1",
+    "CUNIT2",
+    "CRVAL1",
+    "CRVAL2",
+    "CRPIX1",
+    "CRPIX2",
+    "CD1_1",
+    "CD1_2",
+    "CD2_1",
+    "CD2_2",
+    "PC1_1",
+    "PC1_2",
+    "PC2_1",
+    "PC2_2",
+    "CDELT1",
+    "CDELT2",
+    "WCSSRC",
+)
+
+
+def replace_wcs(h: fits.Header, cards: list[tuple[str, Any, str]]) -> None:
+    """Swap the header's WCS for ``cards`` (a solved one, with its SIP
+    terms and provenance): the old cards are removed, the new ones written
+    where the old ``WCSAXES`` was (else at the end)."""
+    at = h.index("WCSAXES") if "WCSAXES" in h else len(h)
+    for key in WCS_KEYS:
+        while key in h:
+            h.remove(key)
+    pos = min(at, len(h))
+    for key, value, comment in cards:
+        if key in h:
+            h[key] = (value, comment)
+            continue
+        h.insert(pos, fits.Card(key, value, comment[:47] if comment else ""))
+        pos += 1
+
+
 def imagetyp(light: bool, exptime: float, name: str) -> str:
     if not light:
         return "BIAS" if exptime <= 0 else "DARK"
@@ -466,8 +508,15 @@ class FrameStore:
         longitude: float | None = None,
         index: bool = True,
         clock: Clock = real_clock,
+        solver: Any = None,
     ) -> None:
         self.root = Path(data_root)
+        #: Optional plate solver (``robofast_core.framesolve.FrameSolver``):
+        #: called with the pixels, the header and the frame's info before
+        #: the file is written; it replaces the approximate WCS when it
+        #: solves (``WCSSRC``) and adds the photometric zero point, and
+        #: returns a summary for the index (docs/sky.md).
+        self.solver = solver
         #: Where ``DATE`` and the index's ``written`` come from (the
         #: sequencer's clock, :mod:`robofast_core.clock`).
         self.clock = clock
@@ -512,6 +561,13 @@ class FrameStore:
         """Build the header and write the frame (atomic, never overwrites)."""
         data = storage_array(image)
         header, _ = build_header(info, data.shape, self.clock())
+        solved: dict[str, Any] | None = None
+        if self.solver is not None and info.light:
+            try:
+                solved = self.solver(data, header, info)
+            except Exception as exc:  # a solve never costs a frame
+                log.warning("%s: plate solve failed: %r", info.telescope, exc)
+                solved = {"error": f"{type(exc).__name__}: {exc}"}
         # The night: the sequencer's clock at StartExposure, the same clock
         # as every other night name (robofast_core.clock).
         night = self.night(info.host_start)
@@ -558,6 +614,8 @@ class FrameStore:
             "bytes": final.stat().st_size,
             "written": self.clock().isoformat(),
         }
+        if solved:
+            record["solve"] = solved
         if self.index:
             self._append_index(
                 d / f"n{night:%Y%m%d}.{safe_name(info.telescope)}.frames.jsonl", record

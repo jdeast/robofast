@@ -1,0 +1,22 @@
+{
+ "catalog": "Gaia DR3 (gaiadr3.gaia_source)",
+ "licence": "CC BY-SA 3.0 IGO; credit ESA/Gaia/DPAC (docs/sky.md)",
+ "epoch": 2016.0,
+ "healpix": {
+  "scheme": "nested",
+  "level": 7
+ },
+ "mag_limit": {
+  "band": "G",
+  "value": 16.0
+ },
+ "columns": {
+  "source_id": "int64",
+  "ra": "float64",
+  "dec": "float64",
+  "pmra": "float32",
+  "pmdec": "float32",
+  "g": "float32",
+  "bp_rp": "float32"
+ }
+}

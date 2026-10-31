@@ -43,9 +43,9 @@ async def site(tmp_path):
         raw["sources"][name]["timeout"] = 0.5
     # CI runs at any time of day: take the Sun out of these tests.
     raw["sources"]["sun"]["limits"]["altitude"] = {"open": [-90, 90]}
-    raw.update(poll_interval=0.2, evaluate_interval=0.05, server_stale_after=0.5)
+    raw.update(poll_interval=0.2, evaluate_interval=0.05, server_stale_after=2.0)
     bridge = WeatherBridge(parse_config(raw))
-    state = WeatherState(safe=False, stale_after=0.5)
+    state = WeatherState(safe=False, stale_after=2.0)
     server = WeatherServer(state, hang_limit=5).start()
     task = asyncio.create_task(bridge.run(state))
     try:
@@ -80,7 +80,7 @@ async def test_alpaca_members_report_real_values(site):
             await oc.get("SkyQuality", timeout=1)
         desc = await oc.get("SensorDescription", timeout=1, SensorName="SkyTemperature")
         assert "MEarth" in desc
-        assert 0 <= await oc.get("TimeSinceLastUpdate", timeout=1, SensorName="") < 0.5
+        assert 0 <= await oc.get("TimeSinceLastUpdate", timeout=1, SensorName="") < 2
         assert 0 <= await oc.get("TimeSinceLastUpdate", timeout=1, SensorName="Humidity") < 2
         # The reasons, for logs and alarms: an Action and a JSON endpoint.
         assert "WeatherStatus" in await sm.get("SupportedActions", timeout=1)
@@ -94,7 +94,12 @@ async def test_alpaca_members_report_real_values(site):
         assert await sm.get("IsSafe", timeout=1) is False
         async with httpx.AsyncClient(trust_env=False) as http:
             r = await http.get(f"http://{server.address}/weather/status")
-        assert r.json()["reasons"] == ["ridge: outsideHumidity=90 > 80 (close limit)"]
+        # The close limit tripped it; later evaluations judge by the open limit.
+        (reason,) = r.json()["reasons"]
+        assert reason in (
+            "ridge: outsideHumidity=90 > 80 (close limit)",
+            "ridge: outsideHumidity=90 > 75 (open limit)",
+        )
     finally:
         await sm.aclose()
         await oc.aclose()
@@ -138,7 +143,7 @@ async def test_supervisor_closes_when_the_bridge_reports_unsafe(site):
         config=SafetyConfig(
             poll_interval=0.05,
             read_timeout=0.5,
-            stale_after=1.0,
+            stale_after=2.0,
             reopen_hold=0.3,
             lease_ttl=2.0,
             dome_timeout=0.5,

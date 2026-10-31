@@ -93,7 +93,7 @@ their good ideas instead (section 9).
   ASCOM Remote, or a native Alpaca server, on a minimal per-telescope Windows
   PC. MaxIm is not in the control path.
 - **Devices we write servers for** (enclosures, PDUs, site weather, MEarth's
-  roof and mounts) are small Python Alpaca servers. Each has hard timeouts,
+  roof and mounts, the FLWO 60-inch's DFM TCS) are small Python Alpaca servers. Each has hard timeouts,
   soft limits and a simulator mode, and must pass ConformU in CI.
 - **Non-Alpaca instruments** (the spectrograph, iodine cell, exposure meter)
   follow the same pattern: one owning service, a small typed HTTP API, a
@@ -665,6 +665,14 @@ Each step is a CI-tested deliverable.
     PC and a protocol-faithful simulator (built; `docs/kiwispec.md`, with
     open questions); next, spectra in the sequencer (`docs/kiwispec.md`
     section 4), then the service against the real PC, attended.
+12. FLWO 60" / TRES: an Alpaca Telescope + Focuser (+ Dome, if the TCS
+    drives it) server for the 60-inch's DFM TCSGalil ("TCSGO"), with a
+    protocol-faithful simulator, passing ConformU in CI, and the
+    weather-unsafe scenario on the `sites/flwo60/` config (built:
+    `robofast_core/devices/tcsgo_*`; protocol, hardware-moving commands
+    and open questions in `docs/tcsgo.md`). Next: answers to those
+    questions, a TRES camera/spectrograph service, then a supervised
+    test on the real TCS.
 
 ## 9. Borrowed ideas
 

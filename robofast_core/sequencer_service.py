@@ -398,6 +398,10 @@ def spectrograph_from_config(
     return remote, names, recorder
 
 
+#: Timeline entries in each status snapshot.
+TIMELINE_IN_SNAPSHOT = 100
+
+
 def snapshot(seq: Sequencer, interval: float = 5.0) -> dict[str, Any]:
     """The sequencer's state for status pages: per telescope ``state``
     (``observing``, ``idle``, ``backoff``, ``gave_up``, ``finished`` or
@@ -441,6 +445,8 @@ def snapshot(seq: Sequencer, interval: float = 5.0) -> dict[str, Any]:
         "quarantined": seq.quarantined,
         "needs_operator": seq.needs_operator,
         "telescopes": tels,
+        # The latest of the sequencer's own timeline (the console's log).
+        "timeline": seq.timeline.recent(TIMELINE_IN_SNAPSHOT, skip_sent=True),
     }
     if seq.spectrograph is not None:
         out["spectrograph"] = {
@@ -460,7 +466,7 @@ def snapshot(seq: Sequencer, interval: float = 5.0) -> dict[str, Any]:
 def write_snapshot(seq: Sequencer, path: Path, interval: float = 5.0) -> None:
     tmp = path.with_name(path.name + ".tmp")
     try:
-        tmp.write_text(json.dumps(snapshot(seq, interval)))
+        tmp.write_text(json.dumps(snapshot(seq, interval), default=str))
         os.replace(tmp, path)
     except OSError:
         log.exception("could not write the status snapshot %s", path)

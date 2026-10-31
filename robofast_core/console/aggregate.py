@@ -324,12 +324,14 @@ class Aggregator:
         return {
             "weather": weather,
             "enclosure": enclosure,
-            "sequencer": {k: v for k, v in seq.items() if k != "telescopes"},
+            "sequencer": {k: v for k, v in seq.items() if k not in ("telescopes", "timeline")},
             "telescopes": tels,
             "spectrograph": spectrograph,
             "plan": self._plan_view(enc),
             "timeline": tl if isinstance(tl, list) else [],
             "alarms": alarms,
+            # For the console's log only (console/logstream.py); not shown.
+            "_sequencer_timeline": seq.get("timeline") or [],
         }
 
     # -- the parts --------------------------------------------------------------------
@@ -459,6 +461,7 @@ class Aggregator:
             "needs_operator": snap.get("needs_operator"),
             "spectrograph": snap.get("spectrograph") if fresh else None,
             "telescopes": snap.get("telescopes", {}) if fresh else {},
+            "timeline": snap.get("timeline") if isinstance(snap.get("timeline"), list) else [],
         }, values
 
     @staticmethod

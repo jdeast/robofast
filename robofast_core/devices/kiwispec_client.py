@@ -80,6 +80,12 @@ class KiwiSpecRefused(KiwiSpecError):
     """Refused before anything was sent (not allowlisted, bad argument)."""
 
 
+class KiwiSpecBusy(KiwiSpecError):
+    """The spectrograph service is busy with another client's job and the
+    request's bounded wait in its queue ran out (docs/kiwispec.md, "Sharing
+    the spectrograph"): nothing is wrong with the spectrograph."""
+
+
 class HardwareNotAllowed(KiwiSpecError):
     """A non-loopback address without hardware permission."""
 

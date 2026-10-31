@@ -1008,3 +1008,39 @@ async def test_the_console_never_opens_the_enclosure(make_rig, tmp_path):
         await app.aclose()
         await sup.stop()
         await rig.stop()
+
+
+async def test_park_one_telescope_goes_through_the_command_box_never_the_roof(make_console):
+    rig = await make_console()
+    await rig.login("alice")
+    r = await rig.act("park", telescope="t2", reason="check the mount")
+    assert r.status_code == 400  # it asks first
+    r = await rig.act("park", reason="all of them", confirm=True)
+    assert r.status_code == 400  # one telescope; the enclosure is "stop"
+    r = await rig.act("park", telescope="t2", reason="check the mount", confirm=True)
+    assert r.status_code == 200, r.text
+    res = r.json()["result"]
+    assert res["telescopes"] == ["t2"] and "lease_revoked" not in res
+    (cmd,) = [json.loads(p.read_text()) for p in (rig.control / "inbox").iterdir()]
+    assert (cmd["action"], cmd["telescopes"]) == ("park", ["t2"])
+    assert rig.fakes.posts() == []  # the supervisor (and so the roof) is never asked
+
+
+def test_the_hold_wrapper_parks_and_clears_through_the_sequencer_hooks(tmp_path):
+    plan = OperatorHold(StaticPlan([], ["t1", "t2"]), ["t1", "t2"], tmp_path)
+    stops, parks, clears = Recorder(), [], []
+    plan.set_preempt_callback(stops)
+    plan.set_operator_hooks(
+        park=lambda t, why: parks.append((t, why)) or True,
+        clear_spectrograph=lambda who, why: clears.append((who, why)) or True,
+    )
+    send_command(tmp_path, "park", ["t2"], operator="bob", reason="mount noise")
+    send_command(tmp_path, "clear_spectrograph", [], operator="bob", reason="fixed")
+    park, clear = plan.take_in()
+    assert park["park_requested"] == {"t2": True} and park["preempted"] == {"t2": True}
+    assert [c[:2] for c in stops.calls] == [("t2", "now")]
+    assert parks == [("t2", "operator park by bob: mount noise")]
+    assert plan.holds["t2"]["action"] == "park" and plan.held == {"t2"}
+    assert clear["ok"] is True and clears == [("bob", "fixed")]
+    with pytest.raises(ValueError):
+        send_command(tmp_path, "park", [], operator="bob", reason="x")

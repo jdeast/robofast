@@ -59,9 +59,10 @@ import httpx
 
 from robofast_core.api_auth import AuditLog, RateLimiter, TokenRecord, TokenStore
 from robofast_core.config import load_config
-from robofast_core.console.aggregate import Aggregator, ConsoleEnclosure
+from robofast_core.console.aggregate import Aggregator, ConsoleEnclosure, alarm_id
 from robofast_core.console.hold import read_holds, send_command
 from robofast_core.console.page import render_page
+from robofast_core.emergency import EmergencyFailed, close_dome, read_token
 from robofast_core.request_api import (
     MAX_LINE,
     ApiConfig,
@@ -81,8 +82,14 @@ COOKIE = "robofast_console"
 MAX_REASON = 500
 #: Operator actions (``POST /console/api/<action>``), and those that must be
 #: confirmed (``"confirm": true`` in the body; the page asks first).
-ACTIONS = ("ack", "pause", "resume", "stop", "clear_lease", "clear_faults")
-CONFIRM = ("stop", "clear_lease", "clear_faults")
+ACTIONS = ("ack", "pause", "resume", "stop", "clear_lease", "clear_faults", "emergency_close")
+CONFIRM = ("stop", "clear_lease", "clear_faults", "emergency_close")
+#: Actions that the per-token action rate limit never blocks (closing is the
+#: safe direction; an observer who has pressed other buttons must still be
+#: able to close).
+UNLIMITED = ("emergency_close",)
+#: Body fields copied into the audit log.
+AUDITED = ("enclosure", "telescope", "id", "reason", "direct")
 
 
 @dataclass
@@ -123,6 +130,11 @@ class ConsoleConfig:
     #: How long an enclosure stop waits for the sequencer to confirm the
     #: holds before it asks the supervisor to close (it closes regardless).
     hold_ack_timeout: float = 5.0
+    #: Emergency close: how long the supervisor gets to accept ``POST
+    #: /close`` before the console closes through the dome's emergency
+    #: channel (docs/console.md), and the bound on that call.
+    emergency_timeout: float = 2.0
+    emergency_dome_timeout: float = 5.0
     record_lines: int = 40
     timeline_entries: int = 60
 
@@ -251,6 +263,8 @@ class Acks:
 class Console:
     """The endpoints (module doc), independent of the HTTP transport."""
 
+    EMERGENCIES = 50
+
     def __init__(
         self,
         enclosures: dict[str, ConsoleEnclosure],
@@ -294,6 +308,8 @@ class Console:
             if requests
             else None
         )
+        #: Emergency closes, shown as alarms (newest last, bounded).
+        self.emergencies: list[dict[str, Any]] = []
         self._cache: tuple[float, dict[str, Any]] | None = None
         self._lock = asyncio.Lock()
         self._kick = asyncio.Event()
@@ -313,6 +329,10 @@ class Console:
                 self._cache = (now, await self.aggregator.collect())
             doc = self._cache[1]
         out = json.loads(json.dumps(doc, default=str))  # a copy to annotate
+        for e in self.emergencies:
+            enc = out["enclosures"].get(e["enclosure"])
+            if enc is not None:
+                enc.setdefault("alarms", []).insert(0, dict(e))
         for enc in out["enclosures"].values():
             for a in enc.get("alarms", []):
                 a["ack"] = self.acks.acks.get(a["id"])
@@ -417,7 +437,9 @@ class Console:
             return await self._request_api(client, req, parts, audit)
         if len(parts) == 1 and parts[0] in ACTIONS and req.method == "POST":
             self._need(client, "operator")
-            ok, wait = self.action_limiter.allow(client.id)
+            ok, wait = (
+                (True, 0.0) if parts[0] in UNLIMITED else self.action_limiter.allow(client.id)
+            )
             if not ok:
                 raise ApiError(
                     429, "too many actions", headers={"Retry-After": str(max(1, round(wait)))}
@@ -426,7 +448,9 @@ class Console:
             if audit is not None:
                 audit.update(
                     action=parts[0],
-                    **{k: body.get(k) for k in ("enclosure", "telescope", "id", "reason")},
+                    **{
+                        k: body.get(k) for k in ("enclosure", "telescope", "id", "reason", "direct")
+                    },
                 )
             result = await self.act(parts[0], client.name, body)
             self.changed()
@@ -590,6 +614,8 @@ class Console:
     async def act(self, action: str, operator: str, body: dict[str, Any]) -> dict[str, Any]:
         """Carry out one operator action (module doc); returns its result."""
         reason = body.get("reason")
+        if action == "emergency_close" and (reason is None or reason == ""):
+            reason = "emergency close"  # no typing on a phone in the rain
         if not isinstance(reason, str) or not reason.strip() or len(reason) > MAX_REASON:
             raise ApiError(400, f"reason: say why (1 to {MAX_REASON} characters)")
         reason = reason.strip()
@@ -600,6 +626,8 @@ class Console:
             if not isinstance(alarm, str) or not 1 <= len(alarm) <= 64:
                 raise ApiError(400, "id: the alarm's id")
             return {"id": alarm, **self.acks.add(alarm, operator, reason)}
+        if action == "emergency_close":
+            return await self._emergency_close(operator, reason, body)
         enc = self._enclosure(body)
         if action in ("pause", "resume", "stop"):
             return await self._hold(enc, action, operator, reason, body.get("telescope"))
@@ -655,6 +683,117 @@ class Console:
             )
             out["lease_revoked"] = bool(reply.get("revoked"))
         return out
+
+    # -- emergency close ----------------------------------------------------------------
+
+    async def _emergency_close(
+        self, operator: str, reason: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Close one enclosure (``enclosure``) or every one (omitted), now
+        (docs/console.md, "Emergency close")."""
+        name = body.get("enclosure")
+        if name is None:
+            encs = list(self.enclosures.values())
+        elif str(name) in self.enclosures:
+            encs = [self.enclosures[str(name)]]
+        else:
+            raise ApiError(400, f"enclosure: one of {sorted(self.enclosures)} (or none: all)")
+        direct = body.get("direct", False)
+        if not isinstance(direct, bool):
+            raise ApiError(400, "direct: true or false")
+        results = await asyncio.gather(
+            *(self._close_one(e, operator, reason, direct) for e in encs)
+        )
+        out = {"enclosures": {e.name: r for e, r in zip(encs, results, strict=True)}}
+        if not all(r["closing"] for r in results):
+            failed = [e.name for e, r in zip(encs, results, strict=True) if not r["closing"]]
+            raise ApiError(502, f"emergency close NOT accepted for {failed}: {out}")
+        return out
+
+    async def _close_one(
+        self, enc: ConsoleEnclosure, operator: str, reason: str, direct: bool
+    ) -> dict[str, Any]:
+        c = self.config
+        out: dict[str, Any] = {"closing": False, "via": None}
+        # 1. Hold every telescope, so the sequencer asks for no new lease and
+        #    the supervisor does not reopen (as for an enclosure stop; not
+        #    waited for: closing comes first).
+        if enc.control_dir is not None:
+            try:
+                out["hold"] = send_command(
+                    enc.control_dir, "stop", enc.telescopes, operator=operator, reason=reason
+                )
+            except OSError as exc:
+                out["hold_error"] = repr(exc)
+        # 2. The supervisor (parks first on a roll-off roof), within emergency_timeout.
+        why = "skipped: direct close asked for"
+        if not direct:
+            try:
+                async with asyncio.timeout(c.emergency_timeout):
+                    reply = await self.supervisors[enc.name].call(
+                        "POST", "close", {"operator": operator, "reason": f"EMERGENCY: {reason}"}
+                    )
+                out.update(closing=True, via="supervisor", lease_revoked=bool(reply.get("revoked")))
+            except TimeoutError:
+                why = f"no answer within {c.emergency_timeout} s"
+            except (ApiError, httpx.HTTPError) as exc:
+                why = getattr(exc, "message", None) or f"{type(exc).__name__}: {exc}"
+            if out["closing"]:
+                self._emergency_event(enc, operator, reason, out)
+                return out
+        out["supervisor"] = why
+        # 3. The dome's own close-only channel (does not wait for parking).
+        if enc.emergency_fallback != "dome" or enc.emergency_token_file is None or not enc.dome_url:
+            out["error"] = f"supervisor: {why}; no emergency channel to the dome configured"
+            self._emergency_event(enc, operator, reason, out)
+            return out
+        try:
+            token = read_token(enc.emergency_token_file)
+            reply = await close_dome(
+                self.http,
+                enc.dome_url,
+                token,
+                operator=operator,
+                reason=reason,
+                via=f"console ({why})",
+                timeout=c.emergency_dome_timeout,
+            )
+            out.update(closing=True, via="dome", shutter=reply.get("shutter"))
+        except (OSError, ValueError, EmergencyFailed) as exc:
+            out["error"] = f"supervisor: {why}; dome: {exc}"
+        self._emergency_event(enc, operator, reason, out)
+        return out
+
+    def _emergency_event(
+        self, enc: ConsoleEnclosure, operator: str, reason: str, out: dict[str, Any]
+    ) -> None:
+        """Remember an emergency close: shown as an alarm until acknowledged."""
+        when = datetime.now(UTC).isoformat()
+        if not out["closing"]:
+            level, text = "critical", f"EMERGENCY CLOSE FAILED by {operator} at {when}"
+        elif out["via"] == "dome":
+            level = "critical"
+            text = (
+                f"EMERGENCY CLOSE sent directly to the dome by {operator} at {when} "
+                "(telescopes not parked first; ClearFaults to reopen)"
+            )
+        else:
+            level, text = "alarm", f"emergency close by {operator} at {when} (supervisor)"
+        detail = f"{reason}; " + "; ".join(
+            f"{k}: {out[k]}" for k in ("supervisor", "error") if out.get(k)
+        )
+        log.critical("console: %s: %s (%s)", enc.name, text, detail)
+        self.emergencies.append(
+            {
+                "id": alarm_id(enc.name, "emergency", text),
+                "enclosure": enc.name,
+                "source": "console",
+                "level": level,
+                "text": text,
+                "detail": detail.strip("; "),
+            }
+        )
+        del self.emergencies[: -self.EMERGENCIES]
 
     async def _applied(self, enc: ConsoleEnclosure, cid: str) -> bool:
         assert enc.control_dir is not None

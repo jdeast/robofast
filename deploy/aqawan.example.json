@@ -5,5 +5,10 @@
   "allow_hardware": false,
   "open_order": [2, 1],
   "close_command": "CLOSE_SEQUENTIAL",
-  "interlock_doors": []
+  "interlock_doors": [],
+  "_emergency_close": "The observer console's close-only channel (docs/console.md): replace the hash with the SHA-256 of the console's token (python -m robofast_core.emergency token).",
+  "emergency_close": {
+    "token_sha256": ["0000000000000000000000000000000000000000000000000000000000000000"],
+    "log": "/var/log/robofast/aqawan1-emergency.jsonl"
+  }
 }

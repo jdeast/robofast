@@ -74,11 +74,20 @@ dialog { background: var(--panel); color: var(--text); border: 1px solid var(--l
   border-radius: 8px; width: min(94vw, 460px); }
 dialog::backdrop { background: rgba(0,0,0,.6); }
 #signin { max-width: 460px; }
+button.emergency { background: var(--bad); color: var(--bg); border-color: var(--bad);
+  font-weight: 800; letter-spacing: .04em; min-height: 44px; padding: 8px 14px; }
+#emergency-dialog { border: 2px solid var(--bad); }
+#emergency-dialog h3 { color: var(--bad); }
+#em-text, #em-result { white-space: pre-line; }
+label.check { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+label.check input { width: auto; }
 .hidden { display: none !important; }
 """
 
 BODY = """
 <header id="top">
+  <button id="emergency" class="emergency hidden" type="button"
+    aria-haspopup="dialog">EMERGENCY CLOSE</button>
   <h1>robofast console</h1>
   <span id="conn" class="badge warn">connecting</span>
   <span id="age" class="dim"></span>
@@ -126,6 +135,21 @@ BODY = """
     </div>
   </section>
 </main>
+<dialog id="emergency-dialog" aria-labelledby="em-title">
+  <h3 id="em-title">Emergency close</h3>
+  <label for="em-enclosure" class="dim">Enclosure</label>
+  <select id="em-enclosure"></select>
+  <p id="em-text"></p>
+  <label class="check"><input id="em-direct" type="checkbox">
+    skip the supervisor: send the close straight to the dome</label>
+  <label for="em-reason" class="dim">Why (optional; recorded with your name)</label>
+  <input id="em-reason" autocomplete="off">
+  <p id="em-result" class="mono"></p>
+  <div class="actions">
+    <button id="em-cancel" type="button">cancel</button>
+    <button id="em-go" class="emergency" type="button">CLOSE NOW</button>
+  </div>
+</dialog>
 <dialog id="confirm">
   <h3 id="confirm-title"></h3>
   <p id="confirm-text"></p>
@@ -241,12 +265,14 @@ function signedOut() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   $("main").classList.add("hidden");
   $("signout").classList.add("hidden");
+  $("emergency").classList.add("hidden");
   $("signin").classList.remove("hidden");
   $("who").textContent = "";
   setConn("signed out", "warn");
 }
 function signedIn(s) {
   session = s;
+  $("emergency").classList.toggle("hidden", !s.can.operate);
   $("signin").classList.add("hidden");
   $("main").classList.remove("hidden");
   $("signout").classList.remove("hidden");
@@ -430,6 +456,51 @@ function render(doc) {
     x.kind === "command" ? x.source + " → " + fmt(x.device) + " " + x.what + " " + x.outcome
       : fmt(x.source) + ": " + fmt(x.what) + (x.detail && Object.keys(x.detail).length ? " " + JSON.stringify(x.detail) : ""))));
 }
+
+// -- emergency close ---------------------------------------------------------------------
+function emergencyText(names) {
+  const encs = (lastDoc && lastDoc.enclosures) || {};
+  const parts = names.map((n) => {
+    const em = ((encs[n] || {}).enclosure || {}).emergency || {};
+    const park = em.park_before_close ? " The supervisor parks the telescopes first (roll-off roof)." : "";
+    const direct = em.fallback === "dome"
+      ? " If the supervisor does not answer within 2 s, the close goes straight to the dome: it does NOT wait for the telescopes to park, and the roof stays latched shut until someone clears the faults."
+      : " If the supervisor does not answer, the console has no other way to close it (no emergency channel configured).";
+    return (names.length > 1 ? n + ": " : "") + "Closes now through the safety supervisor." + park + direct;
+  });
+  return parts.join("\n") + "\nEvery telescope is stopped and held, so nothing reopens until someone resumes.";
+}
+function openEmergency() {
+  const names = (session && Object.keys(session.enclosures || {})) || [];
+  const sel = $("em-enclosure");
+  sel.replaceChildren(...(names.length > 1 ? [h("option", {value: ""}, "all enclosures")] : []),
+    ...names.map((n) => h("option", {value: n}, n)));
+  const update = () => { $("em-text").textContent = emergencyText(sel.value ? [sel.value] : names); };
+  sel.onchange = update;
+  update();
+  $("em-direct").checked = false;
+  $("em-reason").value = "";
+  $("em-result").textContent = "";
+  $("em-go").disabled = false;
+  $("emergency-dialog").showModal();
+}
+$("emergency").addEventListener("click", openEmergency);
+$("em-cancel").addEventListener("click", () => $("emergency-dialog").close());
+$("em-go").addEventListener("click", async () => {
+  $("em-go").disabled = true;
+  $("em-result").textContent = "closing...";
+  const body = {reason: $("em-reason").value.trim(), direct: $("em-direct").checked, confirm: true};
+  if ($("em-enclosure").value) body.enclosure = $("em-enclosure").value;
+  const r = await call("POST", "/console/api/emergency_close", body);
+  if (r.ok) {
+    const res = (r.data.result || {}).enclosures || {};
+    $("em-result").textContent = Object.entries(res).map(([n, x]) =>
+      n + ": closing via " + x.via + (x.supervisor ? " (supervisor: " + x.supervisor + ")" : "")).join("\n");
+  } else {
+    $("em-result").textContent = "NOT CLOSED: " + ((r.data && r.data.error) || r.status);
+    $("em-go").disabled = false;
+  }
+});
 
 // -- requests --------------------------------------------------------------------------
 function show(r) { $("rq-out").textContent = JSON.stringify(r.data, null, 1); }

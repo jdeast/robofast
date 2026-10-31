@@ -19,15 +19,20 @@ ROOT = Path(__file__).resolve().parents[2]
 class Service:
     """``python -m module args...``; stderr goes to ``log_path``."""
 
-    def __init__(self, module: str, *args: str, log_path: Path) -> None:
+    def __init__(
+        self, module: str, *args: str, log_path: Path, stdout_path: Path | None = None
+    ) -> None:
         self.log_path = log_path
         self._log = open(log_path, "w")  # closed in stop()
+        #: A process that prints continuously (the weather bridge) writes
+        #: its stdout to a file, so a full pipe never blocks it.
+        self._out = open(stdout_path, "w") if stdout_path is not None else None
         env = {**os.environ, "PYTHONPATH": str(ROOT), "PYTHONUNBUFFERED": "1"}
         self.proc = subprocess.Popen(
             [sys.executable, "-m", module, *args],
             cwd=ROOT,
             env=env,
-            stdout=subprocess.PIPE,
+            stdout=self._out if self._out is not None else subprocess.PIPE,
             stderr=self._log,
             text=True,
         )
@@ -60,6 +65,8 @@ class Service:
         self.proc.wait(10)
         if self.proc.stdout is not None:
             self.proc.stdout.close()
+        if self._out is not None:
+            self._out.close()
         self._log.close()
 
 

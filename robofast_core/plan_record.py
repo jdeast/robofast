@@ -52,7 +52,7 @@ log = logging.getLogger(__name__)
 __all__ = ["PlanRecord", "ReplayResult", "night_of", "read_record", "replay"]
 
 #: Entry kinds that end one call to ``next_observation``.
-ANSWERS = ("decision", "continue", "idle", "night_over")
+ANSWERS = ("decision", "continue", "idle", "night_over", "join")
 
 
 def night_of(
@@ -262,7 +262,7 @@ async def replay(entries: list[dict[str, Any]]) -> ReplayResult:
             result.compared += 1
             if _key(got) != _key(e):
                 result.mismatches.append((e["t"], tel, _key(e), _key(got)))
-        elif kind == "outcome":
+        elif kind in ("outcome", "member_outcome"):
             obs = handed.get(e["telescope"])
             if obs is None:
                 result.mismatches.append((e["t"], e["telescope"], _key(e), "no observation"))

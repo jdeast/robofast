@@ -1104,15 +1104,19 @@ class KiwiSpecRemote:
     """The service's API, for the sequencer and tools. :meth:`abort` is the
     cleanup hook: bounded, and it never raises."""
 
-    def __init__(self, url: str, *, timeout: float = 10.0) -> None:
+    def __init__(self, url: str, *, timeout: float = 10.0, abort_timeout: float = 45.0) -> None:
         self.url = url.rstrip("/")
         self.timeout = timeout
+        self.abort_timeout = abort_timeout
 
     async def _call(self, method: str, path: str, body: Any = None, timeout: float | None = None):
         import httpx
 
-        async with httpx.AsyncClient(timeout=timeout or self.timeout) as client:
-            r = await client.request(method, self.url + path, json=body)
+        try:
+            async with httpx.AsyncClient(timeout=timeout or self.timeout, trust_env=False) as c:
+                r = await c.request(method, self.url + path, json=body)
+        except httpx.HTTPError as exc:
+            raise KiwiSpecError(f"{method} {path}: {type(exc).__name__}: {exc}") from exc
         data = r.json()
         if r.status_code >= 400:
             raise KiwiSpecError(f"{method} {path}: {r.status_code} {data.get('error')}")
@@ -1124,12 +1128,22 @@ class KiwiSpecRemote:
     async def expose(self, **frame: Any) -> dict[str, Any]:
         return await self._call("POST", "/expose", frame)
 
+    async def calibrate(self, frames: list[dict[str, Any]]) -> dict[str, Any]:
+        """Start a calibration sequence (``[{"kind", "exptime", "n"}, ...]``)."""
+        return await self._call("POST", "/calibrate", {"frames": frames})
+
     async def job(self, job_id: int, wait: float = 0.0) -> dict[str, Any]:
         return await self._call("GET", f"/jobs/{job_id}?wait={wait}", timeout=wait + self.timeout)
 
-    async def abort(self, reason: str, *, timeout: float = 45.0) -> bool:
+    async def stop(self) -> dict[str, Any]:
+        """End the current exposure early, keeping the frame."""
+        return await self._call("POST", "/stop", {})
+
+    async def abort(self, reason: str, *, timeout: float | None = None) -> bool:
         """Abort whatever the spectrograph is doing; True if nothing is left
-        running. Never raises (a cleanup must go on to park and close)."""
+        running. Never raises (a cleanup must go on to park and close).
+        Bounded by ``timeout`` (default ``abort_timeout``)."""
+        timeout = self.abort_timeout if timeout is None else timeout
         try:
             async with asyncio.timeout(timeout):
                 data = await self._call("POST", "/abort", {"reason": reason}, timeout=timeout)

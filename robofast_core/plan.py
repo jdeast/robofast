@@ -58,7 +58,7 @@ from typing import Any, Protocol
 #: "failed": a device error or a refused slew.
 OUTCOMES = ("complete", "interrupted", "failed")
 #: What an observation does on its target (:attr:`Observation.kind`).
-KINDS = ("expose", "autofocus")
+KINDS = ("expose", "autofocus", "spectrum", "spectrograph_calibration")
 
 
 @dataclass
@@ -92,20 +92,60 @@ class Observation:
     #: stopped when the observation ends (docs/guider.md). A telescope
     #: without a guider fails such an observation.
     guide: bool = False
-    #: What to do on the target: ``"expose"`` (``count`` frames), or
+    #: What to do on the target: ``"expose"`` (``count`` frames),
     #: ``"autofocus"`` (focus the telescope there: :mod:`robofast_core.autofocus`;
-    #: ``exptime`` and ``count`` come from the telescope's autofocus config).
+    #: ``exptime`` and ``count`` come from the telescope's autofocus config),
+    #: ``"spectrum"`` (acquire the target on the fiber, guide, and take
+    #: ``count`` spectra with the enclosure's spectrograph, together with the
+    #: other telescopes of ``spectrum["feed"]``; docs/rv_night.md), or
+    #: ``"spectrograph_calibration"`` (the spectrograph's ``calibration``
+    #: frames; no light, the telescope is not moved).
     kind: str = "expose"
     #: For ``kind="autofocus"``: overrides of the telescope's autofocus
     #: config (e.g. ``{"method": "sweep"}``), and ``{"calibrate": true}``
     #: for a calibration sweep.
     autofocus: dict[str, Any] | None = None
+    #: For ``kind="spectrum"``: ``id`` (the same for every telescope feeding
+    #: one spectrum), ``feed`` (the telescopes asked to feed it), ``leader``
+    #: (the telescope that runs the exposures and reports to the plan; None:
+    #: the first to start it), ``iodine`` (bool or None for the
+    #: spectrograph's default), ``target_counts`` (exposure-meter
+    #: termination; ``exptime`` is then the maximum) and ``target`` (the
+    #: target's astrometry for the barycentric correction:
+    #: :meth:`~robofast_core.request_model.Target.to_dict`).
+    spectrum: dict[str, Any] | None = None
+    #: For ``kind="spectrograph_calibration"``: the frames, each ``{"kind":
+    #: "thar"|"slitflat"|"fiberflat"|"bias"|"dark", "exptime": s, "n": N}``
+    #: (the spectrograph service's ``POST /calibrate``).
+    calibration: list[dict[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in KINDS:
             raise ValueError(f"observation {self.name!r}: kind {self.kind!r} not in {KINDS}")
         if self.kind == "autofocus" and not self.light:
             raise ValueError(f"observation {self.name!r}: an autofocus needs light")
+        if self.kind == "spectrum":
+            if not self.light:
+                raise ValueError(f"observation {self.name!r}: a spectrum needs light")
+            self.guide = True
+            spec = dict(self.spectrum or {})
+            spec.setdefault("id", self.name)
+            spec["feed"] = list(spec.get("feed") or [])
+            self.spectrum = spec
+        elif self.spectrum is not None:
+            raise ValueError(f"observation {self.name!r}: 'spectrum' is for kind 'spectrum'")
+        if self.kind == "spectrograph_calibration":
+            if self.light:
+                raise ValueError(
+                    f"observation {self.name!r}: spectrograph calibrations take no light"
+                    " (light: false)"
+                )
+            if not self.calibration:
+                raise ValueError(f"observation {self.name!r}: no calibration frames")
+        elif self.calibration is not None:
+            raise ValueError(
+                f"observation {self.name!r}: 'calibration' is for kind 'spectrograph_calibration'"
+            )
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Observation:
@@ -213,22 +253,53 @@ class StaticPlan(_Queues):
 
 
 class CalibrationPlan(_Queues):
-    """Bias and dark frames on every telescope, then nothing.
+    """Bias and dark frames on every telescope, and the spectrograph's
+    calibrations, then nothing.
 
-    ``darks`` is a list of ``[exptime, count]``. Every frame is dark
-    (``light=False``), so the sequencer takes them in its closed phase: no
-    lease is requested, the enclosure stays closed and the telescopes stay
-    parked (design.md 3.4).
+    ``darks`` is a list of ``[exptime, count]``. ``spectrograph`` is a list
+    of spectrograph calibration frames, ``{"kind": "thar"|"slitflat"|
+    "fiberflat"|"bias"|"dark", "exptime": s, "n": N}``, taken as one
+    ``spectrograph_calibration`` observation by ``spectrograph_telescope``
+    (default: the first telescope; the telescope itself does nothing).
+    Every frame is dark (``light=False``), so the sequencer takes them in its
+    closed phase: no lease is requested, the enclosure stays closed and the
+    telescopes stay parked (design.md 3.4). The spectrograph's biases and
+    darks are true dark frames (shutter closed): legacy MINERVA took them as
+    light frames (docs/kiwispec.md, section 3).
     """
 
     def __init__(
-        self, telescopes: Sequence[str], biases: int = 0, darks: Iterable[Sequence[float]] = ()
+        self,
+        telescopes: Sequence[str],
+        biases: int = 0,
+        darks: Iterable[Sequence[float]] = (),
+        spectrograph: Iterable[dict[str, Any]] = (),
+        spectrograph_telescope: str | None = None,
     ) -> None:
         frames = [Observation("bias", exptime=0.0, count=biases, light=False)] if biases else []
         for exptime, count in darks:
             name = f"dark{exptime:g}"
             frames.append(Observation(name, exptime=float(exptime), count=int(count), light=False))
-        super().__init__({tel: list(frames) for tel in telescopes})
+        queues = {tel: list(frames) for tel in telescopes}
+        spec = [dict(f) for f in spectrograph]
+        if spec:
+            tel = spectrograph_telescope or next(iter(telescopes), None)
+            if tel not in queues:
+                raise ValueError(f"calibration plan: unknown spectrograph_telescope {tel!r}")
+            for f in spec:
+                if f.get("kind") not in ("thar", "slitflat", "fiberflat", "bias", "dark"):
+                    raise ValueError(f"calibration plan: spectrograph frame {f!r}: bad kind")
+            queues[tel].insert(
+                0,
+                Observation(
+                    "spectrograph calibration",
+                    exptime=0.0,
+                    light=False,
+                    kind="spectrograph_calibration",
+                    calibration=spec,
+                ),
+            )
+        super().__init__(queues)
 
 
 class CallablePlan:

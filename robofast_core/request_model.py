@@ -123,24 +123,56 @@ def _check_keys(d: Any, allowed: set[str], required: set[str], what: str) -> dic
 
 @dataclass
 class Target:
-    """A sidereal target, ICRS (J2000) coordinates. Proper motion is ignored
-    (it does not matter for scheduling)."""
+    """A sidereal target, ICRS coordinates at ``epoch``.
+
+    The astrometry after ``dec_deg`` is optional. Scheduling ignores it; a
+    spectrum's barycentric correction (:mod:`robofast_core.spectra`) uses it:
+    ``pm_ra`` (mu_alpha* = mu_alpha cos(dec)) and ``pm_dec`` in mas/yr,
+    ``epoch`` (Julian year of the coordinates; default 2000.0),
+    ``parallax`` in mas and ``rv`` (systemic radial velocity) in km/s.
+    """
 
     name: str
     ra_hours: float
     dec_deg: float
+    pm_ra: float | None = None
+    pm_dec: float | None = None
+    epoch: float | None = None
+    parallax: float | None = None
+    rv: float | None = None
+
+    _ASTROMETRY: ClassVar[dict[str, tuple[float, float]]] = {
+        "pm_ra": (-1e5, 1e5),
+        "pm_dec": (-1e5, 1e5),
+        "epoch": (1800.0, 2200.0),
+        "parallax": (0.0, 1e4),
+        "rv": (-3e5, 3e5),
+    }
 
     @classmethod
     def from_dict(cls, d: Any, what: str) -> Target:
-        _check_keys(d, {"name", "ra_hours", "dec_deg"}, {"name", "ra_hours", "dec_deg"}, what)
+        keys = {"name", "ra_hours", "dec_deg", *cls._ASTROMETRY}
+        _check_keys(d, keys, {"name", "ra_hours", "dec_deg"}, what)
+        extra = {
+            k: _number(d[k], f"{what}.{k}", *rng)
+            for k, rng in cls._ASTROMETRY.items()
+            if d.get(k) is not None
+        }
         return cls(
             str(d["name"]),
             _number(d["ra_hours"], f"{what}.ra_hours", 0.0, 24.0),
             _number(d["dec_deg"], f"{what}.dec_deg", -90.0, 90.0),
+            **extra,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "ra_hours": self.ra_hours, "dec_deg": self.dec_deg}
+        d: dict[str, Any] = {"name": self.name, "ra_hours": self.ra_hours, "dec_deg": self.dec_deg}
+        d.update(self.astrometry())
+        return d
+
+    def astrometry(self) -> dict[str, float]:
+        """The optional astrometry that is set (for :mod:`robofast_core.spectra`)."""
+        return {k: getattr(self, k) for k in self._ASTROMETRY if getattr(self, k) is not None}
 
 
 @dataclass
@@ -195,19 +227,31 @@ class InstrumentConfig:
     #: M3 port, selected by the sequencer through the telescope's port
     #: action; only telescopes whose limits list it in ``ports`` are eligible.
     port: str | None = None
+    #: SPECTRUM only: the iodine cell in the beam (None: the spectrograph
+    #: service's default), and the exposure-meter counts that end the
+    #: exposure (``exptime`` is then the maximum; None: timed).
+    iodine: bool | None = None
+    target_counts: float | None = None
 
     @classmethod
     def from_dict(cls, d: Any, what: str) -> InstrumentConfig:
-        _check_keys(d, {"exptime", "count", "filter", "light", "port"}, {"exptime"}, what)
+        keys = {"exptime", "count", "filter", "light", "port", "iodine", "target_counts"}
+        _check_keys(d, keys, {"exptime"}, what)
         count = d.get("count", 1)
         if isinstance(count, bool) or not isinstance(count, int) or count < 1:
             raise ValueError(f"{what}.count: expected a positive integer, got {count!r}")
+        iodine = d.get("iodine")
+        if iodine is not None and not isinstance(iodine, bool):
+            raise ValueError(f"{what}.iodine: expected true or false")
+        counts = d.get("target_counts")
         return cls(
             _number(d["exptime"], f"{what}.exptime", 0.0, 86400.0),
             count,
             None if d.get("filter") is None else str(d["filter"]),
             bool(d.get("light", True)),
             None if d.get("port") is None else str(d["port"]),
+            iodine,
+            None if counts is None else _number(counts, f"{what}.target_counts", 1.0, 1e15),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -218,6 +262,10 @@ class InstrumentConfig:
             d["light"] = False
         if self.port is not None:
             d["port"] = self.port
+        if self.iodine is not None:
+            d["iodine"] = self.iodine
+        if self.target_counts is not None:
+            d["target_counts"] = self.target_counts
         return d
 
 
@@ -237,13 +285,19 @@ class Configuration:
     allow_partial: bool = False
     #: Guide on the target while exposing (light frames; docs/guider.md).
     guide: bool = False
-    #: ``EXPOSE`` (take the instrument configs' frames) or ``AUTO_FOCUS``
+    #: ``EXPOSE`` (take the instrument configs' frames), ``AUTO_FOCUS``
     #: (focus the telescope on the target, with the instrument config's
     #: filter and port; its exptime, if positive, overrides the autofocus
-    #: exposure time). As in the LCO OCS.
+    #: exposure time), as in the LCO OCS; or ``SPECTRUM``: fiber spectra
+    #: (``count`` per instrument config) with the enclosure's spectrograph,
+    #: fed by every telescope of the request that is free when it starts
+    #: (docs/rv_night.md). A SPECTRUM is always guided, its instrument is
+    #: ``spectrograph`` and its instrument configs are light, with optional
+    #: ``iodine`` and ``target_counts``; ``filter`` and ``port`` are not
+    #: allowed (the fiber has its own port, selected by the guider config).
     type: str = "EXPOSE"
 
-    TYPES: ClassVar[tuple[str, ...]] = ("EXPOSE", "AUTO_FOCUS")
+    TYPES: ClassVar[tuple[str, ...]] = ("EXPOSE", "AUTO_FOCUS", "SPECTRUM")
 
     @classmethod
     def from_dict(cls, d: Any, what: str) -> Configuration:
@@ -270,14 +324,35 @@ class Configuration:
             len(ics) != 1 or not isinstance(ics[0], dict) or ics[0].get("light", True) is False
         ):
             raise ValueError(f"{what}: an AUTO_FOCUS needs exactly one light instrument config")
+        parsed = [
+            InstrumentConfig.from_dict(ic, f"{what}.instrument_configs[{i}]")
+            for i, ic in enumerate(ics)
+        ]
+        instrument = str(d.get("instrument", "spectrograph" if ctype == "SPECTRUM" else "imager"))
+        if ctype == "SPECTRUM":
+            if instrument != "spectrograph":
+                raise ValueError(f"{what}: a SPECTRUM's instrument is 'spectrograph'")
+            if d.get("guide") is False:
+                raise ValueError(f"{what}: a SPECTRUM is always guided")
+            guide = True
+            for i, ic in enumerate(parsed):
+                if not ic.light or ic.filter is not None or ic.port is not None:
+                    raise ValueError(
+                        f"{what}.instrument_configs[{i}]: a SPECTRUM frame is light,"
+                        " with no filter or port"
+                    )
+        else:
+            for i, ic in enumerate(parsed):
+                if ic.iodine is not None or ic.target_counts is not None:
+                    raise ValueError(
+                        f"{what}.instrument_configs[{i}]: iodine and target_counts"
+                        " are for SPECTRUM configurations"
+                    )
         return cls(
             str(d["id"]),
             Target.from_dict(d["target"], f"{what}.target"),
-            str(d.get("instrument", "imager")),
-            [
-                InstrumentConfig.from_dict(ic, f"{what}.instrument_configs[{i}]")
-                for i, ic in enumerate(ics)
-            ],
+            instrument,
+            parsed,
             Constraints.from_dict(d.get("constraints"), f"{what}.constraints"),
             status,
             int(d.get("failures", 0)),
@@ -300,7 +375,7 @@ class Configuration:
             d["failures"] = self.failures
         if self.allow_partial:
             d["allow_partial"] = True
-        if self.guide:
+        if self.guide and self.type != "SPECTRUM":
             d["guide"] = True
         if self.type != "EXPOSE":
             d["type"] = self.type
@@ -572,7 +647,9 @@ def from_legacy_csv(path: str | Path, *, instrument: str = "spectrograph") -> li
     (s between visits; legacy default 3 h), ``maxobs`` (visits per night;
     legacy default 2) and ``num`` (exposures; default 1). A header's
     parenthesised unit, e.g. ``ra (hours)``, is ignored, as the legacy reader
-    did. Each active row becomes a standing request with that cadence.
+    did. Each active row becomes a standing request with that cadence; with
+    the default instrument its configuration is a ``SPECTRUM`` (fed by every
+    free telescope, as legacy's ``doSpectra`` with its ``tele_list``).
     """
     groups = []
     with Path(path).open(newline="") as f:
@@ -602,6 +679,11 @@ def from_legacy_csv(path: str | Path, *, instrument: str = "spectrograph") -> li
                                     "configurations": [
                                         {
                                             "id": f"{key}/c",
+                                            **(
+                                                {"type": "SPECTRUM"}
+                                                if instrument == "spectrograph"
+                                                else {}
+                                            ),
                                             "instrument": instrument,
                                             "target": {
                                                 "name": name,

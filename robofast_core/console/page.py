@@ -483,18 +483,28 @@ function render(doc) {
           : opButton("pause", "pause", {enclosure: name, telescope: t}, "Pause " + t,
               t + " finishes its current exposure, then holds. The roof is not touched.", false),
         opButton("stop now", "stop", {enclosure: name, telescope: t}, "Stop " + t + " now",
-          "Abort " + t + "'s exposure and slew and hold it (it stops tracking; it is parked when the enclosure closes). The roof is not touched.", true)));
+          "Abort " + t + "'s exposure and slew and hold it (it stops tracking; it is parked when the enclosure closes). The roof is not touched.", true),
+        opButton("park now", "park", {enclosure: name, telescope: t}, "Park " + t + " now",
+          "Abort " + t + "'s exposure and slew, hold it and park it now. Only this mount moves: the roof and the other telescopes are not touched. Resume lifts the hold.", true)));
   })));
 
   fill("spectrograph-body", encs.map(([name, e]) => {
     const s = e.spectrograph;
     if (s === null || s === undefined) return h("div", {}, title(name), h("p", {class: "dim"}, "none configured"));
-    if (!s.reachable) return h("div", {}, title(name), h("p", {class: "bad"}, "spectrograph service unreachable"));
+    const hl = (e.sequencer || {}).spectrograph;
+    const health = hl ? h("div", {class: "actions"},
+      hl.down ? badge("DOWN: " + hl.down, "bad") : badge("up", "ok"),
+      hl.failures ? h("span", {class: "dim"}, " " + hl.failures + " failure(s)") : null,
+      opButton("clear spectrograph", "clear_spectrograph", {enclosure: name}, "Clear the spectrograph",
+        "The sequencer takes spectra again (it marked the spectrograph down after repeated failures). Only once it is fixed.", true)) : null;
+    if (!s.reachable) return h("div", {}, title(name), health, h("p", {class: "bad"}, "spectrograph service unreachable"));
+    const queue = (s.queue || []).length ? h("p", {class: "dim"}, "waiting: " +
+      s.queue.map((q) => fmt(q.client) + " (" + fmt(q.what) + ", " + fmt(q.waiting, 0) + " s)").join("; ")) : null;
     const j = s.job;
     const bar = h("div", {class: "bar"}, h("div", {}));
     if (j && j.exptime && j.elapsed !== null) bar.firstChild.style.width = Math.min(100, 100 * j.elapsed / j.exptime) + "%";
-    return h("div", {}, title(name),
-      h("div", {class: "big"}, badge(s.busy ? "busy: " + s.busy : "idle", s.busy ? "ok" : "warn")),
+    return h("div", {}, title(name), health,
+      h("div", {class: "big"}, badge(s.busy ? "busy: " + s.busy : "idle", s.busy ? "ok" : "warn")), queue,
       j ? h("div", {}, kv([
         ["job", "#" + j.id + " " + fmt(j.kind) + " " + fmt(j.state) + (j.phase ? " (" + j.phase + ")" : "")],
         ["frame", fmt(j.frames_done) + " of " + fmt(j.frames) + ": " + fmt(j.frame_kind) + " " + fmt(j.object)],

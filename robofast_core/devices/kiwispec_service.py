@@ -42,9 +42,19 @@ All bodies are JSON; errors are ``{"error": ...}`` with 400 (bad request),
   (the exposure meter is paused while it is on; the server itself turns the
   backlight off after 60 s).
 
-One job at a time: ``configure``, ``expose``, ``calibrate`` and
-``backlight`` answer 409 while a job runs. Every wait is bounded; locks are
-released in ``finally``.
+One job at a time. ``configure``, ``expose``, ``calibrate`` and
+``backlight`` take an optional ``"wait": S`` and ``"client": name``: while
+the spectrograph is busy, the request waits in a first-come, first-served
+queue for up to ``S`` s (at most ``max_queue_wait``; at most ``max_queue``
+waiting), then gets it -- or answers 409 with ``"busy": true``. Without
+``wait`` a busy spectrograph answers 409 at once. ``/status`` lists the
+queue. This is how two enclosures' sequencers share the one spectrograph
+(docs/kiwispec.md, "Sharing the spectrograph"). Every wait is bounded;
+locks are released in ``finally``.
+
+``expose`` and ``calibrate`` also take ``"night": "nYYYYMMDD"``: the night
+the raw files are named for (the sequencer's, from its clock; default the
+legacy label, ``n`` + the UTC date, by this service's clock).
 
 Safety
 ------
@@ -85,15 +95,18 @@ import re
 import signal
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from robofast_core.clock import clock_from_config
 from robofast_core.devices.kiwispec_client import (
     CAMERA_PORT,
     SPEC_PORT,
     HardwareNotAllowed,
+    KiwiSpecBusy,
     KiwiSpecError,
     KiwiSpecFailed,
     KiwiSpecTimeout,
@@ -117,6 +130,8 @@ KINDS: dict[str, tuple[bool, str | None, bool, bool, bool]] = {
     "dark": (True, "in", False, False, False),
     "bias": (True, "in", False, False, False),
 }
+#: The iodine stage's named positions (the server's ``[I2POSITIONS]`` names).
+STAGE_NAMES = ("in", "flat", "out")
 #: Legacy object names in file names (``n20261031.<object>.0001.fits``).
 DEFAULT_OBJECT = {
     "thar": "ThAr",
@@ -126,6 +141,8 @@ DEFAULT_OBJECT = {
     "bias": "Bias",
 }
 _OBJECT = re.compile(r"^[A-Za-z0-9_+-]{1,60}$")
+_NIGHT = re.compile(r"^n\d{8}$")
+_CLIENT = re.compile(r"^[A-Za-z0-9_.:/+-]{0,80}$")
 JD_UNIX_EPOCH = 2440587.5
 
 
@@ -155,6 +172,17 @@ def flux_weighted_midpoint(
         weighted += part * (a + b) / 2
         total += part
     return (weighted / total if total > 0 else None), total
+
+
+def queue_args(args: dict[str, Any]) -> tuple[float, str]:
+    """A request's ``wait`` (s) and ``client`` (module doc)."""
+    wait = _num(args.get("wait", 0.0), "wait")
+    if wait < 0:
+        raise ValueError("wait must be >= 0")
+    client = str(args.get("client") or "")
+    if not _CLIENT.match(client):
+        raise ValueError(f"client {client!r} must match {_CLIENT.pattern}")
+    return wait, client
 
 
 def jd(t: datetime.datetime) -> float:
@@ -200,11 +228,15 @@ class KiwiSpecConfig:
     allow_hardware: bool = False
     #: Telescopes that can feed the fiber (legacy tele_list).
     telescopes: list[str] = field(default_factory=lambda: ["T1", "T2", "T3", "T4"])
-    #: The server's named stage positions (mm; spectrograph_server.ini), used
-    #: to check arrival. They must match the server's.
-    stage_positions: dict[str, float] = field(
-        default_factory=lambda: {"in": 11.0, "flat": 68.0, "out": 102.0}
-    )
+    #: The iodine stage's named positions (mm), as a CROSS-CHECK only. The
+    #: live ``spectrograph_server.ini`` on the spectrograph PC is
+    #: authoritative (docs/kiwispec.md, "The iodine stage's positions"): the
+    #: service moves by name, the server resolves the name, and the service
+    #: learns the millimetres from the server's own replies (a stopped stage
+    #: the server names as the position asked for has arrived). A configured
+    #: value that disagrees with the live server raises an alarm. Default:
+    #: none (learn them).
+    stage_positions: dict[str, float] = field(default_factory=dict)
     #: Arrived: within this of the target (mm) and stopped (two consecutive
     #: polls agree to a tenth of it).
     stage_tolerance: float = 0.1
@@ -238,6 +270,14 @@ class KiwiSpecConfig:
     save_retry: float = 2.0
     status_interval: float = 10.0
     status_timeout: float = 15.0
+    #: The claim queue (module doc): the longest a request may wait for the
+    #: spectrograph, and how many may wait at once.
+    max_queue_wait: float = 1800.0
+    max_queue: int = 4
+    #: Simulation only: the clock exposure start times and the default night
+    #: label come from (:func:`robofast_core.clock.clock_from_config`, e.g.
+    #: ``{"file": "clock.json"}``); default the host's clock.
+    clock: dict[str, Any] | None = None
     #: The SI camera set-up legacy sent at start (initialize_si).
     readout_mode: int = 3
     ccd_format: tuple[int, int, int, int, int, int] = (50, 2090, 1, 0, 2052, 1)
@@ -253,6 +293,8 @@ class KiwiSpecConfig:
         d["camera"] = CameraEndpoint(**d["camera"])
         if "ccd_format" in d:
             d["ccd_format"] = tuple(d["ccd_format"])
+        if d.get("stage_positions") is None:
+            d.pop("stage_positions", None)
         return cls(**d)
 
 
@@ -261,6 +303,10 @@ class KiwiSpecConfig:
 
 class Refused(Exception):
     """A request refused before anything moved (409)."""
+
+
+class Busy(Refused):
+    """The spectrograph is held by another request (409, ``"busy": true``)."""
 
 
 class Aborted(Exception):
@@ -275,6 +321,8 @@ class Frame:
     telescopes: list[str] = field(default_factory=list)
     target_counts: float | None = None
     iodine: str | float | None = None
+    #: The night the raw file is named for (None: this service's clock).
+    night: str | None = None
 
 
 @dataclass
@@ -289,12 +337,15 @@ class Job:
     created: float = field(default_factory=time.time)
     ended: float | None = None
     abort_reason: str | None = None
+    #: Who asked for it (the request's ``client``).
+    client: str = ""
     finished: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     def view(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "kind": self.kind,
+            "client": self.client,
             "state": self.state,
             "phase": self.phase,
             "error": self.error,
@@ -330,6 +381,10 @@ class KiwiSpec:
         self.camera = camera
         #: What holds the spectrograph now (a job, configure, backlight).
         self._held: str | None = None
+        #: Requests waiting for it, first come first served: [future, what,
+        #: client, time.time() when queued].
+        self._waiters: deque[list[Any]] = deque()
+        self.clock = clock_from_config(config.clock)
         self._ids = itertools.count(1)
         self.jobs: dict[int, Job] = {}
         self.current: Job | None = None
@@ -342,6 +397,8 @@ class KiwiSpec:
         self.led_on: bool | None = None
         self.backlight: bool | None = None
         self.last_stage_request: str | None = None
+        #: The stage's named positions as the live server reports them (mm).
+        self.stage_learned: dict[str, float] = {}
         self.readings: dict[str, dict[str, Any]] = {}
         self.faults: list[str] = []
         self._status_task: asyncio.Task | None = None
@@ -417,11 +474,16 @@ class KiwiSpec:
         return {
             "name": self.config.name,
             "busy": self._held,
+            "queue": [
+                {"what": w[1], "client": w[2], "waiting": round(time.time() - w[3], 1)}
+                for w in self._waiters
+            ],
             "job": self.current.view() if self.current else None,
             "readings": self.readings,
             "led_on": self.led_on,
             "backlight_on": self.backlight,
             "stage_request": self.last_stage_request,
+            "stage_positions_live": dict(self.stage_learned),
             "alarms": self.alarms(),
         }
 
@@ -437,12 +499,17 @@ class KiwiSpec:
         if self._abort.is_set():
             raise Aborted(self.current.abort_reason if self.current else "aborted")
 
+    def stage_names(self) -> set[str]:
+        return set(STAGE_NAMES) | set(self.config.stage_positions)
+
     async def move_stage(self, where: str | float) -> StagePosition:
         c = self.config
+        target: float | None
         if isinstance(where, str):
-            if where not in c.stage_positions:
+            if where not in self.stage_names():
                 raise ValueError(f"unknown iodine position {where!r}")
-            target = c.stage_positions[where]
+            # The server resolves the name with its own (live) ini.
+            target = c.stage_positions.get(where)
             await self.spec.stage_move(where)
         else:
             target = where
@@ -454,22 +521,42 @@ class KiwiSpec:
         # enough: a stage still decelerating into place reads "unknown" (the
         # server names a position only at round(mm, 1)), and that reading
         # would go into the frame's header.
+        # A named move has also arrived when the stopped stage is at the
+        # position the live server itself names as the one asked for.
         prev: float | None = None
         while True:
             pos = await self.spec.stage_position()
-            if (
-                abs(pos.mm - target) <= c.stage_tolerance
-                and prev is not None
-                and abs(pos.mm - prev) <= c.stage_tolerance / 10
-            ):
+            stopped = prev is not None and abs(pos.mm - prev) <= c.stage_tolerance / 10
+            there = (target is not None and abs(pos.mm - target) <= c.stage_tolerance) or (
+                isinstance(where, str) and pos.name == where
+            )
+            if stopped and there:
+                if isinstance(where, str) and pos.name == where:
+                    self._learn_stage(where, pos.mm)
                 return pos
             prev = pos.mm
             if time.monotonic() >= deadline:
+                want = where if target is None else f"{where} ({target} mm)"
                 raise KiwiSpecTimeout(
-                    f"iodine stage at {pos.mm} mm, not {where} ({target} mm), after"
+                    f"iodine stage at {pos.mm} mm ({pos.name}), not {want}, after"
                     f" {c.stage_timeout:.0f} s (stuck?)"
                 )
             await self._sleep(c.stage_poll)
+
+    def _learn_stage(self, name: str, mm: float) -> None:
+        """Record where the live server puts a named position; alarm if the
+        config's cross-check value disagrees (the server is authoritative)."""
+        self.stage_learned[name] = mm
+        conf = self.config.stage_positions.get(name)
+        if conf is not None and abs(conf - mm) > self.config.stage_tolerance:
+            msg = (
+                f"iodine stage: config stage_positions[{name!r}] = {conf} mm, but the live"
+                f" spectrograph server puts {name!r} at {mm} mm (the server is authoritative;"
+                " fix the config)"
+            )
+            if msg not in self.faults:
+                log.error("%s", msg)
+                self.faults.append(msg)
 
     async def set_led(self, on: bool) -> None:
         if on:
@@ -542,22 +629,69 @@ class KiwiSpec:
 
     def _claim(self, what: str) -> None:
         """Take the spectrograph, synchronously (no await between the check
-        and the claim, so two requests cannot both get it)."""
-        if self._held is not None:
-            raise Refused(f"busy ({self._held}); abort it first")
+        and the claim, so two requests cannot both get it). Nobody jumps
+        the queue."""
+        if self._held is not None or self._waiters:
+            raise Busy(f"busy ({self._held or 'requests queued'}); abort it first")
         self._held = what
 
+    async def acquire(self, what: str, wait: float = 0.0, client: str = "") -> None:
+        """Take the spectrograph, waiting (bounded by ``wait`` and
+        ``max_queue_wait``) in a first-come, first-served queue while it is
+        held. Raises :class:`Busy` when the wait runs out or the queue is
+        full."""
+        if self._held is None and not self._waiters:
+            self._held = what
+            return
+        wait = min(max(0.0, wait), self.config.max_queue_wait)
+        if wait <= 0:
+            raise Busy(f"busy ({self._held or 'requests queued'})")
+        if len(self._waiters) >= self.config.max_queue:
+            raise Busy(f"busy ({self._held}); {len(self._waiters)} requests already waiting")
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        entry = [fut, what, client, time.time()]
+        self._waiters.append(entry)
+        log.info("%s (%s) waits for the spectrograph (held by %s)", what, client, self._held)
+        try:
+            async with asyncio.timeout(wait):
+                await asyncio.shield(fut)
+        except TimeoutError:
+            if fut.done() and not fut.cancelled():
+                return  # handed over just as the wait ran out: it is ours
+            raise Busy(f"busy ({self._held}) for the {wait:.0f} s this request waited") from None
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled():
+                self._release()  # handed over to a request that has gone
+            raise
+        finally:
+            if entry in self._waiters:
+                self._waiters.remove(entry)
+            if not fut.done():
+                fut.cancel()
+
+    def _release(self) -> None:
+        """Free the spectrograph, or hand it to the first request waiting."""
+        self._held = None
+        while self._waiters:
+            fut, what, client, _ = self._waiters.popleft()
+            if not fut.done():
+                self._held = what
+                fut.set_result(True)
+                log.info("spectrograph handed to %s (%s)", what, client)
+                return
+
     @contextlib.asynccontextmanager
-    async def hold(self, what: str):
-        self._claim(what)
+    async def hold(self, what: str, wait: float = 0.0, client: str = ""):
+        await self.acquire(what, wait, client)
         try:
             yield
         finally:
-            self._held = None
+            self._release()
 
     async def configure(self, args: dict[str, Any]) -> dict[str, Any]:
         warnings: list[str] = []
-        async with self.hold("configure"):
+        wait, client = queue_args(args)
+        async with self.hold("configure", wait, client):
             self._abort.clear()
             async with asyncio.timeout(self.config.stage_timeout + 60 + self.config.led_warmup):
                 if "heater" in args or "heater_setpoint" in args:
@@ -584,7 +718,7 @@ class KiwiSpec:
         if isinstance(value, bool):
             return "in" if value else "out"
         if isinstance(value, str):
-            if value not in self.config.stage_positions:
+            if value not in self.stage_names():
                 raise ValueError(f"unknown iodine position {value!r}")
             return value
         return _num(value, "iodine")
@@ -625,12 +759,34 @@ class KiwiSpec:
             if kind not in ("science", "fiberflat"):
                 raise ValueError(f"the iodine position of a {kind} frame is fixed")
             iodine = self._iodine(iodine)
-        return Frame(kind, exptime, obj, teles, counts, iodine)
+        night_label = d.get("night")
+        if night_label is not None and not _NIGHT.match(str(night_label)):
+            raise ValueError(f"night {night_label!r} must look like n20261109")
+        return Frame(
+            kind,
+            exptime,
+            obj,
+            teles,
+            counts,
+            iodine,
+            None if night_label is None else str(night_label),
+        )
 
-    def submit(self, kind: str, frames: list[Frame]) -> Job:
+    def submit(self, kind: str, frames: list[Frame], client: str = "") -> Job:
         job_id = next(self._ids)
         self._claim(f"job {job_id}")
-        job = Job(job_id, kind, frames)
+        return self._start(job_id, kind, frames, client)
+
+    async def submit_wait(
+        self, kind: str, frames: list[Frame], wait: float = 0.0, client: str = ""
+    ) -> Job:
+        """:meth:`submit`, waiting (bounded) in the queue for the spectrograph."""
+        job_id = next(self._ids)
+        await self.acquire(f"job {job_id}", wait, client)
+        return self._start(job_id, kind, frames, client)
+
+    def _start(self, job_id: int, kind: str, frames: list[Frame], client: str) -> Job:
+        job = Job(job_id, kind, frames, client=client)
         self.jobs[job.id] = job
         for old in sorted(self.jobs)[:-50]:
             if self.jobs[old].finished.is_set():
@@ -670,7 +826,7 @@ class KiwiSpec:
             job.state, job.error = "failed", f"{type(exc).__name__}: {exc}"
         finally:
             self._acquisition = None
-            self._held = None
+            self._release()
             job.phase = ""
             job.ended = time.time()
             job.finished.set()
@@ -721,7 +877,7 @@ class KiwiSpec:
             await self._sleep(c.led_warmup - (time.monotonic() - self.led_on_since))
 
         index = await self.spec.get_index()
-        file_name = f"{night()}.{f.object}.{index:04d}.fits"
+        file_name = f"{f.night or night(self.clock())}.{f.object}.{index:04d}.fits"
         await self.spec.call("set_file_name", file_name)
 
         meter = uses_meter
@@ -738,7 +894,7 @@ class KiwiSpec:
         acq = await self.camera.start_acquisition(f.exptime, dark=dark)
         self._acquisition = acq
         t0 = time.monotonic()
-        start_utc = datetime.datetime.now(datetime.UTC)
+        start_utc = self.clock()
         ended_by, samples, failures = "time", [(0.0, 0.0)], 0
         end = f.exptime
         try:
@@ -1053,7 +1209,8 @@ class KiwiSpecServer:
                 return 200, await k.configure(args)
             if method == "POST" and parts == ["expose"]:
                 frame = k.parse_frame(args)
-                return 202, k.submit("expose", [frame]).view()
+                wait, client = queue_args(args)
+                return 202, (await k.submit_wait("expose", [frame], wait, client)).view()
             if method == "POST" and parts == ["calibrate"]:
                 frames = []
                 for spec in args.get("frames") or []:
@@ -1062,10 +1219,13 @@ class KiwiSpecServer:
                         raise ValueError("n must be 1..100")
                     if spec.get("kind") == "science":
                         raise ValueError("a calibration has no science frames")
+                    if "night" in args:
+                        spec = {**spec, "night": args["night"]}
                     frames += [k.parse_frame(spec) for _ in range(n)]
                 if not frames:
                     raise ValueError("no frames")
-                return 202, k.submit("calibrate", frames).view()
+                wait, client = queue_args(args)
+                return 202, (await k.submit_wait("calibrate", frames, wait, client)).view()
             if method == "GET" and parts[:1] == ["jobs"] and len(parts) == 2:
                 job = k.jobs.get(int(parts[1])) if parts[1].isdigit() else None
                 if job is None:
@@ -1081,12 +1241,15 @@ class KiwiSpecServer:
             if method == "POST" and parts == ["stop"]:
                 return 200, k.stop()
             if method == "POST" and parts == ["backlight"]:
-                async with k.hold("backlight"):
+                wait, client = queue_args(args)
+                async with k.hold("backlight", wait, client):
                     await k.set_backlight(bool(args["on"]))
                 return 200, {"backlight_on": k.backlight}
             raise _HTTPError(404, f"no {method} {url.path}")
         except _HTTPError as exc:
             return exc.status, {"error": str(exc)}
+        except Busy as exc:
+            return 409, {"error": str(exc), "busy": True}
         except Refused as exc:
             return 409, {"error": str(exc)}
         except Aborted as exc:
@@ -1104,10 +1267,23 @@ class KiwiSpecRemote:
     """The service's API, for the sequencer and tools. :meth:`abort` is the
     cleanup hook: bounded, and it never raises."""
 
-    def __init__(self, url: str, *, timeout: float = 10.0, abort_timeout: float = 45.0) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        timeout: float = 10.0,
+        abort_timeout: float = 45.0,
+        client: str = "",
+        queue_wait: float = 0.0,
+    ) -> None:
         self.url = url.rstrip("/")
         self.timeout = timeout
         self.abort_timeout = abort_timeout
+        #: Who this is (the service's queue and job views show it), and how
+        #: long ``expose`` and ``calibrate`` wait in the service's queue
+        #: while another client holds the spectrograph (module doc).
+        self.client = client
+        self.queue_wait = queue_wait
 
     async def _call(self, method: str, path: str, body: Any = None, timeout: float | None = None):
         import httpx
@@ -1118,19 +1294,36 @@ class KiwiSpecRemote:
         except httpx.HTTPError as exc:
             raise KiwiSpecError(f"{method} {path}: {type(exc).__name__}: {exc}") from exc
         data = r.json()
+        if r.status_code == 409 and data.get("busy"):
+            raise KiwiSpecBusy(f"{method} {path}: {data.get('error')}")
         if r.status_code >= 400:
             raise KiwiSpecError(f"{method} {path}: {r.status_code} {data.get('error')}")
         return data
 
-    async def status(self) -> dict[str, Any]:
-        return await self._call("GET", "/status")
+    async def status(self, refresh: bool = False) -> dict[str, Any]:
+        """The service's status (``refresh``: read every sensor now, bounded)."""
+        return await self._call("GET", "/status?refresh=1" if refresh else "/status")
+
+    def _queue(self, body: dict[str, Any]) -> tuple[dict[str, Any], float]:
+        body = {**body}
+        body.setdefault("client", self.client)
+        body.setdefault("wait", self.queue_wait)
+        return body, float(body["wait"]) + self.timeout
 
     async def expose(self, **frame: Any) -> dict[str, Any]:
-        return await self._call("POST", "/expose", frame)
+        """Start one frame (raises :class:`KiwiSpecBusy` if another client
+        still holds the spectrograph after ``wait``)."""
+        body, timeout = self._queue(frame)
+        return await self._call("POST", "/expose", body, timeout=timeout)
 
-    async def calibrate(self, frames: list[dict[str, Any]]) -> dict[str, Any]:
+    async def calibrate(
+        self, frames: list[dict[str, Any]], night: str | None = None
+    ) -> dict[str, Any]:
         """Start a calibration sequence (``[{"kind", "exptime", "n"}, ...]``)."""
-        return await self._call("POST", "/calibrate", {"frames": frames})
+        body, timeout = self._queue({"frames": frames})
+        if night is not None:
+            body["night"] = night
+        return await self._call("POST", "/calibrate", body, timeout=timeout)
 
     async def job(self, job_id: int, wait: float = 0.0) -> dict[str, Any]:
         return await self._call("GET", f"/jobs/{job_id}?wait={wait}", timeout=wait + self.timeout)

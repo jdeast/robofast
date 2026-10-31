@@ -31,7 +31,7 @@ import inspect
 import logging
 import math
 import subprocess
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -255,6 +255,8 @@ class Telemetry:
         self.weather = weather
         self.supervisor = supervisor
         self.site = site
+        #: The time the Sun and Moon are computed for (robofast_core.clock).
+        self.clock: Callable[[], datetime] = utcnow
         self.weather_interval = weather_interval
         self.weather_max_age = weather_max_age
         self.enclosure_interval = enclosure_interval
@@ -345,7 +347,7 @@ class Telemetry:
 
     async def poll_sky(self) -> None:
         assert self.site is not None
-        values = await asyncio.to_thread(sun_and_moon, self.site, utcnow())
+        values = await asyncio.to_thread(sun_and_moon, self.site, self.clock())
         for name, (value, unit, kw, comment) in values.items():
             self.registry.publish(
                 f"sky.{name}",

@@ -41,11 +41,17 @@ def watchdog(omnisim):
 
 
 @pytest.fixture
-def services():
+def services(request):
     started: list[Service] = []
     yield started
     for s in started:
         s.stop()
+    report = getattr(request.node, "rep_call", None)
+    if report is not None and report.failed:  # show what the processes said
+        for s in started:
+            lines = s.log_path.read_text().splitlines()
+            text = "\n".join(line for line in lines if "HTTP Request" not in line)
+            print(f"\n--- {s.log_path.name} ---\n{text}")
 
 
 @pytest.fixture

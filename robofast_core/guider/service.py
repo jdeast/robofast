@@ -18,6 +18,12 @@ calibrated) or 503 (a device failed).
   end to command sent) and alarms.
 * ``GET /telemetry?n=N`` -- the last N per-frame records.
 * ``GET /values`` -- the service's value registry (``<scope>.guide_*``).
+* ``GET /frame?max=N`` -- the last frame the camera took (guide window or
+  acquisition frame), binned to at most N pixels a side (default 128, at
+  most 1024), as :func:`robofast_core.frameview.encode_array` JSON, with
+  what to draw over it: the target (fiber) and its radius, the last
+  centroid and FWHM, the guide window, the state. For people to look at
+  (the observer console); 404 before the first frame.
 * ``POST /start`` ``{"target"?: [x, y], "mode"?: "closed"|"open",
   "exposure"?: s, "dec"?: deg}`` -- acquire and guide; 409 if running.
   ``dec`` is the target's declination (pulse-guide east lengths).
@@ -85,11 +91,13 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
+from robofast_core.frameview import bin_to, encode_array
 from robofast_core.guider import calibration as calib
 from robofast_core.guider.base import (
     ROI,
     Camera,
     Clock,
+    Frame,
     GuiderError,
     HardwareNotAllowed,
     RealClock,
@@ -325,6 +333,27 @@ def build_parts(cfg: GuiderServiceConfig, *, allowed: bool, clock: Clock) -> Par
 # -- the service ------------------------------------------------------------------------
 
 
+class FrameTap:
+    """A camera that keeps its last frame (for ``GET /frame``); otherwise
+    the camera itself."""
+
+    def __init__(self, camera: Camera) -> None:
+        self._camera = camera
+        self.last: Frame | None = None
+        self.count = 0
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return getattr(self._camera, name)
+
+    async def expose(self, exposure: float, roi: ROI | None, gain: float | None) -> Frame:
+        frame = await self._camera.expose(exposure, roi, gain)
+        self.last = frame
+        self.count += 1
+        return frame
+
+
 class _HTTPError(Exception):
     def __init__(self, status: int, message: str) -> None:
         super().__init__(message)
@@ -375,6 +404,9 @@ class GuiderService:
                 )
             )
         p = self.parts
+        #: The camera, keeping its last frame (``GET /frame``).
+        self.tap = FrameTap(p.camera)
+        p.camera = self.tap  # type: ignore[assignment]
         self.guider = Guider(
             p.camera,
             gcfg,
@@ -500,6 +532,32 @@ class GuiderService:
         }
         return s
 
+    def frame(self, max_side: int = 128) -> dict[str, Any]:
+        """The last frame, binned, with its overlays (module doc)."""
+        f = self.tap.last
+        if f is None:
+            raise _HTTPError(404, "no frame yet")
+        g = self.guider
+        binned, factor = bin_to(f.data, max(8, min(int(max_side), 1024)))
+        m = g.last
+        star = None
+        if m is not None and m.valid and math.isfinite(m.x):
+            star = {"x": m.x, "y": m.y, "fwhm": m.fwhm if math.isfinite(m.fwhm) else None}
+        return {
+            **encode_array(binned),
+            "binning": factor,
+            "roi": f.roi.as_json(),
+            "count": self.tap.count,
+            "exposure": f.exposure,
+            "utc_end": None if f.utc_end is None else f.utc_end.isoformat(),
+            "state": g.state,
+            "target": None if g.config.target is None else list(g.config.target),
+            "fiber_radius": g.config.fiber_radius,
+            "star": star,
+            "guide_roi": None if g._roi is None else g._roi.as_json(),
+            "scope": self.config.scope,
+        }
+
     async def _respond(self, method: str, target: str, body: bytes) -> tuple[int, Any]:
         g = self.guider
         url = urlparse(target)
@@ -516,6 +574,8 @@ class GuiderService:
                 return 200, {"records": [asdict(r) for r in list(g.records)[-n:]]}
             if method == "GET" and parts == ["values"]:
                 return 200, self.registry.as_json()
+            if method == "GET" and parts == ["frame"]:
+                return 200, self.frame(int(query.get("max", 128)))
             if method != "POST":
                 raise _HTTPError(404, f"no {method} {url.path}")
             if parts == ["stop"]:

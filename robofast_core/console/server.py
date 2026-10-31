@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import hmac
 import json
 import logging
@@ -53,16 +54,19 @@ from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import httpx
+import numpy as np
 
 from robofast_core.api_auth import AuditLog, RateLimiter, TokenRecord, TokenStore
 from robofast_core.config import load_config
 from robofast_core.console.aggregate import Aggregator, ConsoleEnclosure, alarm_id
 from robofast_core.console.hold import read_holds, send_command
+from robofast_core.console.images import ImageSources, NoFrame
 from robofast_core.console.page import render_page
 from robofast_core.emergency import EmergencyFailed, close_dome, read_token
+from robofast_core.frameview import SCALES, STRETCHES, render
 from robofast_core.request_api import (
     MAX_LINE,
     ApiConfig,
@@ -145,6 +149,17 @@ class ConsoleConfig:
     #: channel (docs/console.md), and the bound on that call.
     emergency_timeout: float = 2.0
     emergency_dome_timeout: float = 5.0
+    #: Images (docs/console.md, "Images"): requests per token per minute and
+    #: burst (thumbnails at a few Hz each, so apart from ``rate_per_minute``);
+    #: the most often a guider is asked for its frame however many watch;
+    #: how often a saved frame is looked for; the guider's binning target
+    #: (pixels a side, on the guide computer); the largest PNG side served.
+    image_per_minute: float = 900.0
+    image_burst: float = 60.0
+    image_min_interval: float = 0.4
+    image_file_poll: float = 2.0
+    guider_frame_max: int = 256
+    image_max_side: int = 1024
     record_lines: int = 40
     timeline_entries: int = 60
 
@@ -306,6 +321,15 @@ class Console:
             n: SupervisorClient(e.supervisor_url, self.http, c.status_timeout)
             for n, e in enclosures.items()
         }
+        self.images = ImageSources(
+            enclosures,
+            self.http,
+            timeout=c.status_timeout,
+            min_interval=c.image_min_interval,
+            file_poll=c.image_file_poll,
+            guider_frame_max=c.guider_frame_max,
+        )
+        self.image_limiter = RateLimiter(c.image_per_minute, c.image_burst)
         self.limiter = RateLimiter(c.rate_per_minute, c.rate_burst)
         self.action_limiter = RateLimiter(c.action_per_minute, c.action_burst)
         self.fail_limiter = RateLimiter(c.auth_fail_per_minute, c.auth_fail_burst)
@@ -424,10 +448,11 @@ class Console:
             audit.update(client=client.name, token_id=client.id)
         if req.method == "POST" and by_cookie:
             self._check_csrf(req, sid)
-        ok, wait = self.limiter.allow(client.id)
+        parts = [p for p in path.split("/") if p][1:]  # after "console"
+        image = parts[:2] in (["api", "image"], ["api", "pixel"], ["api", "fits"])
+        ok, wait = (self.image_limiter if image else self.limiter).allow(client.id)
         if not ok:
             raise ApiError(429, "rate limit exceeded", headers={"Retry-After": str(round(wait))})
-        parts = [p for p in path.split("/") if p][1:]  # after "console"
         if parts == ["logout"] and req.method == "POST":
             if sid is not None:
                 self.sessions.pop(sid, None)
@@ -443,6 +468,12 @@ class Console:
         if parts == ["events"] and req.method == "GET":
             self._need(client, "read", "operator")
             return self._open_stream(client)
+        if parts == ["images"] and req.method == "GET":
+            self._need(client, "read", "operator")
+            return Response(200, {"sources": self.images.sources()})
+        if image and len(parts) == 3 and req.method == "GET":
+            self._need(client, "read", "operator")
+            return await self._image(parts[0], parts[1], parts[2], req)
         if parts[:1] == ["v1"]:
             return await self._request_api(client, req, parts, audit)
         if len(parts) == 1 and parts[0] in ACTIONS and req.method == "POST":
@@ -468,6 +499,88 @@ class Console:
         if len(parts) == 1 and parts[0] in ACTIONS:
             raise ApiError(405, f"{req.method} not allowed", headers={"Allow": "POST"})
         raise ApiError(404, "not found")
+
+    # -- images ---------------------------------------------------------------------------
+
+    async def _image(
+        self, what: str, enclosure: str, source: str, req: HttpRequest
+    ) -> Response | RawResponse:
+        """``image`` (a PNG view), ``pixel`` (one value) or ``fits`` (the
+        frame) of a source's latest frame (docs/console.md, "Images")."""
+        query = {k: v[0] for k, v in parse_qs(urlsplit(req.target).query).items()}
+        try:
+            frame = await self.images.frame(enclosure, source)
+        except KeyError:
+            raise ApiError(404, f"no image source {enclosure}/{source}") from None
+        except NoFrame as exc:
+            raise ApiError(404, str(exc)) from None
+        h, w = frame.data.shape
+
+        def number(key: str, default: int, lo: int, hi: int) -> int:
+            try:
+                v = int(float(query.get(key, default)))
+            except ValueError:
+                raise ApiError(400, f"{key}: a number") from None
+            return max(lo, min(v, hi))
+
+        if what == "pixel":
+            x, y = number("x", 0, 0, w - 1), number("y", 0, 0, h - 1)
+            value = float(frame.data[y, x])
+            b = float(frame.meta.get("binning") or 1)
+            ox, oy = frame.meta.get("origin") or [0, 0]
+            return Response(
+                200,
+                {
+                    "frame": frame.id,
+                    "x": x,
+                    "y": y,
+                    "value": value if np.isfinite(value) else None,
+                    "detector": [ox + (x + 0.5) * b - 0.5, oy + (y + 0.5) * b - 0.5],
+                },
+            )
+        if what == "fits":
+            data = await asyncio.to_thread(frame.fits_bytes)
+            name = frame.path.name if frame.path is not None else f"{enclosure}-{source}.fits"
+            safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name)
+            return RawResponse(
+                200,
+                data,
+                "application/fits",
+                {"Content-Disposition": f'attachment; filename="{safe}"'},
+            )
+        scale, kind = query.get("scale", "zscale"), query.get("stretch", "linear")
+        if scale not in SCALES or kind not in STRETCHES:
+            raise ApiError(400, f"scale: one of {SCALES}; stretch: one of {STRETCHES}")
+        max_side = number("max", 512, 16, self.config.image_max_side)
+        region = None
+        if all(k in query for k in ("x0", "y0", "x1", "y1")):
+            region = (
+                number("x0", 0, 0, w - 1),
+                number("y0", 0, 0, h - 1),
+                number("x1", w, 1, w),
+                number("y1", h, 1, h),
+            )
+        key = f"{scale}|{kind}|{max_side}|{region}"
+        etag = f'"{frame.id}.{hashlib.sha256(key.encode()).hexdigest()[:10]}"'
+        if req.headers.get("if-none-match") == etag:
+            return RawResponse(304, b"", "image/png", {"ETag": etag})
+        limits = await asyncio.to_thread(frame.limits_for, scale)
+        png, view = await asyncio.to_thread(
+            render,
+            frame.data,
+            region=region,
+            max_side=max_side,
+            scale=scale,
+            kind=kind,
+            limits=limits,
+        )
+        meta = {**frame.meta, **view, "id": frame.id, "shape": [w, h]}
+        return RawResponse(
+            200,
+            png,
+            "image/png",
+            {"ETag": etag, "X-Frame": json.dumps(meta, ensure_ascii=True, default=str)},
+        )
 
     # -- authentication -----------------------------------------------------------------------
 

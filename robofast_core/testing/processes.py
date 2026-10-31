@@ -80,3 +80,17 @@ class SupervisorProcess(Service):
         self.startup = time.monotonic() - t0
         self.url: str = hello["url"]
         self.epoch: str = hello["epoch"]
+
+
+class SequencerProcess(Service):
+    """``robofast_core.sequencer_service`` with the enclosure ``config``."""
+
+    def __init__(self, config: dict[str, Any], workdir: Path, tag: str = "sequencer") -> None:
+        path = workdir / f"{tag}.json"
+        path.write_text(json.dumps(config))
+        super().__init__(
+            "robofast_core.sequencer_service",
+            "--config",
+            str(path),
+            log_path=workdir / f"{tag}.log",
+        )

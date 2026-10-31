@@ -14,6 +14,13 @@ Point the tests at a simulator in one of two ways:
 ``scripts/fetch_omnisim.sh`` downloads and verifies the Linux build. If
 neither variable is set the tests *fail* (they never silently skip), since a
 green run that tested nothing is worse than a red one.
+
+OmniSim serves one device of each type (v0.4.0 always configures device 0
+only), so the two-telescope tests run a *second* OmniSim (``omnisim2``) for
+the second telescope and camera: started from ``ROBOFAST_OMNISIM_BIN``, or
+found at ``ROBOFAST_OMNISIM_ADDRESS2``. OmniSim refuses to start while a
+process of its own name runs, so the second runs from a renamed copy of the
+executable, next to links to the rest of the release.
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import socket
 import subprocess
 import time
@@ -91,24 +99,37 @@ def _ready(address: str) -> bool:
     return {"Telescope", "Camera", "Dome"} <= {d["DeviceType"] for d in devs}
 
 
-@pytest.fixture(scope="session")
-def omnisim(tmp_path_factory) -> str:
-    address = os.environ.get("ROBOFAST_OMNISIM_ADDRESS")
+def _renamed(binary: str, workdir: Path, name: str) -> str:
+    """``binary`` as ``workdir/name``, with links to the files beside it."""
+    src = Path(binary)
+    for f in src.parent.iterdir():
+        if f != src:
+            (workdir / f.name).symlink_to(f)
+    shutil.copy2(src, workdir / name)
+    return str(workdir / name)
+
+
+def _omnisim(tmp_path_factory, address_var: str, log_var: str, rename: str | None = None):
+    """Yield the address of an OmniSim: the one at ``$address_var``, or a
+    fresh one started from ``$ROBOFAST_OMNISIM_BIN`` (as ``rename``, if given)."""
+    address = os.environ.get(address_var)
     if address:
         if not _ready(address):
-            pytest.fail(f"no OmniSim answering at ROBOFAST_OMNISIM_ADDRESS={address}")
+            pytest.fail(f"no OmniSim answering at {address_var}={address}")
         yield address
         return
     binary = os.environ.get("ROBOFAST_OMNISIM_BIN")
     if not binary:
         pytest.fail(
-            "alpaca_sim tests need ROBOFAST_OMNISIM_BIN or ROBOFAST_OMNISIM_ADDRESS"
+            f"alpaca_sim tests need ROBOFAST_OMNISIM_BIN or {address_var}"
             " (see scripts/fetch_omnisim.sh)"
         )
     home = tmp_path_factory.mktemp("omnisim-home")
+    if rename:
+        binary = _renamed(binary, tmp_path_factory.mktemp("omnisim-bin"), rename)
     port = _free_port()
     address = f"127.0.0.1:{port}"
-    log_path = Path(os.environ.get("ROBOFAST_OMNISIM_LOG", home / "omnisim.log"))
+    log_path = Path(os.environ.get(log_var) or home / "omnisim.log")
     log = open(log_path, "w")  # closed in teardown
     env = {**os.environ, "HOME": str(home)}
     proc = subprocess.Popen(
@@ -134,6 +155,19 @@ def omnisim(tmp_path_factory) -> str:
         except subprocess.TimeoutExpired:
             proc.kill()
         log.close()
+
+
+@pytest.fixture(scope="session")
+def omnisim(tmp_path_factory):
+    yield from _omnisim(tmp_path_factory, "ROBOFAST_OMNISIM_ADDRESS", "ROBOFAST_OMNISIM_LOG")
+
+
+@pytest.fixture(scope="session")
+def omnisim2(tmp_path_factory):
+    """A second OmniSim, for a second telescope and camera."""
+    yield from _omnisim(
+        tmp_path_factory, "ROBOFAST_OMNISIM_ADDRESS2", "ROBOFAST_OMNISIM_LOG2", rename="omnisim2"
+    )
 
 
 class _Plain:
@@ -206,13 +240,23 @@ class Truth:
             time.sleep(0.2)
 
 
-@pytest.fixture
-def truth(omnisim):
-    t = Truth(omnisim)
+def _truth(address: str):
+    t = Truth(address)
     t.reset()
     yield t
     for d in (t.tel, t.cam, t.dome):
         d.http.close()
+
+
+@pytest.fixture
+def truth(omnisim):
+    yield from _truth(omnisim)
+
+
+@pytest.fixture
+def truth2(omnisim2):
+    """Ground truth for the second OmniSim (only its telescope and camera are used)."""
+    yield from _truth(omnisim2)
 
 
 @pytest.fixture

@@ -1,19 +1,23 @@
 # Example systemd unit for the sequencer of one enclosure (instance %i).
-# Not installed anywhere; copy and adapt. Paths below are placeholders, and
-# the command is the test sequencer until a production entry point exists.
+# Not installed anywhere; copy and adapt. Paths below are placeholders.
 #
-#   systemctl enable --now robofast-sequencer@enclosure1
+#   systemctl enable --now robofast-sequencer@aqawan1
 #
-# One unit per enclosure is what keeps a single sequencer per lease holder
-# (--name): a restarted process uses the same name, so it can recover the
-# lease its crashed predecessor left behind (see robofast_core/sequencer.py).
+# It reads the enclosure's config file, the same one its supervisor reads
+# (sites/minerva/aqawan1.json is an example): the telescopes and cameras, the
+# supervisor's address, the sequencer settings and the plan. One unit per
+# enclosure is what keeps a single sequencer per lease holder
+# (sequencer_name in the config): a restarted process uses the same name, so
+# it can recover the lease its crashed predecessor left behind (see
+# robofast_core/sequencer.py).
 #
 # On a crash it is restarted after RestartSec. The new process waits for the
-# old lease to lapse (lease_ttl), aborts the exposure and parks, then recovers
-# the lease; the supervisor reopens after its usual checks. Exit status 3
-# (quarantined, or gave up for the night) needs an operator: no restart. If it
-# keeps crashing, systemd stops trying after StartLimitBurst and the
-# supervisor raises its orphaned-lease alarm.
+# old lease to lapse (lease_ttl), aborts every exposure and parks every
+# telescope, then recovers the lease; the supervisor reopens after its usual
+# checks. Exit status 3 (quarantined, or a telescope gave up for the night)
+# needs an operator: no restart. Exit status 0 (stopped, or the plan is
+# done) is not restarted either. If it keeps crashing, systemd stops trying
+# after StartLimitBurst and the supervisor raises its orphaned-lease alarm.
 
 [Unit]
 Description=robofast sequencer (%i)
@@ -26,11 +30,11 @@ StartLimitBurst=5
 Type=simple
 User=robofast
 WorkingDirectory=/opt/robofast
-ExecStart=/opt/robofast/venv/bin/python -m robofast_core.testing.run_sequencer --name %i --supervisor http://127.0.0.1:8100 --devices 127.0.0.1:11111
+ExecStart=/opt/robofast/venv/bin/python -m robofast_core.sequencer_service --config /etc/robofast/%i.json
 Restart=on-failure
 RestartSec=10
 RestartPreventExitStatus=3
-# SIGTERM cancels the observation, cleans up (bounded by cancel_ack_timeout
+# SIGTERM cancels the observations, cleans up (bounded by cancel_ack_timeout
 # and park_timeout) and releases the lease; allow for that before SIGKILL.
 TimeoutStopSec=180
 

@@ -152,35 +152,67 @@ The only component allowed to open or close an enclosure
   itself, since it cannot know the telescope is safe; after
   `orphan_timeout` it alarms. A lease the sequencer quarantined is never
   recovered, only cleared.
-- **Park before reopen.** With a telescope configured, no lease is granted
-  until it reports `AtPark` (a read-only check), so nothing reopens on a
-  telescope that a crash or a failed cleanup left unparked.
+- **Park before reopen.** No lease is granted until every telescope in the
+  enclosure reports `AtPark` (read-only checks, all at once). One that is
+  unparked or cannot be read raises an alarm naming it, and nothing is
+  granted, so nothing reopens on a telescope that a crash or a failed
+  cleanup left unparked. A dead mount therefore keeps the enclosure closed
+  for its neighbours too, until it is fixed or removed from the config.
 
 ### 3.4 Sequencer, one per enclosure
 
 `robofast_core/sequencer.py`. Each "generation" of observing:
 
 1. request an open lease and wait for the supervisor to open;
-2. **re-plan from scratch** (never resume a stale action);
-3. take grants for this generation only;
-4. run the observation as one asyncio task;
-5. on lease revocation: revoke the grants (fence), cancel the task, wait a
+2. take grants for this generation only, per telescope;
+3. observe as one asyncio task (one child task per telescope, section
+   3.5), each **re-planning from scratch** before every observation (never
+   resume a stale action);
+4. on lease revocation: revoke the grants (fence), cancel the task, wait a
    bounded time for it to finish; if it doesn't, **quarantine** (never
    release the lease, so nothing reopens) and alarm;
-6. clean up with fresh grants: abort the exposure, park, in parallel and
-   bounded;
-7. release the lease; only then may a new generation start.
+5. clean up with fresh grants: abort every exposure, park every telescope,
+   all in parallel and bounded;
+6. release the lease; only then may a new generation start.
 
 At startup, before its first lease, the sequencer waits while a live lease
 of its own holder name is outstanding (a crashed predecessor's, until it
-lapses), cleans up (always: a crash can leave the telescope unparked even
-with no lease outstanding), and then recovers the predecessor's lease if
-there is one. Its name must be stable across restarts and unique per
+lapses), cleans up every telescope (always: a crash can leave one unparked
+even with no lease outstanding), and then recovers the predecessor's lease
+if there is one. Its name must be stable across restarts and unique per
 enclosure; one process manager unit per enclosure keeps it so. If two
 processes do share a name, the supervisor still never recovers a live lease,
 recovery is idempotent, and they take turns, one lease at a time.
 
-Repeated device errors back off, then give up for the night and alarm.
+Repeated device errors back off, then give up for the night and alarm,
+per telescope (section 3.5).
+
+**Plans.** The sequencer asks a *plan provider* for each telescope's next
+observation whenever that telescope is free, and reports how each ended
+(`robofast_core/plan.py`):
+
+```python
+class PlanProvider(Protocol):
+    async def next_observation(self, telescope: str) -> Observation | None: ...
+    def report(self, telescope: str, obs: Observation, outcome: str, frames: int) -> None: ...
+```
+
+`None` means nothing more for that telescope tonight; outcomes are
+`complete`, `interrupted` (the enclosure closed, or the sequencer stopped)
+and `failed` (a device error or a refused slew). The dispatch scheduler
+(section 3.7) will implement it; for now there is a static target list and
+a calibration-only plan (bias and dark frames, telescope parked; they still
+run under an open lease). The night ends, and the process exits, when every
+telescope's plan is done or it gave up.
+
+**Entry point.** `python -m robofast_core.sequencer_service --config
+<enclosure.json>` builds the owners, the lease client and the plan from the
+enclosure's config file, which the supervisor service reads too
+(`robofast_core/config.py`; `sites/minerva/aqawan1.json` is MINERVA's
+Aqawan 1 with T1 and T2, on placeholder addresses). SIGTERM cleans up and
+releases the lease; exit status 3 means "needs an operator" (quarantined, or
+a telescope gave up) and is not restarted. The config is JSON for now; YAML
+is read when PyYAML is installed.
 
 The sequencer's states (startup, calibrations, observing, weather hold,
 shutdown) are an explicit graph defined as data, POCS-style, with states
@@ -189,9 +221,35 @@ tagged as safe to enter in any weather.
 ### 3.5 Several telescopes per enclosure
 
 The enclosure sequencer arbitrates its telescopes: one lease per enclosure,
-grants per telescope. MEarth North needs a **collision checker** that vets
-every slew target and path against the other telescopes' positions before
-the grant allows the move.
+grants per telescope (`TelescopeUnit`: a telescope and its camera). MINERVA's
+Aqawan 1 holds T1 and T2, which cannot collide; MEarth North's telescopes
+can.
+
+- **Each telescope observes in its own task**, children of the generation's
+  task in an asyncio `TaskGroup`. A telescope task catches its own errors
+  (device errors, timeouts, refused slews, plan errors, bugs), so one
+  telescope's failure never cancels its siblings: the legacy bug where one
+  telescope's exception ended the night.
+- **Backoff and give-up are per telescope.** After an error the telescope
+  aborts its exposure and parks (bounded, with its fenced generation
+  grants), waits `error_backoff` while the others keep observing, and after
+  `max_consecutive_errors` in a row gives up for the night (alarm) while the
+  others carry on. When no telescope is left working, the generation ends,
+  the lease is released and the enclosure closes; a telescope still in
+  backoff then waits a full `error_backoff` with the enclosure closed, so a
+  dead camera cannot cycle the roof.
+- **Quarantine stays per generation:** one lease, one fence over every
+  telescope's grants, one bounded cancel. Cleanup aborts every camera and
+  parks every telescope in parallel; so does the startup recovery.
+- **Supervisor:** no lease unless every telescope reports `AtPark`
+  (section 3.3); on a roll-off roof, `park_before_close` parks them all in
+  parallel within `park_wait`, then closes regardless.
+- **Collision checking hook.** Before every slew the telescope task asks a
+  `SlewGuard` (default: allow). MEarth North's **collision checker** will be
+  one: it vets each target and path against the other telescopes'
+  positions and raises `SlewDenied`, which counts as that telescope's
+  error. Parking is never vetted (cleanup must always be able to park), so
+  MEarth also needs a park order or park positions that cannot collide.
 
 ### 3.6 Telescopes and pointing models
 
@@ -274,7 +332,11 @@ support is often worse. So:
   mid-exposure; feed erroring, hanging, or frozen at "safe"; recovery and
   reopen; device hang or death; second-client interference; sequencer crash
   with the enclosure open, and its restart and recovery; supervisor crash
-  (heartbeat closes).
+  (heartbeat closes); two telescopes in one enclosure (both abort, park and
+  close; one's camera hangs or keeps failing while the other observes on; a
+  refused slew; stale grants refused on each). OmniSim serves one telescope
+  and camera, so the simulator tier runs a second OmniSim for the second
+  pair.
 - `master` requires the `test` gate check.
 
 ## 6. Defaults (proposed; to be confirmed)
@@ -290,9 +352,10 @@ support is often worse. So:
 | `orphan_timeout` | 10 min | alarm if a revoked lease is still unreleased |
 | `shutter_timeout` | 120 s | shutter move before re-command and alarm |
 | `cancel_ack_timeout` | 10 s | wait for a cancelled task before quarantine |
-| `error_backoff` | 300 s | wait after a device error |
-| `max_consecutive_errors` | 3 | then give up for the night and alarm |
-| `park_before_close` | off | roll-off roofs: park (bounded) before closing |
+| `error_backoff` | 300 s | a telescope's wait after a device error |
+| `max_consecutive_errors` | 3 | then that telescope gives up for the night and alarms |
+| `plan_timeout` | 30 s | bound on asking the plan for a telescope's next observation |
+| `park_before_close` | off | roll-off roofs: park every telescope (bounded, in parallel) before closing |
 | `park_wait` | 60 s | bound on that park |
 
 ## 7. Open decisions
@@ -330,6 +393,8 @@ Each step is a CI-tested deliverable.
    system and logs what it *would* have done, for comparison.
 8. One telescope, attended nights, then robotic; then the rest of MINERVA.
 9. Request API and dispatch scheduler; then MEarth (collision checker).
+10. **Done:** several telescopes per enclosure (section 3.5) and the
+    production sequencer entry point with its plan-provider interface.
 
 ## 9. Borrowed ideas
 

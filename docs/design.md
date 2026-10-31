@@ -144,6 +144,17 @@ The only component allowed to open or close an enclosure
 - **Hardware heartbeat behind it.** Where the enclosure controller supports
   it (the Aqawan's does), the supervisor pings it; if the pings stop, the
   hardware closes on its own. That makes every software bug survivable.
+- **A crashed sequencer's lease.** It expires and the enclosure closes, but
+  it is never released, so nothing is granted until it is cleared. Only its
+  restarted sequencer (`recover`, same holder name) or an operator (`clear`,
+  logged with their name) can clear it, and only once it is no longer live
+  and the enclosure is confirmed closed. The supervisor never clears one by
+  itself, since it cannot know the telescope is safe; after
+  `orphan_timeout` it alarms. A lease the sequencer quarantined is never
+  recovered, only cleared.
+- **Park before reopen.** With a telescope configured, no lease is granted
+  until it reports `AtPark` (a read-only check), so nothing reopens on a
+  telescope that a crash or a failed cleanup left unparked.
 
 ### 3.4 Sequencer, one per enclosure
 
@@ -159,6 +170,15 @@ The only component allowed to open or close an enclosure
 6. clean up with fresh grants: abort the exposure, park, in parallel and
    bounded;
 7. release the lease; only then may a new generation start.
+
+At startup, before its first lease, the sequencer waits while a live lease
+of its own holder name is outstanding (a crashed predecessor's, until it
+lapses), cleans up (always: a crash can leave the telescope unparked even
+with no lease outstanding), and then recovers the predecessor's lease if
+there is one. Its name must be stable across restarts and unique per
+enclosure; one process manager unit per enclosure keeps it so. If two
+processes do share a name, the supervisor still never recovers a live lease,
+recovery is idempotent, and they take turns, one lease at a time.
 
 Repeated device errors back off, then give up for the night and alarm.
 
@@ -209,6 +229,12 @@ model.
   the safety supervisor, each sequencer and the device servers into
   processes. The interfaces between them are plain HTTP/JSON (Alpaca for
   devices), so splitting is configuration, not a rewrite.
+- systemd restarts them (`deploy/` has example units): the supervisor
+  always, the sequencer on failure, except for "needs an operator"
+  (quarantine, give-up). A crash-looping sequencer stops being restarted and
+  the supervisor's orphan alarm takes over.
+- Long-running processes keep bounded in-memory state: the timeline is a
+  ring buffer (`timeline_size`), and so is the alarm list.
 - No message bus (pyobs's XMPP and Rockit's Pyro were both costs in the
   evaluations).
 - Alpaca has no authentication: device traffic stays on an isolated network.
@@ -247,7 +273,8 @@ support is often worse. So:
 - **Scenario suite** (grows with each bug found in the field): weather unsafe
   mid-exposure; feed erroring, hanging, or frozen at "safe"; recovery and
   reopen; device hang or death; second-client interference; sequencer crash
-  with the enclosure open; supervisor crash (heartbeat closes).
+  with the enclosure open, and its restart and recovery; supervisor crash
+  (heartbeat closes).
 - `master` requires the `test` gate check.
 
 ## 6. Defaults (proposed; to be confirmed)
@@ -260,6 +287,7 @@ support is often worse. So:
 | `reopen_hold` | 20 min | continuous safe time before (re)opening |
 | `lease_ttl` | 60 s | an unrenewed lease is revoked and the enclosure closed |
 | `lease_renew_interval` | 10 s | sequencer renewal period |
+| `orphan_timeout` | 10 min | alarm if a revoked lease is still unreleased |
 | `shutter_timeout` | 120 s | shutter move before re-command and alarm |
 | `cancel_ack_timeout` | 10 s | wait for a cancelled task before quarantine |
 | `error_backoff` | 300 s | wait after a device error |

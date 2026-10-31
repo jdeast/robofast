@@ -3,7 +3,9 @@
 Every device command (whether it was sent, rejected, timed out or failed) and
 every safety/sequencer event lands here with a ``time.monotonic()`` timestamp.
 Tests assert against it ("nothing from the observing task reached the
-telescope after the lease was revoked"); in production it is the audit trail.
+telescope after the lease was revoked"); in production it is the audit trail
+(every event is also logged), and ``maxlen`` keeps only the latest entries so
+a long-running process does not grow without bound.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -31,9 +34,9 @@ class Entry:
 
 
 class Timeline:
-    def __init__(self) -> None:
+    def __init__(self, maxlen: int | None = None) -> None:
         self._lock = threading.Lock()
-        self._entries: list[Entry] = []
+        self._entries: deque[Entry] = deque(maxlen=maxlen)
         self.t0 = time.monotonic()
 
     def _add(self, entry: Entry) -> Entry:

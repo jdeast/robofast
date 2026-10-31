@@ -1,0 +1,28 @@
+# Example systemd unit for the safety supervisor of one enclosure (instance %i).
+# Not installed anywhere; copy and adapt. Paths below are placeholders.
+#
+#   systemctl enable --now robofast-supervisor@enclosure1
+#
+# The supervisor starts closed and, on SIGTERM, revokes the lease and closes
+# before it exits. It is restarted on any exit: an enclosure with no
+# supervisor is closed only by its hardware heartbeat.
+
+[Unit]
+Description=robofast safety supervisor (%i)
+After=network-online.target
+Wants=network-online.target
+# Keep restarting however often it fails.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=robofast
+WorkingDirectory=/opt/robofast
+ExecStart=/opt/robofast/venv/bin/python -m robofast_core.supervisor_service --config /etc/robofast/%i/supervisor.json
+Restart=always
+RestartSec=2
+# Long enough for the final, bounded CloseShutter.
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

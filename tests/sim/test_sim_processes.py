@@ -13,6 +13,7 @@ import os
 import signal
 import time
 
+import httpx
 import pytest
 
 from robofast_core import Observation, Sequencer, SequencerConfig, Timeline
@@ -40,11 +41,17 @@ def watchdog(omnisim):
 
 
 @pytest.fixture
-def services():
+def services(request):
     started: list[Service] = []
     yield started
     for s in started:
         s.stop()
+    report = getattr(request.node, "rep_call", None)
+    if report is not None and report.failed:  # show what the processes said
+        for s in started:
+            lines = s.log_path.read_text().splitlines()
+            text = "\n".join(line for line in lines if "HTTP Request" not in line)
+            print(f"\n--- {s.log_path.name} ---\n{text}")
 
 
 @pytest.fixture
@@ -57,6 +64,7 @@ def supervisor(omnisim, weather, watchdog, services, truth, tmp_path):
             "safetymonitor": server.address,
             "observingconditions": server.address,
             "heartbeat": watchdog.address,
+            "telescope": omnisim,
         },
         "safety": SAFETY,
     }
@@ -110,17 +118,60 @@ async def test_supervisor_dies_watchdog_closes(
     assert closed >= HB_TIMEOUT - SAFETY["heartbeat_interval"]  # the watchdog, not the supervisor
 
 
-async def test_sequencer_process_killed(omnisim, supervisor, services, truth, record_timing):
+def _sequencer_process(omnisim, supervisor, services, tag: str = "sequencer") -> Service:
     seq = Service(
         "robofast_core.testing.run_sequencer",
         *("--supervisor", supervisor.url, "--devices", omnisim, "--exptime", "60"),
         *("--config", json.dumps(SEQ), "--remote", json.dumps(REMOTE)),
-        log_path=supervisor.log_path.with_name("sequencer.log"),
+        log_path=supervisor.log_path.with_name(f"{tag}.log"),
     )
     services.append(seq)
+    return seq
+
+
+def _lease(supervisor) -> dict:
+    return httpx.get(f"{supervisor.url}/status", trust_env=False, timeout=5).json()["lease"]
+
+
+async def test_sequencer_process_killed(omnisim, supervisor, services, truth, record_timing):
+    seq = _sequencer_process(omnisim, supervisor, services)
     await _observing(truth)
     seq.signal(signal.SIGKILL)
     closed = await await_until(truth.closed, BOUND, what="close after lease expiry")
     record_timing(closed=closed, lease_ttl=SAFETY["lease_ttl"])
     assert closed >= SAFETY["lease_ttl"] - SEQ["lease_renew_interval"]
     assert truth.exposing() and not truth.parked()  # nobody left to clean up
+
+
+async def test_sequencer_restart_recovers(omnisim, supervisor, services, truth, record_timing):
+    """SIGKILL mid-exposure and an immediate restart: the new process aborts,
+    parks, recovers the lease and observes again under a new one."""
+    first = _sequencer_process(omnisim, supervisor, services, "first")
+    await _observing(truth)
+    old = _lease(supervisor)
+    t0 = time.monotonic()
+    first.signal(signal.SIGKILL)
+    second = _sequencer_process(omnisim, supervisor, services, "second")
+    await await_until(truth.closed, BOUND, what="closed")
+    closed = time.monotonic() - t0
+    # Parked-and-idle lasts only until the new lease, so use the report (and
+    # the supervisor, which grants nothing until it has read AtPark).
+    await await_until(lambda: second.log_line("startup_cleanup_done"), BOUND, what="cleanup")
+    cleaned_up = time.monotonic() - t0
+    assert "'aborted': True, 'parked': True, 'errors': []" in second.log_line(
+        "startup_cleanup_done"
+    )
+    await await_until(lambda: _lease(supervisor)["id"] != old["id"], BOUND, what="new lease")
+    recovered = time.monotonic() - t0
+    await _observing(truth)
+    observing = time.monotonic() - t0
+    record_timing(
+        closed=closed,
+        cleaned_up=cleaned_up,
+        new_lease=recovered,
+        observing_again=observing,
+        lease_ttl=SAFETY["lease_ttl"],
+    )
+    new = _lease(supervisor)
+    assert new["id"] == old["id"] + 1 and new["holder"] == "seq" and new["live"]
+    assert "lease_recovered" in supervisor.log_path.read_text()

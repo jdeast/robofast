@@ -17,10 +17,31 @@ Each "generation" of observing runs like this::
 
 The sequencer never touches the enclosure: it has no dome grant at all. It
 only learns "open" from ``lease.wait_open()`` and "stop" from
-``lease.revoked``. Its ``supervisor`` is anything with ``request_open``: the
+``lease.revoked``. Its ``supervisor`` is a :class:`LeaseSource`: the
 in-process :class:`SafetySupervisor`, or a
 :class:`~robofast_core.lease_client.RemoteSupervisor` for one in another
 process (whose leases revoke themselves if the supervisor cannot be reached).
+
+Starting up after a crash
+-------------------------
+The sequencer's ``name`` is its lease holder identity: stable across
+restarts, one per enclosure. Before its first lease, :meth:`Sequencer.run`
+
+1. waits while a *live* lease of this holder is outstanding (a crashed
+   predecessor's, until it lapses; or a twin's -- see below), since cleaning
+   up under it would disturb it;
+2. cleans up (abort the exposure, park), as after any generation -- always,
+   because even with no lease outstanding a crash can leave the telescope
+   unparked, and the supervisor grants nothing until it is parked;
+3. if the predecessor's lease is still outstanding (revoked, unreleased),
+   asks the supervisor to release it (``recover``); the supervisor refuses
+   until the enclosure is confirmed closed, so this retries.
+
+Two processes with the same name (a twin) are a deployment error that the
+process manager prevents (one systemd unit per enclosure); the protocol stays
+safe if it happens: a live lease is never recovered, recovery is idempotent
+(the second ``recover`` is a no-op), and the supervisor's one-lease rule
+means the twins take turns, each generation ending with its own cleanup.
 """
 
 from __future__ import annotations
@@ -33,7 +54,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from robofast_core.owner import DeviceError, DeviceOwner, Grant
-from robofast_core.safety import LeaseRevoked, OpenLease, SafetySupervisor
+from robofast_core.safety import LeaseRevoked, OpenLease, RecoveryRefused, SafetySupervisor
 from robofast_core.timeline import Timeline
 
 log = logging.getLogger(__name__)
@@ -45,6 +66,14 @@ class LeaseSource(Protocol):
     """Where open leases come from (a supervisor, local or remote)."""
 
     async def request_open(self, holder: str) -> OpenLease: ...
+
+    async def lease_status(self) -> dict[str, Any] | None:
+        """The outstanding lease's :meth:`OpenLease.state`, or None."""
+        ...
+
+    async def recover(self, lease_id: int, holder: str) -> bool:
+        """Release a dead lease of ``holder``; raise :class:`RecoveryRefused`."""
+        ...
 
 
 @dataclass
@@ -76,6 +105,9 @@ class SequencerConfig:
     #: stops a dead camera from cycling the enclosure open and shut.
     error_backoff: float = 300.0
     max_consecutive_errors: int = 3
+    #: At startup, how often to re-check a predecessor's lease or retry its
+    #: recovery.
+    recover_poll: float = 1.0
 
 
 @dataclass
@@ -112,6 +144,7 @@ class Sequencer:
         self.quarantined = False
         self.frames: list[dict[str, Any]] = []
         self.cleanups: list[CleanupReport] = []
+        self.startup_cleanup: CleanupReport | None = None
         self.consecutive_errors = 0
         self.gave_up = False
         self._outcome: str | None = None
@@ -122,6 +155,7 @@ class Sequencer:
     # -- main loop --------------------------------------------------------
 
     async def run(self) -> None:
+        await self._recover()
         while True:
             lease = await self.supervisor.request_open(self.name)
             self._outcome = None
@@ -134,6 +168,7 @@ class Sequencer:
                 await self._run_generation(self.generation, lease, obs)
             finally:
                 if self.quarantined:
+                    lease.quarantine()
                     self._event("lease_held_quarantined", lease=lease.id)
                 else:
                     lease.release()
@@ -150,6 +185,31 @@ class Sequencer:
                 await asyncio.sleep(self.config.error_backoff)
             else:
                 self.consecutive_errors = 0
+
+    async def _recover(self) -> None:
+        """Clean up after a crashed predecessor before the first lease (see
+        the module doc)."""
+        poll = self.config.recover_poll
+        while True:
+            state = await self.supervisor.lease_status()
+            mine = state is not None and state["holder"] == self.name
+            if mine and state["live"]:
+                await asyncio.sleep(poll)  # not lapsed yet, or a twin observing
+            elif self.startup_cleanup is None:
+                self.startup_cleanup = await self._cleanup(0, "startup_cleanup")
+            elif not mine:
+                return
+            elif state["quarantined"]:
+                self._event("predecessor_quarantined", lease=state["id"], level="critical")
+                return  # request_open waits until an operator clears it
+            else:
+                try:
+                    if await self.supervisor.recover(state["id"], self.name):
+                        self._event("lease_recovered", lease=state["id"])
+                    return
+                except RecoveryRefused as exc:
+                    log.info("%s: recovery of lease #%d: %s", self.name, state["id"], exc)
+                    await asyncio.sleep(poll)
 
     async def _renew(self, lease: OpenLease) -> None:
         while True:
@@ -250,10 +310,10 @@ class Sequencer:
 
     # -- cleanup ----------------------------------------------------------
 
-    async def _cleanup(self, gen: int) -> CleanupReport:
+    async def _cleanup(self, gen: int, what: str = "cleanup") -> CleanupReport:
         report = CleanupReport(gen)
         t0 = time.monotonic()
-        self._event("cleanup_start", gen=gen)
+        self._event(f"{what}_start", gen=gen)
         cam = self.camera.grant(f"{self.name}/cleanup#{gen}")
         tel = self.telescope.grant(f"{self.name}/cleanup#{gen}")
         try:
@@ -265,7 +325,7 @@ class Sequencer:
             tel.revoke("cleanup done")
         report.duration = time.monotonic() - t0
         self._event(
-            "cleanup_done",
+            f"{what}_done",
             gen=gen,
             aborted=report.aborted,
             parked=report.parked,

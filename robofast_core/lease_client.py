@@ -20,6 +20,10 @@ that sends a renewal each time the sequencer calls :meth:`RemoteLease.renew`
 -- and only then, so a sequencer that stops renewing still lets the lease
 expire. ``request_open`` itself retries until it gets a lease: a sequencer
 with no supervisor to talk to simply waits, closed.
+
+For startup after a crash, :meth:`RemoteSupervisor.lease_status` and
+:meth:`RemoteSupervisor.recover` are the remote forms of the supervisor's own
+(see :mod:`robofast_core.sequencer`).
 """
 
 from __future__ import annotations
@@ -31,7 +35,7 @@ from typing import Any
 
 import httpx
 
-from robofast_core.safety import OpenLease
+from robofast_core.safety import OpenLease, RecoveryRefused
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +61,7 @@ class RemoteSupervisor:
         self.retry = retry
         self._http = httpx.AsyncClient(base_url=url, trust_env=False)
         self._tasks: set[asyncio.Task] = set()
+        self._tokens: dict[int, str] = {}
 
     async def _call(self, method: str, path: str, wait: float = 0.0, **kw: Any) -> Any:
         r = await self._http.request(method, path, timeout=wait + self.timeout, **kw)
@@ -86,6 +91,38 @@ class RemoteSupervisor:
 
     async def status(self) -> dict[str, Any]:
         return await self._call("GET", "/status")
+
+    async def lease_status(self) -> dict[str, Any] | None:
+        """The outstanding lease's state, or None (retrying through errors)."""
+        while True:
+            try:
+                lease = (await self.status())["lease"]
+            except (httpx.HTTPError, SupervisorAPIError, ValueError, KeyError) as exc:
+                log.warning("no status from %s: %r", self.url, exc)
+                await asyncio.sleep(self.retry)
+                continue
+            if lease is None or lease["released"]:
+                return None
+            self._tokens[lease["id"]] = lease["token"]
+            return lease
+
+    async def recover(self, lease_id: int, holder: str) -> bool:
+        """Release a dead lease of ``holder`` (one :meth:`lease_status` saw).
+
+        True if released now, False if there was nothing to release (already
+        released, or the supervisor restarted since); anything else raises
+        :class:`RecoveryRefused`, meaning "not now".
+        """
+        path = f"/leases/{self._tokens[lease_id]}/recover"
+        try:
+            r = await self._http.post(path, json={"holder": holder}, timeout=self.timeout)
+        except httpx.HTTPError as exc:
+            raise RecoveryRefused(f"supervisor unreachable: {exc!r}") from exc
+        if r.status_code == 404:
+            return False
+        if r.status_code != 200:
+            raise RecoveryRefused(f"HTTP {r.status_code}: {r.text[:200]}")
+        return bool(r.json()["released_now"])
 
     async def aclose(self) -> None:
         """Cancel background work (pending releases get a bounded chance)."""
@@ -154,23 +191,28 @@ class RemoteLease(OpenLease):
         super().renew()
         self._renew_wanted.set()
 
+    def quarantine(self) -> None:
+        super().quarantine()
+        self._client._spawn(self._send("quarantine"), f"lease-{self.token}-quarantine")
+
     def release(self) -> None:
         if self.released.is_set():
             return
         super().release()
         self._stop_workers()
-        self._client._spawn(self._send_release(), f"lease-{self.token}-release")
+        self._client._spawn(self._send("release"), f"lease-{self.token}-release")
 
-    async def _send_release(self, attempts: int = 3) -> None:
+    async def _send(self, action: str, attempts: int = 3) -> None:
         for attempt in range(attempts):
             try:
-                await self._client._call("POST", f"/leases/{self.token}/release")
+                await self._client._call("POST", f"/leases/{self.token}/{action}")
                 return
             except (httpx.HTTPError, SupervisorAPIError, ValueError) as exc:
                 # Harmless if the supervisor is gone or restarted (the lease
-                # died with it); otherwise it grants no new lease until the
-                # release arrives, which fails closed.
-                log.warning("lease %s: release not delivered: %r", self.token, exc)
+                # died with it); otherwise an undelivered release fails closed
+                # (no new lease until it arrives), and an undelivered
+                # quarantine still leaves the lease blocking new ones.
+                log.warning("lease %s: %s not delivered: %r", self.token, action, exc)
                 if isinstance(exc, SupervisorAPIError) and "HTTP 404" in str(exc):
                     return
             if attempt + 1 < attempts:

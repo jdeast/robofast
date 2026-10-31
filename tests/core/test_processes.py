@@ -70,24 +70,26 @@ class Site:
         }
         self.server = FakeAlpacaServer(devices).start()
 
-    def supervisor(self, port: int = 0, tag: str = "supervisor") -> SupervisorProcess:
+    def supervisor(
+        self, port: int = 0, tag: str = "supervisor", **safety: float
+    ) -> SupervisorProcess:
         a = self.server.address
         config = {
             "listen": f"127.0.0.1:{port}",
-            "devices": {"dome": a, "safetymonitor": a, "observingconditions": a},
-            "safety": SAFETY,
+            "devices": {"dome": a, "safetymonitor": a, "observingconditions": a, "telescope": a},
+            "safety": {**SAFETY, **safety},
         }
         proc = SupervisorProcess(config, self.workdir, tag)
         self.services.append(proc)
         return proc
 
-    def sequencer_process(self, url: str) -> Service:
+    def sequencer_process(self, url: str, tag: str = "sequencer") -> Service:
         proc = Service(
             "robofast_core.testing.run_sequencer",
             *("--supervisor", url, "--devices", self.server.address, "--exptime", "30"),
             *("--config", json.dumps(FAST_SEQ)),
             *("--remote", json.dumps(FAST_REMOTE)),
-            log_path=self.workdir / "sequencer.log",
+            log_path=self.workdir / f"{tag}.log",
         )
         self.services.append(proc)
         return proc
@@ -242,3 +244,132 @@ async def test_supervisor_sigterm_closes_before_exiting(site):
     await wait_until(site.safe_state, 5, what="closed, parked, camera idle")
     assert site.dome.watchdog_trips == 0
     assert "supervisor stopping" in seq.timeline.first_event("cancel_requested").detail["reason"]
+
+
+# -- recovery from a sequencer crash --------------------------------------------
+
+
+def _post(url: str, path: str, **body: object) -> httpx.Response:
+    return httpx.post(url + path, json=body, trust_env=False, timeout=5)
+
+
+def _lease(url: str) -> dict:
+    return _get(url, "/status").json()["lease"]
+
+
+def _alarms(url: str) -> list[str]:
+    return _get(url, "/status").json()["alarms"]
+
+
+async def _kill_while_exposing(site: Site, url: str) -> tuple[dict, float]:
+    """Start a sequencer process and SIGKILL it mid-exposure; return its lease."""
+    seq = site.sequencer_process(url, "first")
+    await wait_until(site.observing, 20, what="open and exposing")
+    lease = _lease(url)
+    seq.signal(signal.SIGKILL)
+    return lease, time.monotonic()
+
+
+async def test_restarted_sequencer_recovers(site):
+    """SIGKILL mid-exposure, restarted at once (as systemd would): the new
+    process waits for the old lease to lapse, aborts and parks, recovers the
+    lease once the enclosure is closed, and observes again under a new one."""
+    sup = site.supervisor()
+    old, t0 = await _kill_while_exposing(site, sup.url)
+    second = site.sequencer_process(sup.url, "second")
+    await wait_until(site.closed, SAFETY["lease_ttl"] + MARGIN, what="closed")
+    closed = time.monotonic() - t0
+    # Parked-and-idle lasts only until the new lease, so use the report (and
+    # the supervisor, which grants nothing until it has read AtPark).
+    await wait_until(lambda: second.log_line("startup_cleanup_done"), 5, what="cleanup")
+    safe = time.monotonic() - t0
+    assert "'aborted': True, 'parked': True, 'errors': []" in second.log_line(
+        "startup_cleanup_done"
+    )
+    assert site.cam.exposures_aborted == 1
+    await wait_until(lambda: _lease(sup.url)["id"] != old["id"], 10, what="a new lease")
+    recovered = time.monotonic() - t0
+    await wait_until(site.observing, 10, what="observing again")
+    observing = time.monotonic() - t0
+    new = _lease(sup.url)
+    assert new["id"] == old["id"] + 1 and new["holder"] == old["holder"] == "seq"
+    assert new["live"] and site.cam.exposures_started == 2
+    assert "lease_recovered" in sup.log_path.read_text()
+    print(
+        f"sequencer SIGKILL + restart: closed {closed:.2f} s, cleaned up {safe:.2f} s,"
+        f" new lease {recovered:.2f} s, observing again {observing:.2f} s"
+        f" (lease_ttl {SAFETY['lease_ttl']} s, reopen_hold {SAFETY['reopen_hold']} s)"
+    )
+
+
+async def test_sequencer_sigterm_cleans_up_and_releases(site):
+    """``systemctl stop``: no orphan to recover."""
+    sup = site.supervisor()
+    seq = site.sequencer_process(sup.url)
+    await wait_until(site.observing, 20, what="open and exposing")
+    seq.signal(signal.SIGTERM)
+    assert await asyncio.to_thread(seq.proc.wait, 10) == 0
+    assert _lease(sup.url)["released"]
+    await wait_until(site.safe_state, 2, what="closed, parked, camera idle")
+
+
+async def test_recover_refused_while_live_or_for_another_holder(site):
+    sup = site.supervisor()
+    seq = site.sequencer_process(sup.url)
+    await wait_until(site.observing, 20, what="open and exposing")
+    path = f"/leases/{_lease(sup.url)['token']}/recover"
+    live = _post(sup.url, path, holder="seq")
+    assert live.status_code == 409 and "live" in live.json()["error"]
+    seq.signal(signal.SIGKILL)
+    await wait_until(site.closed, SAFETY["lease_ttl"] + MARGIN, what="closed")
+    other = _post(sup.url, path, holder="other")
+    assert other.status_code == 409 and "belongs to 'seq'" in other.json()["error"]
+    assert _post(sup.url, path, holder="seq").json()["released_now"] is True
+    assert _post(sup.url, path, holder="seq").json()["released_now"] is False  # idempotent
+
+
+async def test_twin_sequencers_race_to_recover(site):
+    """Two restarted processes with the same holder (a deployment error):
+    one recovery, one lease at a time, and observing resumes. (A twin's
+    startup cleanup may still abort the other's first exposure.)"""
+    sup = site.supervisor()
+    old, _ = await _kill_while_exposing(site, sup.url)
+    twins = [site.sequencer_process(sup.url, f"twin{i}") for i in (1, 2)]
+    await wait_until(lambda: _lease(sup.url)["id"] != old["id"], 15, what="a new lease")
+    await wait_until(site.observing, 10, what="observing again")
+    assert sup.log_path.read_text().count("lease_recovered") == 1
+    # > old + 1 when one twin's startup cleanup cut the other's first generation short
+    assert _lease(sup.url)["id"] >= old["id"] + 1
+    assert all(t.proc.poll() is None for t in twins)
+
+
+async def test_orphan_alarm_and_operator_clear(site):
+    """Not restarted: the supervisor alarms after orphan_timeout and stays
+    closed; an operator clears the lease, and still nothing is granted until
+    the telescope is parked."""
+    orphan_timeout = 1.0
+    sup = site.supervisor(orphan_timeout=orphan_timeout)
+    old, t0 = await _kill_while_exposing(site, sup.url)
+    await wait_until(
+        lambda: any("orphaned" in a for a in _alarms(sup.url)),
+        SAFETY["lease_ttl"] + orphan_timeout + MARGIN,
+        what="orphan alarm",
+    )
+    alarmed = time.monotonic() - t0
+    assert site.closed() and not site.tel.AtPark
+    path = f"/leases/{old['token']}/clear"
+    assert _post(sup.url, path, operator=" ", reason="x").status_code == 400
+    r = _post(sup.url, path, operator="jde", reason="sequencer host down")
+    assert r.status_code == 200 and r.json()["released_now"] is True
+    assert "cleared by jde: sequencer host down" in sup.log_path.read_text()
+    assert _get(sup.url, "/status").json()["orphaned_for"] is None
+    refused = _post(sup.url, "/leases", holder="x", wait=0.5).json()
+    assert refused == {"granted": False}  # the telescope is still unparked
+    assert any("telescope not parked" in a for a in _alarms(sup.url))
+    site.tel.Park()
+    granted = _post(sup.url, "/leases", holder="x", wait=2).json()
+    assert granted["granted"] and granted["lease"]["id"] == old["id"] + 1
+    print(
+        f"orphan alarm {alarmed:.2f} s after SIGKILL"
+        f" (lease_ttl {SAFETY['lease_ttl']} s, orphan_timeout {orphan_timeout} s)"
+    )

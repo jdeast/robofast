@@ -23,13 +23,16 @@ with a config like (device addresses are Alpaca ``host:port``, optionally
                  "heartbeat_interval": 2}
     }
 
-``observingconditions``, ``telescope`` (needed for ``park_before_close``) and
-``heartbeat`` are optional; with ``heartbeat_interval`` set and no
+``observingconditions``, ``telescope`` (needed for ``park_before_close``; when
+present, no lease is granted unless it reports ``AtPark``) and ``heartbeat``
+are optional; with ``heartbeat_interval`` set and no
 ``heartbeat`` entry, the pings go to the dome itself (the normal case; see
 :mod:`robofast_core.heartbeat_watchdog`). The process prints one JSON line,
 ``{"url": ..., "epoch": ...}``, on stdout once it is listening, logs to
 stderr, and on SIGTERM or SIGINT revokes the lease and closes before it
-exits. Run it under systemd (``Restart=always``); it starts closed.
+exits. Run it under systemd (``Restart=always``; ``deploy/`` has an example
+unit); it starts closed. ``timeline_size`` (default 10000) bounds the
+in-memory record of commands and events.
 
 Sequencers use it through :class:`robofast_core.lease_client.RemoteSupervisor`.
 
@@ -48,9 +51,19 @@ is random per process start, so after a restart every old token is unknown
   for it to open (if not yet open) or to be revoked or released.
 * ``POST /leases/{token}/renew`` -- 200 with the state, or 410 if revoked.
 * ``POST /leases/{token}/release``.
+* ``POST /leases/{token}/quarantine`` -- the holder keeps the lease on
+  purpose (its task ignored cancellation); only ``clear`` releases it.
+* ``POST /leases/{token}/recover`` ``{"holder"}`` -- a restarted sequencer
+  releases its crashed predecessor's lease, after cleaning up (see
+  :mod:`robofast_core.safety`). 409 if the lease is live, quarantined,
+  another holder's, or the enclosure is not confirmed closed yet.
+* ``POST /leases/{token}/clear`` ``{"operator", "reason"}`` -- the same, for
+  an operator who has made the telescope safe; logged.
 
-A lease's state is ``{"token", "id", "holder", "ttl", "live", "opened",
-"revoked", "reason", "released"}``. There is no authentication: like Alpaca,
+``recover`` and ``clear`` are idempotent: they answer 200 with
+``"released_now"`` true or false. A lease's state is ``{"token", "id",
+"holder", "ttl", "live", "opened", "revoked", "reason", "released",
+"quarantined"}``; ``GET /status`` shows the latest one. There is no authentication: like Alpaca,
 this stays on the isolated control network.
 """
 
@@ -67,27 +80,25 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from robofast_core.alpaca import alpaca_owner
-from robofast_core.safety import ENCLOSURE_MEMBERS, OpenLease, SafetyConfig, SafetySupervisor
+from robofast_core.safety import (
+    ENCLOSURE_MEMBERS,
+    OpenLease,
+    RecoveryRefused,
+    SafetyConfig,
+    SafetySupervisor,
+)
 from robofast_core.timeline import Timeline
 
 log = logging.getLogger(__name__)
 
 #: The longest a single long-poll may wait (s).
 MAX_WAIT = 30.0
+#: Released leases kept for lookups (older tokens answer 404).
+KEEP_LEASES = 100
 
 
 def lease_state(lease: OpenLease, token: str) -> dict[str, Any]:
-    return {
-        "token": token,
-        "id": lease.id,
-        "holder": lease.holder,
-        "ttl": lease.ttl,
-        "live": lease.live,
-        "opened": lease.opened.is_set(),
-        "revoked": lease.revoked.is_set(),
-        "reason": lease.revoke_reason,
-        "released": lease.released.is_set(),
-    }
+    return {"token": token, **lease.state()}
 
 
 class _Error(Exception):
@@ -177,12 +188,28 @@ class SupervisorServer:
                     self.supervisor.timeline.event(
                         self.supervisor.name, "lease_released", lease=lease.id
                     )
+                elif method == "POST" and action == "quarantine":
+                    lease.quarantine()
+                    self.supervisor.timeline.event(
+                        self.supervisor.name, "lease_quarantined", lease=lease.id
+                    )
+                elif method == "POST" and action == "recover":
+                    now = await self.supervisor.recover(lease.id, str(args["holder"]))
+                    return 200, {**lease_state(lease, token), "released_now": now}
+                elif method == "POST" and action == "clear":
+                    operator = str(args["operator"]).strip()
+                    if not operator:
+                        raise _Error(400, "clear needs an operator name")
+                    now = await self.supervisor.clear(lease.id, operator, str(args["reason"]))
+                    return 200, {**lease_state(lease, token), "released_now": now}
                 else:
                     raise _Error(404, f"no {method} {url.path}")
                 return 200, lease_state(lease, token)
             raise _Error(404, f"no {method} {url.path}")
         except _Error as exc:
             return exc.status, {"error": str(exc)}
+        except RecoveryRefused as exc:
+            return 409, {"error": str(exc)}
         except (ValueError, TypeError, KeyError) as exc:
             return 400, {"error": f"bad request: {exc!r}"}
 
@@ -209,6 +236,9 @@ class SupervisorServer:
         except TimeoutError:
             return {"granted": False}
         self._leases[lease.id] = (lease, request)
+        for old in sorted(self._leases)[:-KEEP_LEASES]:
+            if self._leases[old][0].released.is_set():
+                del self._leases[old]
         return {"granted": True, "lease": lease_state(lease, self._token(lease))}
 
     async def _wait_change(self, lease: OpenLease, wait: float) -> None:
@@ -272,7 +302,7 @@ def build(config: dict[str, Any], timeline: Timeline) -> SafetySupervisor:
 
 
 async def serve(config: dict[str, Any]) -> None:
-    supervisor = build(config, Timeline())
+    supervisor = build(config, Timeline(maxlen=config.get("timeline_size", 10000)))
     host, _, port = config.get("listen", "127.0.0.1:8100").rpartition(":")
     server = await SupervisorServer(supervisor, host, int(port)).start()
     task = asyncio.current_task()

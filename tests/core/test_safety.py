@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import time
 
+import pytest
+
+from robofast_core.safety import RecoveryRefused
 from robofast_core.testing.checks import wait_until
 
 
@@ -133,9 +136,9 @@ async def test_sequencer_cannot_command_the_dome(make_rig):
 async def test_roll_off_parks_before_closing(make_rig):
     """park_before_close: with no sequencer to park, safety parks, then closes."""
     rig = make_rig(safety=dict(park_before_close=True, park_wait=1.0))
-    rig.tel.Unpark()
     await rig.start(sequencer=False)
     lease = await _open(rig)
+    rig.tel.Unpark()  # a lease is granted only on a parked telescope
     rig.weather.set_safe(False)
     await wait_until(rig.dome_closed, 3)
     assert rig.parked()
@@ -145,3 +148,51 @@ async def test_roll_off_parks_before_closing(make_rig):
     assert any(e.what == "Park" for e in park)
     assert min(e.t for e in park if e.what == "Park") < min(close_t)
     lease.release()
+
+
+async def test_recover_only_a_dead_lease_of_the_holder_once_closed(make_rig):
+    rig = make_rig()
+    await rig.start(sequencer=False)
+    sup = rig.supervisor
+    lease = await _open(rig, "seq")  # and never renewed: its holder "crashed"
+
+    async def refused(lease_id: int, holder: str, why: str) -> None:
+        with pytest.raises(RecoveryRefused, match=why):
+            await sup.recover(lease_id, holder)
+
+    await refused(lease.id, "seq", "live")
+    rig.dome.hang()  # the close cannot be confirmed
+    await wait_until(lease.revoked.is_set, 2, what="lease expired")
+    await refused(lease.id, "seq", "not confirmed closed")
+    rig.dome.unhang()
+    await wait_until(rig.dome_closed, 3, what="closed")
+    await refused(lease.id, "other", "belongs to 'seq'")
+    await refused(lease.id + 1, "seq", "no lease")
+    lease.quarantine()
+    await refused(lease.id, "seq", "quarantined")
+    assert await sup.clear(lease.id, "operator", "checked the telescope") is True
+    assert await sup.recover(lease.id, "seq") is False  # idempotent
+    assert sup.outstanding() is None
+    assert rig.timeline.first_event("lease_cleared").detail["operator"] == "operator"
+
+
+async def test_concurrent_recovers_release_once(make_rig):
+    rig = make_rig()
+    await rig.start(sequencer=False)
+    lease = await _open(rig, "seq")
+    await wait_until(lease.revoked.is_set, 2, what="lease expired")
+    await wait_until(rig.dome_closed, 3, what="closed")
+    results = await asyncio.gather(*(rig.supervisor.recover(lease.id, "seq") for _ in range(3)))
+    assert sorted(results) == [False, False, True]
+    assert len(rig.timeline.events("lease_recovered")) == 1
+
+
+async def test_orphaned_lease_alarms_and_stays_closed(make_rig):
+    rig = make_rig(safety=dict(orphan_timeout=0.5))
+    await rig.start(sequencer=False)
+    lease = await _open(rig, "seq")  # never renewed, never released
+    await wait_until(lambda: any("orphaned" in a for a in rig.supervisor.alarms), 3)
+    alarm = next(e for e in rig.timeline.events("alarm") if "orphaned" in e.detail["msg"])
+    assert lease.revoked_at is not None and alarm.t - lease.revoked_at >= 0.5
+    assert rig.dome_closed() and not lease.released.is_set()
+    assert rig.supervisor.status()["orphaned_for"] >= 0.5

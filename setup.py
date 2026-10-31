@@ -93,7 +93,7 @@ setup(
         'Topic :: Scientific/Engineering',
 
         # Pick your license as you wish
-        'License :: OSI Approved :: Apache Software License',
+        'License :: OSI Approved :: BSD License',
 
         # Specify the Python versions you support here. In particular, ensure
         # that you indicate you support Python 3. These classifiers are *not*

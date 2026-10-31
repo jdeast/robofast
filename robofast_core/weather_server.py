@@ -1,11 +1,22 @@
 """A small Alpaca SafetyMonitor + ObservingConditions server.
 
-This is the shape the real site-weather bridge will take: something scrapes
-or receives the site's weather and calls :meth:`WeatherState.update`; Alpaca
-clients read ``IsSafe`` and ``TimeSinceLastUpdate``. The server is itself
-fail-closed: ``IsSafe`` is False if no update has arrived within
-``stale_after`` seconds (set it to ``None`` to disable that, which tests do
-to exercise the supervisor's own staleness check).
+The site weather bridge (:mod:`robofast_core.weather_bridge`) evaluates the
+site's real feeds and calls :meth:`WeatherState.publish`; tests and the
+standalone server call :meth:`WeatherState.update`. Alpaca clients read
+``IsSafe``, the ObservingConditions members and ``TimeSinceLastUpdate``. The
+server is itself fail-closed: ``IsSafe`` is False if no update has arrived
+within ``stale_after`` seconds (set it to ``None`` to disable that, which
+tests do to exercise the supervisor's own staleness check).
+
+ObservingConditions: a member the publisher does not provide is
+``NotImplemented``; one it provides but cannot currently measure (stale or
+missing data) answers a DriverException (0x500), never an old value.
+``TimeSinceLastUpdate("")`` is the time since the last publish (the bridge's
+liveness); ``TimeSinceLastUpdate("Humidity")`` etc. is the age of that
+sensor's own data. ``SensorDescription`` names each sensor's source.
+
+The reasons behind the verdict are served as JSON by ``GET /weather/status``
+and by the SafetyMonitor's ``Action("WeatherStatus")``.
 
 For tests it adds fault injection (:meth:`WeatherState.set_mode`):
 ``"ok"``, ``"error"`` (HTTP 500 on every device request) and ``"hang"``
@@ -36,6 +47,14 @@ log = logging.getLogger(__name__)
 
 NOT_IMPLEMENTED = 0x400
 INVALID_VALUE = 0x401
+ACTION_NOT_IMPLEMENTED = 0x40C
+DRIVER_ERROR = 0x500
+
+
+class _AlpacaFault(Exception):
+    def __init__(self, number: int, message: str) -> None:
+        super().__init__(message)
+        self.number = number
 
 
 class WeatherState:
@@ -47,13 +66,19 @@ class WeatherState:
         self.last_update = time.monotonic()
         self.mode = "ok"
         self.connected = False
-        self.conditions: dict[str, float] = {
+        self.conditions: dict[str, float | None] = {
             "cloudcover": 0.0,
             "humidity": 30.0,
             "rainrate": 0.0,
             "temperature": 10.0,
             "windspeed": 2.0,
         }
+        #: member -> wall-clock (Unix) time its data was measured.
+        self.sensor_times: dict[str, float] = {}
+        #: member -> SensorDescription.
+        self.descriptions: dict[str, str] = {}
+        #: The publisher's latest status (reasons, readings), served as JSON.
+        self.status: dict[str, Any] = {"note": "no weather bridge attached"}
         self._feed_stop: threading.Event | None = None
         self._feed_thread: threading.Thread | None = None
 
@@ -66,6 +91,42 @@ class WeatherState:
                 self.safe = bool(safe)
             self.conditions.update(conditions)
             self.last_update = time.monotonic()
+
+    def publish(
+        self,
+        *,
+        safe: bool,
+        conditions: dict[str, float | None],
+        sensor_times: dict[str, float] | None = None,
+        descriptions: dict[str, str] | None = None,
+        status: dict[str, Any] | None = None,
+    ) -> None:
+        """Replace everything with a new evaluation (the weather bridge's path).
+
+        ``conditions`` keys are lower-case ObservingConditions members; a
+        ``None`` value means "provided, but no valid current reading".
+        """
+        with self._lock:
+            self.safe = bool(safe)
+            self.conditions = dict(conditions)
+            self.sensor_times = dict(sensor_times or {})
+            self.descriptions = dict(descriptions or {})
+            if status is not None:
+                self.status = status
+            self.last_update = time.monotonic()
+
+    def sensor_age(self, sensor: str) -> float:
+        """TimeSinceLastUpdate for one sensor (lower-case member name)."""
+        with self._lock:
+            if sensor not in self.conditions:
+                raise NotImplementedError
+            if self.conditions[sensor] is None or sensor not in self.sensor_times:
+                raise _AlpacaFault(DRIVER_ERROR, f"{sensor}: no current reading")
+            return max(0.0, time.time() - self.sensor_times[sensor])
+
+    def status_json(self) -> str:
+        with self._lock:
+            return json.dumps(self.status)
 
     def age(self) -> float:
         with self._lock:
@@ -170,6 +231,9 @@ class _Handler(BaseHTTPRequestHandler):
         if parts[:1] == ["control"] and self.command == "PUT" and len(parts) == 2:
             self._control(parts[1], params.get("value", ""))
             return
+        if parts == ["weather", "status"] and self.command == "GET":
+            self._send(200, json.loads(state.status_json()))
+            return
         if parts[:1] == ["management"]:
             self._send(200, _alpaca(self._management(parts), ctid=ctid, stid=stid))
             return
@@ -197,6 +261,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         except ValueError as exc:
             self._send(200, _alpaca(ctid=ctid, stid=stid, err=INVALID_VALUE, msg=str(exc)))
+            return
+        except _AlpacaFault as exc:
+            self._send(200, _alpaca(ctid=ctid, stid=stid, err=exc.number, msg=str(exc)))
             return
         self._send(200, _alpaca(value, ctid=ctid, stid=stid))
 
@@ -249,7 +316,7 @@ class _Handler(BaseHTTPRequestHandler):
             "driverinfo": "robofast_core.weather_server",
             "driverversion": "0.0.1",
             "interfaceversion": 3 if device == "safetymonitor" else 2,
-            "supportedactions": [],
+            "supportedactions": ["WeatherStatus"],
             "connecting": False,
         }
         if self.command == "PUT":
@@ -258,6 +325,18 @@ class _Handler(BaseHTTPRequestHandler):
                 return None
             if member in ("connect", "disconnect"):
                 state.connected = member == "connect"
+                return None
+            if member == "action":
+                if params.get("action", "").lower() != "weatherstatus":
+                    raise _AlpacaFault(
+                        ACTION_NOT_IMPLEMENTED, f"action {params.get('action')!r} not supported"
+                    )
+                return state.status_json()
+            if device == "observingconditions" and member == "refresh":
+                return None
+            if device == "observingconditions" and member == "averageperiod":
+                if float(params.get("averageperiod", "nan")) != 0.0:
+                    raise ValueError("only AveragePeriod 0 (instantaneous) is supported")
                 return None
             raise NotImplementedError
         if member == "connected":
@@ -272,13 +351,20 @@ class _Handler(BaseHTTPRequestHandler):
             raise NotImplementedError
         # observingconditions
         if member == "timesincelastupdate":
-            return state.age()
+            sensor = params.get("sensorname", "").lower()
+            return state.age() if not sensor else state.sensor_age(sensor)
+        if member == "sensordescription":
+            sensor = params.get("sensorname", "").lower()
+            if sensor not in state.conditions:
+                raise NotImplementedError
+            return state.descriptions.get(sensor, sensor)
         if member == "averageperiod":
             return 0.0
-        if member == "refresh":
-            return None
         if member in state.conditions:
-            return state.conditions[member]
+            value = state.conditions[member]
+            if value is None:
+                raise _AlpacaFault(DRIVER_ERROR, f"{member}: no current reading")
+            return value
         raise NotImplementedError
 
 

@@ -8,3 +8,5 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+# Weather-page credentials live outside the repository; never commit any.
+*.credentials

@@ -243,8 +243,8 @@ model.
 ### 3.10 Configuration
 
 Per-site YAML: which Alpaca endpoint each device is, enclosure membership,
-timeouts, limits, and policies. A new site is a new config directory plus any
-device servers it needs.
+timeouts, limits, and policies (the first is `sites/minerva/weather.yaml`).
+A new site is a new config directory plus any device servers it needs.
 
 ## 4. Windows control PCs
 
@@ -316,7 +316,9 @@ Each step is a CI-tested deliverable.
 2. Own asyncio Alpaca client; drop alpyca.
 3. Supervisor as its own process, with a heartbeat device and the
    "supervisor dies" scenario.
-4. Site weather bridge (Alpaca SafetyMonitor + ObservingConditions) for
+4. Site weather bridge (built; `docs/weather_bridge.md`; to be compared
+   with the legacy system in its shadow mode). Alpaca SafetyMonitor +
+   ObservingConditions for
    MINERVA's real feeds.
 5. Aqawan enclosure Alpaca server with a simulator mode, passing ConformU.
 6. Windows bridge on one control PC: ASCOM Remote for the camera and PWI4;

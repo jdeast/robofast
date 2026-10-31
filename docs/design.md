@@ -105,6 +105,13 @@ their good ideas instead (section 9).
   midpoint, and gives the sequencer's cleanup a bounded abort that never
   raises. Like the Aqawan server, it refuses a non-loopback PC without
   `allow_hardware` in the config and `--hardware`.
+- **The guider** (`robofast_core/guider/`, `docs/guider.md`) is one such
+  service per guide camera, run on the computer the camera is plugged into
+  so frames never cross the network in the loop: camera, centroider,
+  PI(D) controller, a measured device-to-pixel calibration, and a
+  tip/tilt (Starlight Xpress AO, PI E-518) or mount offsets, with
+  offloading to the mount and fiber acquisition. Every real backend is
+  behind the same `allow_hardware` + `--hardware` gate.
 - Vendor extras that Alpaca lacks (PWI4 M3 port selection, fans, pointing
   models) use Alpaca `Action()` or a typed side channel per device client.
 - **robofast ships its own small asyncio Alpaca client.** alpyca serializes
@@ -257,6 +264,15 @@ after a restart), then runs the night. The dispatch scheduler ends the
 night once the Sun is above its `max_sun_alt` and rising; on that clean
 exit `deploy/robofast-calibrations@.service` takes the morning
 calibrations.
+
+**Guiding.** An observation with `guide` (a request configuration's
+`"guide": true`) starts the telescope's guider once on target, which must
+reach `guiding` within its acquisition timeout; each exposure first checks
+that the guider has not failed; the observation's end stops it. Cleanup
+and a telescope's error path stop the guider *before* aborting the slew
+and parking. A guider failure is that telescope's ordinary error. The
+guider is a separate service reached over HTTP (section 3.1,
+`docs/guider.md`); per telescope, `guider` in the enclosure config.
 
 **Saving frames.** With an `images` entry in the enclosure config, every
 frame is saved (`robofast_core/imaging.py`, `docs/data.md`). The image is
@@ -529,7 +545,10 @@ broker outage costs only ToOs, never the night.
   measurement time, maximum age, unit and FITS keyword. Publishers: the
   frame pipeline reads the telescope, focuser, rotator and filter at each
   exposure start and the camera at each exposure end, through the
-  generation's own grants, so the fence covers those reads. A background
+  generation's own grants, so the fence covers those reads. While a
+  telescope guides, its guider's state, residual, flux, FWHM, rate,
+  latency, fiber pixel and tip/tilt position are copied in as
+  `<telescope>.guide_*` (GUIDSTAT, GUIDRMS, ...). A background
   task reads the weather bridge's ObservingConditions (read-only), the
   shutter and weather verdict from the supervisor's status, and the Sun
   and Moon (astropy). The site and the software version (`git describe`)
@@ -719,6 +738,12 @@ Each step is a CI-tested deliverable.
     full-frame download over ASCOM Remote on a control PC (step 6), the
     plate scales and position angles of each telescope, and a guider/FAU
     image path.
+14. Guider (built, simulators only; `docs/guider.md`): a generic guide
+    service next to the camera, with SX AO, PI E-518 and mount-offset
+    backends and their simulators, measured calibrations, offloading, fiber
+    acquisition, and the sequencer hook. Next: the ZWO backend on a real
+    FAU camera, then T2's AO unit commissioned (attended, with JDE's
+    approval), then the TRES front end (an Andor Zyla backend).
 
 ## 9. Borrowed ideas
 

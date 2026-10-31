@@ -258,6 +258,20 @@ night once the Sun is above its `max_sun_alt` and rising; on that clean
 exit `deploy/robofast-calibrations@.service` takes the morning
 calibrations.
 
+**Saving frames.** With an `images` entry in the enclosure config, every
+frame is saved (`robofast_core/imaging.py`, `docs/data.md`). The image is
+downloaded right after `ImageReady`, by the Alpaca ImageBytes transfer with
+JSON as the fallback, with a timeout sized by the image. This happens in
+the telescope's task and under its generation grant, because the camera
+holds only one image and the next exposure discards it. A `now-after-readout`
+preemption therefore waits for the download as well. Building the header and
+writing the FITS file run in a bounded background task per telescope, which
+overlaps the next exposure; if the writer falls `queue_size` frames behind,
+the next exposure waits. An observation is reported `complete` only once its
+frames are on disk, with their paths, so the request API's data endpoint
+returns real files. If a write fails, the pipeline raises an alarm and that
+telescope gives up for the night. Frames are never dropped silently.
+
 **Entry point.** `python -m robofast_core.sequencer_service --config
 <enclosure.json>` builds the owners, the lease client and the plan from the
 enclosure's config file, which the supervisor service reads too
@@ -509,7 +523,23 @@ broker outage costs only ToOs, never the night.
 - Published state carries the time it was measured and a maximum age;
   consumers treat expired state as unknown (pyobs).
 - A value registry collects device state for status pages and FITS headers
-  (RTS2).
+  (RTS2; `robofast_core/registry.py`). Values are named `<scope>.<name>`,
+  where the scope is a telescope (`t1.ccd_temp`) or shared (`site`,
+  `software`, `weather`, `enclosure`, `sky`). Each value carries its
+  measurement time, maximum age, unit and FITS keyword. Publishers: the
+  frame pipeline reads the telescope, focuser, rotator and filter at each
+  exposure start and the camera at each exposure end, through the
+  generation's own grants, so the fence covers those reads. A background
+  task reads the weather bridge's ObservingConditions (read-only), the
+  shutter and weather verdict from the supervisor's status, and the Sun
+  and Moon (astropy). The site and the software version (`git describe`)
+  are static. The header builder snapshots the registry at exposure start
+  and end. A value past its maximum age, or one whose last read failed, is
+  written undefined and marked `STALE` with its old value, never as
+  current. The sequencer's status snapshot includes the registry.
+- Frames are saved by the sequencer itself (section 3.4, `docs/data.md`):
+  atomic, never overwritten, checksummed, UTC from the camera, and a
+  lost frame stops its telescope with an alarm.
 - Alarms (email or chat) for: quarantine, give-up, shutter not reaching the
   commanded state, safety supervisor or heartbeat failures.
 - Status and control go through the APIs, never through files, with one
@@ -563,7 +593,9 @@ support is often worse. So:
 - **Fast tier:** pure-Python fakes and an in-process weather server; unit
   tests plus the scenario suite. Python 3.12-3.14.
 - **Simulator tier:** the same scenarios against the official ASCOM
-  OmniSimulators (pinned, checksum-verified).
+  OmniSimulators (pinned, checksum-verified), plus a real FITS frame
+  written from OmniSim's camera and read back, and the full-frame download
+  time in both transfer modes (published with the other timings).
 - **Conformance:** ConformU against every Alpaca server robofast ships.
 - **Scenario suite** (grows with each bug found in the field): weather unsafe
   mid-exposure; feed erroring, hanging, or frozen at "safe"; recovery and
@@ -616,6 +648,13 @@ support is often worse. So:
 | `idle_poll` | 60 s | with nothing observable, ask again this often |
 | `too_poll` | 10 s | re-check waiting ToOs and the drop box this often |
 | `reserve_timeout` | 60 s | a ToO is held for the telescope it preempted this long |
+| `images.queue_size` | 4 | frames per telescope waiting to be written before the next exposure waits (`docs/data.md`) |
+| `images.imagebytes` | on | camera images by the Alpaca ImageBytes transfer (JSON fallback) |
+| `images.download_timeout_base`, `download_min_rate` | 30 s, 2 MB/s | image download timeout: base + generous size / rate |
+| `images.pointing_max_age`, `camera_max_age` | 60 s, 60 s | telescope and camera values go stale in headers after this |
+| `images.weather_max_age` | 300 s | a weather value older than this is written as stale |
+| `images.flush_timeout` | 120 s | bound on waiting for a telescope's frames to be written |
+| `images.compress` | off | Rice-compress integer frames (`.fits.fz`) |
 
 ## 7. Open decisions
 
@@ -673,6 +712,13 @@ Each step is a CI-tested deliverable.
     and open questions in `docs/tcsgo.md`). Next: answers to those
     questions, a TRES camera/spectrograph service, then a supervised
     test on the real TCS.
+13. **Done:** the sequencer saves its frames (section 3.4, `docs/data.md`):
+    ImageBytes download, the value registry (section 3.8), the FITS header
+    builder and an atomic, never-overwriting writer with a nightly index;
+    real file paths in the request API's data pointers. Next: measure
+    full-frame download over ASCOM Remote on a control PC (step 6), the
+    plate scales and position angles of each telescope, and a guider/FAU
+    image path.
 
 ## 9. Borrowed ideas
 

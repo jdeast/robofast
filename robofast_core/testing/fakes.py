@@ -22,7 +22,12 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from datetime import UTC, datetime
 from typing import Any
+
+import numpy as np
+
+from robofast_core.imagebytes import ImageArray
 
 
 class FakeDeviceError(Exception):
@@ -170,6 +175,18 @@ class FakeTelescope(FakeDevice):
         self.SiteLatitude = 31.68
         self.ra = 0.0
         self.dec = 0.0
+        #: ASCOM EquatorialSystem: 2 = J2000.
+        self.EquatorialSystem = 2
+        self.Altitude = 60.0
+        self.Azimuth = 120.0
+
+    @property
+    def RightAscension(self) -> float:
+        return self.ra
+
+    @property
+    def Declination(self) -> float:
+        return self.dec
 
     @property
     def AtPark(self) -> bool:
@@ -226,6 +243,13 @@ class FakeTelescope(FakeDevice):
         return ""
 
 
+class FakeFocuser(FakeDevice):
+    def __init__(self, position: int = 12345, temperature: float = 8.5) -> None:
+        super().__init__()
+        self.Position = position
+        self.Temperature = temperature
+
+
 class FakeFilterWheel(FakeDevice):
     """A filter wheel that takes ``move_time`` seconds per move; ``Position``
     reads -1 while it moves (as the ASCOM interface says)."""
@@ -252,13 +276,55 @@ class FakeFilterWheel(FakeDevice):
 
 
 class FakeCamera(FakeDevice):
-    def __init__(self) -> None:
+    """A camera whose image is ``NumX x NumY`` UInt16 pixels (value: the
+    exposure number), with the state members the frame pipeline reads.
+    ``image_error`` makes ``ImageArray`` raise; ``download_time`` delays it."""
+
+    def __init__(self, numx: int = 32, numy: int = 24) -> None:
         super().__init__()
         self._state = 0
         self._ends = 0.0
         self._ready = False
         self.exposures_started = 0
         self.exposures_aborted = 0
+        self.Name = "FakeCamera"
+        self.SensorName = "FakeSensor"
+        self.CameraXSize, self.CameraYSize = numx, numy
+        self.NumX, self.NumY = numx, numy
+        self.StartX = self.StartY = 0
+        self.BinX = self.BinY = 1
+        self.PixelSizeX = self.PixelSizeY = 9.0
+        self.ElectronsPerADU = 1.5
+        self.MaxADU = 65535
+        self.ReadoutModes = ["Normal", "Fast"]
+        self.ReadoutMode = 0
+        self.CCDTemperature = -20.0
+        self.SetCCDTemperature = -20.0
+        self.CoolerOn = True
+        self.CoolerPower = 40.0
+        self.Gain = 1
+        self.Offset = 10
+        self.LastExposureStartTime: str | None = None
+        self.LastExposureDuration: float | None = None
+        self.image_error: str | None = None
+        self.download_time = 0.0
+        self.downloads = 0
+
+    @property
+    def ImageArray(self) -> ImageArray:
+        if self.image_error is not None:
+            raise FakeDeviceError(self.image_error)
+        if not self._ready:
+            raise FakeDeviceError("no image available")
+        self.downloads += 1
+        data = np.full((self.NumX, self.NumY), self.exposures_started, dtype="<u2")
+        data[self.NumX - 1, 0] = 1000  # x = last, y = 0: FITS row 0, last column
+        return ImageArray(data, 8, "imagebytes", data.nbytes + 44)
+
+    async def get(self, member: str, *, timeout: float | None = None) -> Any:
+        if member == "ImageArray" and self.download_time:
+            await asyncio.sleep(self.download_time)
+        return await super().get(member, timeout=timeout)
 
     def _update(self) -> None:
         if self._state == 2 and self._now() >= self._ends:
@@ -283,6 +349,9 @@ class FakeCamera(FakeDevice):
         self._ready = False
         self._ends = self._now() + duration
         self.exposures_started += 1
+        start = datetime.now(UTC)
+        self.LastExposureStartTime = start.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+        self.LastExposureDuration = float(duration)
 
     def AbortExposure(self) -> None:
         self._update()
@@ -344,6 +413,8 @@ class FakeObservingConditions(FakeDevice):
     def __init__(self, weather: FakeWeather) -> None:
         super().__init__()
         self._weather = weather
+        self.Humidity = 30.0
+        self.Temperature = 11.5
 
     def TimeSinceLastUpdate(self, sensor: str) -> float:
         return self._weather.age()

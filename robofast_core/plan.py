@@ -31,7 +31,12 @@ service use when present:
   answer as that telescope's next observation.
 * ``set_preempt_callback(fn)`` -- the sequencer passes its ``preempt``;
 * ``async serve()`` -- a background task run alongside the sequencer (the
-  dispatch scheduler's ToO intake).
+  dispatch scheduler's ToO intake);
+* a ``files`` keyword on ``report`` -- with the sequencer's frame pipeline
+  (:mod:`robofast_core.imaging`) on, the sequencer passes the observation's
+  written frames as paths relative to the data root (a ``complete`` report
+  only after they are all on disk). Plans whose ``report`` lacks it are
+  called without it.
 
 :func:`plan_from_config` builds any of them from a config entry (see
 :mod:`robofast_core.sequencer_service`).
@@ -78,6 +83,9 @@ class Observation:
     #: If it is interrupted or fails part-way, only the frames not yet taken
     #: are re-taken (otherwise the whole observation is).
     allow_partial: bool = False
+    #: The target's name for FITS ``OBJECT`` and file names (``name`` if None;
+    #: the dispatch scheduler's names carry request ids as well).
+    object: str | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Observation:
@@ -120,7 +128,8 @@ class PlanProvider(Protocol):
 
     def report(self, telescope: str, obs: Observation, outcome: str, frames: int) -> None:
         """How ``obs`` ended on ``telescope`` (one of :data:`OUTCOMES`), and
-        how many of its frames were taken."""
+        how many of its frames were taken. (Optionally also ``files=``: see
+        the module doc.)"""
         ...
 
 
@@ -134,6 +143,8 @@ class _Queues:
     def __init__(self, queues: dict[str, Iterable[Observation]]) -> None:
         self.queues = {tel: deque(obs) for tel, obs in queues.items()}
         self.history: list[tuple[str, str, str, int]] = []
+        #: Frames written per report that had any: (telescope, name, paths).
+        self.files: list[tuple[str, str, list[str]]] = []
 
     async def next_observation(self, telescope: str) -> Observation | None:
         queue = self.queues.get(telescope)
@@ -143,8 +154,17 @@ class _Queues:
         queue = self.queues.get(telescope)
         return queue[0] if queue else None
 
-    def report(self, telescope: str, obs: Observation, outcome: str, frames: int) -> None:
+    def report(
+        self,
+        telescope: str,
+        obs: Observation,
+        outcome: str,
+        frames: int,
+        files: list[str] | None = None,
+    ) -> None:
         self.history.append((telescope, obs.name, outcome, frames))
+        if files:
+            self.files.append((telescope, obs.name, list(files)))
         if outcome != "complete":
             if obs.allow_partial and 0 < frames < obs.count:
                 obs = replace(obs, count=obs.count - frames)
@@ -200,12 +220,22 @@ class CallablePlan:
         self._fn = fn
         self._takes_telescope = bool(inspect.signature(fn).parameters)
         self.history: list[tuple[str, str, str, int]] = []
+        self.files: list[tuple[str, str, list[str]]] = []
 
     async def next_observation(self, telescope: str) -> Observation | None:
         return self._fn(telescope) if self._takes_telescope else self._fn()
 
-    def report(self, telescope: str, obs: Observation, outcome: str, frames: int) -> None:
+    def report(
+        self,
+        telescope: str,
+        obs: Observation,
+        outcome: str,
+        frames: int,
+        files: list[str] | None = None,
+    ) -> None:
         self.history.append((telescope, obs.name, outcome, frames))
+        if files:
+            self.files.append((telescope, obs.name, list(files)))
 
 
 def as_plan(plan: PlanProvider | Callable[..., Observation | None]) -> PlanProvider:

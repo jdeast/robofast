@@ -124,6 +124,19 @@ by ``filter_timeout``); the port is selected with the telescope's Alpaca
 that telescope), so nothing is ever observed through the wrong filter or
 port.
 
+Saving images
+-------------
+With an :class:`~robofast_core.imaging.Imaging` (``imaging=``), every frame
+is saved: telescope telemetry is read into the value registry right after
+``StartExposure``; once ``ImageReady``, the camera's state is read and the
+image downloaded (still counted as "exposing", so a ``now-after-readout``
+preemption waits for the download too), then queued for the telescope's
+background writer, which overlaps the next exposure. An observation is
+reported ``complete`` only once its frames are on disk, with their paths
+(the plan's ``report(..., files=...)``). If a frame cannot be written, that
+telescope gives up for the night (an alarm); the others observe on. See
+:mod:`robofast_core.imaging`.
+
 Starting up after a crash
 -------------------------
 The sequencer's ``name`` is its lease holder identity: stable across
@@ -150,12 +163,15 @@ means the twins take turns, each generation ending with its own cleanup.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from robofast_core.imaging import FrameWriteFailed, Imaging, PendingFrame
 from robofast_core.owner import DeviceError, DeviceOwner, Grant, GrantRevoked
 from robofast_core.plan import Idle, Observation, PlanProvider, as_plan
 from robofast_core.safety import LeaseRevoked, OpenLease, RecoveryRefused, SafetySupervisor
@@ -380,6 +396,7 @@ class Sequencer:
         camera: DeviceOwner | None = None,
         config: SequencerConfig | None = None,
         slew_guard: SlewGuard | None = None,
+        imaging: Imaging | None = None,
     ) -> None:
         units = list(telescopes)
         if telescope is not None or camera is not None:
@@ -397,6 +414,9 @@ class Sequencer:
         self.timeline = timeline
         self.config = config or SequencerConfig()
         self.slew_guard: SlewGuard = slew_guard or AllowAllSlews()
+        #: The frame pipeline (module doc), or None: frames are not saved.
+        self.imaging = imaging
+        self._report_files = _accepts_files(self.plan.report)
         if self.config.abort_policy not in ("abort", "stop"):
             raise ValueError(f"abort_policy {self.config.abort_policy!r}")
         self.generation = 0
@@ -773,7 +793,7 @@ class Sequencer:
                 if state.closed and obs.light:
                     self._give_back(unit, obs)  # the plan changed its mind
                     return
-                taken: list[int] = []
+                taken: list[Any] = []
                 try:
                     await self._observe_preemptible(state, unit, tel, cam, obs, taken)
                 except asyncio.CancelledError:
@@ -794,6 +814,15 @@ class Sequencer:
                     unit.gave_up = True
                     self._event("giving_up", telescope=unit.name, error=str(exc), level="critical")
                     return
+                except FrameWriteFailed as exc:
+                    # Never observe on while frames are being lost (module doc).
+                    self._report(unit, obs, "failed", taken)
+                    await self._telescope_failed(state, unit, tel, cam, f"frame writing: {exc}")
+                    if not unit.gave_up:
+                        unit.gave_up = True
+                        self._event(
+                            "giving_up", telescope=unit.name, error=str(exc), level="critical"
+                        )
                 except Exception as exc:
                     self._report(unit, obs, "failed", taken)
                     await self._telescope_failed(state, unit, tel, cam, repr(exc))
@@ -858,7 +887,7 @@ class Sequencer:
         tel: Grant,
         cam: Grant,
         obs: Observation,
-        taken: list[int],
+        taken: list[Any],
     ) -> None:
         """:meth:`_observe` as a child task that :meth:`preempt` can stop
         (module doc). Raises what the observation raised, or
@@ -963,8 +992,12 @@ class Sequencer:
         )
 
     def _report(self, unit: TelescopeUnit, obs: Observation, outcome: str, taken: list) -> None:
+        files = [f.path for f in taken if isinstance(f, PendingFrame) and f.path is not None]
         try:
-            self.plan.report(unit.name, obs, outcome, len(taken))
+            if self._report_files and self.imaging is not None:
+                self.plan.report(unit.name, obs, outcome, len(taken), files=files)
+            else:
+                self.plan.report(unit.name, obs, outcome, len(taken))
         except Exception:  # the plan's bug must not end this telescope's night
             log.exception("%s: plan.report(%s, %s)", self.name, unit.name, obs.name)
 
@@ -1044,10 +1077,11 @@ class Sequencer:
         tel: Grant,
         cam: Grant,
         obs: Observation,
-        taken: list[int],
+        taken: list[Any],
     ) -> None:
         cfg = self.config
         gen = state.gen
+        imaging = self.imaging
         self._event("target_start", gen=gen, telescope=unit.name, target=obs.name)
         if obs.light and state.lease is None:
             raise RuntimeError(f"{obs.name}: light frames in a closed generation")
@@ -1071,20 +1105,39 @@ class Sequencer:
             await self._wait_for(lambda: tel.get("Slewing"), lambda s: not s, cfg.slew_timeout)
             self._event("on_target", gen=gen, telescope=unit.name, ra=ra, dec=dec)
         for i in range(obs.count):
-            # From here until it is read out, a "now-after-readout" preemption
-            # waits for this exposure.
+            if imaging is not None:
+                imaging.check(unit.name)  # a lost frame stops the telescope first
+            # From here until it is read out (downloaded, with imaging), a
+            # "now-after-readout" preemption waits for this exposure.
             unit.exposing = True
             try:
+                host_start = datetime.now(UTC)
                 await cam.call("StartExposure", obs.exptime, obs.light)
                 self._event(
                     "exposure_started", gen=gen, telescope=unit.name, index=i, exptime=obs.exptime
                 )
+                exposure = None
+                if imaging is not None:
+                    exposure = await imaging.exposure_started(
+                        unit.name,
+                        tel,
+                        obs,
+                        index=i,
+                        host_start=host_start,
+                        sequencer=self.name,
+                        generation=gen,
+                        ids=self._ids(unit.name),
+                    )
                 await self._wait_for(
                     lambda: cam.get("ImageReady"), bool, obs.exptime + cfg.readout_margin
                 )
+                frame: Any = i
+                if exposure is not None:
+                    assert imaging is not None
+                    frame = await imaging.exposure_done(unit.name, cam, exposure)
             finally:
                 unit.exposing = False
-            taken.append(i)
+            taken.append(frame)
             self.frames.append(
                 {
                     "gen": gen,
@@ -1092,6 +1145,7 @@ class Sequencer:
                     "index": i,
                     "target": obs.name,
                     "t": time.monotonic(),
+                    **({"image": frame} if isinstance(frame, PendingFrame) else {}),
                 }
             )
             self._event("exposure_complete", gen=gen, telescope=unit.name, index=i)
@@ -1099,6 +1153,22 @@ class Sequencer:
             if policy in ("now-after-readout", "now") and i + 1 < obs.count:
                 self._record_preemption(state, unit, policy, aborted=False)
                 raise Preempted(policy)
+        if imaging is not None and taken:
+            # Complete means on disk: the plan records the paths.
+            await imaging.flush(unit.name)
+
+    def _ids(self, telescope: str) -> dict[str, Any]:
+        """The plan's request ids for what ``telescope`` is observing (the
+        dispatch scheduler's ``current()``), for the FITS header."""
+        fn = getattr(self.plan, "current", None)
+        try:
+            cur = fn().get(telescope) if fn is not None else None
+        except Exception:
+            log.exception("%s: plan.current()", self.name)
+            cur = None
+        if not cur:
+            return {}
+        return {k: cur.get(k) for k in ("group", "request", "configuration")}
 
     async def _select_port(
         self, state: _Generation, unit: TelescopeUnit, tel: Grant, port: str
@@ -1107,6 +1177,8 @@ class Sequencer:
             raise Unsupported(f"{unit.name} cannot select M3 port {port!r} (no port_action)")
         await tel.call("Action", unit.port_action, port, timeout=self.config.port_timeout)
         self._event("port_selected", gen=state.gen, telescope=unit.name, port=port)
+        if self.imaging is not None:
+            self.imaging.port_selected(unit.name, port)
 
     async def _select_filter(self, state: _Generation, unit: TelescopeUnit, name: str) -> None:
         fw = state.filterwheels.get(unit.name)
@@ -1123,6 +1195,8 @@ class Sequencer:
                 lambda: fw.get("Position"), lambda p: p == position, self.config.filter_timeout
             )
         self._event("filter_selected", gen=state.gen, telescope=unit.name, filter=name)
+        if self.imaging is not None:
+            self.imaging.filter_selected(unit.name, name, position)
 
     # -- cleanup ----------------------------------------------------------
 
@@ -1193,6 +1267,15 @@ class Sequencer:
             report.parked.append(name)
         except (DeviceError, TimeoutError) as exc:
             report.errors.append(f"{name}: telescope park: {exc!r}")
+
+
+def _accepts_files(report: Callable[..., Any]) -> bool:
+    """Whether a plan's ``report`` takes the ``files`` keyword."""
+    try:
+        params = inspect.signature(report).parameters
+    except (TypeError, ValueError):
+        return False
+    return "files" in params or any(p.kind is p.VAR_KEYWORD for p in params.values())
 
 
 async def _wait_any(events: Sequence[asyncio.Event], timeout: float) -> None:

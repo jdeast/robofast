@@ -409,7 +409,14 @@ class DispatchScheduler:
             return Idle(self.config.idle_poll, "nothing observable")
         return self._make_observation(self._new_visit(best.request, now, best.score))
 
-    def report(self, telescope: str, obs: Observation, outcome: str, frames: int) -> None:
+    def report(
+        self,
+        telescope: str,
+        obs: Observation,
+        outcome: str,
+        frames: int,
+        files: list[str] | None = None,
+    ) -> None:
         self.history.append((telescope, obs.name, outcome, frames))
         visit = self._current.get(telescope)
         if visit is None or visit.obs is not obs:
@@ -435,6 +442,9 @@ class DispatchScheduler:
                     "observation": obs.name,
                     "instrument_config": visit.ic,
                     "frames": frames,
+                    # Written frames, relative to the data root (the
+                    # sequencer's frame pipeline; absent without it).
+                    **({"files": list(files)} if files else {}),
                 }
             )
             del done[: -self.config.history_size]
@@ -1067,6 +1077,7 @@ class DispatchScheduler:
             filter=ic.filter,
             port=ic.port,
             allow_partial=c.allow_partial,
+            object=c.target.name,
         )
 
     def _observation(self, visit: _Visit) -> Observation:

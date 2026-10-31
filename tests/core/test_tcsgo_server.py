@@ -87,7 +87,6 @@ class Rig:
     sim: TCSGOSim
     server: TCSGOServer
     owners: list[DeviceOwner] = field(default_factory=list)
-    raw: list[AlpacaDevice] = field(default_factory=list)
 
     def owner(self, kind: str, name: str | None = None, **kw) -> DeviceOwner:
         addr = self.server.address
@@ -100,14 +99,6 @@ class Rig:
         )
         self.owners.append(o)
         return o
-
-    async def device(self, kind: str) -> AlpacaDevice:
-        """A raw Alpaca client, for members DeviceOwner's METHODS table lacks
-        (PulseGuide, Move, SlewToAzimuth)."""
-        d = AlpacaDevice(self.server.address, kind)
-        self.raw.append(d)
-        await d.connect(timeout=5)
-        return d
 
     def telescope(self):
         return self.owner("telescope").grant("test")
@@ -139,8 +130,6 @@ async def make_rig():
     for rig in rigs:
         for o in rig.owners:
             o.close()
-        for d in rig.raw:
-            await d.aclose()
         await asyncio.sleep(0)
         rig.server.stop()
         rig.sim.stop()
@@ -263,13 +252,12 @@ async def test_offset_action_and_pulse_guide(make_rig):
     assert set(await tel.get("SupportedActions")) == {"Offset", "Status", "Faults"}
     # PulseGuide: ASCOM directions; IsPulseGuiding during it.
     d0 = await tel.get("Declination")
-    raw = await rig.device("telescope")
-    await raw.put("PulseGuide", timeout=5, Direction=0, Duration=300)
+    await tel.call("PulseGuide", 0, 300)
     assert await tel.get("IsPulseGuiding") is True
     await until_false(tel, "IsPulseGuiding", 3)
     assert (await tel.get("Declination") - d0) * 3600 == pytest.approx(5 * 0.3, abs=0.2)
     with pytest.raises(InvalidValueException):
-        await raw.put("PulseGuide", timeout=5, Direction=4, Duration=300)
+        await tel.call("PulseGuide", 4, 300)
 
 
 async def test_status_and_faults_actions(make_rig):
@@ -322,17 +310,16 @@ async def test_garbled_tcs_is_an_error(make_rig):
 async def test_focuser(make_rig):
     rig = make_rig(focus_min=-1000.0, focus_max=1000.0)
     foc = rig.focuser()
-    raw = await rig.device("focuser")
     assert await foc.get("MaxStep") == 2000 and await foc.get("Absolute") is True
     assert await foc.get("Position") == 1000  # TCS 0 microns
-    await raw.put("Move", timeout=5, Position=700)
+    await foc.call("Move", 700)
     assert await foc.get("IsMoving") is True
     await until_false(foc, "IsMoving", 3)
     assert await foc.get("Position") == 700 and rig.sim.focus == pytest.approx(-300)
     with pytest.raises(InvalidValueException):
-        await raw.put("Move", timeout=5, Position=2001)
+        await foc.call("Move", 2001)
     with pytest.raises(NotImplementedException):
-        await raw.put("Halt", timeout=5)
+        await foc.call("Halt")
 
 
 async def test_tcs_dome(make_rig):
@@ -349,7 +336,7 @@ async def test_tcs_dome(make_rig):
     assert await dome.get("ShutterStatus") == CLOSING
     await wait_until(lambda: rig.sim.state()["shutters"]["upper"] == "closed", 3)
     assert await dome.get("ShutterStatus") == CLOSED
-    await (await rig.device("dome")).put("SlewToAzimuth", timeout=5, Azimuth=90.0)
+    await dome.call("SlewToAzimuth", 90.0)
     await wait_until(lambda: abs(rig.sim.state()["dome_az"] - 90) < 0.1, 5, what="dome at 90")
     assert await dome.get("Azimuth") == pytest.approx(90.0, abs=0.1)
     await dome.set("Slaved", True)

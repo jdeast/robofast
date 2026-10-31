@@ -22,6 +22,11 @@ The pieces:
 * :mod:`robofast_core.sequencer` -- one asyncio :class:`Sequencer` per
   enclosure. Its observing task is cancelled when the lease is revoked, and
   cleanup aborts the exposure and parks the telescope.
+* :mod:`robofast_core.imaging` -- the sequencer's frame pipeline: telemetry
+  into the value registry (:mod:`robofast_core.registry`), the image
+  download (ImageBytes, :mod:`robofast_core.imagebytes`), and a bounded
+  background writer of FITS files (:mod:`robofast_core.fits_writer`;
+  ``docs/data.md``).
 * :mod:`robofast_core.dispatch` -- the dispatch scheduler, a plan provider
   that picks the best observable request for a telescope now, and takes
   targets of opportunity (preempting one telescope through the sequencer);

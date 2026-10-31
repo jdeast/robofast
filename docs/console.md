@@ -149,7 +149,8 @@ dialog; the destructive ones (marked *confirm*) must also send
 | `emergency_close` (*confirm*) | `enclosure` (omit: all), `direct`, `reason` (optional) | close now, by any path that answers (below). Never rate limited |
 
 Requests and ToOs go through the request API's own code
-(`/console/api/v1/...` is `/api/v1/...` for the signed-in observer): the same
+(`/console/api/v1/...` is `/api/v1/...`, the previous prefix of `/api/...`,
+for the signed-in observer): the same
 validation, scopes (`submit`, `too`), ownership (an observer cancels their
 own groups; `admin` any) and drop box.
 

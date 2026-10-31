@@ -371,14 +371,24 @@ may be wrong about the 60-inch's focus.
 
 ### 3.7 Planning and the request API
 
-- **Requests** are modelled the LCO OCS way
-  (`robofast_core/request_model.py`): RequestGroup (who, priority, ToO or
-  not) → Request (windows, allowed telescopes, cadence) → Configuration (one
-  target, one instrument type, optional tighter constraints, a status) →
-  InstrumentConfig (exposure time, count, filter). Status per
+- **Requests** are written in the LCO OCS request language, with its field
+  names, nesting and units (`robofast_core/request_model.py`;
+  `docs/request_language.md` field by field), so OCS clients such as TOM
+  Toolkit's `OCSFacility` work unchanged: RequestGroup (`proposal`,
+  `ipp_value`, `observation_type`) → Request (`windows`, `location`) →
+  Configuration (`type`, `instrument_type`, a `target` in degrees, optional
+  tighter `constraints`, a status) → InstrumentConfig (`exposure_time`,
+  `exposure_count`, `optical_elements.filter`). robofast's own fields live
+  in the `extra_params` of their level: a request's cadence, several
+  telescopes and `max_attempts`; a configuration's `allow_partial`; an
+  instrument config's M3 `port`, `iodine` and exposure-meter
+  `target_counts`; altitude, Sun and hour-angle constraints; the ToO
+  deadline, policy and class. The previous robofast JSON still loads for
+  one release (converted on load). Status per
   configuration: PENDING, ATTEMPTED, COMPLETED, FAILED (after
   `max_attempts` failed attempts; interruptions do not count), EXPIRED,
-  CANCELED. A request with a cadence (`min_interval`, `max_per_night`) is
+  CANCELED; requests and groups report the OCS `state`. A request with a
+  cadence (`extra_params.cadence`: `min_interval`, `max_per_night`) is
   *standing*: it returns to PENDING after each visit, as MINERVA's RV
   targets do. Requests load from JSON files, validated with errors that
   name the entry; `from_legacy_csv` converts a legacy MINERVA target
@@ -450,15 +460,19 @@ may be wrong about the 60-inch's focus.
   control network. A small REST API over JSON, in its own process, on
   loopback behind a TLS reverse proxy (`deploy/` has nginx and Caddy
   examples; it refuses a non-loopback address without TLS unless told
-  `--insecure-bind`). Under `/api/v1`: submit a request group, submit a
-  ToO, validate (the same checks, plus a dry run of the scheduler's hard
+  `--insecure-bind`). The OCS observation portal's endpoints under `/api`
+  (`/api/v1`, the previous prefix, kept for one release): submit a request
+  group (a RAPID_RESPONSE or TIME_CRITICAL one is a ToO), validate (the same checks, plus a dry run of the scheduler's hard
   constraints over the coming night on a coarse grid: which telescopes
   could start each request, when, and the commonest reasons why not), list
   and get groups with each configuration's status, cancel, the enclosures'
   status (weather verdict, shutter, lease and faults from the supervisor;
   each telescope's state and current observation from a status snapshot the
   sequencer writes), and data pointers for completed observations (paths
-  only, from a configured template; no files served).
+  only, from a configured template; no files served); and what an OCS
+  client reads: `/api/instruments/`, `/api/profile/` (the configured
+  proposals), `/api/requests/{id}` and its observation blocks,
+  `/api/telescope_states/`, and the cadence expansion.
   **Authentication** (`robofast_core/api_auth.py`): a token per client,
   stored only as a salted HMAC-SHA256 in a tokens file outside any
   repository, compared in constant time; scopes `read`, `submit`, `too`,
@@ -481,8 +495,10 @@ may be wrong about the 60-inch's focus.
   `QUEUED`, `ACCEPTED`, `REJECTED` (with the scheduler's reason) or
   `CANCELED` (withdrawn while queued). Canceling an accepted group cancels
   every configuration not yet finished; an observation in progress
-  finishes, then its visit ends. `docs/tom_facility.md` sketches a TOM
-  Toolkit facility module on these endpoints.
+  finishes, then its visit ends. A TOM uses TOM Toolkit's own
+  `OCSFacility` with settings only (`docs/tom_facility.md`); not supported
+  yet: time accounting per proposal, non-sidereal targets, seeing and
+  transparency constraints, dither/mosaic expansion, an archive.
 - Configured as the enclosure's plan entry, `{"type": "dispatch", "site":
   ..., "requests": ..., "telescopes": {...limits...}, ...}`
   (`sites/minerva/dispatch.example.json`).
@@ -495,14 +511,17 @@ interrupt an observation in progress, on one telescope, without disturbing
 the others or the enclosure's lease. A Rubin alert followed up within
 minutes is the motivating case.
 
-**The request.** A ToO is a request group with a `too` entry: a
-`deadline` (latest start), a `priority_class` (an integer ≥ 1; normal
-requests are class 0) and an interrupt `policy`. The request's
+**The request.** A ToO is a request group whose OCS `observation_type` is
+`RAPID_RESPONSE` or `TIME_CRITICAL`, with `extra_params.too`: a `deadline`
+(latest start; default the end of the last window), a `priority_class` (an
+integer ≥ 1; normal requests are class 0; default 2 for RAPID_RESPONSE, 1
+for TIME_CRITICAL) and an interrupt `policy` (default `now-after-readout`
+for RAPID_RESPONSE, `next` for TIME_CRITICAL). The request's
 `telescopes` says which telescopes may take it. It arrives through
 `DispatchScheduler.submit_too()` (in process) or as a JSON file renamed
 into the plan's `too_dropbox` directory (moved to `accepted/` or to
 `rejected/` with an `.error` file saying why). The request API (section
-3.7, `POST /api/v1/toos`) writes into the same drop box. ToOs are kept in
+3.7, `POST /api/requestgroups`, or `/api/toos`) writes into the same drop box. ToOs are kept in
 the scheduler's state file, so a restart does not lose one.
 
 **Eligibility.** A ToO is taken only when it passes the same hard

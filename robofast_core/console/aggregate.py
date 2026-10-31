@@ -115,6 +115,9 @@ class ConsoleEnclosure:
     images_root: Path | None = None
     images_site: str = "site"
     spectrograph_frames: Path | None = None
+    #: The enclosure config's ``site`` (latitude, longitude, elevation), for
+    #: the sky view when there is no dispatch plan to give one.
+    site: dict[str, Any] | None = None
 
     @classmethod
     def from_spec(
@@ -218,6 +221,7 @@ class ConsoleEnclosure:
             if not images.get("data_root")
             else _resolve(images["data_root"], cbase),
             images_site=str(images.get("site", "site")),
+            site=config.get("site") if isinstance(config.get("site"), dict) else None,
             spectrograph_frames=None
             if spec.get("spectrograph_frames") is None
             else _resolve(spec["spectrograph_frames"], base),

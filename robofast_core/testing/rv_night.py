@@ -1110,7 +1110,17 @@ def console_park_problems(o: Outcome) -> list[str]:
     for t, c in o.dome_log:
         if t0 <= t <= t1 + 1.0 and c.startswith(("OPEN", "CLOSE")):
             bad.append(f"the roof moved ({c}) while the console parked t2")
-    if any(e[1] == "t1" and e[2] == "park" and t0 <= e[0] <= t1 + 1.0 for e in o.mount_events):
+    # (Unless the generation ended meanwhile -- every telescope idle, or a
+    # revocation: then its cleanup parks t1 too, as it should.)
+    ended = [
+        e
+        for what in ("idle_release", "cancel_requested")
+        for e in tl.events(what, SEQUENCER)
+        if t0 <= e.t <= t1 + 1.0
+    ]
+    if not ended and any(
+        e[1] == "t1" and e[2] == "park" and t0 <= e[0] <= t1 + 1.0 for e in o.mount_events
+    ):
         bad.append("t1 parked when the console parked t2")
     if not any(e[1] == "t2" and e[2] == "park" and t0 <= e[0] <= t1 + 0.5 for e in o.mount_events):
         bad.append("t2's mount never parked for the console")

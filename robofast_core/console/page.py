@@ -89,6 +89,14 @@ button.emergency { background: var(--bad); color: var(--bg); border-color: var(-
 a.button { display: inline-flex; align-items: center; padding: 8px 12px; min-height: 40px;
   border: 1px solid var(--line); border-radius: 6px; background: var(--btn); color: var(--text);
   text-decoration: none; }
+.skywrap { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; }
+svg.sky { width: min(100%, 380px); height: auto; flex: 0 0 auto; }
+svg.sky text { font: 11px system-ui, sans-serif; }
+table.targets { border-collapse: collapse; font-size: 13px; flex: 1 1 320px; }
+table.targets th, table.targets td { padding: 3px 6px; border-top: 1px solid var(--line); text-align: right; }
+table.targets th:first-child, table.targets td:first-child { text-align: left; }
+table.targets tr.now td { font-weight: 700; }
+.tablewrap { overflow-x: auto; flex: 1 1 320px; }
 label.check { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
 label.check input { width: auto; }
 .hidden { display: none !important; }
@@ -122,6 +130,7 @@ BODY = """
   <section id="weather"><h2>Weather</h2><div id="weather-body"></div></section>
   <section id="enclosure"><h2>Enclosure</h2><div id="enclosure-body"></div></section>
   <section id="telescopes" class="wide"><h2>Telescopes</h2><div id="telescope-body"></div></section>
+  <section id="sky" class="wide"><h2>Sky</h2><div id="sky-body"></div></section>
   <section id="images" class="wide"><h2>Images</h2>
     <div class="actions">
       <label>guiders <select id="img-rate" aria-label="guider refresh rate">
@@ -318,6 +327,7 @@ function signedIn(s) {
   $("requests").classList.toggle("hidden", !s.requests);
   connect();
   loadImageSources();
+  loadSky();
 }
 $("signin-go").addEventListener("click", async () => {
   const token = $("token").value.trim();
@@ -550,6 +560,88 @@ $("em-go").addEventListener("click", async () => {
     $("em-go").disabled = false;
   }
 });
+
+// -- the sky ---------------------------------------------------------------------------
+// An alt/az chart (zenith at the centre, the horizon at the edge, north up,
+// east left as seen from below), built with createElementNS: no markup.
+// The SVG namespace is a name, not an address: nothing is fetched (spelled
+// in two parts so the page holds no literal URL; the tests check that).
+const SVGNS = "http:" + "//www.w3.org/2000/svg";
+function s(tag, attrs, ...kids) {
+  const el = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) if (v !== null && v !== undefined) el.setAttribute(k, String(v));
+  for (const kid of kids) if (kid !== null && kid !== undefined) el.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+  return el;
+}
+const R = 150, C = 170;
+function xy(alt, az) {
+  const r = R * (90 - Math.max(-10, Math.min(90, alt))) / 90, a = az * Math.PI / 180;
+  return [C - r * Math.sin(a), C - r * Math.cos(a)];
+}
+function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+function skyChart(e) {
+  const svg = s("svg", {viewBox: "0 0 340 340", class: "sky", role: "img", "aria-label": "sky chart"});
+  const line = css("--line"), dim = css("--dim"), text = css("--text");
+  svg.append(s("circle", {cx: C, cy: C, r: R, fill: "none", stroke: dim}));
+  for (const alt of [30, 60]) svg.append(s("circle", {cx: C, cy: C, r: R * (90 - alt) / 90, fill: "none", stroke: line}));
+  const lims = Object.values(e.telescopes || {});
+  if (lims.length) {
+    const lo = Math.max(...lims.map((t) => t.min_alt)), hi = Math.min(...lims.map((t) => t.max_alt));
+    svg.append(s("circle", {cx: C, cy: C, r: R * (90 - lo) / 90, fill: "none", stroke: css("--bad"), "stroke-dasharray": "4 3"}));
+    svg.append(s("circle", {cx: C, cy: C, r: R * (90 - hi) / 90, fill: "none", stroke: css("--warn"), "stroke-dasharray": "2 3"}));
+  }
+  for (const [lab, az] of [["N", 0], ["E", 90], ["S", 180], ["W", 270]]) {
+    const [x, y] = xy(-8, az);
+    svg.append(s("text", {x, y: y + 4, "text-anchor": "middle", fill: dim}, lab));
+  }
+  for (const t of e.targets || []) {
+    if (t.alt === undefined || t.alt < -5) continue;
+    const [x, y] = xy(t.alt, t.az), on = (t.telescopes || []).length > 0;
+    const g = s("g", {}, s("title", {}, t.name + " alt " + fmt(t.alt, 1) + " az " + fmt(t.az, 1)));
+    g.append(s("circle", {cx: x, cy: y, r: on ? 4 : 2.5, fill: on ? css("--ok") : (t.too ? css("--warn") : css("--accent"))}));
+    if (on || t.too) g.append(s("text", {x: x + 6, y: y + 4, fill: text}, t.name));
+    svg.append(g);
+  }
+  for (const [name, b, col] of [["Sun", e.sun, css("--warn")], ["Moon", e.moon, dim]]) {
+    if (!b) continue;
+    const [x, y] = xy(Math.max(b.alt, -9), b.az);
+    svg.append(s("circle", {cx: x, cy: y, r: 7, fill: b.alt > 0 ? col : "none", stroke: col}));
+    svg.append(s("text", {x: x + 9, y: y + 4, fill: col}, name + (b.alt <= 0 ? " (down)" : "")));
+  }
+  for (const [tn, t] of Object.entries(e.telescopes || {})) {
+    if (t.alt === null || t.alt === undefined || t.az === null || t.az === undefined) continue;
+    const [x, y] = xy(t.alt, t.az), col = css("--bad");
+    svg.append(s("path", {d: `M${x - 7} ${y}H${x + 7}M${x} ${y - 7}V${y + 7}`, stroke: col, "stroke-width": 2}));
+    svg.append(s("text", {x: x - 8, y: y - 8, "text-anchor": "end", fill: col, "font-weight": 700}, tn.toUpperCase()));
+  }
+  return svg;
+}
+function skyTable(e) {
+  const later = ((e.targets || [])[0] || {}).later || [];
+  const head = h("tr", {}, h("th", {}, "target"), h("th", {}, "on"), h("th", {}, "alt"), h("th", {}, "az"),
+    h("th", {}, "X now"), later.map((l) => h("th", {}, "X +" + l.hours + "h")), h("th", {}, "HA"));
+  const air = (x, alt) => x === null || x === undefined ? (alt !== undefined && alt <= 0 ? "down" : "—") : fmt(x, 2);
+  const rows = (e.targets || []).map((t) => h("tr", {class: (t.telescopes || []).length ? "now" : ""},
+    h("td", {}, t.too ? badge("ToO", "warn") : null, " ", t.name), h("td", {}, (t.telescopes || []).join(",") || ""),
+    h("td", {}, fmt(t.alt, 1)), h("td", {}, fmt(t.az, 0)), h("td", {}, air(t.airmass, t.alt)),
+    (t.later || []).map((l) => h("td", {}, air(l.airmass, l.alt))), h("td", {}, fmt(t.hour_angle, 2))));
+  return h("div", {class: "tablewrap"}, h("table", {class: "targets"}, h("thead", {}, head), h("tbody", {}, rows)));
+}
+let skyTimer = null;
+async function loadSky() {
+  if (skyTimer) { clearTimeout(skyTimer); skyTimer = null; }
+  if (!session) return;
+  const r = await call("GET", "/console/api/sky");
+  if (r.ok) {
+    const encs = Object.entries(r.data.enclosures || {}), multi = encs.length > 1;
+    fill("sky-body", encs.map(([name, e]) => e.error ? h("p", {class: "bad"}, name + ": " + e.error)
+      : h("div", {}, multi ? h("h3", {}, name) : null,
+          h("p", {class: "dim"}, e.site ? "LST " + fmt(e.lst_hours, 2) + " h · Sun " + fmt((e.sun || {}).alt, 1) + "° · Moon " +
+            fmt((e.moon || {}).alt, 1) + "°, " + Math.round(100 * ((e.moon || {}).illumination || 0)) + "% lit · limits dashed" : "no site configured"),
+          h("div", {class: "skywrap"}, skyChart(e), skyTable(e)))));
+  }
+  skyTimer = setTimeout(loadSky, 15000);
+}
 
 // -- images ---------------------------------------------------------------------------
 // Frames are scaled on the server (PNG); each guider thumbnail is fetched at

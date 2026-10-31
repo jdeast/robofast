@@ -107,7 +107,8 @@ class AutofocusTriggers:
         self._state: dict[str, _State] = {}
         #: (telescope, reason) of every autofocus handed out.
         self.history: list[tuple[str, str]] = []
-        if not hasattr(inner, "peek"):
+        self._inner_peeks = getattr(inner, "peek", None) is not None
+        if not self._inner_peeks:
             # Without the inner plan's peek there is nothing to peek with:
             # the sequencer then asks next_observation (and gives answers back).
             self.peek = None  # type: ignore[assignment]
@@ -135,10 +136,10 @@ class AutofocusTriggers:
         nxt = await self._peek_inner(telescope)
         af = self._autofocus_for(telescope, nxt)
         if af is not None:
-            if not hasattr(self.inner, "peek"):
+            if not self._inner_peeks:
                 st.held, st.holding = nxt, True
             return af
-        if hasattr(self.inner, "peek"):
+        if self._inner_peeks:
             return await self.inner.next_observation(telescope)
         return nxt
 

@@ -184,10 +184,10 @@ def fit_hyperbola(
             break
         keep = new
     xs, hs, es = x[keep], h[keep], e[keep]
-    if not (xs.min() < x0 < xs.max()):
+    if (xs < x0).sum() < 2 or (xs > x0).sum() < 2:
         raise FitError(f"hyperbola: best focus {x0:.1f} not bracketed by the points")
     err0 = _x0_error(x0, chi2, xs, hs, es, sym, float(xs.max() - xs.min()))
-    return HyperbolaFit(x0, err0, a, mp, mm, chi2, idx[keep].tolist())
+    return HyperbolaFit(float(x0), err0, a, mp, mm, chi2, idx[keep].tolist())
 
 
 @dataclass
@@ -223,8 +223,8 @@ def fit_parabola(x, h, err=None, *, clip: float = 3.0, min_points: int = 4) -> P
         raise FitError("parabola: upside down")
     v = -a1 / (2 * a2)
     x0 = v + xc
-    if not (x[keep].min() < x0 < x[keep].max()):
-        raise FitError(f"parabola: vertex {x0:.1f} outside the points")
+    if (x[keep] < x0).sum() < 2 or (x[keep] > x0).sum() < 2:
+        raise FitError(f"parabola: vertex {x0:.1f} not bracketed by the points")
     # Error of the vertex by propagation (scaled by the reduced chi^2 if > 1).
     chi2 = float((((h[keep] - np.polyval(c, x[keep] - xc)) / e[keep]) ** 2).sum())
     scale = max(1.0, chi2 / max(1, int(keep.sum()) - 3))
@@ -301,7 +301,7 @@ def two_point(
     z = (x1 + x2) / 2 - (h1**2 - h2**2) / (2 * m**2 * (x1 - x2))
     a2 = h1**2 - m**2 * (x1 - z) ** 2
     err = math.hypot(h1 * e1, h2 * e2) / (m**2 * abs(x1 - x2))
-    return TwoPoint(z, err, a2, ratio)
+    return TwoPoint(float(z), float(err), float(a2), float(ratio))
 
 
 @dataclass

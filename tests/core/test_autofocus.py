@@ -10,6 +10,7 @@ the seeing FWHM (``tolerance``), and never more than ~90 steps.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import copy
 import functools
 import math
@@ -122,7 +123,12 @@ def _calibration_store() -> FocusStore:
         assert res.success, res.message
         return store
 
-    return asyncio.run(go())
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(go())
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:  # from inside a test's loop
+        return pool.submit(lambda: asyncio.run(go())).result()
 
 
 @pytest.fixture

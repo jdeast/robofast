@@ -444,7 +444,8 @@ def _moments(cut: np.ndarray, x: float, y: float) -> float:
             s2 = new
             break
         s2 = new
-    return 2.3548 * math.sqrt(s2)
+    # Less the pixel's own width (a uniform pixel adds 1/12 px^2 per axis).
+    return 2.3548 * math.sqrt(max(s2 - 2.0 / 12.0, 0.25 * s2))
 
 
 def _donut_edge(r: np.ndarray, f: np.ndarray, rmax: float) -> float:

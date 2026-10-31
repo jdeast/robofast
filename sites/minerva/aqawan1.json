@@ -9,7 +9,7 @@
     "safetymonitor, observingconditions: the site weather bridge (sites/minerva/weather.yaml listens on 11111).",
     "t1, t2: ASCOM Remote on each telescope's Windows PC, serving its mount (PWI4) and camera as device 0.",
     "safety and sequencer: SafetyConfig and SequencerConfig fields; omitted ones take the defaults in docs/design.md section 6.",
-    "plan: calibration frames only, until the dispatch scheduler exists; or run with --plan targets.json."
+    "plan: calibration frames only; or run with --plan dispatch.example.json (the dispatch scheduler) or --plan targets.example.json (a static list)."
   ],
   "name": "aqawan1",
   "listen": "127.0.0.1:8100",

@@ -7,16 +7,23 @@ from scratch, at the time it is used (design.md 3.4: never resume a stale
 action). It then reports how each observation ended, so the provider can
 mark it done, retry it or drop it.
 
-The dispatch scheduler (design.md 3.7) will be a :class:`PlanProvider`: its
-``next_observation`` picks the best request for that telescope right now
-(priority, time-dependent bonus, hard constraints), and its ``report``
-updates the request's status. Until it exists there are two simple ones:
+Providers:
 
+* :class:`~robofast_core.dispatch.DispatchScheduler` (design.md 3.7) --
+  picks the best request for that telescope right now (hard constraints,
+  then priority plus a time-dependent bonus), updates the request's status
+  from each report, and takes targets of opportunity, interrupting a
+  telescope through the sequencer's ``preempt`` (design.md 3.7.1);
 * :class:`StaticPlan` -- a fixed target list (JSON), worked through in order;
 * :class:`CalibrationPlan` -- dark and bias frames only; the telescope is
   never unparked.
 
-:func:`plan_from_config` builds either from a config entry (see
+A provider may also implement two optional hooks, which the sequencer and
+its service use when present: ``set_preempt_callback(fn)`` (the sequencer
+passes its ``preempt``) and ``async serve()`` (a background task run
+alongside the sequencer, e.g. to take in ToOs).
+
+:func:`plan_from_config` builds any of them from a config entry (see
 :mod:`robofast_core.sequencer_service`).
 """
 
@@ -59,6 +66,18 @@ class Observation:
         return cls(**d)
 
 
+@dataclass
+class Idle:
+    """Returned by :meth:`PlanProvider.next_observation`: nothing to do *now*,
+    ask again after ``seconds`` (or sooner, if the sequencer is woken by
+    :meth:`~robofast_core.sequencer.Sequencer.preempt`). The telescope stops
+    tracking and stays where it is (not parked) while it waits; the
+    enclosure stays open. ``None`` still means "nothing more tonight"."""
+
+    seconds: float
+    reason: str = ""
+
+
 class PlanProvider(Protocol):
     """The sequencer's source of observations, one telescope at a time.
 
@@ -68,8 +87,9 @@ class PlanProvider(Protocol):
     there counts as that telescope's error. ``report`` must not block.
     """
 
-    async def next_observation(self, telescope: str) -> Observation | None:
-        """What ``telescope`` should do now, or None: nothing more tonight."""
+    async def next_observation(self, telescope: str) -> Observation | Idle | None:
+        """What ``telescope`` should do now; :class:`Idle` to wait; or None:
+        nothing more tonight."""
         ...
 
     def report(self, telescope: str, obs: Observation, outcome: str, frames: int) -> None:
@@ -171,6 +191,8 @@ def plan_from_config(
       (a JSON list of targets, relative to ``base``). A target is an
       :class:`Observation`'s fields plus an optional ``telescopes`` list.
     * ``{"type": "calibration", "biases": 10, "darks": [[60, 5]]}``.
+    * ``{"type": "dispatch", "site": {...}, "requests": "requests.json", ...}``
+      (:func:`robofast_core.dispatch.dispatch_from_config`).
     """
     config = dict(config)
     kind = config.pop("type", None)
@@ -187,4 +209,8 @@ def plan_from_config(
         return StaticPlan(targets, telescopes)
     if kind == "calibration":
         return CalibrationPlan(telescopes, **config)
-    raise ValueError(f"plan type {kind!r}: expected 'static' or 'calibration'")
+    if kind == "dispatch":
+        from robofast_core.dispatch import dispatch_from_config  # imports astropy
+
+        return dispatch_from_config(config, telescopes, base=base)
+    raise ValueError(f"plan type {kind!r}: expected 'static', 'calibration' or 'dispatch'")

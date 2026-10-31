@@ -22,6 +22,11 @@ The pieces:
 * :mod:`robofast_core.sequencer` -- one asyncio :class:`Sequencer` per
   enclosure. Its observing task is cancelled when the lease is revoked, and
   cleanup aborts the exposure and parks the telescope.
+* :mod:`robofast_core.dispatch` -- the dispatch scheduler, a plan provider
+  that picks the best observable request for a telescope now, and takes
+  targets of opportunity (preempting one telescope through the sequencer);
+  requests are modelled in :mod:`robofast_core.request_model`, positions
+  come from :mod:`robofast_core.sky` (astropy).
 * :mod:`robofast_core.supervisor_service` -- the supervisor as its own
   process with a small HTTP/JSON lease API (its docstring says how to run
   it); :mod:`robofast_core.lease_client` is the sequencer's side of it.

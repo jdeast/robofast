@@ -1,0 +1,31 @@
+{
+  "_note": [
+    "A dispatch-scheduler plan entry for Aqawan 1 (robofast_core/dispatch.py; docs/design.md 3.7):",
+    "  python -m robofast_core.sequencer_service --config sites/minerva/aqawan1.json --plan sites/minerva/dispatch.example.json",
+    "or paste it (without _note) as the 'plan' entry of aqawan1.json.",
+    "site: Mt. Hopkins (legacy site_mtHopkins.ini). Limits: legacy scheduler.ini (MINALT 21, MAXALT 83,",
+    "HORIZON -12, MINMOONSEP 10), which the legacy scheduler read but never applied.",
+    "state and too_dropbox are relative to this file here; use absolute paths (e.g. under",
+    "/var/lib/robofast) in production. A ToO is a JSON request group with a 'too' entry dropped",
+    "into too_dropbox (see too.example.json)."
+  ],
+  "type": "dispatch",
+  "site": {"latitude": 31.680407, "longitude": -110.878977, "elevation": 2316.0},
+  "requests": "requests.example.json",
+  "state": "dispatch-state.json",
+  "too_dropbox": "too-dropbox",
+  "telescopes": {
+    "t1": {"instruments": ["spectrograph", "imager"], "min_alt": 21, "max_alt": 83},
+    "t2": {"instruments": ["spectrograph", "imager"], "min_alt": 21, "max_alt": 83}
+  },
+  "max_sun_alt": -12,
+  "min_moon_sep": 10,
+  "slew_overhead": 120,
+  "frame_overhead": 10,
+  "w_setting": 1.0,
+  "w_airmass": 1.0,
+  "w_cadence": 1.0,
+  "setting_horizon": 7200,
+  "idle_poll": 60,
+  "too_poll": 10
+}

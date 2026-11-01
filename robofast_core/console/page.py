@@ -432,6 +432,23 @@ function opButton(label, action, body, title, text, danger) {
     onclick: () => act(action, body, title, text, danger)}, label);
 }
 
+function dutyText(d) {
+  if (!d || !d.attended_only) return "not needed (hardware heartbeat)";
+  if (!d.on_duty) return h("span", {class: "warn"}, "nobody: attended only, will not open");
+  const left = d.expires_in;
+  return d.on_duty + (left !== undefined && left < 0 ? " (EXPIRED)" : "") +
+    " (renewed " + fmt(d.renewed_ago, 0) + " s ago)";
+}
+// Renew my duty while this page is open (attended-only enclosures).
+setInterval(async () => {
+  if (!session || !lastDoc) return;
+  for (const [name, e] of Object.entries(lastDoc.enclosures || {})) {
+    const d = (e.enclosure || {}).duty;
+    if (d && d.attended_only && d.on_duty === session.name)
+      await call("POST", "/console/api/duty", {enclosure: name, op: "renew"});
+  }
+}, 60000);
+
 function render(doc) {
   lastDoc = doc; lastAt = Date.now();
   drawManual(doc);
@@ -479,6 +496,7 @@ function render(doc) {
           (l.revoked ? ", revoked: " + fmt(l.reason) : "") + (l.quarantined ? ", QUARANTINED" : "") +
           (l.released ? ", released" : "")) : "none"],
         ["heartbeat", n.heartbeat_age === null || n.heartbeat_age === undefined ? "—" : fmt(n.heartbeat_age, 1) + " s ago"],
+        ["operator duty", dutyText(n.duty)],
         ["holds", holds.length ? holds.map(([t, x]) => t + ": " + x.action + " by " + x.operator + " (" + x.reason + ")").join("; ") : "none"],
         ["sequencer", e.sequencer ? (e.sequencer.running ? "running" : e.sequencer.running === false ? h("span", {class: "bad"}, "not running") : "—") : "—"],
       ]),
@@ -493,7 +511,14 @@ function render(doc) {
         opButton("clear lease", "clear_lease", {enclosure: name}, "Clear the dead lease",
           "Only once the telescopes are safe: this lets the supervisor grant a new lease.", true),
         opButton("clear faults", "clear_faults", {enclosure: name}, "Clear enclosure faults",
-          "ClearFaults on the enclosure controller (refused unless it is closed).", true)));
+          "ClearFaults on the enclosure controller (refused unless it is closed).", true),
+        n.duty && n.duty.attended_only ? (n.duty.on_duty === (session && session.name)
+          ? opButton("off duty", "duty", {enclosure: name, op: "off"}, "Go off duty",
+              "This enclosure runs attended only: going off duty closes it.", true)
+          : opButton("on duty", "duty", {enclosure: name, op: "on"}, "Go on duty at " + name,
+              "You will be the operator on duty: this page renews it while it stays open." +
+              " If it stops (page closed, network lost), an alarm, then the enclosure closes.", false))
+          : null));
   }));
 
   fill("telescope-body", encs.flatMap(([name, e]) => Object.entries(e.telescopes || {}).map(([t, x]) => {

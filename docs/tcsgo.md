@@ -267,8 +267,13 @@ not carried over:
    is the shutter order constrained (upper before lower when opening, lower
    before upper when closing, as configured)? Does `#20` need the AUTO DOME
    switch up in normal operation?
-5. **Is there any watchdog** that closes the dome if robofast (or its
-   supervisor) dies? The TCS has no heartbeat command, unlike the Aqawan.
+5. ~~Is there any watchdog~~ **Answered** (JDE, 2026-10-31): none he is
+   aware of. So the 60-inch runs **attended only**: its supervisor
+   (`safety.attended_only` in `sites/flwo60/flwo60.json`) grants no lease,
+   and the dome never opens, unless an operator is on duty through the
+   observer console, renewed while the console is open; an expired duty
+   alarms and then closes (`docs/console.md`, "Operator duty"; design.md
+   3.3).
 6. **Park or stow?** Should robofast park with `#58` (where is the 60-inch's
    park position?) or stow at zenith (`#10` + slew)? What alt/az should
    `AtPark` check? Does `#58` end in hold mode?

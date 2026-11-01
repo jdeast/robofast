@@ -176,6 +176,7 @@ async def test_supervisor_closes_when_the_bridge_reports_unsafe(site):
         observing_conditions=owners[2],
         timeline=tl,
         config=SafetyConfig(
+            attended_only=False,
             poll_interval=0.05,
             read_timeout=0.5,
             stale_after=2.0,

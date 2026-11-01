@@ -55,6 +55,11 @@ and optionally:
   (:class:`~robofast_core.pointmodel.PointingCorrector`;
   docs/pointing_model.md): applied to every slew, measured on every solved
   frame, built by ``kind="pointing_model"`` runs.
+* per telescope, ``pa_calibration``: the port PA calibration store and the
+  routine's settings (:class:`~robofast_core.rotcal.RotatorSetup`;
+  docs/rotcal.md); the sequencer then also moves the rotator, for
+  ``kind="rotator_calibration"``, and the frame pipeline seeds every
+  frame's WCS from it.
 * ``images`` -- save every frame (:mod:`robofast_core.imaging`;
   ``docs/data.md``): ``{"data_root": "/data", "site": "minerva", ...}``
   with :class:`~robofast_core.imaging.ImagingConfig` fields; a relative
@@ -161,6 +166,7 @@ TELESCOPE_KEYS = {
     "autofocus",
     "guider",
     "pointing",
+    "pa_calibration",
 }
 
 
@@ -219,6 +225,14 @@ def build_units(
                 pointing = PointingCorrector.from_config(name, entry["pointing"], base=base)
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"telescope {name!r}: {exc}") from exc
+        pa_cal = None
+        if entry.get("pa_calibration") is not None:
+            from robofast_core.rotcal import RotatorSetup
+
+            try:
+                pa_cal = RotatorSetup.from_config(entry["pa_calibration"], base=base)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"telescope {name!r}: {exc}") from exc
         guider = None
         if "guider" in entry:
             from robofast_core.guider.service import GuiderRemote
@@ -237,6 +251,8 @@ def build_units(
                 autofocus=autofocus,
                 guider=guider,
                 pointing=pointing,
+                rotator=owners.get("rotator") if pa_cal is not None else None,
+                pa_calibration=pa_cal,
             )
         )
     if not units:

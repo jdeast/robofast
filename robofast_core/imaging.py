@@ -45,7 +45,7 @@ import logging
 import math
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -302,6 +302,11 @@ class Imaging:
         #: sequencer): headers get the true position in ``RA``/``DEC`` and the
         #: mount's in ``MNTRA``/``MNTDEC``; every solved frame is a sample.
         self.pointing: dict[str, Any] = {}
+        #: PA calibrations per telescope (:class:`~robofast_core.rotcal.PAStore`,
+        #: docs/rotcal.md): the approximate WCS's PA and parity per port and
+        #: rotator angle, and PACALIB/PAFLIP in the header (the plate
+        #: solver's hint).
+        self.pa_stores: dict[str, Any] = {}
 
     def set_clock(self, clock: Callable[[], datetime]) -> None:
         """Stamp frames (``DATE``, the index) and compute the Sun and Moon
@@ -335,6 +340,8 @@ class Imaging:
             if telescope in self.pointing:
                 self._correct_pointing(telescope)
         optics = Optics.from_dict(self.config.telescopes.get(telescope))
+        if obs.light and telescope in self.pa_stores:
+            optics = self._calibrated_optics(telescope, obs.port, optics)
         info = FrameInfo(
             telescope=telescope,
             object=obs.object or obs.name,
@@ -679,6 +686,29 @@ class Imaging:
                 keyword=kw,
                 comment=comment,
             )
+
+    def _calibrated_optics(self, telescope: str, port: str | None, optics: Optics) -> Optics:
+        """The port's measured PA (at the rotator's mechanical angle) and
+        parity for the approximate WCS, and in the header."""
+        mech = self.registry.get(f"{telescope}.rotator.mechanical")
+        try:
+            got = self.pa_stores[telescope].wcs_for(
+                telescope, port, None if mech is None or mech.error else mech.value
+            )
+        except Exception:
+            log.exception("%s: PA calibration", telescope)
+            return optics
+        if got is None:
+            return optics
+        pa, flip = got
+        for name, value, unit, kw, comment in (
+            ("pa.calibrated", round(pa, 4), "deg", "PACALIB", "Image PA from the PA calibration"),
+            ("pa.flip", flip, "", "PAFLIP", "Mirror-imaged field (PA calibration)"),
+        ):
+            self.registry.publish(
+                f"{telescope}.{name}", value, max_age=None, unit=unit, keyword=kw, comment=comment
+            )
+        return replace(optics, position_angle=pa, flip=flip)
 
     def _pointing_sample(self, telescope: str, solve: dict[str, Any]) -> None:
         pc = self.pointing.get(telescope)

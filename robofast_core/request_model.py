@@ -489,6 +489,9 @@ class Configuration:
     #: ``exposure_time`` each through the instrument config's port; the
     #: target only says when the run is schedulable (pick one near the
     #: zenith at the intended time) -- the grid covers the whole sky.
+    #: ``ROTATOR_CALIBRATION`` (robofast's): measure the port's PA and
+    #: parity on the target's field at the rotator angles of the
+    #: telescope's ``pa_calibration`` (docs/rotcal.md).
     type: str = "EXPOSE"
 
     TYPES: ClassVar[tuple[str, ...]] = (
@@ -498,6 +501,7 @@ class Configuration:
         "AUTO_FOCUS",
         "SPECTRUM",
         "POINTING_MODEL",
+        "ROTATOR_CALIBRATION",
     )
     GUIDE_MODES: ClassVar[tuple[str, ...]] = ("", "ON", "OFF")
 
@@ -553,7 +557,7 @@ class Configuration:
                 ic.light = False
             elif ctype != "EXPOSE" and not ic.light:
                 raise ValueError(f"{what}.instrument_configs[{i}]: a {ctype} frame is light")
-        if ctype in ("AUTO_FOCUS", "POINTING_MODEL") and len(parsed) != 1:
+        if ctype in ("AUTO_FOCUS", "POINTING_MODEL", "ROTATOR_CALIBRATION") and len(parsed) != 1:
             raise ValueError(f"{what}: an {ctype} needs exactly one light instrument config")
         default = "spectrograph" if ctype == "SPECTRUM" else "imager"
         instrument = str(d.get("instrument_type") or default)

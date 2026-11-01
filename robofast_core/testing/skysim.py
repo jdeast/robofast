@@ -337,6 +337,7 @@ class SkyFocusScene(FocusScene):
         focal_um_per_step: float = 1.0,
         effective_exposure: float | None = None,
         seed: int = 1,
+        pa: Callable[[], float] | None = None,
     ) -> None:
         cam = sky.camera
         super().__init__(
@@ -357,6 +358,8 @@ class SkyFocusScene(FocusScene):
         self.sky = sky
         self.mount = mount
         self.clock = clock
+        #: The image PA (deg) now, e.g. following a rotator (None: the camera's).
+        self.pa = pa
         #: Truth of the last frame (true pointing, stars).
         self.last_truth: dict[str, Any] = {}
 
@@ -383,6 +386,7 @@ class SkyFocusScene(FocusScene):
             binning=binning,
             defocus=self.defocus(optical),
             transparency=self.transparency,
+            pa=None if self.pa is None else self.pa(),
         )
         self.last_truth = frame.truth
         return frame.image

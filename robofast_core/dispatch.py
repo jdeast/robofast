@@ -75,7 +75,10 @@ none, so it is never sent to a telescope that would observe through the
 wrong port), and one naming a ``filter`` only for telescopes whose
 ``filters`` (if given) include it, and one naming a calibration-stage
 position (``optical_elements.calstage``) only for telescopes whose
-``calstage`` lists it. The sequencer then selects them.
+``calstage`` lists it, and an ``ARC`` or ``LAMP_FLAT`` naming a lamp
+(``optical_elements.lamp``) only for telescopes whose ``lamps`` list it
+(none by default: MINERVA has no lamps). The sequencer then selects them
+(and, for a lamp, switches it on and off: docs/pulizzi.md).
 
 Spectra fed by several telescopes
 ---------------------------------
@@ -179,6 +182,7 @@ from robofast_core import sky
 from robofast_core.plan import Idle, Observation
 from robofast_core.plan_record import PlanRecord
 from robofast_core.request_model import (
+    LAMP_TYPES,
     Configuration,
     Request,
     RequestGroup,
@@ -248,6 +252,10 @@ class TelescopeLimits:
     #: Its calibration-stage positions (the TRES front end's ``calstage``);
     #: a configuration naming another is not for this telescope.
     calstage: list[str] = field(default_factory=list)
+    #: Its calibration lamps (names on its lamp switch: docs/pulizzi.md); an
+    #: ARC or LAMP_FLAT naming another is not for this telescope. Empty (the
+    #: default, and MINERVA): no lamp calibrations at all.
+    lamps: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any], what: str) -> TelescopeLimits:
@@ -1022,6 +1030,8 @@ class DispatchScheduler:
                     reasons.append(f"{telescope} has no filter {ic.filter!r}")
                 if ic.calstage is not None and ic.calstage not in limits.calstage:
                     reasons.append(f"{telescope} has no calstage position {ic.calstage!r}")
+                if ic.lamp is not None and ic.lamp not in limits.lamps:
+                    reasons.append(f"{telescope} has no lamp {ic.lamp!r}")
         if any(c.type == "SPECTRUM" for c in configs):
             if self.spectrograph_down is not None:
                 reasons.append(f"spectrograph down ({self.spectrograph_down})")
@@ -1403,6 +1413,20 @@ class DispatchScheduler:
                     "target": c.target.internal(),
                     **self._acquisition_entry(visit, c),
                 },
+            )
+        if c.type in LAMP_TYPES:
+            return Observation(
+                f"{ic.lamp} [{c.id}#{visit.ic}{suffix}]",
+                exptime=ic.exptime,
+                count=ic.count - visit.done,
+                light=False,
+                filter=ic.filter,
+                port=ic.port,
+                calstage=ic.calstage,
+                allow_partial=c.allow_partial,
+                object=c.target.name,
+                kind="arc" if c.type == "ARC" else "lamp_flat",
+                lamp=ic.lamp,
             )
         if c.type == "SKY_FLAT":
             return Observation(

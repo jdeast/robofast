@@ -68,6 +68,8 @@ KINDS = (
     "pointing_model",
     "rotator_calibration",
     "sky_flat",
+    "arc",
+    "lamp_flat",
 )
 
 
@@ -147,6 +149,13 @@ class Observation:
     #: is computed: opposite the Sun, 75 deg high): overrides of the
     #: telescope's ``sky_flats`` settings (``filters``, ``count``, ...).
     flats: dict[str, Any] | None = None
+    #: For ``kind="arc"`` and ``kind="lamp_flat"`` (request types ARC and
+    #: LAMP_FLAT; docs/pulizzi.md): the calibration lamp, by its name on the
+    #: telescope's lamp switch. The telescope is not moved and no lease is
+    #: needed (``light`` is false: no sky light), but the shutter opens: the
+    #: sequencer selects the calibration stage, switches the lamp on, waits
+    #: its warm-up, takes ``count`` frames and switches it off again.
+    lamp: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in KINDS:
@@ -176,6 +185,17 @@ class Observation:
             self.spectrum = spec
         elif self.spectrum is not None:
             raise ValueError(f"observation {self.name!r}: 'spectrum' is for kind 'spectrum'")
+        if self.kind in ("arc", "lamp_flat"):
+            if self.light:
+                raise ValueError(
+                    f"observation {self.name!r}: a {self.kind} takes no sky light (light: false)"
+                )
+            if not self.lamp:
+                raise ValueError(f"observation {self.name!r}: a {self.kind} names its lamp")
+            if self.guide:
+                raise ValueError(f"observation {self.name!r}: a {self.kind} is not guided")
+        elif self.lamp is not None:
+            raise ValueError(f"observation {self.name!r}: 'lamp' is for kinds 'arc', 'lamp_flat'")
         if self.kind == "spectrograph_calibration":
             if self.light:
                 raise ValueError(

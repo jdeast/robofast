@@ -171,7 +171,7 @@ from robofast_core.api_auth import (
 from robofast_core.cancel import isolated
 from robofast_core.config import load_config, telescopes
 from robofast_core.dispatch import DispatchScheduler, dispatch_from_config
-from robofast_core.request_model import RequestGroup, upgrade_legacy
+from robofast_core.request_model import NO_LAMPS, RequestGroup, upgrade_legacy
 
 log = logging.getLogger(__name__)
 
@@ -786,6 +786,16 @@ class RequestApi:
                 out.append(f"{what}.telescopes: {unknown} not in {enc.name} {enc.telescopes}")
                 continue
             for j, c in enumerate(r.configurations):
+                lamps = {ic.lamp for ic in c.instrument_configs} - {None}
+                have_lamps = {x for t in tels for x in enc.planner.limits[t].lamps}
+                if lamps and not have_lamps:
+                    out.append(f"{what}.configurations[{j}].type: {c.type!r}: {NO_LAMPS}")
+                for lamp in sorted(lamps):
+                    if have_lamps and not any(lamp in enc.planner.limits[t].lamps for t in tels):
+                        out.append(
+                            f"{what}.configurations[{j}]: no lamp {lamp!r} on {tels}"
+                            f" (they have {sorted(have_lamps)})"
+                        )
                 if not any(c.instrument in enc.planner.limits[t].instruments for t in tels):
                     have = sorted({x for t in tels for x in enc.planner.limits[t].instruments})
                     out.append(

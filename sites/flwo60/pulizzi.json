@@ -1,0 +1,26 @@
+{
+  "_note": [
+    "The TRES calibration lamps on the FLWO 60-inch: Alpaca switch/0 over a Pulizzi IPC power controller (docs/pulizzi.md).",
+    "  python -m robofast_core.devices.pulizzi_server --config sites/flwo60/pulizzi.json --simulate",
+    "Hardware is NOT allowed: allow_hardware stays false until every item under 'Confirm on the mountain' in docs/pulizzi.md is checked.",
+    "Then: allow_hardware true here AND --hardware on the command line, on the computer the unit's serial cable is plugged into.",
+    "port.device is a placeholder for that computer's serial device.",
+    "outlets: the lamp-to-outlet map from FLWO's legacy 60-inch software (ThAr1 2, ThAr2 7, Incand 4, Incand2 1); unconfirmed on the live system.",
+    "Outlets 3, 5, 6 and 8 are not lamps (their loads are unknown; 3 and 5 were seen on): they are not listed, so robofast never touches them.",
+    "max_on (s): placeholders, to be set from the lamps' rated duty and TRES practice; warm-up times are in flwo60.json (the sequencer's lamps entry)."
+  ],
+  "name": "flwo60-lamps",
+  "listen": "127.0.0.1:11170",
+  "allow_hardware": false,
+  "port": {"type": "serial", "device": "/dev/ttyS0", "baud": 9600, "timeout": 1.0},
+  "unit_name": "@@@@",
+  "outlets": [
+    {"outlet": 2, "name": "ThAr1", "lamp": true, "max_on": 1800, "description": "ThAr lamp 1 (legacy 'lamp thar')"},
+    {"outlet": 7, "name": "ThAr2", "lamp": true, "max_on": 1800, "description": "ThAr lamp 2 (legacy 'lamp thar2')"},
+    {"outlet": 4, "name": "Incand", "lamp": true, "max_on": 1800, "description": "incandescent flat lamp (legacy 'lamp inc')"},
+    {"outlet": 1, "name": "Incand2", "lamp": true, "max_on": 1800, "description": "incandescent flat lamp 2 (legacy 'lamp inc2')"}
+  ],
+  "poll_interval": 2.0,
+  "status_max_age": 1.0,
+  "lamps_off_on_stop": true
+}

@@ -186,10 +186,12 @@ The legacy software never sends `#7`: on-sky offsets come from the TRES
 guider through the relay, which robofast does with `Action("Offset")`.
 The rest of what that software controls is not in TCSGalil. The TRES
 front end's calibration stage (`calstage` and its positions) is covered by
-its own Alpaca server (`docs/tres_frontend.md`); the rest has no robofast
-service yet (gaps, not built): the calibration lamps (a Pulizzi power
-switch), the atmospheric dispersion corrector, and the spectrograph bench
-(calibration box, fiber selector, bench focus).
+its own Alpaca server (`docs/tres_frontend.md`), and the calibration
+lamps (`lamp`, on a Pulizzi power switch) by an Alpaca Switch server, with
+`ARC` and `LAMP_FLAT` requests for the 60-inch (`docs/pulizzi.md`). The
+rest has no robofast service yet (gaps, not built): the atmospheric
+dispersion corrector and the spectrograph bench (calibration box, fiber
+selector, bench focus).
 
 ## Status (`#26`)
 

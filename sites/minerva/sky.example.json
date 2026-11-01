@@ -1,0 +1,47 @@
+{
+  "_note": [
+    "Target vetting, the star catalog and per-port photometry (docs/sky.md; robofast_core/vetting.py).",
+    "Used as the dispatch plan's 'vetting' entry: \"vetting\": \"sky.example.json\" (relative to the plan).",
+    "catalog.cache_dir: the Gaia DR3 tile cache (scripts/build_catalog.py fills it; absolute in production).",
+    "ports: '<telescope>/<port>' or '<port>'. fau: ZWO ASI174 behind the 2 % beamsplitter (98 % to the fiber);",
+    "fiber positions from fau_t1.ini / fau_t2.ini XFIBER, YFIBER (guider_tN.example.json guide.target).",
+    "photometry values marked ESTIMATED are guesses (sites/minerva/README.md: photometry); T2's FAU zero point",
+    "is MEASURED on 2026-04-23 frames (5 plate-solved frames, Gaia G, 4 arcsec aperture, airmass uncorrected)",
+    "in the stored 16-bit ADU (the ASI174's 12-bit counts x 16; its e-/ADU is unknown, so gain is 1 ADU).",
+    "reject: no flag rejects a request yet; every flag is a warning in validate and in the plan record."
+  ],
+  "catalog": {"cache_dir": "catalog-cache", "level": 7, "mag_limit": 16, "fetch": true},
+  "reject": [],
+  "companion_radius": 10.0,
+  "companion_dmag": 2.5,
+  "min_snr": 20.0,
+  "ports": {
+    "fau": {
+      "shape": [1216, 1936], "plate_scale": 0.265, "fiber": [949.0, 617.0],
+      "max_star_distance": 400.0, "capture_radius": 8.0, "exposure": 0.5, "seeing": 1.5,
+      "photometry": {
+        "band": "G", "aperture": 700.0, "obstruction": 0.47,
+        "efficiency": {"mirrors_ESTIMATED": 0.73, "optics_ESTIMATED": 0.9, "qe_ESTIMATED": 0.6, "beamsplitter": 0.02},
+        "gain": 1.0, "read_noise": 4.0, "saturation": 65535, "extinction": 0.15
+      }
+    },
+    "t2/fau": {
+      "shape": [1216, 1936], "plate_scale": 0.2655, "fiber": [948.0, 626.0],
+      "max_star_distance": 400.0, "capture_radius": 8.0, "exposure": 0.5, "seeing": 1.5,
+      "photometry": {
+        "band": "G", "aperture": 700.0, "obstruction": 0.47,
+        "efficiency": {"mirrors_ESTIMATED": 0.73, "optics_ESTIMATED": 0.9, "qe_ESTIMATED": 0.6, "beamsplitter": 0.02},
+        "zero_point": 19.70, "zero_point_error": 0.10, "zero_point_date": "2026-04-23", "zero_point_unit": "ADU/s",
+        "gain": 1.0, "read_noise": 4.0, "saturation": 65520, "extinction": 0.15
+      }
+    },
+    "imager": {
+      "shape": [2048, 2048], "plate_scale": 0.61, "exposure": 30.0, "seeing": 1.5,
+      "photometry": {
+        "band": "V", "aperture": 700.0, "obstruction": 0.47,
+        "efficiency": {"mirrors_ESTIMATED": 0.73, "corrector_ESTIMATED": 0.95, "filter_ESTIMATED": 0.85, "qe_ESTIMATED": 0.85},
+        "gain": 1.0, "read_noise": 8.0, "saturation": 65535, "extinction": 0.15
+      }
+    }
+  }
+}

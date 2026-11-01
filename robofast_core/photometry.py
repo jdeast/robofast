@@ -73,6 +73,10 @@ class PortPhotometry:
     zero_point: float | None = None
     zero_point_error: float | None = None
     zero_point_date: str | None = None
+    #: What the measured zero point counts: "e-/s", or "ADU/s" when the
+    #: camera's e-/ADU is not known (then ``gain`` should be 1 and
+    #: ``saturation`` in the same ADU, so rates and wells stay consistent).
+    zero_point_unit: str = "e-/s"
     #: Detector (for S/N and saturation): e-/ADU, e- rms, ADU.
     gain: float = 1.0
     read_noise: float = 5.0
@@ -90,6 +94,8 @@ class PortPhotometry:
         if set(d) - known:
             raise ValueError(f"photometry: unknown keys {sorted(set(d) - known)}")
         out = cls(**d)
+        if out.zero_point_unit not in ("e-/s", "ADU/s"):
+            raise ValueError("photometry: zero_point_unit is e-/s or ADU/s")
         if out.band not in PHOTON_RATE:
             raise ValueError(f"photometry: band {out.band!r} not one of {sorted(PHOTON_RATE)}")
         for k, v in out.efficiency.items():

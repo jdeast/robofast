@@ -50,6 +50,7 @@ COVERED = {
     "kiwispec.example.json",
     "request_api.example.json",
     "requests.example.json",
+    "sky.example.json",
     "targets.example.json",
     "too.example.json",
     "weather.yaml",
@@ -304,3 +305,23 @@ def test_kiwispec_agrees():
     site = KiwiSpecConfig.from_dict(_json("kiwispec.example.json"))
     assert deployed.stage_positions == site.stage_positions
     assert math.isclose(site.heater_setpoint, 55.0)
+
+
+def test_sky_config_loads():
+    """sky.example.json: the vetting config (docs/sky.md), with T2's measured
+    FAU zero point and the fiber's 98 %."""
+    from robofast_core.vetting import Vetter
+
+    cfg = _json("sky.example.json")
+    cfg["catalog"] = {"cache_dir": str(SITE.parents[1] / "tests/core/data/catalog"), "fetch": False}
+    v = Vetter.from_config(cfg)
+    fau2 = v.port("t2", "fau")
+    assert fau2 is not None and fau2.photometry.zp == 19.70
+    assert fau2.fiber == tuple(_json("guider_t2.example.json")["guide"]["target"])
+    assert v.port("t1", "fau").fiber == tuple(_json("guider_t1.example.json")["guide"]["target"])
+    est = v.port("t1", "fau").photometry
+    # The FAU sees 2 %; the fiber the other 98 %: 2.5 log10(49) mag brighter.
+    fiber = est.with_fraction("beamsplitter", 0.98)
+    assert fiber.zp - est.zp == pytest.approx(4.225, abs=1e-3)
+    # The chain's estimate agrees with T2's measured zero point (at ~1 e-/ADU).
+    assert abs(est.zp_estimated - 19.70) < 0.5

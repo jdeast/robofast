@@ -30,6 +30,7 @@ shows, with the same ids:
 | each guider, `GET /status` | failed, its own alarms, not answering |
 | KiwiSpec, `GET /status` | its alarms, not answering |
 | weather bridge, `GET /weather/status` | *would close* (shadow rain), not answering |
+| the throughput monitor, its status file (`throughput` in the console's enclosure entry) | a telescope's clear-night throughput more than `alarm_drop` below its baseline (warning), a sudden step down (alarm); docs/throughput.md |
 | the console | its acknowledgements file (`acks` in its config) acknowledges; with `console_url`, the console not answering `/healthz` is itself an alarm |
 | the notifier | a source that raises or times out (critical) |
 

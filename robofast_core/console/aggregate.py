@@ -19,7 +19,10 @@ Sources, per enclosure (docs/console.md):
 * the operator holds -- ``holds.json`` in ``operator_control``;
 * the nightly plan record -- the tail of the night's JSON-lines file;
 * the dispatch scheduler's queue -- through the request API's read-only
-  view of its state file.
+  view of its state file;
+* the throughput monitor -- its status file (``throughput`` in the
+  enclosure's entry; docs/throughput.md): each telescope's efficiency
+  trend, and an alarm when it has dropped.
 """
 
 from __future__ import annotations
@@ -119,6 +122,8 @@ class ConsoleEnclosure:
     #: The enclosure config's ``site`` (latitude, longitude, elevation), for
     #: the sky view when there is no dispatch plan to give one.
     site: dict[str, Any] | None = None
+    #: The throughput monitor's status file (robofast_core.throughput).
+    throughput_status: Path | None = None
 
     @classmethod
     def from_spec(
@@ -134,6 +139,7 @@ class ConsoleEnclosure:
             "weather",
             "emergency_close",
             "spectrograph_frames",
+            "throughput",
         }
         if unknown:
             raise ValueError(f"enclosure {name}: unknown keys {sorted(unknown)}")
@@ -226,6 +232,9 @@ class ConsoleEnclosure:
             spectrograph_frames=None
             if spec.get("spectrograph_frames") is None
             else _resolve(spec["spectrograph_frames"], base),
+            throughput_status=None
+            if spec.get("throughput") is None
+            else _resolve(spec["throughput"], base),
         )
 
 
@@ -324,6 +333,7 @@ class Aggregator:
             m = ((holds_doc or {}).get("manual") or {}).get(t)
             tels[t]["manual"] = m if isinstance(m, dict) else None
         spectrograph = self._spectrograph_view(spec, spec_err, enc, alarm)
+        throughput = self._throughput_view(enc, alarm)
         return {
             "weather": weather,
             "enclosure": enclosure,
@@ -331,6 +341,7 @@ class Aggregator:
             "telescopes": tels,
             "spectrograph": spectrograph,
             "plan": self._plan_view(enc),
+            "throughput": throughput,
             "timeline": tl if isinstance(tl, list) else [],
             "alarms": alarms,
             # For the console's log only (console/logstream.py); not shown.
@@ -590,6 +601,35 @@ class Aggregator:
             "queue": [q for q in spec.get("queue") or [] if isinstance(q, dict)],
             "backlight_on": spec.get("backlight_on"),
         }
+
+    @staticmethod
+    def _throughput_view(enc: ConsoleEnclosure, alarm: Any) -> dict[str, Any] | None:
+        """The throughput monitor's status for this enclosure's telescopes,
+        and its alarms (a stale file is shown with its age, not alarmed:
+        the monitor runs once a morning)."""
+        if enc.throughput_status is None:
+            return None
+        try:
+            doc = json.loads(enc.throughput_status.read_text())
+        except FileNotFoundError:
+            return {"time": None, "series": {}, "detail": "no status yet"}
+        except (OSError, ValueError) as exc:
+            return {"time": None, "series": {}, "detail": f"unreadable: {exc}"[:200]}
+        mine = {t.lower() for t in enc.telescopes}
+        series = {
+            k: v
+            for k, v in (doc.get("series") or {}).items()
+            if isinstance(v, dict) and str(v.get("telescope", "")).lower() in mine
+        }
+        for a in doc.get("alarms") or []:
+            if isinstance(a, dict) and str(a.get("telescope", "")).lower() in mine:
+                alarm(
+                    "throughput",
+                    str(a.get("text")),
+                    str(a.get("level", "warning")),
+                    str(a.get("detail", "")),
+                )
+        return {"time": doc.get("time"), "series": series}
 
     def _plan_view(self, enc: ConsoleEnclosure) -> dict[str, Any]:
         out: dict[str, Any] = {"recent": [], "upcoming": [], "record": None}

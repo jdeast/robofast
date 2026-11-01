@@ -15,7 +15,9 @@ Sections: the enclosure (open time, every close and why), weather
 interruptions, time on sky per telescope, requests completed/failed,
 autofocus (results and the seeing/FWHM trend), guiding (rms) and fiber flux
 (exposure meter), zero points per telescope and filter against the
-previous nights' (``--history``: earlier reports), pointing (plate-solve
+previous nights' (``--history``: earlier reports) and, with
+``--throughput``, the throughput monitor's trend per telescope and port
+(docs/throughput.md), pointing (plate-solve
 offsets, pointing-model alarms), acquisition methods, the spectrograph's
 frames (science and calibrations by kind), alarms and anomalies (errors,
 gave up, preemptions, dropped telescopes, lost frames). A QA verdict lists
@@ -120,6 +122,8 @@ class _Inputs:
     plan: list[dict[str, Any]] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
     history: list[dict[str, Any]] = field(default_factory=list)
+    #: The throughput monitor's section (:func:`robofast_core.throughput.report_section`).
+    throughput: dict[str, Any] | None = None
 
 
 def gather(
@@ -232,6 +236,8 @@ def build_report(inp: _Inputs, qa: QAConfig | None = None) -> dict[str, Any]:
             if ref is not None and zp is not None:
                 tt.setdefault("zero_point_change", {})[flt] = round(zp - ref, 3)
     rep["telescopes"] = tels
+    if inp.throughput is not None:
+        rep["throughput"] = inp.throughput
 
     # -- requests --
     outcomes = Counter()
@@ -314,6 +320,7 @@ def build_report(inp: _Inputs, qa: QAConfig | None = None) -> dict[str, Any]:
         po = tt.get("pointing_offset_median")
         if po is not None and po > qa.pointing_offset:
             look.append(f"{tel}: median pointing offset {po:.0f} arcsec")
+    look += (inp.throughput or {}).get("look_at", [])
     for t, v in rep["guiding"]["rms_arcsec_median"].items():
         if v is not None and v > qa.guide_rms:
             look.append(f"{t}: guiding rms {v:.2f} arcsec")
@@ -366,6 +373,10 @@ def render_markdown(rep: dict[str, Any]) -> str:
             f"{tt.get('spectrum_seconds', 0)} s | {tt.get('solved', 0)} | "
             f"{tt.get('pointing_offset_median')} | {zp or '-'} |"
         )
+    if rep.get("throughput"):
+        from robofast_core.throughput import render_markdown as throughput_markdown
+
+        L += ["", *throughput_markdown(rep["throughput"])]
     rq = rep["requests"]
     L += ["", "## Requests", "", f"Outcomes: {rq['outcomes']}; ToOs {rq['too']};"
           f" preemptions {rq['preemptions']}.", ""]  # fmt: skip
@@ -436,6 +447,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--history", default=None, help="directory of earlier report-*.json")
     ap.add_argument("--out", required=True, help="directory for report-<night>.md/.json")
     ap.add_argument("--notifier", default=None, help="notifier config: send the report")
+    ap.add_argument(
+        "--throughput", default=None, help="throughput config: ingest the night, add its section"
+    )
     args = ap.parse_args(argv)
     inp = gather(
         args.night,
@@ -444,6 +458,12 @@ def main(argv: list[str] | None = None) -> int:
         logs=args.log,
         history=args.history or args.out,
     )
+    if args.throughput:
+        from robofast_core import throughput
+
+        tcfg = throughput.ThroughputConfig.load(args.throughput)
+        upd = throughput.update(tcfg, args.night, args.data_root)
+        inp.throughput = throughput.report_section(upd.result, args.night)
     rep = build_report(inp)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

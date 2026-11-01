@@ -57,12 +57,15 @@ once after any action) and falls back to polling `/console/api/status`.
 | Sky | an alt/az chart: each telescope's pointing, the targets (current ones highlighted, ToOs marked), the Sun and the Moon, the altitude limits; a target table with altitude, azimuth, airmass now and in 1 and 2 h, and hour angle | the snapshot's `tel.alt`/`tel.az` and `current`; the dispatch scheduler's requests; astropy (`robofast_core/console/skyview.py`) |
 | Images | each guider's live frame with the fiber, the centroid and the guide window drawn on it; each telescope's latest saved frame; the spectrograph's latest raw frame (below) | guider `GET /frame`, the frame index, `spectrograph_frames` |
 | Requests | submit, validate or cancel a request group or ToO; list one's own groups | the request API, in process |
+| Throughput | per telescope, port and filter: last night, efficiency against the optics, change against the baseline, slope per 30 days, the latest event (shown only with a `throughput` entry) | the throughput monitor's status file (docs/throughput.md) |
 
 Alarms raised: the supervisor's own alarms; an enclosure fault; a quarantined
 lease, or one revoked but not released; the sequencer quarantined, needing an
 operator, or not running (its snapshot is stale); a telescope that gave up or
 lost frames; *would close* weather; a guider that failed or alarmed; the
-spectrograph's alarms; any service unreachable. An alarm's id is a hash of
+spectrograph's alarms; any service unreachable; the throughput monitor's
+(a telescope's clear-night throughput more than its limit below the
+baseline: `warning`; a sudden step down: `alarm`). An alarm's id is a hash of
 its enclosure, source and text, so an acknowledgement sticks to that alarm
 (kept in `acks`, across restarts) and a new one is not hidden by an old ack.
 

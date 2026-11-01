@@ -12,6 +12,8 @@
     "stop the whole enclosure. spectrograph: the KiwiSpec service (deploy/kiwispec.example.json listens on 8130).",
     "emergency_close: the token file (mode 600) for the dome server's close-only channel, used when the supervisor",
     "does not answer within 2 s; fallback 'dome' closes without waiting for the telescopes to park (docs/console.md).",
+    "throughput: the throughput monitor's status file (throughput.example.json; docs/throughput.md): its section",
+    "and its alarms (a drop below the baseline, a sudden step down) on the page and so through the notifier.",
     "Every address is a 127.0.0.1 placeholder."
   ],
   "listen": "127.0.0.1:8400",
@@ -24,7 +26,8 @@
       "config": "aqawan1.json",
       "plan": "dispatch.example.json",
       "spectrograph": "http://127.0.0.1:8130",
-      "emergency_close": {"token_file": "/etc/robofast/aqawan1-emergency.token", "fallback": "dome"}
+      "emergency_close": {"token_file": "/etc/robofast/aqawan1-emergency.token", "fallback": "dome"},
+      "throughput": "/var/lib/robofast/throughput/status.json"
     }
   },
   "refresh": 2.0

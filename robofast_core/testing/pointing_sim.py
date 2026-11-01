@@ -1,7 +1,7 @@
 """An all-sky synthetic star catalog and a mount on the simulated sky, for
 tests that point all over the sky (pointing runs, calibrations).
 
-The bundled test catalog (``tests/core/data/catalog``) covers five fields;
+The test sky (``tests/core/skydata.py``) covers five fields;
 a pointing grid needs stars everywhere. :class:`SyntheticCatalog` makes them
 up, deterministically: each 1 x 1 deg cell (in RA and sin Dec) gets its own
 random stars (a Poisson number for ``density`` per square degree, uniform in

@@ -484,10 +484,21 @@ class Configuration:
     #: instrument_type is ``spectrograph`` and its instrument configs are
     #: light, with optional ``iodine`` and ``target_counts``; ``filter`` and
     #: ``port`` are not allowed (the fiber has its own port, selected by the
-    #: guider config).
+    #: guider config). ``POINTING_MODEL`` (robofast's): a pointing run
+    #: (docs/pointing_model.md), ``exposure_count`` points over the sky of
+    #: ``exposure_time`` each through the instrument config's port; the
+    #: target only says when the run is schedulable (pick one near the
+    #: zenith at the intended time) -- the grid covers the whole sky.
     type: str = "EXPOSE"
 
-    TYPES: ClassVar[tuple[str, ...]] = ("EXPOSE", "DARK", "BIAS", "AUTO_FOCUS", "SPECTRUM")
+    TYPES: ClassVar[tuple[str, ...]] = (
+        "EXPOSE",
+        "DARK",
+        "BIAS",
+        "AUTO_FOCUS",
+        "SPECTRUM",
+        "POINTING_MODEL",
+    )
     GUIDE_MODES: ClassVar[tuple[str, ...]] = ("", "ON", "OFF")
 
     @classmethod
@@ -542,8 +553,8 @@ class Configuration:
                 ic.light = False
             elif ctype != "EXPOSE" and not ic.light:
                 raise ValueError(f"{what}.instrument_configs[{i}]: a {ctype} frame is light")
-        if ctype == "AUTO_FOCUS" and len(parsed) != 1:
-            raise ValueError(f"{what}: an AUTO_FOCUS needs exactly one light instrument config")
+        if ctype in ("AUTO_FOCUS", "POINTING_MODEL") and len(parsed) != 1:
+            raise ValueError(f"{what}: an {ctype} needs exactly one light instrument config")
         default = "spectrograph" if ctype == "SPECTRUM" else "imager"
         instrument = str(d.get("instrument_type") or default)
         if ctype == "SPECTRUM":

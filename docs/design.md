@@ -357,10 +357,15 @@ can.
 
 ### 3.6 Telescopes and pointing models
 
-The telescope layer hides the mount type. Pointing models live with the
-mount software where it has them (PWI4 for the CDK700s, per M3 port), and in
-robofast's telescope layer for mounts that don't. The sequencer never sees a
-model.
+The telescope layer hides the mount type. robofast keeps its own pointing
+model per telescope and M3 port (`robofast_core/pointmodel.py`,
+`docs/pointing_model.md`): built from plate solves by a pointing run (a
+`POINTING_MODEL` request) and from every solved frame, terms chosen by
+significance and cross-validated, applied to every slew (optionally with
+the vendor's model switched off), inverted for the FITS headers, with a
+rolling local correction and a nightly drift alarm. Where the mount
+software's own model is kept (PWI4 on the CDK700s, for now), robofast's
+can run disabled, measuring only.
 
 Where a telescope really points is measured, not assumed (`docs/sky.md`):
 robofast has its own star catalog (Gaia DR3 tiles cached on disk, a

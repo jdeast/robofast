@@ -450,7 +450,12 @@ may be wrong about the 60-inch's focus.
   *standing*: it returns to PENDING after each visit, as MINERVA's RV
   targets do. Requests load from JSON files, validated with errors that
   name the entry; `from_legacy_csv` converts a legacy MINERVA target
-  spreadsheet export. An InstrumentConfig may name a `filter` and an M3
+  spreadsheet export, and `robofast_core.catalogs` the FLWO 60-inch's
+  telshell catalogs (`.mct` target lists, `.off` offset patterns; `.sec`
+  confidential lists described but never decrypted) into an intermediate
+  form shaped like the proposed target model, request groups for the
+  60-inch, and back into `.mct` for the legacy software
+  (`docs/catalogs.md`; rules ported from FLWO's telshell, T. Groner). An InstrumentConfig may name a `filter` and an M3
   `port`; a Configuration may set `allow_partial`.
 - The scheduler is a **dispatch scheduler** (`robofast_core/dispatch.py`),
   RTS2/POCS-style: whenever a telescope is free it evaluates every request
@@ -916,7 +921,10 @@ Each step is a CI-tested deliverable.
     park and when off, with a simulator, ConformU in CI, the sequencer
     turning it on before light frames and its state in the headers (built:
     `robofast_core/devices/adc_*`, `docs/adc.md`, hardware locked until
-    confirmed). Next: answers to those questions, a TRES
+    confirmed). The TRES catalogs import as request groups and export
+    back for telshell (built: `robofast_core/catalogs/`,
+    `docs/catalogs.md`; the target database waits for the live catalog
+    directory). Next: answers to those questions, a TRES
     camera/spectrograph service, then a supervised test on the real TCS.
     MEarth South: an Alpaca Dome server for its roll-off roof (a
     parallel-port interface box, no watchdog, so attended only), with a
@@ -968,3 +976,4 @@ Each step is a CI-tested deliverable.
 | RTS2 | declared blocking between operations; value registry; dispatch selector with time-dependent bonus |
 | LCO OCS / TOM Toolkit | request and status model; facility interface |
 | ASCOM | Alpaca protocol, OmniSim, ConformU, ASCOM Remote |
+| FLWO telshell (T. Groner) | the TRES catalog formats and their reading rules (`docs/catalogs.md`) |

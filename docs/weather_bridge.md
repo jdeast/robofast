@@ -14,9 +14,10 @@ site pages --HTTP--> (fetch,     (staleness,    (weather_server.py)
 
 > **ACTION: validate rain false-positive rate in shadow mode before enforcing.**
 > MINERVA's WXT510 rain sensor was disabled in legacy for false positives
-> ("can be triggered by wind"). Rain from Redis and the ridge page is
-> evaluated and logged as `would close: rain ...` but does not make
-> `IsSafe` false until `enforce_rain: true` is set for those sources in
+> ("can be triggered by wind"). Rain from every MINERVA source (Redis, the
+> ridge page, and the cloud page's MEarth 998 sentinel) is evaluated and
+> logged as `would close: rain ...` but does not make `IsSafe` false until
+> `enforce_rain: true` is set for that source in
 > `sites/minerva/weather.yaml` (see [Rain](#rain)).
 
 | Module | Role |
@@ -154,9 +155,11 @@ its rain is evaluated and held exactly the same way, but only *reported*:
 the reason reads `would close: rain: <why> at <time>; holding until <time>
 (rain not enforced)`, it is listed in the status JSON's `would_close`, and
 `IsSafe` is unaffected; missing rain data from such a source is a note, not
-"unknown". MINERVA: Redis and the ridge page (both the WXT510) have
-`enforce_rain: false`; the cloud page's MEarth 998.0 sentinel, which legacy
-enforced as "much more reliable than wxt510Rain", stays enforced.
+"unknown". MINERVA: every source has `enforce_rain: false`. Redis and the ridge page
+are both the WXT510. The cloud page's MEarth 998.0 sentinel, which legacy
+enforced as "much more reliable than wxt510Rain", is shadow only too (JDE,
+2026-10-31): it is reported as `would close`, and the roof is not closed on
+it.
 
 ### Redis sources
 
@@ -238,8 +241,8 @@ ridge page at the same moment, so it is the same WXT510 station):
 | rain_intensity | `rain_intensity` | mm/h | rain rate; served as RainRate |
 | hail_intensity | `hail_intensity` | | rain rate (shadow) |
 | rain_duration, hail, hail_duration | same | cumulative | logged only |
-| mearth | `m_bolt` (time `mbolt_time`) | degC | **identity inferred** from the key name; limits as the MEarth cloud column |
-| aurora | `aurora` | degC | limits as the Aurora cloud column; `a_sky` equalled it |
+| mearth | `m_bolt` (time `mbolt_time`) | degC | the MEarth cloud sensor (confirmed, JDE 2026-10-31); limits as the MEarth cloud column |
+| aurora | `aurora` | degC | the Aurora sensor (confirmed, JDE 2026-10-31); limits as the Aurora cloud column; `a_sky` equalled it |
 | boltwood | `boltwood` (time `boltwood_time`) | degC | read -0.0 (= "sensor down"); which sensor is unknown: logged only |
 | sky_limit | `sky_limit` | degC | the FLWO observers' MEarth limit; dynamic limit, off |
 
@@ -273,7 +276,7 @@ legacy code does not state were established as follows:
   **totalRain's unit is not established** (mm assumed).
 - **Cloud page** times are MST (UTC-7, no DST); the 6/5/4-field layouts
   are legacy's; 0.0 and -999.9 mean "sensor down"; 998.0 from MEarth means
-  rain.
+  rain (shadow only at MINERVA).
 
 Legacy behaviour not ported: the snow/ice manual-inspection lockout
 (`manualDecision.txt`, coldest-temperature tracking) and the per-enclosure

@@ -1,0 +1,71 @@
+Metadata-Version: 2.4
+Name: robofast
+Version: 0.0.1
+Summary: Robotic Observatory Control Software
+Home-page: https://github.com/jdeast/robofast
+Author: Jason Eastman
+Author-email: jason.eastman@cfa.harvard.edu
+Keywords: robofast,observatory,robotic,autonomous
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Science/Research
+Classifier: Topic :: Scientific/Engineering
+Classifier: License :: OSI Approved :: BSD License
+Classifier: Programming Language :: Python :: 3.7
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Programming Language :: Python :: 3 :: Only
+Requires-Python: >=3.7, <4
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy
+Requires-Dist: scipy
+Requires-Dist: matplotlib
+Requires-Dist: ipdb
+Requires-Dist: astropy
+Requires-Dist: astroquery
+Requires-Dist: pywin32
+Requires-Dist: pytest
+Requires-Dist: pyyaml
+Requires-Dist: pyephem
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: keywords
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+This code is (will be) a generic robotic observatory code that autonomously executes 
+astronomical observations. 
+
+New observatories must write new configuration files (see config/* for examples) 
+and Hardware Abstraction Layer (HAL) classes (see hal/*.py for examples) that 
+translate the specific hardware (e.g., Paramount, Cdk700) into generic commands 
+(slew). As such, these HAL classes must expose standardized function names, which
+are enforced by the high-level wrappers (e.g., telescope.py). See existing codes 
+for examples.
+
+After that, they can take advantage of the generalized robotic code and all of its 
+infrastructure.
+
+If you write code to support new hardware, please consider a pull request or sending
+it to me so other users can use (and improve) it.
+
+To see the new core (`robofast_core/`) run a whole simulated MINERVA RV night
+on your machine, see [docs/demo.md](docs/demo.md).
+
+To deploy it on a control host (users, systemd units, secrets, firewall,
+time, backups, upgrades), see [docs/deploy.md](docs/deploy.md); for alarm
+notifications by email, chat or a pager hook, [docs/notifier.md](docs/notifier.md).
+
+## License
+
+BSD 3-Clause; see [LICENSE](LICENSE).

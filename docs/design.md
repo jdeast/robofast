@@ -294,6 +294,12 @@ switched off on every way out (error, preemption, cancellation, with a
 grant of its own that a fence does not revoke), every cleanup switches all
 lamps off, and the switch server itself turns off any lamp left on longer
 than its `max_on`. MINERVA has no lamps: its requests for them are refused.
+A telescope with an atmospheric dispersion corrector (`adc`: the 60-inch's,
+served as an Alpaca Switch for tracking plus a Rotator per prism,
+`docs/adc.md`) has its ADC tracking switched on once on target for light
+frames, and the sequencer waits (bounded by `adc_settle_timeout`) for it
+to report `Settled`; an ADC that does not settle is a warning, not a
+failure. Every cleanup switches the tracking off (prisms neutral).
 
 **Autofocus.** An observation of `kind="autofocus"` (or a request
 configuration of type `AUTO_FOCUS`) focuses its telescope on its field,
@@ -901,7 +907,16 @@ Each step is a CI-tested deliverable.
     ConformU in CI, and `ARC`/`LAMP_FLAT` requests and sequencer lamp frames
     for the 60-inch only (built: `robofast_core/devices/pulizzi*`,
     `robofast_core/lamps.py`, `docs/pulizzi.md`, hardware locked until
-    confirmed). Next: answers to those questions, the ADC, a TRES
+    confirmed). The 60-inch's atmospheric dispersion corrector (two prism
+    motors on one serial line; it serves TRES and FAST alike) is served as
+    two Alpaca Rotators (the prisms) and a Switch (tracking on/off and its
+    state), following the telescope from the TCSGO server with the legacy
+    daemon's math (checked against its own test vectors), holding on stale
+    input, during slews and beyond its zenith-distance limit, neutral at
+    park and when off, with a simulator, ConformU in CI, the sequencer
+    turning it on before light frames and its state in the headers (built:
+    `robofast_core/devices/adc_*`, `docs/adc.md`, hardware locked until
+    confirmed). Next: answers to those questions, a TRES
     camera/spectrograph service, then a supervised test on the real TCS.
     MEarth South: an Alpaca Dome server for its roll-off roof (a
     parallel-port interface box, no watchdog, so attended only), with a

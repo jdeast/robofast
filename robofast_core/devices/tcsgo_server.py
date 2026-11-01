@@ -708,8 +708,10 @@ class _Handler(BaseHTTPRequestHandler):
         if parts != lower or len(lower) != 5 or lower[:2] != ["api", "v1"]:
             self._send(400, f"unknown path {url.path}", "text/plain")
             return
-        device = lower[2]
-        if device not in srv.devices or lower[3] != "0":
+        # Device 0 is served under its type's name, any other number N as
+        # "type/N" (a server with two devices of one type lists both).
+        device = lower[2] if lower[3] == "0" else f"{lower[2]}/{lower[3]}"
+        if device not in srv.devices:
             self._send(400, f"no device {parts[2]}/{parts[3]}", "text/plain")
             return
         member = lower[4]

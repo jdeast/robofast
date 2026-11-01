@@ -153,6 +153,7 @@ name the snapshot that a value comes from.
 | `TRACKING` | telescope, start | mount tracking |
 | `FOCPOS`, `FOCTEMP` | focuser, start | [step], [C] |
 | `ROTPOS`, `ROTMECH` | rotator, start | [deg] sky and mechanical angle |
+| `ADCTRACK`, `ADCSETTL`, `ADCDEFL`, `ADCANGA`, `ADCANGB` | the ADC server (docs/adc.md), start of light frames | tracking, settled on this target, prism deflection [deg], each motor's angle from home [deg] |
 | `INSTRUME`, `DETECTOR` | camera | camera `Name`, `SensorName` |
 | `PIXSIZE1`, `PIXSIZE2` | camera | [um] unbinned pixel size |
 | `EGAIN`, `MAXADU` | camera | [e-/ADU], [ADU] |

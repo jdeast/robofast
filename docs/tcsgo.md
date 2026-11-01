@@ -189,8 +189,12 @@ front end's calibration stage (`calstage` and its positions) is covered by
 its own Alpaca server (`docs/tres_frontend.md`), and the calibration
 lamps (`lamp`, on a Pulizzi power switch) by an Alpaca Switch server, with
 `ARC` and `LAMP_FLAT` requests for the 60-inch (`docs/pulizzi.md`). The
-rest has no robofast service yet (gaps, not built): the atmospheric
-dispersion corrector and the spectrograph bench (calibration box, fiber
+atmospheric dispersion corrector (`adc_on`/`adc_off` and the legacy ADC
+daemon, which took the telescope's position from the TCS window's status
+reader) has its own Alpaca Rotator/Switch server that reads the position
+from this server's Telescope instead, so it works with or without the
+legacy software (`docs/adc.md`). The rest has no robofast service yet
+(gaps, not built): the spectrograph bench (calibration box, fiber
 selector, bench focus).
 
 ## Status (`#26`)

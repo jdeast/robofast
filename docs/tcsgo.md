@@ -295,8 +295,9 @@ not carried over:
    example config spaces commands 0.5 s apart.
 4. **Is the 60-inch dome (rotation and shutters) wired to the TCS?** The
    legacy software rotates the dome only with `#20`/`#43` and reads `#62`,
-   so rotation probably is; it never sends the shutter commands, so the
-   shutters are still open. If they are, is the shutter order constrained (upper before lower when opening, lower
+   so rotation probably is. It never sends the shutter commands, so whether
+   the shutters are wired to the TCS is still unknown. If they are, is the
+   shutter order constrained (upper before lower when opening, lower
    before upper when closing, as configured)? Does `#20` need the AUTO DOME
    switch up in normal operation?
 5. ~~Is there any watchdog~~ **Answered** (JDE, 2026-10-31): none he is

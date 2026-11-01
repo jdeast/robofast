@@ -28,7 +28,9 @@ jobs:
   pytest:
     name: pytest
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The fast tier takes ~13-14 min serially (1474 tests, 2026-11-01); 15
+    # cancelled PR #59's 3.12 and 3.14 jobs just short of the end.
+    timeout-minutes: 30
     # Data robofast downloads from Zenodo (robofast_core/zenodo.py; the Gaia
     # DR3 extracts are CC BY-NC, so not in this BSD repository) land here,
     # and the cache step below keeps them between runs: Zenodo is a free
@@ -120,8 +122,10 @@ jobs:
   # Telescope/Focuser/Dome server (scripts/conformu_tcsgo.py), the MEarth
   # South roof Dome server (scripts/conformu_mearth_roof.py), and the TRES
   # front end's calibration-stage FilterWheel/Focuser server
-  # (scripts/conformu_tres_frontend.py), and the 60-inch's calibration-lamp
-  # Switch server on its Pulizzi simulator (scripts/conformu_pulizzi.py).
+  # (scripts/conformu_tres_frontend.py), the 60-inch's calibration-lamp
+  # Switch server on its Pulizzi simulator (scripts/conformu_pulizzi.py), and
+  # the 60-inch's ADC Rotator/Switch server on its prism-motor simulator
+  # (scripts/conformu_adc.py).
   conformu:
     name: conformu
     runs-on: ubuntu-latest
@@ -162,6 +166,9 @@ jobs:
       - name: ConformU against the calibration-lamp Switch server
         if: ${{ !cancelled() }}
         run: python scripts/conformu_pulizzi.py --conformu "$CONFORMU_BIN" --out "${{ runner.temp }}/conformu-pulizzi"
+      - name: ConformU against the ADC Rotator and Switch server
+        if: ${{ !cancelled() }}
+        run: python scripts/conformu_adc.py --conformu "$CONFORMU_BIN" --out "${{ runner.temp }}/conformu-adc"
       - name: Upload ConformU logs
         if: always()
         continue-on-error: true
@@ -175,6 +182,7 @@ jobs:
             ${{ runner.temp }}/conformu-mearth-roof
             ${{ runner.temp }}/conformu-tres-frontend
             ${{ runner.temp }}/conformu-pulizzi
+            ${{ runner.temp }}/conformu-adc
           if-no-files-found: warn
 
   # End to end: a whole simulated MINERVA RV night (docs/demo.md) on

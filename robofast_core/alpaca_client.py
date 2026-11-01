@@ -201,6 +201,8 @@ METHODS: dict[str, tuple[str, tuple[str, ...]]] = {
     "TimeSinceLastUpdate": ("GET", ("SensorName",)),
     # switch (a PDU outlet)
     "SetSwitch": ("PUT", ("Id", "State")),
+    "GetSwitch": ("GET", ("Id",)),
+    "GetSwitchValue": ("GET", ("Id",)),
     # any device: a driver-specific action (the enclosure heartbeat)
     "Action": ("PUT", ("Action", "Parameters")),
 }

@@ -51,6 +51,10 @@ and optionally:
   (:class:`~robofast_core.guider.service.GuiderRemote`; docs/guider.md).
   Observations with ``guide`` start it on target; cleanup stops it before
   parking.
+* per telescope, ``pointing``: robofast's own pointing model
+  (:class:`~robofast_core.pointmodel.PointingCorrector`;
+  docs/pointing_model.md): applied to every slew, measured on every solved
+  frame, built by ``kind="pointing_model"`` runs.
 * ``images`` -- save every frame (:mod:`robofast_core.imaging`;
   ``docs/data.md``): ``{"data_root": "/data", "site": "minerva", ...}``
   with :class:`~robofast_core.imaging.ImagingConfig` fields; a relative
@@ -156,6 +160,7 @@ TELESCOPE_KEYS = {
     "rotator",
     "autofocus",
     "guider",
+    "pointing",
 }
 
 
@@ -206,6 +211,14 @@ def build_units(
                 autofocus = AutofocusSetup.from_dict(entry["autofocus"], base)
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"telescope {name!r}: {exc}") from exc
+        pointing = None
+        if entry.get("pointing") is not None:
+            from robofast_core.pointmodel import PointingCorrector
+
+            try:
+                pointing = PointingCorrector.from_config(name, entry["pointing"], base=base)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"telescope {name!r}: {exc}") from exc
         guider = None
         if "guider" in entry:
             from robofast_core.guider.service import GuiderRemote
@@ -223,6 +236,7 @@ def build_units(
                 focuser=owners.get("focuser") if autofocus is not None else None,
                 autofocus=autofocus,
                 guider=guider,
+                pointing=pointing,
             )
         )
     if not units:
@@ -436,6 +450,7 @@ def snapshot(seq: Sequencer, interval: float = 5.0) -> dict[str, Any]:
             "consecutive_errors": u.consecutive_errors,
             "current": current.get(name),
             "park_requested": u.park_requested,
+            "alarms": list(u.alarms),
         }
     out = {
         "time": datetime.now(UTC).isoformat(),

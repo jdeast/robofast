@@ -120,6 +120,25 @@ class FrameSolver:
         # How far the mount's idea of the optical axis was from the truth.
         tra, tdec = sol.sky([crpix[0]], [crpix[1]])
         out["offset_arcsec"] = round(float(separation(ra, dec, tra[0], tdec[0])) * 3600.0, 2)
+        # For the pointing model (robofast_core.pointmodel): where the optical
+        # axis really pointed, where the mount said it was (MNTRA/MNTDEC
+        # when robofast's model rewrote RA/DEC), the sidereal time at
+        # mid-exposure, the port, and the requested target.
+        out["axis_ra"], out["axis_dec"] = round(float(tra[0]), 7), round(float(tdec[0]), 7)
+        mra, mdec = _num(h, "MNTRA"), _num(h, "MNTDEC")
+        if mra is not None and mdec is not None:
+            out["mount_ra"], out["mount_dec"] = round(mra * 15.0, 7), round(mdec, 7)
+        else:
+            out["mount_ra"], out["mount_dec"] = ra, dec
+        lst = _num(h, "LST")
+        if lst is not None:
+            half = 0.5 * (_num(h, "EXPTIME") or 0.0) * 360.98564736629 / 86400.0
+            out["lst"] = round((lst * 15.0 + half) % 360.0, 6)
+        for key, kw in (("port", "PORT"), ("objra", "OBJRA"), ("objdec", "OBJDEC")):
+            if h.get(kw) is not None:
+                out[key] = h.get(kw)
+        if h.get("DATE-OBS"):
+            out["date_obs"] = str(h["DATE-OBS"])
         exptime = _num(h, "EXPTIME") or 0.0
         gain = _num(h, "EGAIN")
         sat = _num(h, "MAXADU") or _num(h, "SATURATE")

@@ -348,7 +348,8 @@ Detection rejects the ASI174's many hot pixels by their sharpness.
 
 - Measured plate scales, PAs and parities for each MINERVA port (T2's FAU:
   section 9); the imagers' and T1's FAU zero points; the ASI174's e-/ADU.
-- A pointing-model builder on top of `pointing.fit` and the solver.
+- ~~A pointing-model builder~~: `robofast_core/pointmodel.py`,
+  `docs/pointing_model.md`.
 - astrometry.net index files on the control hosts, if a blind fallback is
   wanted.
 - The Gaia cache filled for the target list on each host; `select:

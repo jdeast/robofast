@@ -188,7 +188,7 @@ dialog; the destructive ones (marked *confirm*) must also send
 | `stop` (*confirm*) | `enclosure` only | the whole enclosure: hold every telescope, then ask the supervisor to close (`POST /close`, which revokes the lease). The sequencer aborts every exposure and parks every telescope as for any revocation, and with no lease the supervisor closes. While held, the sequencer asks for no new lease, so it stays closed until someone resumes |
 | `clear_lease` (*confirm*) | `enclosure` | release a dead (crashed or quarantined) lease once the telescopes are safe: the supervisor's `clear`, with the observer's name (design.md 3.3). Refused while the lease is live |
 | `clear_spectrograph` (*confirm*) | `enclosure` | the sequencer takes spectra again after it marked the spectrograph down (through `operator_control`; the spectrograph panel shows up/down, the failures and who waits in its queue) |
-| `clear_faults` (*confirm*) | `enclosure` | the enclosure's `ClearFaults` (the supervisor refuses unless it is closed); also releases an emergency close latch |
+| `clear_faults` (*confirm*) | `enclosure` | the enclosure's `ClearFaults` (the supervisor refuses unless it is closed); also releases an emergency close latch, and restarts automatic fault clearing if a recurrence stopped it (`docs/aqawan.md`) |
 | `manual` | `enclosure`, `telescope`, `op`, ... | manual control of one telescope (below; `take` needs *confirm*) |
 | `emergency_close` (*confirm*) | `enclosure` (omit: all), `direct`, `reason` (optional) | close now, by any path that answers (below). Never rate limited |
 

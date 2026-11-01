@@ -126,6 +126,9 @@ jobs:
       - name: ConformU against the TCSGO Telescope, Focuser and Dome server
         if: ${{ !cancelled() }}
         run: python scripts/conformu_tcsgo.py --conformu "$CONFORMU_BIN" --out "${{ runner.temp }}/conformu-tcsgo"
+      - name: ConformU against the PDU Switch server
+        if: ${{ !cancelled() }}
+        run: python scripts/conformu_pdu.py --conformu "$CONFORMU_BIN" --out "${{ runner.temp }}/conformu-pdu"
       - name: Upload ConformU logs
         if: always()
         continue-on-error: true
@@ -135,6 +138,7 @@ jobs:
           path: |
             ${{ runner.temp }}/conformu
             ${{ runner.temp }}/conformu-tcsgo
+            ${{ runner.temp }}/conformu-pdu
           if-no-files-found: warn
 
   # End to end: a whole simulated MINERVA RV night (docs/demo.md) on

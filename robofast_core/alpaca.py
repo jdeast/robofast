@@ -23,6 +23,7 @@ DEVICE_TYPES = frozenset(
         "dome",
         "safetymonitor",
         "observingconditions",
+        "switch",
     }
 )
 

@@ -60,6 +60,10 @@ and optionally:
   docs/rotcal.md); the sequencer then also moves the rotator, for
   ``kind="rotator_calibration"``, and the frame pipeline seeds every
   frame's WCS from it.
+* per telescope, ``recovery``: the recovery ladder per device
+  (:class:`~robofast_core.recovery.RecoveryLadder`; docs/recovery.md):
+  reconnect, restart the vendor software, power-cycle its PDU outlet, then
+  give up for the night.
 * ``images`` -- save every frame (:mod:`robofast_core.imaging`;
   ``docs/data.md``): ``{"data_root": "/data", "site": "minerva", ...}``
   with :class:`~robofast_core.imaging.ImagingConfig` fields; a relative
@@ -167,6 +171,7 @@ TELESCOPE_KEYS = {
     "guider",
     "pointing",
     "pa_calibration",
+    "recovery",
 }
 
 
@@ -233,6 +238,14 @@ def build_units(
                 pa_cal = RotatorSetup.from_config(entry["pa_calibration"], base=base)
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"telescope {name!r}: {exc}") from exc
+        recovery = None
+        if entry.get("recovery") is not None:
+            from robofast_core.recovery import RecoveryLadder
+
+            try:
+                recovery = RecoveryLadder.from_config(name, entry["recovery"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"telescope {name!r}: {exc}") from exc
         guider = None
         if "guider" in entry:
             from robofast_core.guider.service import GuiderRemote
@@ -253,6 +266,7 @@ def build_units(
                 pointing=pointing,
                 rotator=owners.get("rotator") if pa_cal is not None else None,
                 pa_calibration=pa_cal,
+                recovery=recovery,
             )
         )
     if not units:

@@ -960,9 +960,14 @@ class GuiderRemote:
         self.started = False
         poll, self._poll = self._poll, None
         if poll is not None:
+            # Bounded, and never swallowing our own cancellation: a cancel
+            # that lands inside an httpx request can be lost (the request
+            # returns normally), so the poll task may outlive its cancel;
+            # it also ends by itself once it is no longer ``self._poll``.
             poll.cancel()
-            with contextlib.suppress(BaseException):
-                await poll
+            await asyncio.wait({poll}, timeout=self.timeout)
+            if poll.done() and not poll.cancelled():
+                poll.exception()  # retrieved (it only ever logs)
         try:
             async with asyncio.timeout(self.timeout):
                 data = await self._call("POST", "/stop", {"reason": reason})
@@ -975,8 +980,12 @@ class GuiderRemote:
         return bool(data.get("stopped", False))
 
     async def _poll_loop(self) -> None:
-        while True:
+        me = asyncio.current_task()
+        # Ends when stop() replaces it, even if its cancel was lost (stop()).
+        while self._poll is me:
             await asyncio.sleep(self.poll_interval)
+            if self._poll is not me:
+                return
             try:
                 self._publish(await self.status())
             except Exception as exc:

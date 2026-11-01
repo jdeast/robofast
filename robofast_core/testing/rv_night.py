@@ -616,17 +616,32 @@ class SimulatedNight:
         level = root.level
         root.setLevel(logging.INFO)
         root.addHandler(handler)
-        try:
-            await asyncio.wait_for(
-                run(
-                    seq,
-                    seq._remote,  # type: ignore[attr-defined]
-                    status_file=self.out / "sequencer-status.json",
-                    status_interval=1.0,
-                ),
-                timeout,
+        task = asyncio.ensure_future(
+            run(
+                seq,
+                seq._remote,  # type: ignore[attr-defined]
+                status_file=self.out / "sequencer-status.json",
+                status_interval=1.0,
             )
+        )
+        try:
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+            if not done:
+                # Where everything was stuck, before cancelling (CI flakes).
+                why = f"sequencer run {_tag(self, seq)} still running after {timeout} s"
+                _dump_tasks(why)
+                self.outcome.errors.append(why)
+                # The service stops cleanly on cancellation (as on SIGTERM).
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            else:
+                task.result()
         finally:
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(BaseException):
+                    await task
             root.removeHandler(handler)
             root.setLevel(level)
             handler.close()
@@ -925,6 +940,7 @@ class SimulatedNight:
         deadline = time.monotonic() + timeout
         while not pred():
             if time.monotonic() > deadline:
+                _dump_tasks(f"director: timed out waiting for {what}")
                 raise TimeoutError(f"director: timed out waiting for {what}")
             await asyncio.sleep(0.05)
 
@@ -1008,6 +1024,17 @@ class SimulatedNight:
     @staticmethod
     def _both(tl: Timeline) -> list[Any]:
         return [e for e in tl.events("spectrum_started") if len(e.detail["telescopes"]) == 2]
+
+
+def _dump_tasks(why: str) -> None:
+    """Log every asyncio task's stack (where a stuck night is stuck)."""
+    import io
+
+    buf = io.StringIO()
+    for t in sorted(asyncio.all_tasks(), key=lambda t: t.get_name()):
+        buf.write(f"--- {t.get_name()}\n")
+        t.print_stack(limit=30, file=buf)
+    log.error("%s; tasks:\n%s", why, buf.getvalue())
 
 
 def _holds(control: Path) -> dict[str, Any]:

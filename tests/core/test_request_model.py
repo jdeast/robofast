@@ -354,3 +354,52 @@ def test_legacy_csv(tmp_path):
     path.write_text("name,ra,dec,exptime,priority,active\nHD 1,1.5,95,300,5,1\n")
     with pytest.raises(ValueError, match=r"targets.csv:2: .*target.dec"):
         from_legacy_csv(path)
+
+
+# -- KiwiSpec is iodine only (JDE 2026-10-31) ---------------------------------------
+
+
+def _spectrum(**conf) -> dict:
+    c = {
+        "id": "c",
+        "type": "SPECTRUM",
+        "instrument_type": "spectrograph",
+        "target": {"type": "ICRS", "name": "HD 1", "ra": 10.0, "dec": 20.0},
+        "instrument_configs": [{"exposure_time": 60.0}],
+        **conf,
+    }
+    return {"id": "g", "requests": [{"id": "r", "configurations": [c]}]}
+
+
+@pytest.mark.parametrize(
+    "conf",
+    [
+        {"type": "ARC"},
+        {"type": "LAMP_FLAT"},
+        {"instrument_configs": [{"exposure_time": 1.0, "extra_params": {"lamp": "ThAr"}}]},
+        {"instrument_configs": [{"exposure_time": 1.0, "extra_params": {"thar": True}}]},
+        {"extra_params": {"calibration_lamp": "thar"}},
+    ],
+)
+def test_lamp_calibrations_are_refused_with_the_reason(conf):
+    with pytest.raises(ValueError, match="iodine only"):
+        RequestGroup.from_dict(_spectrum(**conf))
+
+
+def test_iodine_calibration_examples():
+    """The B stars go through the iodine cell, once a night; templates
+    without it, once."""
+    groups = {g.id: g for g in load_request_groups(SITES / "minerva" / "requests.example.json")}
+    bstars = [g for k, g in groups.items() if k.startswith("BSTAR-")]
+    templates = [g for k, g in groups.items() if k.startswith("TEMPLATE-")]
+    assert len(bstars) >= 2 and templates
+    for g in bstars:
+        [r] = g.requests
+        [c] = r.configurations
+        assert c.type == "SPECTRUM" and all(ic.iodine is True for ic in c.instrument_configs)
+        assert r.cadence is not None and r.cadence.max_per_night == 1
+    for g in templates:
+        [r] = g.requests
+        [c] = r.configurations
+        assert c.type == "SPECTRUM" and all(ic.iodine is False for ic in c.instrument_configs)
+        assert r.cadence is None

@@ -110,9 +110,16 @@ async def test_pointing_run_builds_a_model_that_puts_the_next_target_on_the_axis
     await run(rig, imaging)
     assert [h[2] for h in plan.history] == ["complete", "complete"]
     [built] = rig.sequencer.pointing_models
-    assert sorted(built.model.terms) == sorted(EQ)
-    for k, v in EQ.items():
-        assert built.model.terms[k] == pytest.approx(v, abs=1.0)
+    # Every injected term, recovered. The exact term set is not asserted
+    # here (test_pointmodel's run on the simulated sky does, at a fixed
+    # time): this run is on the wall clock, so its 18 star fields differ from
+    # run to run, and the simulated sky's per-field solve systematics (~0.3")
+    # stand far above its ~0.05" of noise. Now and then (2 of 30 local runs) a
+    # ~0.3" Dec-centering term (DCEC or DCES) clears the 4-sigma bar. Any such
+    # extra term must stay negligible.
+    assert set(EQ) <= set(built.model.terms), sorted(built.model.terms)
+    for k, v in built.model.terms.items():
+        assert v == pytest.approx(EQ.get(k, 0.0), abs=1.0), (k, v)
     assert built.cv_rms < 0.5 and built.sources == {"run": 18}
     # Saved, with every sample logged.
     assert ModelStore(tmp_path / "pointing" / "models").load("t1", None).model == built.model

@@ -20,8 +20,10 @@ exposure started; it honours ``BinX``/``BinY`` and the subframe.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -193,6 +195,18 @@ class StarfieldCamera(FakeCamera):
         self._optical_at_start = self.focuser.optical
         self._duration = float(duration)
         self.exposed_at.append(self._optical_at_start)
+
+    async def get(self, member: str, *, timeout: float | None = None) -> Any:
+        if member != "ImageArray":
+            return await super().get(member, timeout=timeout)
+        if self.download_time:
+            await asyncio.sleep(self.download_time)
+        await self._gate()
+        # Rendered off the event loop, as a real camera's download never
+        # blocks it: a sky frame takes ~0.3 s of CPU, more on a loaded CI
+        # runner, and a blocked loop starves the supervisor's weather reads
+        # (a short stale_after then revokes the lease mid-run).
+        return await asyncio.to_thread(lambda: self.ImageArray)
 
     @property
     def ImageArray(self) -> ImageArray:

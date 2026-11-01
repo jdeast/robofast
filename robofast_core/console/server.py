@@ -99,6 +99,7 @@ ACTIONS = (
     "emergency_close",
     "clear_spectrograph",
     "manual",
+    "duty",
 )
 CONFIRM = ("stop", "park", "clear_lease", "clear_faults", "emergency_close", "clear_spectrograph")
 #: Actions that the per-token action rate limit never blocks (closing is the
@@ -200,8 +201,9 @@ class NotAllowed(Exception):
 
 class SupervisorClient:
     """The only way the console reaches a safety supervisor. ``ALLOWED`` is
-    the whole list: read, close (revoke), clear a dead lease, clear faults.
-    Nothing here can request a lease, renew one or open anything."""
+    the whole list: read, close (revoke), clear a dead lease, clear faults,
+    operator duty (which only permits the supervisor's own policy to grant
+    a lease). Nothing here can request a lease, renew one or open anything."""
 
     ALLOWED = (
         ("GET", "status"),
@@ -209,6 +211,7 @@ class SupervisorClient:
         ("POST", "close"),
         ("POST", "faults/clear"),
         ("POST", "leases/*/clear"),
+        ("POST", "duty"),
     )
 
     def __init__(self, url: str, http: httpx.AsyncClient, timeout: float) -> None:
@@ -529,6 +532,8 @@ class Console:
                 )
             result = await self.act(parts[0], client.name, body)
             target = body.get("telescope") or body.get("enclosure") or "all"
+            if parts[0] == "duty" and body.get("op") == "renew":
+                return Response(200, {"ok": True, "result": result})  # no log line each minute
             self.log.note(
                 str(body.get("enclosure") or ""),
                 f"{client.name}: {parts[0]} {target}: {body.get('reason') or ''}".strip(),
@@ -809,6 +814,10 @@ class Console:
             reason = "emergency close"  # no typing on a phone in the rain
         if action == "manual" and body.get("op") not in ("take", "release") and not reason:
             reason = "manual control"
+        if action == "duty" and not reason:
+            reason = {"on": "on duty", "off": "off duty", "renew": "console open"}.get(
+                str(body.get("op")), ""
+            )
         if not isinstance(reason, str) or not reason.strip() or len(reason) > MAX_REASON:
             raise ApiError(400, f"reason: say why (1 to {MAX_REASON} characters)")
         reason = reason.strip()
@@ -843,6 +852,18 @@ class Console:
                 "applied": await self._applied(enc, cid),
             }
         sup = self.supervisors[enc.name]
+        if action == "duty":
+            # The operator on duty is the token's name (attended_only:
+            # docs/console.md, "Operator duty").
+            op = body.get("op")
+            if op not in ("on", "off", "renew"):
+                raise ApiError(400, 'op: "on", "off" or "renew"')
+            return {
+                "enclosure": enc.name,
+                **await sup.call(
+                    "POST", "duty", {"operator": operator, "op": op, "reason": reason}
+                ),
+            }
         if action == "clear_faults":
             return {
                 "enclosure": enc.name,

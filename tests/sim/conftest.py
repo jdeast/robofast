@@ -57,6 +57,7 @@ from robofast_core.weather_server import WeatherServer, WeatherState
 pytestmark = pytest.mark.alpaca_sim
 
 SIM_SAFETY = dict(
+    attended_only=False,  # no hardware heartbeat in most sim rigs; not about duty
     poll_interval=0.25,
     read_timeout=2.0,
     stale_after=3.0,

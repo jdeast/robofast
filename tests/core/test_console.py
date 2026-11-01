@@ -144,6 +144,8 @@ class Fakes:
                 return httpx.Response(200, json={"revoked": True})
             if path == "/faults/clear":
                 return httpx.Response(200, json={"reply": "cleared"})
+            if path == "/duty":
+                return httpx.Response(200, json={"on_duty": body["operator"], "op": body["op"]})
             if path.startswith("/leases/") and path.endswith("/clear"):
                 lease = doc["lease"]
                 return httpx.Response(200, json={**lease, "released_now": True})
@@ -666,6 +668,29 @@ async def test_clear_lease_and_faults(make_console):
     ]
     fakes.supervisor["lease"] = None
     assert (await rig.act("clear_lease", reason="r", confirm=True)).status_code == 409
+
+
+async def test_operator_duty(make_console):
+    """Attended-only enclosures: on/off duty is an operator action (audited);
+    the page's renewals are audited but kept out of the console log."""
+    fakes = Fakes()
+    fakes.supervisor["duty"] = {"attended_only": True, "on_duty": None, "attended": False}
+    rig = await make_console(fakes=fakes)
+    await rig.login("alice")
+    assert (await rig.act("duty", op="maybe")).status_code == 400
+    r = await rig.act("duty", op="on", reason="observing tonight")
+    assert r.status_code == 200 and r.json()["result"]["on_duty"] == "alice"
+    assert (await rig.act("duty", op="renew")).status_code == 200  # no reason needed
+    assert (await rig.act("duty", op="off")).status_code == 200
+    assert [b for p, b in fakes.posts() if p == "sup.test/duty"] == [
+        {"operator": "alice", "op": "on", "reason": "observing tonight"},
+        {"operator": "alice", "op": "renew", "reason": "console open"},
+        {"operator": "alice", "op": "off", "reason": "off duty"},
+    ]
+    audited = [a for a in rig.audit() if a.get("action") == "duty"]
+    assert [a["op"] for a in audited] == ["maybe", "on", "renew", "off"]
+    status = await rig.status()
+    assert status["enclosure"]["duty"]["attended_only"] is True
 
 
 def test_the_supervisor_client_has_no_way_to_open():

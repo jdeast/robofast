@@ -403,7 +403,8 @@ def test_shipped_flwo60_configs():
     cfg = TCSGOConfig.from_dict(json.loads((ROOT / "sites/flwo60/tcsgo.json").read_text()))
     assert cfg.tcs.host == "127.0.0.1" and not cfg.allow_hardware and not cfg.dome
     site = json.loads((ROOT / "sites/flwo60/flwo60.json").read_text())
-    SafetyConfig(**site["safety"])
+    # No watchdog (JDE 2026-10-31): attended only.
+    assert SafetyConfig(**site["safety"]).attended_only is True
     SequencerConfig(**site["sequencer"])
     (entry,) = telescopes(site).values()
     assert device_address(entry["telescope"]) == (cfg.listen, 0)
@@ -468,9 +469,16 @@ async def test_flwo60_unsafe_weather_mid_exposure(make_rig, dome_kind):
         telescopes=[sup_tel],  # nothing reopens on an unparked 60-inch
         timeline=tl,
         config=SafetyConfig(
-            **{**site["safety"], **FAST_SAFETY, "dome_timeout": 5.0, "shutter_timeout": 5.0}
+            **{
+                **FAST_SAFETY,
+                **site["safety"],  # attended only: the 60-inch has no watchdog
+                "dome_timeout": 5.0,
+                "shutter_timeout": 5.0,
+            }
         ),
     )
+    assert sup.config.attended_only
+    sup.duty_on("observer", "the 60-inch night")  # no lease without it
     seq = Sequencer(
         site["sequencer_name"],
         supervisor=sup,

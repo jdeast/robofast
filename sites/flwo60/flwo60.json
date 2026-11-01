@@ -9,7 +9,8 @@
     "tillinghast.camera: the TRES CCD's Alpaca camera (to be written; placeholder).",
     "dome: the 60-inch dome's Alpaca server; the TCSGO server's dome/0 if the TCS drives the dome (unconfirmed), else its own server.",
     "safetymonitor, observingconditions: a weather bridge for Mt. Hopkins (placeholder).",
-    "No hardware heartbeat: the TCS has none, so nothing closes the dome if the supervisor dies (docs/tcsgo.md, questions).",
+    "No hardware heartbeat: the TCS has none, and the dome has no watchdog (JDE 2026-10-31: none he is aware of), so nothing closes the dome if the supervisor dies.",
+    "So safety.attended_only (also the default without a heartbeat): no lease, and the dome never opens, unless an operator is on duty through the observer console ('on duty', renewed while the page is open). duty_ttl s without a renewal: a critical alarm; duty_grace s later the supervisor closes (docs/console.md, Operator duty).",
     "site: the 60-inch on Mt. Hopkins, approximate (public)."
   ],
   "name": "flwo60",
@@ -25,7 +26,10 @@
   },
   "safety": {
     "park_before_close": false,
-    "park_wait": 120
+    "park_wait": 120,
+    "attended_only": true,
+    "duty_ttl": 300,
+    "duty_grace": 300
   },
   "sequencer_name": "flwo60-sequencer",
   "command_timeout": 10,

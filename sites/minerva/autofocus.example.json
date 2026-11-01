@@ -6,7 +6,7 @@
     "telescope_1.ini: imager on M3 port 1, FAU on port 2, MINFOCUS 455 (port 1) and 100 (port 2), MAXFOCUS 33000. telescope_2.ini: imager on port 2, FAU on port 1, MINFOCUS 100, MAXFOCUS 33000. The focus is in microns (um_per_step 1). The ports are named 'imager' and 'fau' here.",
     "f/6.5 (700 mm, 4560 mm); the CDK700 focusers move the instrument (focal_plane_factor 1). The obstruction is a placeholder until measured; the calibration's slope checks it.",
     "Saturation: legacy SATURATION is 60000 for every camera; 55000 here keeps the measured stars below the non-linear top.",
-    "model: the legacy focus model's temperature term (C0 per C about T0, on the primary's temperature; T1: -29.1 about 10.089 C, T2: -52.94 about 8.95 C); here on the focuser's temperature until the primary's is in the registry. The delta-T and gravity terms (instruments.json) wait for those values. Its zero point is learned from each successful autofocus (store).",
+    "model: the legacy focus model's temperature term (C0 per C about T0, on the primary's temperature; T1: -29.1 about 10.089 C, T2: -52.94 about 8.95 C); here on the focuser's temperature until the primary's is in the registry. The gravity term (C2 (sin(alt) - G0); T1 434.6 about 0.7777, T2 2220.265 about 0.7824) reads the mount's altitude; the delta-T term (instruments.json) waits for M1 and ambient temperatures. Refit both from the autofocus history with python -m robofast_core.focusmodel. Its zero point is learned from each successful autofocus (store).",
     "max_start_error: the legacy guesses were 130-600 um off on 2026-04-23 (T2). Backlash is not known: measure it (0 here).",
     "Run a calibration sweep ({\"kind\": \"autofocus\", \"autofocus\": {\"calibrate\": true}}) once per port and filter before relying on the V-curve."
   ],
@@ -40,8 +40,8 @@
           }
         },
         "model": {
-          "terms": {"{tel}.focuser.temperature": -29.1},
-          "reference": {"{tel}.focuser.temperature": 10.089}
+          "terms": {"{tel}.focuser.temperature": -29.1, "sin:{tel}.tel.alt": 434.6},
+          "reference": {"{tel}.focuser.temperature": 10.089, "sin:{tel}.tel.alt": 0.7777}
         },
         "store": "/var/lib/robofast/focus_t1.json"
       }
@@ -74,8 +74,8 @@
           }
         },
         "model": {
-          "terms": {"{tel}.focuser.temperature": -52.94},
-          "reference": {"{tel}.focuser.temperature": 8.95}
+          "terms": {"{tel}.focuser.temperature": -52.94, "sin:{tel}.tel.alt": 2220.265},
+          "reference": {"{tel}.focuser.temperature": 8.95, "sin:{tel}.tel.alt": 0.7824}
         },
         "store": "/var/lib/robofast/focus_t2.json"
       }

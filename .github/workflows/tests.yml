@@ -64,8 +64,10 @@ jobs:
       - name: Fetch the pinned Zenodo data
         continue-on-error: true
         run: python -m robofast_core.zenodo fetch
+      # In parallel (pytest-xdist, one worker per runner core): ~4x faster
+      # than serial, and it keeps the tests honest about shared state.
       - name: Run unit tests
-        run: python -m pytest -m "not alpaca_sim and not e2e" --durations=10
+        run: python -m pytest -n auto -m "not alpaca_sim and not e2e" --durations=10
 
   # Integration tier: the same scenarios against the official ASCOM Alpaca
   # OmniSimulators (Linux x64 build, pinned and checksum-verified).

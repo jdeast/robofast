@@ -297,6 +297,11 @@ class Imaging:
         self.written: list[WrittenFrame] = []
         #: Download timings: (telescope, transfer, bytes, seconds).
         self.downloads: list[tuple[str, str, int, float]] = []
+        #: robofast's pointing model per telescope
+        #: (:class:`~robofast_core.pointmodel.PointingCorrector`, set by the
+        #: sequencer): headers get the true position in ``RA``/``DEC`` and the
+        #: mount's in ``MNTRA``/``MNTDEC``; every solved frame is a sample.
+        self.pointing: dict[str, Any] = {}
 
     def set_clock(self, clock: Callable[[], datetime]) -> None:
         """Stamp frames (``DATE``, the index) and compute the Sun and Moon
@@ -327,6 +332,8 @@ class Imaging:
             reads = [(tel, TELESCOPE_MEMBERS, "")]
             reads += [(grant, members, "") for grant, members, _ in self._aux.get(telescope, [])]
             await self._read_batch(telescope, reads, self.config.pointing_max_age)
+            if telescope in self.pointing:
+                self._correct_pointing(telescope)
         optics = Optics.from_dict(self.config.telescopes.get(telescope))
         info = FrameInfo(
             telescope=telescope,
@@ -572,6 +579,7 @@ class Imaging:
                 )
                 if written.record.get("solve"):
                     self._publish_solve(telescope, written.record["solve"])
+                    self._pointing_sample(telescope, written.record["solve"])
                 if self.config.measure_fwhm and info.imagetyp == "LIGHT":
                     await self._publish_fwhm(telescope, info, image)
             except Exception as exc:
@@ -639,6 +647,55 @@ class Imaging:
                 max_age=age,
                 unit="mag",
                 comment=f"Zero point of the last frame (G for 1 {zp['unit']}, {zp['n']} stars)",
+            )
+
+    def _correct_pointing(self, telescope: str) -> None:
+        """Rewrite the mount's position through robofast's pointing model
+        (where the telescope really points); keep the mount's as MNTRA/MNTDEC."""
+        pc = self.pointing[telescope]
+        ra = self.registry.get(f"{telescope}.tel.ra")
+        dec = self.registry.get(f"{telescope}.tel.dec")
+        lst = self.registry.get(f"{telescope}.tel.lst")
+        if ra is None or dec is None or lst is None or ra.error or dec.error or lst.error:
+            return
+        try:
+            tra, tdec = pc.reported(float(ra.value), float(dec.value), float(lst.value))
+        except Exception:
+            log.exception("%s: pointing model inverse", telescope)
+            return
+        max_age = self.config.pointing_max_age
+        for name, value, unit, kw, comment in (
+            ("tel.mount_ra", float(ra.value), "h", "MNTRA", "Mount-reported RA (before the model)"),
+            ("tel.mount_dec", float(dec.value), "deg", "MNTDEC", "Mount-reported Dec"),
+            ("tel.ra", tra, "h", None, "RA through the pointing model"),
+            ("tel.dec", tdec, "deg", None, "Dec through the pointing model"),
+        ):
+            self.registry.publish(
+                f"{telescope}.{name}",
+                value,
+                max_age=max_age,
+                measured=ra.measured,
+                unit=unit,
+                keyword=kw,
+                comment=comment,
+            )
+
+    def _pointing_sample(self, telescope: str, solve: dict[str, Any]) -> None:
+        pc = self.pointing.get(telescope)
+        if pc is None or getattr(pc, "running", False):
+            return
+        try:
+            out = pc.frame_solved(solve)
+        except Exception:
+            log.exception("%s: pointing sample", telescope)
+            return
+        if out and out.get("residual_arcsec") is not None:
+            self.registry.publish(
+                f"{telescope}.pointing.residual",
+                out["residual_arcsec"],
+                max_age=self.config.fwhm_max_age,
+                unit="arcsec",
+                comment="Last solved frame minus the pointing model",
             )
 
     def _alarm(self, telescope: str, message: str) -> None:

@@ -256,6 +256,7 @@ from typing import Any, Protocol
 
 import numpy as np
 
+from robofast_core import pointmodel
 from robofast_core.autofocus import (
     Autofocus,
     AutofocusSetup,
@@ -268,6 +269,7 @@ from robofast_core.imagebytes import ImageArray, fits_order
 from robofast_core.imaging import FrameWriteFailed, Imaging, PendingFrame
 from robofast_core.owner import DeviceError, DeviceOwner, Grant, GrantRevoked
 from robofast_core.plan import Idle, Observation, PlanProvider, as_plan
+from robofast_core.pointmodel import PointingCorrector
 from robofast_core.registry import ValueRegistry
 from robofast_core.safety import LeaseRevoked, OpenLease, RecoveryRefused, SafetySupervisor
 from robofast_core.spectra import SpectrumRecorder
@@ -296,6 +298,20 @@ __all__ = [
 log = logging.getLogger(__name__)
 
 CAMERA_IDLE = 0  # ASCOM CameraState.cameraIdle
+
+#: A pointing run's settings (docs/pointing_model.md): the telescope's
+#: ``pointing.run`` entry and an observation's ``pointing`` override them.
+POINTING_RUN_DEFAULTS: dict[str, Any] = {
+    "min_alt": 25.0,
+    "max_alt": 85.0,
+    "moon_distance": 15.0,
+    "max_hour_angle": None,
+    "min_dec": None,
+    "max_dec": None,
+    "settle": 2.0,
+    "min_points": 12,
+    "significance": 4.0,
+}
 
 #: Preemption policies, weakest first (module doc).
 PREEMPT_POLICIES = ("next", "now-after-readout", "now")
@@ -490,6 +506,14 @@ class TelescopeUnit:
     spectrum: str | None = field(default=None, init=False)
     #: An operator asked to park it now (why; :meth:`Sequencer.request_park`).
     park_requested: str | None = field(default=None, init=False)
+    #: robofast's pointing model (docs/pointing_model.md): applied to every
+    #: slew, measured on every solved frame, built by ``kind="pointing_model"``.
+    pointing: PointingCorrector | None = None
+    #: Alarms raised tonight (the status snapshot carries them to the console
+    #: and the notifier).
+    alarms: list[str] = field(default_factory=list, init=False)
+    #: The generation in which the mount's own pointing model was switched off.
+    vendor_off_gen: int | None = field(default=None, init=False)
 
     @property
     def active(self) -> bool:
@@ -761,6 +785,8 @@ class Sequencer:
         self._spec_recovery: asyncio.Task | None = None
         #: Every spectrum and spectrograph calibration frame taken tonight.
         self.spectrum_records: list[dict[str, Any]] = []
+        #: Pointing models built tonight (docs/pointing_model.md).
+        self.pointing_models: list[Any] = []
         #: The spectrograph job this sequencer started and has not seen end,
         #: and the telescope that started it.
         self._spec_job: int | None = None
@@ -787,6 +813,7 @@ class Sequencer:
         self._gen: _Generation | None = None
         #: Observation tasks that ignored cancellation (fenced; kept referenced).
         self._orphans: set[asyncio.Task] = set()
+        self._wire_pointing()
         hook = getattr(self.plan, "set_preempt_callback", None)
         if hook is not None:
             hook(self.preempt)
@@ -961,6 +988,14 @@ class Sequencer:
     def _event(self, what: str, **detail: Any) -> None:
         self.timeline.event(self.name, what, **detail)
 
+    def alarm(self, telescope: str, text: str) -> None:
+        """Raise an alarm about ``telescope`` (status snapshot, console, notifier)."""
+        unit = self.units.get(telescope)
+        if unit is not None and text not in unit.alarms:
+            unit.alarms.append(text)
+        log.error("%s: %s", telescope, text)
+        self._event("alarm", telescope=telescope, text=text, level="alarm")
+
     @property
     def needs_operator(self) -> bool:
         """Quarantined, or some telescope gave up: an operator should look."""
@@ -968,7 +1003,17 @@ class Sequencer:
 
     # -- main loop --------------------------------------------------------
 
+    def _wire_pointing(self) -> None:
+        """Pointing models: their alarms to :meth:`alarm`, their frames from
+        the frame pipeline."""
+        for u in self.units.values():
+            if u.pointing is not None:
+                u.pointing.on_alarm = lambda text, u=u: self.alarm(u.name, text)
+                if self.imaging is not None:
+                    self.imaging.pointing[u.name] = u.pointing
+
     async def run(self) -> None:
+        self._wire_pointing()
         try:
             await self._run()
         finally:
@@ -1665,13 +1710,33 @@ class Sequencer:
             assert state.lease is not None
             await tel.set("Tracking", True)
             await state.lease.wait_open()
+            if obs.kind == "pointing_model":
+                await self._pointing_run(state, unit, tel, cam, obs, taken)
+                return
             ra, dec = obs.ra_hours, obs.dec_deg
             if ra is None or dec is None:
                 lst = await tel.get("SiderealTime")
                 lat = await tel.get("SiteLatitude")
                 ra, dec = (lst - 0.5) % 24.0, max(-89.0, min(89.0, lat - 10.0))
-            await self.slew_guard.check_slew(unit.name, ra, dec)
-            await tel.call("SlewToCoordinatesAsync", ra, dec)
+            cra, cdec = ra, dec
+            if unit.pointing is not None:
+                await self._vendor_model_off(state, unit, tel)
+                lst = float(await tel.get("SiderealTime"))
+                cra, cdec, applied = unit.pointing.command(
+                    ra, dec, lst, obs.port, self.clock(), guided=obs.guide
+                )
+                self._event(
+                    "pointing_applied",
+                    gen=gen,
+                    telescope=unit.name,
+                    ra=ra,
+                    dec=dec,
+                    commanded_ra=round(cra, 7),
+                    commanded_dec=round(cdec, 6),
+                    **applied,
+                )
+            await self.slew_guard.check_slew(unit.name, cra, cdec)
+            await tel.call("SlewToCoordinatesAsync", cra, cdec)
             await self._wait_for(lambda: tel.get("Slewing"), lambda s: not s, cfg.slew_timeout)
             self._event("on_target", gen=gen, telescope=unit.name, ra=ra, dec=dec)
             if obs.guide:
@@ -1750,6 +1815,221 @@ class Sequencer:
         if imaging is not None and taken:
             # Complete means on disk: the plan records the paths.
             await imaging.flush(unit.name)
+
+    # -- pointing model (docs/pointing_model.md) --------------------------------
+
+    async def _vendor_model_off(self, state: _Generation, unit: TelescopeUnit, tel: Grant) -> None:
+        """Switch the mount software's own pointing model off, once a
+        generation, where robofast's replaces it (``pointing.vendor_off``)."""
+        pc = unit.pointing
+        if pc is None or not pc.vendor_off or unit.vendor_off_gen == state.gen:
+            return
+        await tel.call("Action", pc.vendor_off["action"], pc.vendor_off.get("parameters", ""))
+        unit.vendor_off_gen = state.gen
+        self._event("vendor_model_off", gen=state.gen, telescope=unit.name)
+
+    async def _take_image(
+        self,
+        state: _Generation,
+        unit: TelescopeUnit,
+        tel: Grant,
+        cam: Grant,
+        obs: Observation,
+        exptime: float,
+        taken: list[Any],
+        **mark: Any,
+    ) -> np.ndarray:
+        """One light exposure, saved (with imaging) and returned in FITS
+        order (rows = y): what a calibration routine measures."""
+        imaging = self.imaging
+        if imaging is not None:
+            imaging.check(unit.name)
+        i = len(taken)
+        unit.exposing = True
+        try:
+            host_start = self.clock()
+            await cam.call("StartExposure", exptime, True)
+            self._event(
+                "exposure_started", gen=state.gen, telescope=unit.name, index=i, exptime=exptime
+            )
+            exposure = None
+            if imaging is not None:
+                exposure = await imaging.exposure_started(
+                    unit.name,
+                    tel,
+                    replace(obs, exptime=exptime),
+                    index=i,
+                    host_start=host_start,
+                    sequencer=self.name,
+                    generation=state.gen,
+                    ids=self._ids(unit.name),
+                )
+            await self._wait_for(
+                lambda: cam.get("ImageReady"), bool, exptime + self.config.readout_margin
+            )
+            if exposure is not None:
+                assert imaging is not None
+                frame: Any = await imaging.exposure_done(unit.name, cam, exposure, keep_image=True)
+                image, frame.image = frame.image, None
+            else:
+                frame = i
+                image = await cam.get("ImageArray", timeout=self.config.readout_margin)
+        finally:
+            unit.exposing = False
+        taken.append(frame)
+        self.frames.append(
+            {
+                "gen": state.gen,
+                "telescope": unit.name,
+                "index": i,
+                "target": obs.name,
+                "t": time.monotonic(),
+                **mark,
+                **({"image": frame} if isinstance(frame, PendingFrame) else {}),
+            }
+        )
+        self._event("exposure_complete", gen=state.gen, telescope=unit.name, index=i)
+        data = image.data if isinstance(image, ImageArray) else np.asarray(image)
+        return fits_order(data)
+
+    async def _pointing_run(
+        self,
+        state: _Generation,
+        unit: TelescopeUnit,
+        tel: Grant,
+        cam: Grant,
+        obs: Observation,
+        taken: list[Any],
+    ) -> None:
+        """A pointing run (``kind="pointing_model"``): ``obs.count`` points
+        over the sky, each slewed to with robofast's model off, exposed,
+        plate-solved and recorded; then a model is built, saved and used."""
+        pc = unit.pointing
+        if pc is None or pc.solver is None or pc.catalog is None:
+            raise Unsupported(
+                f"{unit.name} cannot build a pointing model (no pointing entry with"
+                " solver and catalog)"
+            )
+        run = {**POINTING_RUN_DEFAULTS, **pc.run, **(obs.pointing or {})}
+        unknown = set(run) - set(POINTING_RUN_DEFAULTS)
+        if unknown:
+            raise ObservationFailed(f"pointing run: unknown settings {sorted(unknown)}")
+        await self._vendor_model_off(state, unit, tel)
+        lst0 = float(await tel.get("SiderealTime")) * 15.0
+        avoid = []
+        if run["moon_distance"]:
+            try:
+                from robofast_core.sky import Site, offline_iers, sky_now
+
+                offline_iers()
+                moon = sky_now(Site(pc.latitude, pc.longitude), self.clock()).moon
+                avoid.append((float(moon.ra.deg), float(moon.dec.deg), float(run["moon_distance"])))
+            except Exception:
+                log.exception("%s: the Moon's position for the pointing run", unit.name)
+        grid = pointmodel.sky_grid(
+            obs.count,
+            min_alt=run["min_alt"],
+            max_alt=run["max_alt"],
+            latitude=pc.latitude,
+            lst=lst0,
+            avoid=avoid,
+            max_hour_angle=run["max_hour_angle"],
+            min_dec=run["min_dec"],
+            max_dec=run["max_dec"],
+        )
+        binning = int(await cam.get("BinX"))
+        self._event(
+            "pointing_run_start",
+            gen=state.gen,
+            telescope=unit.name,
+            port=obs.port,
+            points=len(grid),
+        )
+        samples: list[pointmodel.Sample] = []
+        pc.running = True
+        try:
+            for i, (az, alt) in enumerate(grid):
+                lst = float(await tel.get("SiderealTime")) * 15.0
+                ra, dec = pointmodel.grid_radec(az, alt, pc.latitude, lst)
+                try:
+                    await self.slew_guard.check_slew(unit.name, ra / 15.0, dec)
+                except SlewDenied as exc:
+                    self._event("pointing_point_skipped", telescope=unit.name, i=i, why=str(exc))
+                    continue
+                await tel.call("SlewToCoordinatesAsync", ra / 15.0, dec)
+                await self._wait_for(
+                    lambda: tel.get("Slewing"), lambda s: not s, self.config.slew_timeout
+                )
+                if run["settle"]:
+                    await asyncio.sleep(run["settle"])
+                mra = float(await tel.get("RightAscension")) * 15.0
+                mdec = float(await tel.get("Declination"))
+                lst = float(await tel.get("SiderealTime")) * 15.0
+                when = self.clock()
+                image = await self._take_image(
+                    state, unit, tel, cam, obs, obs.exptime, taken, pointing=True
+                )
+                mid = lst + 0.5 * obs.exptime * pointmodel.SIDEREAL_DEG_PER_S
+                try:
+                    sample = await asyncio.to_thread(
+                        pointmodel.solve_sample,
+                        image,
+                        pc,
+                        mra,
+                        mdec,
+                        mid,
+                        when,
+                        obs.port,
+                        binning,
+                    )
+                except Exception as exc:  # SolveError, CatalogUnavailable
+                    self._event(
+                        "pointing_point_unsolved", telescope=unit.name, i=i, error=str(exc)[:200]
+                    )
+                    continue
+                pc.add_sample(sample)
+                samples.append(sample)
+                self._event(
+                    "pointing_point",
+                    telescope=unit.name,
+                    i=i,
+                    az=round(az, 2),
+                    alt=round(alt, 2),
+                    error_arcsec=round(sample.error_arcsec, 2),
+                )
+            if self.imaging is not None and taken:
+                await self.imaging.flush(unit.name)
+        finally:
+            pc.running = False
+        if len(samples) < run["min_points"]:
+            raise ObservationFailed(
+                f"pointing run: {len(samples)} of {len(grid)} points solved"
+                f" (at least {run['min_points']} needed)"
+            )
+        built = await asyncio.to_thread(
+            pointmodel.build,
+            samples,
+            mount=pc.mount,
+            latitude=pc.latitude,
+            telescope=unit.name,
+            port=obs.port,
+            significance=run["significance"],
+            when=self.clock(),
+        )
+        built.note = f"pointing run {obs.name}"
+        pc.set_model(built)
+        self.pointing_models.append(built)
+        self._event(
+            "pointing_model_built",
+            gen=state.gen,
+            telescope=unit.name,
+            port=obs.port,
+            terms=built.model.terms,
+            rms_before=built.rms_before,
+            rms_after=built.rms_after,
+            cv_rms=built.cv_rms,
+            n=built.n,
+        )
 
     # -- autofocus ----------------------------------------------------------
 

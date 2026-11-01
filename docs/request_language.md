@@ -63,7 +63,7 @@ acted on.
 | JSON | Unit / values | Python | Notes |
 |---|---|---|---|
 | `id` | string | | optional on submit |
-| `type` | `EXPOSE`, `DARK`, `BIAS`, `AUTO_FOCUS`, `SPECTRUM` | | DARK/BIAS: every frame shutter closed. `SPECTRUM` is a fiber spectrum fed by every free telescope of the request (docs/rv_night.md) |
+| `type` | `EXPOSE`, `DARK`, `BIAS`, `AUTO_FOCUS`, `SPECTRUM`, `POINTING_MODEL` | | DARK/BIAS: every frame shutter closed. `SPECTRUM` is a fiber spectrum fed by every free telescope of the request (docs/rv_night.md). `POINTING_MODEL` (robofast's) is a pointing run: `exposure_count` grid points over the sky, the target only gates when it is schedulable (docs/pointing_model.md) |
 | `instrument_type` | e.g. `imager`, `spectrograph` | `instrument` | the telescope must list it. Previously `instrument` |
 | `target` | below | | |
 | `constraints` | below | | |

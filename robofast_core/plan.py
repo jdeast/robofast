@@ -59,7 +59,7 @@ from typing import Any, Protocol
 #: "failed": a device error or a refused slew.
 OUTCOMES = ("complete", "interrupted", "failed")
 #: What an observation does on its target (:attr:`Observation.kind`).
-KINDS = ("expose", "autofocus", "spectrum", "spectrograph_calibration")
+KINDS = ("expose", "autofocus", "spectrum", "spectrograph_calibration", "pointing_model")
 
 
 @dataclass
@@ -119,12 +119,19 @@ class Observation:
     #: "thar"|"slitflat"|"fiberflat"|"bias"|"dark", "exptime": s, "n": N}``
     #: (the spectrograph service's ``POST /calibrate``).
     calibration: list[dict[str, Any]] | None = None
+    #: For ``kind="pointing_model"`` (a pointing run, docs/pointing_model.md:
+    #: ``count`` grid points of ``exptime`` each, through ``port``; the
+    #: target is only where the scheduler checks visibility): overrides of
+    #: the telescope's ``pointing.run`` settings (``min_alt``, ...).
+    pointing: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in KINDS:
             raise ValueError(f"observation {self.name!r}: kind {self.kind!r} not in {KINDS}")
-        if self.kind == "autofocus" and not self.light:
-            raise ValueError(f"observation {self.name!r}: an autofocus needs light")
+        if self.kind in ("autofocus", "pointing_model") and not self.light:
+            raise ValueError(f"observation {self.name!r}: a {self.kind} needs light")
+        if self.pointing is not None and self.kind != "pointing_model":
+            raise ValueError(f"observation {self.name!r}: 'pointing' is for kind 'pointing_model'")
         if self.kind == "spectrum":
             if not self.light:
                 raise ValueError(f"observation {self.name!r}: a spectrum needs light")

@@ -488,6 +488,8 @@ class Aggregator:
             alarm(tel, f"{tel} gave up for the night", "critical")
         if out["frames_failed"]:
             alarm(tel, f"{tel}: frames lost ({out['frames_failed']})", "critical")
+        for text in s.get("alarms") or []:
+            alarm(tel, str(text), "alarm")
         for key, label in TELESCOPE_VALUES.items():
             v = values.get(f"{tel}.{key}")
             if isinstance(v, dict):

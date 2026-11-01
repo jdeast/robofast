@@ -6,6 +6,7 @@
   "open_order": [2, 1],
   "close_command": "CLOSE_SEQUENTIAL",
   "interlock_doors": [],
+  "_fault_auto_clear": "Automatic fault clearing is the safety supervisor's policy (safety.fault_auto_clear in sites/minerva/aqawan1.json; docs/aqawan.md). This server refuses an automatic clear unless both shutters are closed, and never clears an E-stop or an emergency close latch automatically.",
   "_emergency_close": "The observer console's close-only channel (docs/console.md): replace the hash with the SHA-256 of the console's token (python -m robofast_core.emergency token).",
   "emergency_close": {
     "token_sha256": ["0000000000000000000000000000000000000000000000000000000000000000"],

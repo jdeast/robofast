@@ -71,7 +71,9 @@ is random per process start, so after a restart every old token is unknown
 * ``POST /faults/clear`` ``{"operator", "reason"}`` -- an operator clears
   the enclosure's faults (``Action("ClearFaults")`` on the supervisor's
   privileged dome grant; logged). 409 if the dome refuses, e.g. because it
-  is not closed. Nothing clears faults automatically.
+  is not closed. With ``fault_auto_clear`` the supervisor also clears a
+  fault itself, under the rules in :mod:`robofast_core.safety`; an operator
+  clear restarts automatic clearing after a recurrence stopped it.
 
 ``recover`` and ``clear`` are idempotent: they answer 200 with
 ``"released_now"`` true or false. A lease's state is ``{"token", "id",

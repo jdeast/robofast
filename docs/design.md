@@ -177,6 +177,12 @@ The only component allowed to open or close an enclosure
   granted, so nothing reopens on a telescope that a crash or a failed
   cleanup left unparked. A dead mount therefore keeps the enclosure closed
   for its neighbours too, until it is fixed or removed from the config.
+- **Enclosure faults** (a separate axis from the shutter position) alarm
+  and block opening; a fault with the enclosure open closes it. Where
+  configured (`fault_auto_clear`, MINERVA's Aqawan) the supervisor clears a
+  fault itself, only with both shutters confirmed closed, never an E-stop,
+  at most once an hour and alarming each time; a recurrence within the hour
+  stops automatic clearing until an operator clears (`docs/aqawan.md`).
 
 ### 3.4 Sequencer, one per enclosure
 
@@ -765,6 +771,8 @@ support is often worse. So:
 | `heartbeat_interval` | none | supervisor ping period; at most `heartbeat_timeout`/4, or the config is rejected |
 | `heartbeat_timeout` | none | the enclosure's own heartbeat timeout (Aqawan PAC: 60 s, confirmed); required with `heartbeat_interval` |
 | `fault_action` | none | the dome's read-only fault channel (Aqawan: `Faults`); any fault alarms and blocks opening, and a fault with the enclosure not closed closes it |
+| `fault_auto_clear` | off (MINERVA: on) | clear a fault automatically, only with the enclosure closed, never an E-stop; a recurrence stops it until an operator clears (`docs/aqawan.md`) |
+| `fault_auto_clear_interval`, `fault_auto_clear_settle` | 1 h, 15 s | at most one automatic clear per interval; a fault still there `settle` after one counts as a recurrence |
 | `shutter_unreadable_grace` | 15 s | while open is wanted, a shutter unreadable this long revokes the lease and closes (shutterError does so at once) |
 | `shutter_error_backoff` | 30 min | no reopen after a shutter error, so a broken shutter is not cycled |
 | `min_alt`, `max_alt` | 21°, 83° | per-telescope altitude limits (legacy MINALT, MAXALT) |

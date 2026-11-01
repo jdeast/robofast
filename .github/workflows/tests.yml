@@ -117,7 +117,8 @@ jobs:
   # Conformance: ConformU (pinned, checksum-verified) against every Alpaca
   # server robofast ships, each backed by its simulator: the Aqawan Dome
   # server (scripts/conformu_aqawan.py) and the FLWO 60-inch TCSGO
-  # Telescope/Focuser/Dome server (scripts/conformu_tcsgo.py).
+  # Telescope/Focuser/Dome server (scripts/conformu_tcsgo.py), and the MEarth
+  # South roof Dome server (scripts/conformu_mearth_roof.py).
   conformu:
     name: conformu
     runs-on: ubuntu-latest
@@ -149,6 +150,9 @@ jobs:
       - name: ConformU against the PDU Switch server
         if: ${{ !cancelled() }}
         run: python scripts/conformu_pdu.py --conformu "$CONFORMU_BIN" --out "${{ runner.temp }}/conformu-pdu"
+      - name: ConformU against the MEarth South roof Dome server
+        if: ${{ !cancelled() }}
+        run: python scripts/conformu_mearth_roof.py --conformu "$CONFORMU_BIN" --out "${{ runner.temp }}/conformu-mearth-roof"
       - name: Upload ConformU logs
         if: always()
         continue-on-error: true
@@ -159,6 +163,7 @@ jobs:
             ${{ runner.temp }}/conformu
             ${{ runner.temp }}/conformu-tcsgo
             ${{ runner.temp }}/conformu-pdu
+            ${{ runner.temp }}/conformu-mearth-roof
           if-no-files-found: warn
 
   # End to end: a whole simulated MINERVA RV night (docs/demo.md) on

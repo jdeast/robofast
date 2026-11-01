@@ -29,6 +29,7 @@ SETTINGS = {
     "telescope": ROOT / "scripts" / "conformu-telescope.settings.json",
     "focuser": ROOT / "scripts" / "conformu-focuser.settings.json",
     "dome": ROOT / "scripts" / "conformu-dome.settings.json",
+    "filterwheel": ROOT / "scripts" / "conformu-filterwheel.settings.json",
 }
 
 

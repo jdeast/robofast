@@ -1,7 +1,10 @@
 """A fake site Redis server for tests (and for trying the bridge).
 
 Speaks just enough RESP2 for :mod:`robofast_core.resp`: ``SELECT``, ``GET``,
-``MGET`` and ``PING``. Every command received is recorded (``commands``), so
+``MGET`` and ``PING`` (and ``SET``, only with ``writable``: for the TRES
+calibration stage's legacy-key shim,
+:mod:`robofast_core.devices.calstage_redis`). Every command received is
+recorded (``commands``), so
 tests can assert the bridge never sends anything else; any other command is
 answered with an error and recorded too.
 
@@ -90,6 +93,9 @@ class RedisFeedState:
         self.drop = False
         #: Every command received, as a list of str.
         self.commands: list[list[str]] = []
+        #: Accept ``SET`` (else it is answered with an error, like any
+        #: other command this fake does not know).
+        self.writable = False
         self.lock = threading.Lock()
 
     def snapshot(self, db: int) -> dict[str, str]:
@@ -151,6 +157,10 @@ class _Handler(socketserver.StreamRequestHandler):
                 out = b"+OK\r\n"
             elif cmd == "GET" and len(args) == 2:
                 out = _bulk(feed.snapshot(db).get(args[1]))
+            elif cmd == "SET" and len(args) == 3 and feed.writable:
+                with feed.lock:
+                    feed.dbs.setdefault(db, {})[args[1]] = args[2]
+                out = b"+OK\r\n"
             elif cmd == "MGET" and len(args) > 1:
                 data = feed.snapshot(db)
                 out = b"*%d\r\n" % (len(args) - 1) + b"".join(_bulk(data.get(k)) for k in args[1:])

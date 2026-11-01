@@ -7,6 +7,7 @@
     "Every address is a 127.0.0.1 placeholder.",
     "tillinghast.telescope: the TCSGO server (sites/flwo60/tcsgo.json listens on 11140).",
     "tillinghast.camera: the TRES CCD's Alpaca camera (to be written; placeholder).",
+    "tillinghast.calstage: the TRES front end's calibration stage (sites/flwo60/tres_frontend.json listens on 11160; docs/tres_frontend.md).",
     "dome: the 60-inch dome's Alpaca server; the TCSGO server's dome/0 if the TCS drives the dome (unconfirmed), else its own server.",
     "safetymonitor, observingconditions: a weather bridge for Mt. Hopkins (placeholder).",
     "No hardware heartbeat: the TCS has none, and the dome has no watchdog (JDE 2026-10-31: none he is aware of), so nothing closes the dome if the supervisor dies.",
@@ -22,7 +23,8 @@
     "observingconditions": "127.0.0.1:11111"
   },
   "telescopes": {
-    "tillinghast": {"telescope": "127.0.0.1:11140/0", "camera": "127.0.0.1:11142/0"}
+    "tillinghast": {"telescope": "127.0.0.1:11140/0", "camera": "127.0.0.1:11142/0",
+                    "calstage": "127.0.0.1:11160/0"}
   },
   "safety": {
     "park_before_close": false,

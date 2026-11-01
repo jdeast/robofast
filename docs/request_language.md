@@ -95,6 +95,7 @@ acted on.
 | `exposure_time` | s | `exptime` | for `AUTO_FOCUS`, if positive, the focus exposure time |
 | `exposure_count` | int ≥ 1 | `count` | |
 | `optical_elements.filter` | name | `filter` | a hard constraint on the telescope's filters. Other groups refused |
+| `optical_elements.calstage` | name | `calstage` | a calibration-stage position (the FLWO 60-inch's TRES front end: `out`, `sky`, `science`, ...; docs/tres_frontend.md), selected before the exposures; a hard constraint on the telescope's `calstage` limits |
 | `mode` | readout mode code | `mode` | kept |
 | `extra_params.port`* | M3 port name | `port` | |
 | `extra_params.iodine`* | bool | | SPECTRUM only: the iodine cell in (true; science, B stars) or out (false; templates). Absent: the spectrograph service's `default_iodine` (`in`) |

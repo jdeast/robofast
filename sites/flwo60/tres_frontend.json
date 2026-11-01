@@ -1,0 +1,29 @@
+{
+  "_note": [
+    "The TRES front end's calibration stage on the FLWO 60-inch: Alpaca filterwheel/0 (named positions) and focuser/0 (microns) over a PI C-663 + L-505 (docs/tres_frontend.md).",
+    "  python -m robofast_core.devices.tres_frontend_server --config sites/flwo60/tres_frontend.json --simulate",
+    "Hardware is NOT allowed: allow_hardware stays false until every item under 'Confirm on the mountain' in docs/tres_frontend.md is checked.",
+    "Then: allow_hardware true here AND --hardware on the command line, on the front-end computer the controller is plugged into.",
+    "port.device is a placeholder for that computer's serial device for the controller.",
+    "positions (mm): out/sky/science are the 2021 public tres-guider values, unconfirmed; in, block_sky, block_science are unknown (null: refused until set).",
+    "legacy_redis: the transition shim, off (null). See the doc before turning it on; it must never point at a shared server without JDE's approval."
+  ],
+  "name": "flwo60-tres",
+  "listen": "127.0.0.1:11160",
+  "allow_hardware": false,
+  "port": {"type": "serial", "device": "/dev/ttyUSB0", "baud": 115200, "timeout": 2.0},
+  "axis": "1",
+  "positions": {
+    "out": 0.0,
+    "sky": 10.0,
+    "science": 20.0,
+    "in": null,
+    "block_sky": null,
+    "block_science": null
+  },
+  "tolerance": 0.01,
+  "focuser": true,
+  "move_timeout": 60.0,
+  "reference_timeout": 120.0,
+  "legacy_redis": null
+}

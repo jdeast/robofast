@@ -110,3 +110,55 @@ async def test_watchdog_closes_a_dome_without_a_heartbeat():
     finally:
         wd.stop()
         server.stop()
+
+
+async def test_supervisor_stops_and_closes_when_its_loops_lose_their_cancels(make_rig):
+    """A cancel landing inside an httpx request can be lost (the request
+    returns normally; robofast_core.cancel). Every supervisor loop loses one
+    here. Stopping must still end within its bound, stop the heartbeat pings
+    (they would keep the hardware from closing by itself), send the final
+    close, and pass the stopper's cancellation on."""
+    rig = make_rig(safety=HEARTBEAT, heartbeat_timeout=0.4)
+    sup = rig.supervisor
+    await rig.start(sequencer=False)
+    await wait_until(lambda: sup.status()["pinged_ago"] is not None, 5)
+    pings = 0
+    lost: set[str] = set()
+
+    async def lose_cancel_once(what: str) -> None:
+        try:
+            await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            if what in lost:
+                raise
+            lost.add(what)  # lost, as inside httpx: the "request" just returns
+
+    async def ping(*_a, **_k):
+        nonlocal pings
+        pings += 1
+        await lose_cancel_once("heartbeat")
+
+    async def read_weather():
+        await lose_cancel_once("weather")
+        return True, "safe", True
+
+    async def enforce():
+        await lose_cancel_once("enclosure")
+
+    sup._hb.call = ping
+    sup._read_weather = read_weather
+    sup._enforce_once = enforce
+    await asyncio.sleep(0.1)  # every loop is inside its "request"
+    run = rig.tasks[0]
+    n0 = len(rig.timeline.entries())
+    run.cancel()
+    done, _ = await asyncio.wait({run}, timeout=sup.config.dome_timeout + 3)
+    rig.tasks.remove(run)
+    assert done, "the supervisor's stop hangs on loops whose cancels were lost"
+    assert run.cancelled(), "the supervisor swallowed its own cancellation"
+    assert lost == {"heartbeat", "weather", "enclosure"}
+    assert any(e.what == "CloseShutter" for e in rig.timeline.entries()[n0:])
+    n = pings
+    await asyncio.sleep(0.5)
+    assert pings == n, "heartbeat pings go on after the supervisor stopped"
+    assert not sup.open_allowed()

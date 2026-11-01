@@ -267,6 +267,7 @@ from robofast_core.autofocus import (
     publish_result,
     term_source,
 )
+from robofast_core.cancel import stop_task
 from robofast_core.clock import Clock, real_clock
 from robofast_core.devices.kiwispec_client import KiwiSpecBusy, KiwiSpecError
 from robofast_core.imagebytes import ImageArray, fits_order
@@ -1000,9 +1001,12 @@ class Sequencer:
         with no alarms and no job stuck); with ``spectrograph_auto_recover``
         a passing check marks it up."""
         cfg = self.config
-        while self.spectrograph_down is not None:
+        me = asyncio.current_task()
+        # Also ends once it is no longer the current check, even if its
+        # cancel was lost (robofast_core.cancel).
+        while self.spectrograph_down is not None and self._spec_recovery is me:
             await asyncio.sleep(cfg.spectrograph_recovery_interval)
-            if self.spectrograph is None:
+            if self.spectrograph is None or self._spec_recovery is not me:
                 return
             try:
                 st = await asyncio.wait_for(
@@ -1055,10 +1059,8 @@ class Sequencer:
         try:
             await self._run()
         finally:
-            task = self._spec_recovery
-            if task is not None and not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+            task, self._spec_recovery = self._spec_recovery, None
+            await stop_task(task, self.config.cancel_ack_timeout)
 
     async def _run(self) -> None:
         await self._recover()

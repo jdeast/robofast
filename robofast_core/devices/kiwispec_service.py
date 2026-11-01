@@ -105,6 +105,7 @@ from http import HTTPStatus
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from robofast_core.cancel import isolated, stop_task
 from robofast_core.clock import clock_from_config
 from robofast_core.devices.kiwispec_client import (
     CAMERA_PORT,
@@ -1132,10 +1133,8 @@ class KiwiSpec:
             log.error(
                 "job %d did not end within %.0f s; cancelling", job.id, self.config.abort_timeout
             )
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                async with asyncio.timeout(5):
-                    await task
+            # Bounded, passing our own cancellation on (robofast_core.cancel).
+            await stop_task(task, 5)
             await self._drop_camera()
             self.faults.append(f"job {job.id} did not end after abort: camera unresponsive?")
         return {"aborted": True, "ended": ended, "job": job.view()}
@@ -1345,7 +1344,7 @@ class KiwiSpecRemote:
 
         try:
             async with httpx.AsyncClient(timeout=timeout or self.timeout, trust_env=False) as c:
-                r = await c.request(method, self.url + path, json=body)
+                r = await isolated(c.request(method, self.url + path, json=body))
         except httpx.HTTPError as exc:
             raise KiwiSpecError(f"{method} {path}: {type(exc).__name__}: {exc}") from exc
         data = r.json()

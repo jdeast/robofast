@@ -68,6 +68,7 @@ import socket
 import time
 from dataclasses import dataclass, field
 
+from robofast_core.cancel import stop_task
 from robofast_core.owner import DeviceError, DeviceTimeout
 
 log = logging.getLogger(__name__)
@@ -460,13 +461,12 @@ class PACClient:
                             raise PACPreempted(f"{command}: pre-empted") from None
                         raise
                     finally:
-                        if not inner.done():
-                            inner.cancel()
-                            try:
-                                await inner
-                            except BaseException:
-                                pass
-                        self._inflight = None
+                        try:
+                            if not inner.done():
+                                # Bounded, passing our own cancellation on.
+                                await stop_task(inner, self.connect_timeout)
+                        finally:
+                            self._inflight = None
         except TimeoutError:
             raise PACTimeout(
                 f"PAC {command}: no complete reply within {time.monotonic() - t0:.1f} s"

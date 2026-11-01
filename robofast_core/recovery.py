@@ -42,6 +42,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from robofast_core.cancel import isolated
+
 log = logging.getLogger(__name__)
 
 __all__ = ["RUNGS", "DevicePolicy", "PDUSwitch", "RecoveryLadder", "RecoveryResult"]
@@ -148,7 +150,7 @@ async def run_hook(hook: dict[str, Any], timeout: float) -> str:
     import httpx
 
     async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.request(hook.get("method", "POST"), hook["url"])
+        r = await isolated(client.request(hook.get("method", "POST"), hook["url"]))
         r.raise_for_status()
         return r.text[-300:]
 

@@ -95,6 +95,7 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
+from robofast_core.cancel import isolated
 from robofast_core.frameview import bin_to, encode_array
 from robofast_core.guider import calibration as calib
 from robofast_core.guider.base import (
@@ -898,7 +899,7 @@ class GuiderRemote:
             async with httpx.AsyncClient(
                 timeout=timeout or self.timeout, trust_env=False
             ) as client:
-                r = await client.request(method, self.url + path, json=body)
+                r = await isolated(client.request(method, self.url + path, json=body))
         except httpx.HTTPError as exc:
             raise GuiderError(f"guider {method} {path}: {type(exc).__name__}: {exc}") from exc
         data = r.json()

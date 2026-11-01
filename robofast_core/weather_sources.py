@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from robofast_core import resp
+from robofast_core.cancel import isolated
 from robofast_core.sun import LEGACY_PRESSURE_HPA, LEGACY_TEMPERATURE_C, sun_altitude
 
 
@@ -199,7 +200,7 @@ class HttpSource(WeatherSource):
         if self.config.credentials_file:
             auth = read_credentials(self.config.credentials_file)
         try:
-            r = await self._http.get(self.url, auth=auth)
+            r = await isolated(self._http.get(self.url, auth=auth))
         except httpx.HTTPError as exc:
             raise SourceError(f"GET {self.url}: {type(exc).__name__}: {exc}") from exc
         if r.status_code != 200:

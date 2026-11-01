@@ -125,6 +125,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from robofast_core.cancel import stop_task
 from robofast_core.devices.aqawan_pac import (
     SHUTTER_STATES,
     HardwareNotAllowed,
@@ -482,6 +483,11 @@ class Aqawan:
                     st = await self._poll_status()
                     if st.shutter(n) == "OPEN":
                         continue
+                    if self._sequence is not asyncio.current_task():
+                        # A close or abort cancelled this sequence and the
+                        # cancel was lost: never open after it.
+                        log.warning("open sequence superseded; not opening shutter %d", n)
+                        return
                     if st.shutter(n) != "OPENING":
                         await self._command_open(n)
                 await self._wait_open(n)
@@ -523,9 +529,9 @@ class Aqawan:
     async def _cancel_sequence(self) -> None:
         task, self._sequence = self._sequence, None
         if task is not None and not task.done():
-            task.cancel()
-            with contextlib.suppress(BaseException):
-                await asyncio.wait_for(task, 1.0)
+            # Bounded, passing our own cancellation on; a sequence that
+            # outlives its cancel opens nothing more (_open_sequence).
+            await stop_task(task, 1.0)
 
     async def close(self) -> None:
         await self._cancel_sequence()

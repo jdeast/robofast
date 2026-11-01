@@ -29,6 +29,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from robofast_core.cancel import isolated
 from robofast_core.notifier.core import Notification
 
 
@@ -204,7 +205,7 @@ class WebhookSink:
         if own:
             client = httpx.AsyncClient(trust_env=False, follow_redirects=False)
         try:
-            r = await client.post(url, json=self.payload(n), timeout=self.timeout)
+            r = await isolated(client.post(url, json=self.payload(n), timeout=self.timeout))
             r.raise_for_status()
         finally:
             if own:

@@ -35,6 +35,7 @@ from typing import Any
 
 import httpx
 
+from robofast_core.cancel import isolated, stop_tasks
 from robofast_core.safety import OpenLease, RecoveryRefused
 
 log = logging.getLogger(__name__)
@@ -64,7 +65,7 @@ class RemoteSupervisor:
         self._tokens: dict[int, str] = {}
 
     async def _call(self, method: str, path: str, wait: float = 0.0, **kw: Any) -> Any:
-        r = await self._http.request(method, path, timeout=wait + self.timeout, **kw)
+        r = await isolated(self._http.request(method, path, timeout=wait + self.timeout, **kw))
         if r.status_code != 200:
             raise SupervisorAPIError(f"{method} {path}: HTTP {r.status_code}: {r.text[:200]}")
         return r.json()
@@ -115,7 +116,7 @@ class RemoteSupervisor:
         """
         path = f"/leases/{self._tokens[lease_id]}/recover"
         try:
-            r = await self._http.post(path, json={"holder": holder}, timeout=self.timeout)
+            r = await isolated(self._http.post(path, json={"holder": holder}, timeout=self.timeout))
         except httpx.HTTPError as exc:
             raise RecoveryRefused(f"supervisor unreachable: {exc!r}") from exc
         if r.status_code == 404:
@@ -129,9 +130,8 @@ class RemoteSupervisor:
         pending = list(self._tasks)
         if pending:
             await asyncio.wait(pending, timeout=self.timeout)
-        for t in pending:
-            t.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        # Bounded: a worker whose cancel was lost ends on its own (not live).
+        await stop_tasks(pending, self.timeout)
         await self._http.aclose()
 
 
@@ -177,7 +177,8 @@ class RemoteLease(OpenLease):
 
     async def _renewer(self) -> None:
         path = f"/leases/{self.token}/renew"
-        while True:
+        # Ends once released or revoked, even if its cancel was lost.
+        while self.live:
             await self._renew_wanted.wait()
             self._renew_wanted.clear()
             try:

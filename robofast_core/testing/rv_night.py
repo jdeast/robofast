@@ -55,7 +55,6 @@ import contextlib
 import json
 import logging
 import os
-import socket
 import sys
 import time
 from dataclasses import dataclass, field
@@ -164,12 +163,6 @@ def _recording_telescope(name: str, events: list[tuple[float, str, str]]) -> Any
     return _Tel(slew_time=0.3, park_time=0.3)
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _scene(seed: int) -> FocusScene:
     rng = np.random.default_rng(seed)
     detector = Detector(shape=(512, 512))
@@ -255,6 +248,7 @@ class SimulatedNight:
         self.s = settings or NightSettings()
         self.outcome = Outcome(self.out, self.s, reopen_hold=self.s.reopen_hold)
         self.services: list[Service] = []
+        self._bridge_address: str | None = None
         self.telescopes: dict[str, Telescope] = {}
         self._stack = contextlib.AsyncExitStack()
         #: The one clock (module doc); its phases are written to clock.json.
@@ -300,9 +294,11 @@ class SimulatedNight:
         # is opened up here: the scheduler's twilight limit (max_sun_alt)
         # keeps the night dark.
         raw["sources"]["sun"]["limits"]["altitude"] = {"open": [-90, 90]}
-        self.bridge_address = f"127.0.0.1:{_free_port()}"
+        # Port 0: the bridge binds a free port itself and logs it
+        # (_bridge_address); a port picked here and released could be taken
+        # before the bridge binds it (parallel runs).
         raw.update(
-            listen=self.bridge_address,
+            listen="127.0.0.1:0",
             poll_interval=0.2,
             evaluate_interval=0.1,
             server_stale_after=3.0,
@@ -318,6 +314,19 @@ class SimulatedNight:
             stdout_path=self.out / "weather_bridge.out",
         )
         self.services.append(self.bridge)
+
+    @property
+    def bridge_address(self) -> str:
+        """The weather bridge's ``host:port``, from its log (it binds port 0)."""
+        if self._bridge_address is None:
+            deadline = time.monotonic() + 30
+            prefix = "serving Alpaca on http://"
+            while (line := self.bridge.log_line(prefix)) is None:
+                if self.bridge.proc.poll() is not None or time.monotonic() > deadline:
+                    raise RuntimeError(f"weather bridge not serving; see {self.bridge.log_path}")
+                time.sleep(0.05)
+            self._bridge_address = line.split(prefix, 1)[1].strip()
+        return self._bridge_address
 
     def set_weather(self, safe: bool) -> None:
         db = dict(self.redis.feed.dbs[7])

@@ -53,7 +53,6 @@ from that file, so a restarted sequencer stays held.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import inspect
 import json
 import logging
@@ -67,6 +66,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from robofast_core.cancel import stop_task
 from robofast_core.plan import Idle, Observation, PlanProvider
 
 log = logging.getLogger(__name__)
@@ -378,10 +378,8 @@ class OperatorHold:
                     log.exception("operator holds: taking commands in")
                 await asyncio.sleep(self.poll)
         finally:
-            if task is not None:
-                task.cancel()
-                with contextlib.suppress(BaseException):
-                    await task
+            # Bounded, passing our own cancellation on (robofast_core.cancel).
+            await stop_task(task, 10.0)
 
     # -- commands -------------------------------------------------------------------
 

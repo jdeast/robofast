@@ -168,6 +168,7 @@ from robofast_core.api_auth import (
     TokenStore,
     inside_git_worktree,
 )
+from robofast_core.cancel import isolated
 from robofast_core.config import load_config, telescopes
 from robofast_core.dispatch import DispatchScheduler, dispatch_from_config
 from robofast_core.request_model import RequestGroup, upgrade_legacy
@@ -1202,8 +1203,8 @@ class RequestApi:
         if self._http is None:
             self._http = httpx.AsyncClient(timeout=self.config.status_timeout)
         try:
-            r = await self._http.get(
-                f"{enc.supervisor_url}/status", timeout=self.config.status_timeout
+            r = await isolated(
+                self._http.get(f"{enc.supervisor_url}/status", timeout=self.config.status_timeout)
             )
             r.raise_for_status()
             s = r.json()

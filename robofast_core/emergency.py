@@ -50,6 +50,8 @@ from typing import Any
 
 import httpx
 
+from robofast_core.cancel import isolated
+
 log = logging.getLogger(__name__)
 
 #: The one endpoint (on the dome server's own port).
@@ -219,11 +221,13 @@ async def close_dome(
     """Ask the dome server to close, on the emergency channel. Raises
     :class:`EmergencyFailed` with the dome's answer if it did not accept."""
     try:
-        r = await http.put(
-            dome_url.rstrip("/") + PATH,
-            json={"operator": operator, "reason": reason, "via": via},
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=timeout,
+        r = await isolated(
+            http.put(
+                dome_url.rstrip("/") + PATH,
+                json={"operator": operator, "reason": reason, "via": via},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=timeout,
+            )
         )
     except httpx.HTTPError as exc:
         raise EmergencyFailed(f"dome unreachable: {type(exc).__name__}: {exc}") from exc

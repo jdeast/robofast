@@ -272,7 +272,13 @@ def _loop(nu, *, pa_cal=30.0, flip=False, sigma=None):
         target=FIBER, acq_exposure=0.02, exposure=0.1, roi_size=64, capture_radius=3.0,
         coarse_settle=1.0, max_star_distance=600.0, scope="t2", max_reacquire=0,
     )  # fmt: skip
-    g = Guider(SimCamera(world), cfg, mount=m, mount_cal=Calibration("mount", "fau", world.mount_matrix.tolist()), clock=clock)  # noqa: E501
+    g = Guider(
+        SimCamera(world),
+        cfg,
+        mount=m,
+        mount_cal=Calibration("mount", "fau", world.mount_matrix.tolist()),
+        clock=clock,
+    )  # noqa: E501
     g.acquirer = acquirer(s, ra2, dec2, pa=pa_cal, flip=flip, sigma=sigma)
     return g, world, clock
 

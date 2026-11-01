@@ -333,9 +333,36 @@ class Calibration:
         return cls(**{k: v for k, v in d.items() if k in known})
 
 
+def term_value(name: str, value: Any) -> float | None:
+    """A focus-model term's value: the registry value, or for a ``sin:``
+    term the sine of it in degrees (legacy ``guessFocus``'s gravity term,
+    ``sin(alt)``). None when missing or not finite."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v):
+        return None
+    return math.sin(math.radians(v)) if name.startswith("sin:") else v
+
+
+def term_source(name: str) -> str:
+    """The registry name a term reads (``sin:{tel}.tel.alt`` -> ``{tel}.tel.alt``)."""
+    return name.split(":", 1)[1] if name.startswith("sin:") else name
+
+
+#: Values recorded with every autofocus result whether the model uses them
+#: or not, so a later fit (robofast_core/focusmodel.py) can add their terms.
+FOCUS_CONTEXT = ("{tel}.focuser.temperature", "sin:{tel}.tel.alt")
+
+
 @dataclass
 class FocusModel:
     """``focus = zero_point + sum(coeff * (value - reference))`` (module doc).
+
+    A term named ``sin:<value>`` uses the sine (degrees) of the value: the
+    legacy gravity term ``C2 (sin(alt) - G0)`` is
+    ``{"sin:{tel}.tel.alt": C2}`` with reference ``G0``.
 
     ``terms`` maps registry value names (``{tel}`` is replaced by the
     telescope name, e.g. ``"{tel}.focuser.temperature"``) to coefficients
@@ -352,12 +379,12 @@ class FocusModel:
     def correction(self, values: dict[str, float | None]) -> tuple[float, list[str]]:
         total, missing = 0.0, []
         for name, c in self.terms.items():
-            v = values.get(name)
+            v = term_value(name, values.get(name))
             ref = self.reference.get(name, 0.0)
-            if v is None or not math.isfinite(float(v)):
+            if v is None:
                 missing.append(name)
                 continue
-            total += c * (float(v) - ref)
+            total += c * (v - ref)
         return total, missing
 
     def predict(self, values: dict[str, float | None]) -> float | None:

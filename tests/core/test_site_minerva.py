@@ -275,8 +275,14 @@ def test_autofocus_agrees(catalog):
             assert cfg.min_position == t["focus"]["min"][number]
             assert cfg.max_position == t["focus"]["max"][number]
         model = t["focus"]["model"]
-        assert setup.model.terms == {"{tel}.focuser.temperature": model["C0"]}
-        assert setup.model.reference == {"{tel}.focuser.temperature": model["T0"]}
+        assert setup.model.terms == {
+            "{tel}.focuser.temperature": model["C0"],
+            "sin:{tel}.tel.alt": model["C2"],
+        }
+        assert setup.model.reference == {
+            "{tel}.focuser.temperature": model["T0"],
+            "sin:{tel}.tel.alt": model["G0"],
+        }
 
 
 def test_dispatch_limits_agree(catalog):

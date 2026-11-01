@@ -245,11 +245,32 @@ the next prediction starts there. The model **never** replaces a measured
 focus. A failed run changes nothing.
 
 The legacy MINERVA model was
-`F0 + C0 (T_M1 - T0) + C1 (dT - dT0) + C2 (sin alt - G0)`. Its terms come
-over once the primary's temperature and the other inputs are in the registry
-(design.md section 7, item 4). Until then the focuser's own temperature
-stands in. The sequencer publishes it as `{tel}.focuser.temperature` before
-each run.
+`F0 + C0 (T_M1 - T0) + C1 (dT - dT0) + C2 (sin alt - G0)`. The temperature
+term reads the focuser's own temperature until the primary's is in the
+registry; the **gravity term** is a `sin:` term, the sine of the mount's
+altitude (degrees):
+
+```json
+"model": {"terms": {"{tel}.focuser.temperature": -52.94, "sin:{tel}.tel.alt": 2220.265},
+          "reference": {"{tel}.focuser.temperature": 8.95, "sin:{tel}.tel.alt": 0.7824}}
+```
+
+(legacy `telescope_N.ini` C2 and G0, focuser steps = microns;
+`robofast_core.focusmodel.legacy_model` converts a whole legacy set). The
+sequencer publishes `{tel}.focuser.temperature` and `{tel}.tel.alt` before
+each run, and every result records them (and any model terms) whether the
+model uses them or not, so the terms can be **fitted from the autofocus
+history** -- the calibration routine:
+
+```sh
+python -m robofast_core.focusmodel --store /var/lib/robofast/focus_t2.json --key t2/imager/- \
+    --term "{tel}.focuser.temperature" --term "sin:{tel}.tel.alt"
+```
+
+least squares over the successful results of that telescope/port/filter
+(terms below `--significance` sigma dropped), printing the coefficients,
+their errors, the rms, and the `model` entry for the config. The fitted
+model, like any, only predicts where an autofocus starts.
 
 ## 7. In the sequencer
 

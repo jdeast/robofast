@@ -251,3 +251,14 @@ def test_imaging_config_solve_entry(tmp_path):
         "t1", {"solved": True, "rms": 0.2, "zp": {"zp": 22.0, "unit": "e-/s", "n": 9}}
     )
     assert im.registry.get("t1.image.zp").value == 22.0
+
+
+def test_sky_focus_scene_without_catalog_renders_empty(tmp_path):
+    mount = FakeTelescope(slew_time=0.0)
+    mount.ra, mount.dec = 1.0, 10.0
+    c = SkyCamera((64, 64), 0.61, detector=Detector(shape=(64, 64), bias=500.0))
+    sky = SkyScene(catalog_at(tmp_path), c, PortPhotometry(), conditions=SkyConditions())
+    scene = SkyFocusScene(sky, mount, lambda: WHEN)
+    img = scene.render(20000.0, 1.0, (0, 0, 64, 64), 2)
+    assert img.shape == (32, 32) and np.all(img == 500)
+    assert "not cached" in scene.last_truth["error"]

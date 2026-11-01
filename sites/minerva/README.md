@@ -14,6 +14,7 @@ only in `instruments.json`, with `"enabled": false`.
 | `request_api.example.json` | `request_api` |
 | `guider_t1.example.json`, `guider_t2.example.json` | `guider.service` (`GuiderServiceConfig`) |
 | `kiwispec.example.json` | `devices.kiwispec_service` (`KiwiSpecConfig`) |
+| `sky.example.json` | the dispatch plan's `vetting` entry (`vetting.Vetter`; docs/sky.md) |
 | `weather.yaml` | `weather_bridge` |
 | `instruments.json` | reference catalog: every legacy value, including those no module reads yet |
 
@@ -215,3 +216,20 @@ Its limits and their sources are commented in the file itself
     `dispatch.example.json` lists no `ports`.
 18. **Guide parameters** with no legacy source keep the robofast defaults:
     `fiber_radius` 3 px, `capture_radius` 8 px, `roi_size`, exposure times.
+
+## Photometry and target vetting (`sky.example.json`)
+
+Per port: geometry for vetting and an efficiency chain or a measured zero
+point (`PortPhotometry`, docs/sky.md section 4). Values whose key ends in
+`_ESTIMATED` are guesses, to be replaced by measurements.
+
+| Value | Here | Source |
+|---|---|---|
+| aperture 700 mm, central obstruction 0.47 | `photometry.aperture`, `.obstruction` | legacy FITS APTDIA; CDK700 obstruction (PlaneWave: 47 % of the diameter) |
+| mirrors 0.73 (3 aluminium surfaces x 0.9), optics 0.9, corrector 0.95, filter 0.85, QE 0.6 (FAU, ASI174 over Gaia G) / 0.85 (imager) | `efficiency.*_ESTIMATED` | ESTIMATED (typical values; not measured) |
+| FAU beamsplitter 0.02 (the fiber gets the other 0.98) | `efficiency.beamsplitter` | JDE (2026-10-31); `PortPhotometry.with_fraction("beamsplitter", 0.98)` gives the fiber side for exposure-meter and S/N estimates |
+| **T2 FAU zero point G = 19.70 +- 0.10 for 1 ADU/s** | `t2/fau` `photometry.zero_point` | MEASURED 2026-10-31 by robofast's solver on the legacy autofocus frames of night n20260423 (`n20260423.T2.FAU.autofocus.0325`, `0399`, `0671`-`0673`; 5 frames, 3-10 Gaia stars each, 4-arcsec-radius apertures, frame-to-frame rms 0.10 mag, star-to-star 0.3-0.6 mag; airmass not corrected). ADU are the stored 16-bit values (the ASI174's 12-bit counts x 16); its e-/ADU is unknown. The chain above estimates 19.66 for 1 e-/s, i.e. ~1 e- per stored ADU if the chain is right. |
+| T2 FAU plate scale 0.2655 arcsec/px, **mirror-imaged** (east right with north up), PA 99-106 deg on that night | `t2/fau` `plate_scale` | MEASURED by the same solves (the legacy 0.265 is within 0.2 %); the PA follows the field rotation (ROTPOS 190.824 fixed) |
+
+The frames' header RA/Dec are the mount's apparent (JNow) coordinates: solving
+them needs a precession to ICRS first (0.15-0.4 deg in 2026).

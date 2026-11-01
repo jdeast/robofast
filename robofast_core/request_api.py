@@ -74,7 +74,10 @@ previous shape (``errors`` a list).
   without submitting: ``errors`` (an object, entry path to messages; empty
   if valid), ``request_durations`` (the scheduler's estimate, s), and a dry
   run over the coming night on a coarse grid: which telescopes could start
-  each request, when, and the commonest reasons why not.
+  each request, when, and the commonest reasons why not; and, when the plan
+  has ``vetting``, what the star catalog says about each target
+  (``vetting``, ``warnings``; flags the site rejects make the group
+  invalid; docs/sky.md).
 * ``POST /requestgroups/cadence`` (``submit`` or ``too``) -- expand an OCS
   cadence (a request's ``cadence``: ``start``, ``end``, ``period`` and
   ``jitter`` in hours) into one request per window, returned for
@@ -848,8 +851,37 @@ class RequestApi:
             "enclosure": enc.name,
             "request_durations": _durations(enc, group),
         }
+        loop = asyncio.get_running_loop()
+        vetter = getattr(enc.view(), "vetter", None) if not problems else None
+        if vetter is not None:
+            # Target vetting (docs/sky.md): warnings, and errors for the
+            # flags the site rejects (the scheduler's intake would refuse).
+            try:
+                results = await asyncio.wait_for(
+                    loop.run_in_executor(self._pool, vetter.vet_group, group, self.clock()),
+                    self.config.validate_budget,
+                )
+            except Exception as exc:
+                out["vetting"] = {"error": f"vetting unavailable: {exc!r}"}
+            else:
+                out["vetting"] = [r.as_dict() for r in results]
+                out["warnings"] = [
+                    f"{r.target} [{r.port}] {f.code}: {f.message}"
+                    for r in results
+                    for f in r.flags
+                    if f.severity != "error"
+                ]
+                rejected = [
+                    f"{r.target} [{r.port}] {f.code}: {f.message}"
+                    for r in results
+                    for f in r.flags
+                    if f.severity == "error"
+                ]
+                if rejected:
+                    problems += rejected
+                    out["valid"] = False
+                    out["errors"] = problems if legacy else _error_dict(problems)
         if not problems:
-            loop = asyncio.get_running_loop()
             deadline = time.monotonic() + self.config.validate_budget
             out["dry_run"] = await loop.run_in_executor(
                 self._pool, dry_run, enc, group, self.clock(), self.config, deadline

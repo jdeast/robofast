@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import math
 from datetime import UTC, datetime
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -20,8 +19,8 @@ from robofast_core.guider.base import ROI, Frame
 from robofast_core.photometry import PortPhotometry, SkyConditions
 from robofast_core.testing.skysim import SkyCamera, SkyScene
 from robofast_core.testing.starfield import Detector
+from tests.core.skydata import sky_dir
 
-DATA = Path(__file__).parent / "data" / "catalog"
 WHEN = datetime(2026, 7, 1, 6, 0, tzinfo=UTC)
 FIBER = (948.0, 626.0)
 SCALE = 0.265
@@ -70,7 +69,7 @@ def true_pixel(truth, ra, dec):
 
 @pytest.fixture(scope="module")
 def nu():
-    cat = catalog_at(DATA)
+    cat = catalog_at(sky_dir())
     s = cat.cone(263.056, 55.179, 0.02, mag_limit=6.0).at_epoch(2026.5)
     assert len(s) == 2
     return cat, s  # nu1 (brighter), nu2

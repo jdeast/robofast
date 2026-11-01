@@ -431,7 +431,10 @@ async def test_service_end_to_end(tmp_path):
             assert (await http.post("/start", json={})).status_code == 409
             r = await http.post("/locate", json={})
             assert r.status_code == 200
-            assert r.json()["target"] == pytest.approx([321.5, 239.5], abs=0.1)
+            # Located from a noisy backlit frame whose noise draw depends on
+            # timing: within a few tenths (CI once saw 0.10 px off), as in
+            # test_console_images.
+            assert r.json()["target"] == pytest.approx([321.5, 239.5], abs=0.4)
             r = await http.post(
                 "/calibrate",
                 json={"device": "tiptilt", "step": 80, "exposure": 0.02, "frames": 5},

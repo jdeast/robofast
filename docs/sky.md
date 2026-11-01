@@ -333,6 +333,11 @@ unambiguous; otherwise the acquisition fails with "target not identified".
 arcsec apart, both in the FAU): the brightest-star acquisition puts nu1 on
 the fiber when nu2 was asked for, the catalog acquisition puts nu2 there.
 
+Acquisition in normal FAU operation does not rely on plate solving (only
+the target, perhaps a companion, shows in a short frame through the 2 %
+beamsplitter): the guider's acquisition cascade (`docs/acquisition.md`)
+uses the star count, the port's PA calibration and the catalog pattern.
+
 ## 9. Measured on MINERVA
 
 From the legacy T2 FAU autofocus frames of n20260423 (read-only; the frames

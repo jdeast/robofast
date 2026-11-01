@@ -98,8 +98,12 @@ at the end of the request's window. Normal requests are ranked by
   endpoints (`/api/configurations/dither/`, `/api/requests/mosaic/`; the
   form falls back to the unexpanded request); `DIRECT` and `REAL_TIME`
   observation types.
-- `acquisition_config`, `guiding_config.optional`, `optimization_type`
-  and `acceptability_threshold` are accepted and kept, not acted on.
+- `guiding_config.optional`, `optimization_type` and
+  `acceptability_threshold` are accepted and kept, not acted on.
+  `acquisition_config.mode` is acted on (docs/acquisition.md): OCS `WCS`
+  maps to robofast's `SOLVE`, `OFF` to `COORDINATES`, and the robofast
+  modes `AUTO` (default), `BRIGHTEST`, `GEOMETRY` are accepted too; its
+  `exposure_time` is not used.
 - The archive (`/frames/`): no data products to download yet.
 - Cadence windows are not filtered for visibility (the OCS drops windows
   in which the target never rises; robofast leaves them to expire).

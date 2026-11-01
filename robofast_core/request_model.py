@@ -493,6 +493,13 @@ class Configuration:
     #: parity on the target's field at the rotator angles of the
     #: telescope's ``pa_calibration`` (docs/rotcal.md).
     type: str = "EXPOSE"
+    #: ``acquisition_config`` (docs/acquisition.md): how the guider tells the
+    #: target from its neighbours -- ``mode`` (AUTO, BRIGHTEST, GEOMETRY,
+    #: SOLVE, COORDINATES; OCS ``WCS`` is SOLVE and ``OFF`` COORDINATES) and
+    #: ``extra_params`` ``fallback`` (an explicit mode that fails runs the
+    #: AUTO cascade), ``companions`` (``[{"ra", "dec", "g"}]`` deg, beyond the
+    #: catalog) and ``tolerance`` (pixels). Empty: AUTO.
+    acquisition: dict[str, Any] = field(default_factory=dict)
 
     TYPES: ClassVar[tuple[str, ...]] = (
         "EXPOSE",
@@ -528,14 +535,7 @@ class Configuration:
                 f"{what}.guiding_config.mode: {gmode!r}; expected one of {cls.GUIDE_MODES[1:]}"
             )
         guide = gmode == "ON"
-        # Acquisition is the telescope's (its pointing model and the guider's
-        # acquisition); the OCS block is accepted and not used.
-        _check_keys(
-            d.get("acquisition_config") or {},
-            {"mode", "exposure_time", "extra_params"},
-            set(),
-            f"{what}.acquisition_config",
-        )
+        acquisition = _acquisition(d.get("acquisition_config"), f"{what}.acquisition_config")
         ics = d["instrument_configs"]
         if not isinstance(ics, list) or not ics:
             raise ValueError(f"{what}.instrument_configs: expected a non-empty list")
@@ -590,6 +590,7 @@ class Configuration:
             allow_partial,
             guide,
             ctype,
+            acquisition,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -604,6 +605,12 @@ class Configuration:
             "guiding_config": {"mode": "ON" if self.guide or self.type == "SPECTRUM" else "OFF"},
             "status": str(self.status),
         }
+        if self.acquisition:
+            a = dict(self.acquisition)
+            ac: dict[str, Any] = {"mode": a.pop("mode", "AUTO")}
+            if a:
+                ac["extra_params"] = a
+            d["acquisition_config"] = ac
         if self.failures:
             d["failures"] = self.failures
         if self.allow_partial:
@@ -1204,3 +1211,44 @@ def from_legacy_csv(path: str | Path, *, instrument: str = "spectrograph") -> li
             except (KeyError, ValueError) as exc:
                 raise ValueError(f"{what}: {exc}") from exc
     return groups
+
+
+#: acquisition_config.mode values (docs/acquisition.md); OCS's WCS and OFF too.
+ACQUISITION_MODES = ("AUTO", "BRIGHTEST", "GEOMETRY", "SOLVE", "COORDINATES", "WCS", "OFF")
+
+
+def _acquisition(d: Any, what: str) -> dict[str, Any]:
+    """A configuration's ``acquisition_config``, as the guider takes it."""
+    d = _check_keys(d or {}, {"mode", "exposure_time", "extra_params"}, set(), what)
+    mode = str(d.get("mode") or "AUTO").upper()
+    if mode not in ACQUISITION_MODES:
+        raise ValueError(f"{what}.mode: {mode!r}; expected one of {ACQUISITION_MODES}")
+    mode = {"WCS": "SOLVE", "OFF": "COORDINATES"}.get(mode, mode)
+    extra = _extra(d, {"fallback", "companions", "tolerance"}, what)
+    out: dict[str, Any] = {}
+    if mode != "AUTO":
+        out["mode"] = mode
+    if extra.get("fallback") is not None:
+        out["fallback"] = _flag(extra["fallback"], f"{what}.extra_params.fallback")
+    if extra.get("tolerance") is not None:
+        out["tolerance"] = _number(extra["tolerance"], f"{what}.extra_params.tolerance", 0.5, 100.0)
+    if extra.get("companions") is not None:
+        comps = extra["companions"]
+        if not isinstance(comps, list):
+            raise ValueError(f"{what}.extra_params.companions: expected a list")
+        out["companions"] = [
+            {
+                "ra": _number(c.get("ra"), f"{what}.companions[{i}].ra", 0.0, 360.0),
+                "dec": _number(c.get("dec"), f"{what}.companions[{i}].dec", -90.0, 90.0),
+                "g": _number(c.get("g"), f"{what}.companions[{i}].g", -2.0, 25.0),
+            }
+            for i, c in enumerate(comps)
+            if isinstance(c, dict) or _bad(f"{what}.companions[{i}]")
+        ]
+    if out and "mode" not in out:
+        out["mode"] = "AUTO"
+    return out
+
+
+def _bad(what: str) -> bool:
+    raise ValueError(f"{what}: expected an object")

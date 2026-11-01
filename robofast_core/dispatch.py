@@ -701,6 +701,8 @@ class DispatchScheduler:
     def _acquisition_entry(self, visit: _Visit, c: Configuration) -> dict[str, Any]:
         group = visit.request.group
         acq = None if group is None else self.acquisition(group.id, c.target.name)
+        if c.acquisition:
+            acq = {**(acq or {}), **c.acquisition}
         return {} if acq is None else {"acquisition": acq}
 
     def cancel(self, group_id: str) -> None:

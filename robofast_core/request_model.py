@@ -191,6 +191,29 @@ def _check_keys(d: Any, allowed: set[str], required: set[str], what: str) -> dic
     return d
 
 
+#: OCS configuration types for spectrograph lamp calibrations, and
+#: ``extra_params`` keys that would ask for a lamp: refused with
+#: :data:`NO_LAMPS`, since robofast's spectrograph, MINERVA's KiwiSpec, has
+#: none (JDE 2026-10-31).
+LAMP_TYPES = ("ARC", "LAMP_FLAT")
+LAMP_KEYS = ("lamp", "lamps", "thar", "arc", "calibration_lamp")
+NO_LAMPS = (
+    "spectrograph lamp calibrations (ThAr arcs, lamp flats) are not available:"
+    " MINERVA's KiwiSpec has no ThAr or flat lamp and no way to switch to one"
+    " (it is iodine only); observe a rapidly rotating B star through the iodine"
+    " cell instead (SPECTRUM with extra_params.iodine true; docs/kiwispec.md)"
+)
+
+
+def _no_lamps(d: Any, what: str) -> None:
+    """Refuse a lamp request explicitly, before the generic key checks."""
+    extra = d.get("extra_params") if isinstance(d, dict) else None
+    if isinstance(extra, dict):
+        asked = sorted(k for k in extra if str(k).lower() in LAMP_KEYS)
+        if asked:
+            raise ValueError(f"{what}.extra_params.{asked[0]}: {NO_LAMPS}")
+
+
 def _extra(d: dict[str, Any], allowed: set[str], what: str) -> dict[str, Any]:
     """``d["extra_params"]``, checked against robofast's keys for that level."""
     return _check_keys(d.get("extra_params") or {}, allowed, set(), f"{what}.extra_params")
@@ -411,6 +434,7 @@ class InstrumentConfig:
         keys |= {"rotator_mode", "rois", "extra_params"}
         _check_keys(d, keys, {"exposure_time"}, what)
         _unsupported(d, {"rotator_mode": (None, ""), "rois": (None, [])}, what)
+        _no_lamps(d, what)
         extra = _extra(d, cls.EXTRA, what)
         oe = _check_keys(
             d.get("optical_elements") or {}, {"filter"}, set(), f"{what}.optical_elements"
@@ -519,6 +543,9 @@ class Configuration:
         keys |= {"status", "failures"}
         _check_keys(d, keys, {"id", "target", "instrument_configs"}, what)
         _unsupported(d, {"repeat_duration": (None,)}, what)
+        if str(d.get("type") or "").upper() in LAMP_TYPES:
+            raise ValueError(f"{what}.type: {d.get('type')!r}: {NO_LAMPS}")
+        _no_lamps(d, what)
         extra = _extra(d, {"allow_partial"}, what)
         allow_partial = _flag(
             extra.get("allow_partial", False), f"{what}.extra_params.allow_partial"

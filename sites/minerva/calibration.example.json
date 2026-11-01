@@ -5,17 +5,19 @@
     "Every frame is dark (light false), so the sequencer never requests a lease: the enclosure stays",
     "closed and the telescopes parked (docs/design.md 3.4). The process exits when they are done.",
     "spectrograph: KiwiSpec calibrations through the KiwiSpec service (the enclosure config's spectrograph",
-    "entry), taken by spectrograph_telescope (default the first): biases and darks as true dark frames, ThAr and",
-    "fiber flats as light frames (docs/rv_night.md). The counts follow legacy specCalib's dusk and dawn sets",
-    "loosely; adjust them to the reduction pipeline's needs."
+    "entry), taken by spectrograph_telescope (default the first), as true dark frames. KiwiSpec is iodine",
+    "only (JDE 2026-10-31): no ThAr, no fiber flats -- the service refuses them. Biases and darks are legacy",
+    "specCalib's defaults (nbias 11, ndark 11 at 300 s; about 65 min with the 22 s readout). The rest of the",
+    "iodine calibration is observed at night as scheduled requests (requests.example.json): a rapidly",
+    "rotating B star through the iodine cell each night, and templates of each RV star with the cell out",
+    "(docs/kiwispec.md, Calibration). Slit flats only if the slit-flat LED works: set slit_flat_led true in",
+    "the KiwiSpec config, then add {\"kind\": \"slitflat\", \"exptime\": 1, \"n\": 11} (legacy specCalib)."
   ],
   "type": "calibration",
   "biases": 10,
   "darks": [[60, 5], [300, 3]],
   "spectrograph": [
     {"kind": "bias", "exptime": 0, "n": 11},
-    {"kind": "dark", "exptime": 300, "n": 3},
-    {"kind": "thar", "exptime": 1, "n": 5},
-    {"kind": "fiberflat", "exptime": 1, "n": 11}
+    {"kind": "dark", "exptime": 300, "n": 11}
   ]
 }

@@ -225,10 +225,15 @@ bound and every frame an overall bound. It differs from legacy on purpose:
   (`telescopes`), checked against the config, and written to the header
   (`FIBFEED`) and the result; calibrations take none.
 
-**Lamps.** Only the slit-flat LED can be switched through this protocol. A
-ThAr or fiber-flat frame sets up the stage and LED exactly as legacy did and
-exposes; the lamp itself is not controlled (legacy's lamp calls are commented
-out, and the server does not implement them). See question 3.
+**Lamps.** KiwiSpec has none to switch: "There are no ThAr lamps or a way
+to robotically switch over. It's all iodine." (JDE, 2026-10-31). The
+service keeps the generic `thar` and `fiberflat` kinds (they set up the
+stage as legacy did and expose; no lamp is controlled), but only for a
+spectrograph that lists them in `lamp_frames`. MINERVA's config lists
+none, so the service refuses them (400), and `GET /status` reports the
+kinds it accepts (`frame_kinds`). The slit-flat LED is the only lamp the
+protocol can switch; `slit_flat_led` (default false) gates slit flats and
+`/configure`'s `led: true`. See "Calibration" below.
 
 ### The iodine stage's positions: the live server is authoritative
 
@@ -344,7 +349,34 @@ the legacy label, `n` + the UTC date. Exposure start times come from the
 service's host clock (NTP-disciplined; `docs/deploy.md`); a simulation may
 give it a `clock` (`{"file": "clock.json"}`).
 
-## 4. Spectra in the sequencer
+## 4. Calibration: iodine only
+
+KiwiSpec measures radial velocities against the iodine cell's absorption
+lines, imprinted on the star light: the cell is the wavelength reference,
+and the instrumental profile is modelled from the same exposure. There is
+no ThAr lamp, no fiber-flat lamp and no way to switch the fiber over to
+one (JDE, 2026-10-31). robofast's calibration plan for MINERVA follows the
+legacy practice (`minerva-control`: `control.specCalib`, `takeSlitFlat`,
+`spec_equipment_check`, `rv_control.doSpectra` and `mkschedule`,
+`scheduler.py`'s B-star weighting, `targetlist.py`'s `bstar.csv`):
+
+| What | When | How (robofast) | Legacy |
+|---|---|---|---|
+| **Biases** | each calibration run (evening and morning), roof closed | `sites/minerva/calibration.example.json` `spectrograph`: `{"kind": "bias", "n": 11}`; true dark frames, stage `in` | `specCalib(nbias=11)` (taken as light frames: section 3) |
+| **Darks** | same | `{"kind": "dark", "exptime": 300, "n": 11}` | `specCalib(ndark=11, darkexptime=300)` |
+| **B stars through iodine** | at night, a scheduled request, once a night by default | `SPECTRUM` requests with `extra_params.iodine: true` and `extra_params.cadence` (`max_per_night: 1`; raise it, or add `min_interval`, for more), `BSTAR-*` in `sites/minerva/requests.example.json` | a rapidly rotating B star (nearly featureless) observed with the cell in, one per night: `mkschedule` put one at the start of the night, the scheduler weighted B stars up as the night ran out ("weight for 1 Bstar per night") and down once one was observed |
+| **Templates** | at night, one-shot requests, good conditions | `SPECTRUM` with `extra_params.iodine: false` (the cell out), no cadence: complete once taken (`TEMPLATE-*`) | targets observed with `i2` false (`template` targets in the schedule) |
+| **Slit flats** | only if the slit-flat LED works | `slit_flat_led: true` in the KiwiSpec config, then `{"kind": "slitflat", "exptime": 1, "n": 11}` in the calibration plan. **Off by default** | `specCalib` stopped them on 2023-06-12: "Slit flat lamp is dead, skipping slit flats" |
+| ThAr, fiber flats | never | refused: by the KiwiSpec service (not in `lamp_frames`) and by the request language (an `ARC` or `LAMP_FLAT` configuration, or a lamp in `extra_params`, is refused with the reason) | never taken: the lamp calls were commented out, and the server's handlers do not exist |
+
+The science spectra themselves are taken with the cell in (the service's
+`default_iodine: "in"`, or `extra_params.iodine: true`). The B stars'
+names and exposure times in the example are illustrative: the real list
+is legacy's "B stars" sheet, which is not in the public repository. The
+nightly biases and darks take about 65 minutes with the 22 s readout
+(the calibration unit's `TimeoutStartSec` is 2 h).
+
+## 5. Spectra in the sequencer
 
 Done: `docs/rv_night.md`. In short, a `SPECTRUM` request is fed by every
 free telescope it allows. Each one acquires the target, locates the fiber
@@ -358,7 +390,7 @@ sidecar file; the raw frame is never rewritten (question 10 below:
 robofast does not rely on `write_header_done`'s in-place update for
 anything it records itself).
 
-## 5. Questions for JDE
+## 6. Questions for JDE
 
 1. **The exposure meter is disabled** in `spectrograph_server.py`'s
    `__main__` ("*** EXPMETER disabled ***"). Is it in use at all now? If it
@@ -366,11 +398,10 @@ anything it records itself).
    counts per reading) right, and does the PMT see light only while the
    camera shutter is open (the `O` "shutter trigger"), or all the time?
 2. **Is the chiller** (also disabled) still part of KiwiSpec?
-3. **ThAr and fiber flat lamps:** how are they switched today (by hand, a
-   PDU outlet, the calibration unit)? The server's `thar_turn_on` /
-   `flat_turn_on` would crash it. Their warm-up times? (Legacy:
-   `WARMUPMINUTES = 0`, and "Slit flat lamp is dead, skipping slit flats" in
-   `specCalib` -- is the LED dead?)
+3. ~~ThAr and fiber flat lamps~~ **Answered** (JDE, 2026-10-31): there
+   are none, and no way to switch over: KiwiSpec is iodine only (section
+   4). Still open: does the slit-flat LED work (legacy: "Slit flat lamp is
+   dead", 2023)? Until it is confirmed, `slit_flat_led` stays false.
 4. **Iodine stage:** its speed and homing time? Should the service ever
    power-cycle the stage by itself (legacy did, after two failed moves)?
    (The positions are answered: the live server's values are correct, and

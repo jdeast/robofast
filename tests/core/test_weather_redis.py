@@ -485,11 +485,21 @@ async def test_enforced_rain_closes_for_an_hour(site):
     assert (await site.poll(bridge, 200)).state == SAFE
 
 
-async def test_cloud_page_rain_sentinel_stays_enforced(site):
+async def test_cloud_page_rain_sentinel_is_shadow_only(site):
+    """JDE 2026-10-31: MEarth's 998 rain sentinel is reported, not enforced."""
+    assert site.raw["sources"]["cloud"]["enforce_rain"] is False
     bridge = site.bridge()
     site.clock.advance(10)
     site.pages.good(site.clock.now)
     site.pages.cloud = site.pages.cloud.replace("-45.0", "998.0")
+    await bridge.poll()
+    ev = bridge.evaluate()
+    assert ev.state == SAFE and ev.safe  # IsSafe unaffected
+    assert any(r.startswith("would close: rain: cloud reports rain") for r in ev.would_close)
+    assert all(r.endswith("(rain not enforced)") for r in ev.would_close)
+    # Enforcing it is one config switch away (and then it closes).
+    site.raw["sources"]["cloud"]["enforce_rain"] = True
+    bridge = site.bridge()
     await bridge.poll()
     ev = bridge.evaluate()
     assert ev.state == UNSAFE

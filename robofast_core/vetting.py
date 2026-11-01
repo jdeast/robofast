@@ -136,6 +136,10 @@ class VettingConfig:
     saturation_fraction: float = 0.8
     min_snr: float = 20.0
     min_solve_stars: int = 4
+    #: Acquisition (docs/acquisition.md): a star counts as seen above this
+    #: S/N; this many or more and the cascade plate-solves.
+    acq_snr: float = 5.0
+    acq_solve_min: int = 5
     high_pm: float = 500.0
     fiber_dmag: float = 5.0
     #: Flag codes that reject a request at intake (the rest warn).
@@ -174,6 +178,11 @@ class VettingResult:
     unambiguous: bool = False
     n_field: int = 0
     n_solve: int = 0
+    #: Stars the acquisition frame should show (S/N > 5 at the port's
+    #: exposure, in the acquisition box), and the branch of the AUTO cascade
+    #: that count leads to (docs/acquisition.md).
+    n_acq: int = 0
+    acq_branch: str = ""
 
     @property
     def rejected(self) -> bool:
@@ -191,6 +200,8 @@ class VettingResult:
             "match": self.match,
             "n_field": self.n_field,
             "n_solve": self.n_solve,
+            "n_acq": self.n_acq,
+            "acq_branch": self.acq_branch,
             "flags": [asdict(f) for f in self.flags],
         }
 
@@ -369,6 +380,33 @@ def vet(
                 f"a G {stars.g[j]:.2f} star {d[j]:.1f} arcsec from the target, inside the "
                 f"capture radius ({cap:.1f} arcsec)",
             )
+    # Which branch of the acquisition cascade the frame will take.
+    visible = box & (snr > c.acq_snr)
+    res.n_acq = n = int(visible.sum())
+    res.acq_branch = (
+        "solve"
+        if n >= c.acq_solve_min
+        else "triangulate"
+        if n >= 3
+        else "pair"
+        if n == 2
+        else "single"
+        if n == 1
+        else "none"
+    )
+    if res.acq_branch in ("pair", "triangulate"):
+        flag(
+            "acq_relies_on_chip_pa",
+            f"{n} stars in the acquisition frame: acquisition relies on the chip PA"
+            " (the port needs a PA calibration)",
+            branch=res.acq_branch,
+        )
+    if tmag is not None and not snr[k] > c.acq_snr and n:
+        flag(
+            "acq_target_invisible",
+            f"the target is below S/N {c.acq_snr:g} in {port.exposure:g} s but {n} other"
+            " star(s) are not: acquisition would take one of them",
+        )
     ambiguous = {"twin", "blend", "companion", "wds_companion", "not_brightest", "not_in_catalog"}
     res.unambiguous = tmag is not None and not (ambiguous & set(res.codes()))
     return res

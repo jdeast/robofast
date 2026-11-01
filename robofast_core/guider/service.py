@@ -174,6 +174,10 @@ class GuiderServiceConfig:
     #: mount's matrix is seeded from it (PA, parity, plate scale), and it
     #: gives the Redis telemetry its PA.
     pa_calibration: dict[str, Any] | None = None
+    #: The acquisition cascade's thresholds (docs/acquisition.md;
+    #: :class:`~robofast_core.guider.acquire.AcqConfig`). Every start then
+    #: runs the cascade (``mode`` from the target, default AUTO).
+    acquisition: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> GuiderServiceConfig:
@@ -705,12 +709,80 @@ class GuiderService:
         g = self.guider
         g.unambiguous = bool(args.get("unambiguous", False))
         g.identify = None
+        g.acquirer = None
         radec = args.get("target_radec")
         if radec is not None and self._solver is not None:
             from robofast_core.guider.identify import catalog_identifier
 
             ra, dec = (float(v) for v in radec)
             g.identify = catalog_identifier(self._catalog, self._solver, ra, dec)
+        acq = args.get("acquisition")
+        if self.config.acquisition is not None or acq is not None:
+            g.acquirer = self._acquirer(dict(acq or {}), radec, args.get("pointing_sigma"))
+
+    def _acquirer(self, acq: dict[str, Any], radec: Any, pointing_sigma: Any) -> Any:
+        """The acquisition cascade for this target (docs/acquisition.md)."""
+        from robofast_core.guider.acquire import AcqConfig, Acquirer, Neighbour
+
+        g = self.guider
+        cfg = AcqConfig.from_dict(self.config.acquisition)
+        if acq.get("tolerance") is not None:
+            cfg.tolerance = float(acq["tolerance"])
+        pa_cal = self.pa_cal
+        scale = g.config.plate_scale or (pa_cal.plate_scale if pa_cal else None)
+        neighbours: list[Neighbour] = []
+        target_g = acq.get("target_g")
+        if acq.get("companions"):
+            # Given with the target: offsets east/north (arcsec) or positions.
+            for c in acq["companions"]:
+                if "east" in c:
+                    neighbours.append(Neighbour(float(c["east"]), float(c["north"]), float(c["g"])))
+                elif radec is not None:
+                    from robofast_core.catalog import Stars
+                    from robofast_core.guider.acquire import neighbours_from_catalog
+
+                    s = Stars.from_records(_records([c]))
+                    neighbours += neighbours_from_catalog(s, float(radec[0]), float(radec[1]), None)
+        elif radec is not None and self._catalog is not None and scale:
+            neighbours, target_g = self._catalog_neighbours(radec, scale, target_g)
+        return Acquirer(
+            predicted=tuple(g.config.target) if g.config.target else (0.0, 0.0),
+            target_g=None if target_g is None else float(target_g),
+            neighbours=neighbours,
+            scale=scale,
+            pa=None if pa_cal is None else pa_cal.pa(0.0),
+            flip=False if pa_cal is None else pa_cal.flip,
+            pointing_sigma=None if pointing_sigma is None else float(pointing_sigma),
+            solve=g.identify,
+            mode=str(acq.get("mode") or "AUTO"),
+            fallback=bool(acq.get("fallback", False)),
+            config=cfg,
+        )
+
+    def _catalog_neighbours(self, radec: Any, scale: float, target_g: Any) -> tuple[list, Any]:
+        """Catalog stars around the target within the camera's reach."""
+        import math as _m
+
+        from robofast_core.catalog import CatalogUnavailable, separation
+        from robofast_core.guider.acquire import neighbours_from_catalog
+
+        ra, dec = float(radec[0]), float(radec[1])
+        nx, ny = self.guider.camera.sensor
+        radius = _m.hypot(nx, ny) * scale / 3600.0
+        try:
+            s = self._catalog.cone(ra, dec, radius, epoch=datetime.now(UTC))
+        except CatalogUnavailable as exc:
+            log.warning("acquisition: no catalog (%s)", exc)
+            return [], target_g
+        if not len(s):
+            return [], target_g
+        d = separation(ra, dec, s.ra, s.dec) * 3600.0
+        k = int(np.argmin(d))
+        if d[k] <= 3.0:
+            if target_g is None:
+                target_g = float(s.g[k])
+            s = s.take(np.arange(len(s)) != k)
+        return neighbours_from_catalog(s, ra, dec, target_g), target_g
 
     def _refuse_if_busy(self) -> None:
         if self._busy is not None:
@@ -968,3 +1040,14 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def _records(cs: list[dict[str, Any]]) -> np.ndarray:
+    """Companions given as ``{"ra", "dec", "g"}`` (deg) as catalog records."""
+    from robofast_core.catalog import TILE_DTYPE
+
+    rec = np.zeros(len(cs), TILE_DTYPE)
+    for i, c in enumerate(cs):
+        rec[i]["ra"], rec[i]["dec"], rec[i]["g"] = float(c["ra"]), float(c["dec"]), float(c["g"])
+        rec[i]["source_id"] = -1 - i
+    return rec

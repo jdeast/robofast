@@ -28,7 +28,9 @@ jobs:
   pytest:
     name: pytest
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The fast tier takes ~13-14 min serially (1474 tests, 2026-11-01); 15
+    # cancelled PR #59's 3.12 and 3.14 jobs just short of the end.
+    timeout-minutes: 30
     # Data robofast downloads from Zenodo (robofast_core/zenodo.py; the Gaia
     # DR3 extracts are CC BY-NC, so not in this BSD repository) land here,
     # and the cache step below keeps them between runs: Zenodo is a free

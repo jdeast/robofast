@@ -29,7 +29,7 @@ from robofast_core.alpaca_client import (
 )
 from robofast_core.config import device_address, telescopes
 from robofast_core.devices import adc_math
-from robofast_core.devices.adc_mdrive import MOVING, Motors, MotorError, MotorTimeout
+from robofast_core.devices.adc_mdrive import MOVING, MotorError, Motors, MotorTimeout
 from robofast_core.devices.adc_server import (
     SWITCH_IDS,
     SWITCHES,
@@ -98,7 +98,10 @@ def test_the_port_reproduces_every_legacy_vector():
         assert (a, b) == (pytest.approx(v["atarg"], abs=1e-6), pytest.approx(v["btarg"], abs=1e-6))
         ma = adc_math.legacy_motor_degrees(a, adc_math.HOME_ANGLES[0])
         mb = adc_math.legacy_motor_degrees(b, adc_math.HOME_ANGLES[1])
-        assert (ma, mb) == (pytest.approx(v["a_deg"], abs=1e-4), pytest.approx(v["b_deg"], abs=1e-4))
+        assert (ma, mb) == (
+            pytest.approx(v["a_deg"], abs=1e-4),
+            pytest.approx(v["b_deg"], abs=1e-4),
+        )
         assert (adc_math.steps_for(ma), adc_math.steps_for(mb)) == (v["a_steps"], v["b_steps"])
         # The closed form robofast uses is the same chain.
         ca, cb = adc_math.motor_degrees(v["pa"], defl)
@@ -703,7 +706,9 @@ def attach_adc(rig, server: ADCServer):
     return unit.adc
 
 
-async def test_sequencer_tracks_before_light_frames_and_neutral_at_cleanup(make_rig, serve, tmp_path):
+async def test_sequencer_tracks_before_light_frames_and_neutral_at_cleanup(
+    make_rig, serve, tmp_path
+):
     s = serve(FakeFeed())
     plan = StaticPlan(
         [

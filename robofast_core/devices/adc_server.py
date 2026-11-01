@@ -318,6 +318,12 @@ def make_transport(cfg: PortConfig) -> Transport:
     return SerialTransport(cfg.device, cfg.baud)
 
 
+def _step_distance(a: int, b: int) -> int:
+    """Steps between two counter values on the circle (0 and 3999 are 1 apart)."""
+    d = (a - b) % STEPS_PER_TURN
+    return min(d, STEPS_PER_TURN - d)
+
+
 # -- the telescope's position -----------------------------------------------------
 
 
@@ -724,7 +730,7 @@ class ADC:
         if pos != job.last_pos:
             job.last_pos, job.last_change = dict(pos), now
         there = all(
-            p is not None and abs(p - s) <= cfg.tolerance
+            p is not None and _step_distance(p, s) <= cfg.tolerance
             for p, s in zip(pos.values(), job.steps.values(), strict=True)
         )
         if there:

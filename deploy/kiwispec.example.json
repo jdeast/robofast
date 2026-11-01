@@ -5,6 +5,9 @@
   "camera": {"host": "127.0.0.1", "port": 2055},
   "allow_hardware": false,
   "telescopes": ["T1", "T2", "T3", "T4"],
+  "_calibration": "MINERVA's KiwiSpec is iodine only: no ThAr or fiber-flat lamp (lamp_frames empty), and the slit-flat LED is not in use (slit_flat_led false). docs/kiwispec.md, Calibration.",
+  "slit_flat_led": false,
+  "lamp_frames": [],
   "heater_setpoint": 55.0,
   "readout_time": 22.0
 }

@@ -645,15 +645,16 @@ class SimulatedNight:
             spectrograph=[
                 {"kind": "bias", "exptime": 0, "n": 2},
                 {"kind": "dark", "exptime": 0.5, "n": 1},
-                {"kind": "thar", "exptime": 0.3, "n": 2},
-                {"kind": "fiberflat", "exptime": 0.3, "n": 1},
             ],
         )
         return entry
 
     def _requests(self) -> list[dict[str, Any]]:
-        """Six RV standards (SPECTRUM, both telescopes), one imaging field
-        for T1 in a window in the middle of the night."""
+        """Six spectra (SPECTRUM, both telescopes) -- a B star through
+        iodine (the iodine calibration), four RV standards (iodine in) and a
+        template (iodine out) -- and one imaging field for T1 in a window in
+        the middle of the night. KiwiSpec is iodine only (docs/kiwispec.md,
+        section 4)."""
         start = self.s.start
         lst0 = sky.sky_now(MINERVA, start).lst_hours
         groups = []
@@ -663,14 +664,17 @@ class SimulatedNight:
             [(1.0, 20), (2.0, 30), (3.5, 15), (5.0, 35), (6.5, 25), (8.0, 10)]
         ):
             gid = f"RV{i + 1}"
-            extra: dict[str, Any] = {"iodine": True}
+            extra: dict[str, Any] = {"iodine": i != 5}  # the last: a template
+            label = {0: "B star through iodine", 5: "template (iodine out)"}.get(
+                i, f"RV standard {i + 1}"
+            )
             if i == 2:
                 extra["target_counts"] = self.s.expmeter_rate * self.s.rv_exptime * 0.6
             ic = {"exposure_time": self.s.rv_exptime, "exposure_count": 1, "extra_params": extra}
             groups.append(
                 {
                     "id": gid,
-                    "name": f"RV standard {i + 1}",
+                    "name": label,
                     "proposal": "rv-demo",
                     "ipp_value": 5 - 0.5 * i,
                     "requests": [
@@ -685,7 +689,7 @@ class SimulatedNight:
                                     "instrument_type": "spectrograph",
                                     "target": {
                                         "type": "ICRS",
-                                        "name": f"RV{i + 1}",
+                                        "name": TARGET_NAMES.get(i, f"RV{i + 1}"),
                                         "ra": (lst0 + dh) % 24.0 * 15.0,
                                         "dec": float(dec),
                                         "proper_motion_ra": 100.0 * (i + 1),
@@ -1017,6 +1021,10 @@ def _tag(night: SimulatedNight, seq: Sequencer) -> str:
     return next((k for k, v in night.outcome.runs.items() if v is seq), "run")
 
 
+#: The night's B star (iodine in) and template (iodine out), by request index.
+TARGET_NAMES = {0: "BSTAR1", 5: "TEMPLATE6"}
+
+
 # -- the checks ---------------------------------------------------------------------------
 
 
@@ -1042,14 +1050,17 @@ def check(o: Outcome) -> list[str]:
         if not ev(tl, "spectrograph_calibration_done"):
             bad.append(f"{tag}: no spectrograph calibration")
         recs = o.runs[tag].spectrum_records
-        if [r["kind"] for r in recs] != ["bias", "bias", "dark", "thar", "thar", "fiberflat"]:
+        # KiwiSpec is iodine only: no ThAr, no fiber flats.
+        if [r["kind"] for r in recs] != ["bias", "bias", "dark"]:
             bad.append(f"{tag}: calibration frames {[r['kind'] for r in recs]}")
     for name, f in o.spectrograph_files.items():
         kind = f.get("header", {}).get("IMAGETYP", [None])[0]
         if kind in ("bias", "dark") and not f.get("dark"):
             bad.append(f"{name}: a {kind} taken as a light frame")
-        if kind in ("science", "thar", "fiberflat") and f.get("dark"):
+        if kind == "science" and f.get("dark"):
             bad.append(f"{name}: a {kind} taken as a dark frame")
+        if kind not in ("science", "bias", "dark"):
+            bad.append(f"{name}: a {kind} frame (KiwiSpec is iodine only)")
     opens = [t for t, c in o.dome_log if c.startswith("OPEN")]
     for tag in ("evening", "morning"):
         tl = o.timelines.get(tag)
@@ -1286,6 +1297,16 @@ def output_problems(o: Outcome) -> list[str]:
             bad.append(f"{r['file']}: no flux-weighted midpoint")
     if not any(r.get("ended_by") == "counts" for r in science):
         bad.append("no spectrum ended on the exposure meter's counts")
+    # The iodine cell: in for the B star and the RV stars, out for the template.
+    for r in science:
+        want = "out" if r.get("object") == TARGET_NAMES[5] else "in"
+        got = (r.get("iodine") or {}).get("name")
+        if got != want:
+            bad.append(f"{r['file']}: iodine stage {got!r}, expected {want!r}")
+    objects = {r.get("object") for r in science}
+    for i in (0, 5):
+        if TARGET_NAMES[i] not in objects:
+            bad.append(f"no spectrum of {TARGET_NAMES[i]}")
     if not o.plan_record:
         bad.append("no plan record")
     elif not any(e["kind"] == "join" for e in o.plan_record):

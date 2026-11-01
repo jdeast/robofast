@@ -17,9 +17,10 @@
 # Sources (JDE 2026-10-31): the site Redis server is the required primary;
 # the ridge page and the cloud page are advisory backups (an "unsafe" from
 # them still closes; a failed or stale page does not). Rain is evaluated
-# everywhere but enforced only from the cloud page's MEarth rain sentinel,
-# which legacy enforced; WXT-based rain (Redis and ridge) is shadow-only
-# until its false-positive rate has been validated (enforce_rain).
+# everywhere but enforced nowhere yet: WXT-based rain (Redis and ridge) and
+# the cloud page's MEarth 998 rain sentinel are all shadow-only (reported as
+# "would close", IsSafe unaffected) until validated (enforce_rain; the 998
+# sentinel: JDE 2026-10-31).
 
 site:
   name: minerva
@@ -82,10 +83,9 @@ sources:
       hail:           {key: hail}                        # cumulative
       hail_intensity: {key: hail_intensity}
       hail_duration:  {key: hail_duration}
-      # Cloud sensors (sky - ambient, degC). Identities are inferred from
-      # the key names, not verified: m_bolt = the MEarth Boltwood (timed by
-      # mbolt_time), aurora = the Aurora sensor; a_sky equalled aurora at
-      # capture. boltwood (timed by boltwood_time) read -0.0 = legacy's
+      # Cloud sensors (sky - ambient, degC). Confirmed (JDE 2026-10-31):
+      # m_bolt = the MEarth cloud sensor (timed by mbolt_time), aurora = the
+      # Aurora sensor; a_sky equalled aurora at capture. boltwood (timed by boltwood_time) read -0.0 = legacy's
       # "sensor down" 0.0; which sensor it is is unknown, so it is logged
       # but not limited. 0.0 is "down" for all, as legacy.
       mearth:         {key: m_bolt, time: mbolt_time, missing_values: [0.0]}
@@ -167,9 +167,10 @@ sources:
     credentials_file: ~/.config/robofast/sao-weather.credentials
     # Advisory backup since 2026-10-31 (see ridge).
     required: false
-    # legacy enforced MEarth's 998.0 rain sentinel ("much more reliable than
-    # wxt510Rain"), so this one stays enforced.
-    enforce_rain: true
+    # Legacy enforced MEarth's 998.0 rain sentinel ("much more reliable than
+    # wxt510Rain"); JDE 2026-10-31: shadow only here (evaluated, held and
+    # reported as "would close", but IsSafe is unaffected).
+    enforce_rain: false
     # legacy limits['cloudDate']: utcnow() - 6 min (page updates every 5 min)
     stale_after: 360
     timeout: 10

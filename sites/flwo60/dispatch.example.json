@@ -1,0 +1,25 @@
+{
+  "_note": [
+    "A dispatch-scheduler plan entry for the FLWO 60-inch (robofast_core/dispatch.py; docs/design.md 3.7):",
+    "  python -m robofast_core.sequencer_service --config sites/flwo60/flwo60.json --plan sites/flwo60/dispatch.example.json",
+    "Placeholders: the altitude limit follows tcsgo.json (min_alt 20); instruments names the TRES CCD 'tres'.",
+    "calstage: the TRES front end's named positions (tres_frontend.json); lamps: the lamp outlets of the",
+    "Pulizzi switch (pulizzi.json). Listing lamps is what allows ARC and LAMP_FLAT requests on this",
+    "telescope (docs/pulizzi.md); MINERVA lists none, so they are refused there.",
+    "state is relative to this file here; use an absolute path in production."
+  ],
+  "type": "dispatch",
+  "site": {"latitude": 31.6809, "longitude": -110.8781, "elevation": 2344.0},
+  "requests": "requests.example.json",
+  "state": "dispatch-state.json",
+  "telescopes": {
+    "tillinghast": {"instruments": ["tres"], "min_alt": 20, "max_alt": 90,
+                    "calstage": ["out", "sky", "science", "in", "block_sky", "block_science"],
+                    "lamps": ["ThAr1", "ThAr2", "Incand", "Incand2"]}
+  },
+  "max_sun_alt": -12,
+  "min_moon_sep": 10,
+  "slew_overhead": 120,
+  "frame_overhead": 30,
+  "idle_poll": 60
+}

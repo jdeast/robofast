@@ -120,7 +120,8 @@ jobs:
   # Telescope/Focuser/Dome server (scripts/conformu_tcsgo.py), the MEarth
   # South roof Dome server (scripts/conformu_mearth_roof.py), and the TRES
   # front end's calibration-stage FilterWheel/Focuser server
-  # (scripts/conformu_tres_frontend.py).
+  # (scripts/conformu_tres_frontend.py), and the 60-inch's calibration-lamp
+  # Switch server on its Pulizzi simulator (scripts/conformu_pulizzi.py).
   conformu:
     name: conformu
     runs-on: ubuntu-latest
@@ -158,6 +159,9 @@ jobs:
       - name: ConformU against the TRES front-end FilterWheel and Focuser server
         if: ${{ !cancelled() }}
         run: python scripts/conformu_tres_frontend.py --conformu "$CONFORMU_BIN" --out "${{ runner.temp }}/conformu-tres-frontend"
+      - name: ConformU against the calibration-lamp Switch server
+        if: ${{ !cancelled() }}
+        run: python scripts/conformu_pulizzi.py --conformu "$CONFORMU_BIN" --out "${{ runner.temp }}/conformu-pulizzi"
       - name: Upload ConformU logs
         if: always()
         continue-on-error: true
@@ -170,6 +174,7 @@ jobs:
             ${{ runner.temp }}/conformu-pdu
             ${{ runner.temp }}/conformu-mearth-roof
             ${{ runner.temp }}/conformu-tres-frontend
+            ${{ runner.temp }}/conformu-pulizzi
           if-no-files-found: warn
 
   # End to end: a whole simulated MINERVA RV night (docs/demo.md) on

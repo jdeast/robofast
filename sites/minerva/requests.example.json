@@ -14,7 +14,7 @@
     "  1 here, raise it for more; ipp_value sets how hard the scheduler tries.",
     "  TEMPLATE-*: an RV star with the iodine cell OUT (extra_params.iodine false), one-shot (no cadence):",
     "  it completes once taken. One per RV star; good seeing and low airmass matter most.",
-    "Lamp calibrations (type ARC or LAMP_FLAT, extra_params.lamp) are refused: KiwiSpec has none.",
+    "Lamp calibrations (type ARC or LAMP_FLAT) are refused here: KiwiSpec has none (no telescope lists lamps).",
     "Convert a real legacy targets.csv with robofast_core.request_model.from_legacy_csv, or name it",
     "as 'legacy_csv' in the dispatch plan entry (sites/minerva/dispatch.example.json)."
   ],

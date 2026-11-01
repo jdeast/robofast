@@ -16,6 +16,7 @@ example; its shape::
         "t1": {"telescope": "host:port/N", "camera": "host:port/N",
                "filterwheel": "host:port/N",      # optional
                "calstage": "host:port/N",         # optional: TRES front end
+               "lamps": {"switch": "host:port/N", ...},  # optional: docs/pulizzi.md
                "port_action": "..."},             # optional: M3 port Action
         "t2": {...}
       },

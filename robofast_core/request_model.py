@@ -191,10 +191,12 @@ def _check_keys(d: Any, allowed: set[str], required: set[str], what: str) -> dic
     return d
 
 
-#: OCS configuration types for spectrograph lamp calibrations, and
-#: ``extra_params`` keys that would ask for a lamp: refused with
-#: :data:`NO_LAMPS`, since robofast's spectrograph, MINERVA's KiwiSpec, has
-#: none (JDE 2026-10-31).
+#: OCS configuration types for spectrograph lamp calibrations. They run
+#: only where a telescope has lamps (its dispatch limits list them in
+#: ``lamps``: the FLWO 60-inch's TRES, docs/pulizzi.md); the request API
+#: refuses them, with :data:`NO_LAMPS`, for an enclosure without (MINERVA:
+#: KiwiSpec has none, JDE 2026-10-31). ``extra_params`` keys that would ask
+#: for a lamp are refused everywhere (:data:`LAMPS_HOW`).
 LAMP_TYPES = ("ARC", "LAMP_FLAT")
 LAMP_KEYS = ("lamp", "lamps", "thar", "arc", "calibration_lamp")
 NO_LAMPS = (
@@ -203,15 +205,20 @@ NO_LAMPS = (
     " (it is iodine only); observe a rapidly rotating B star through the iodine"
     " cell instead (SPECTRUM with extra_params.iodine true; docs/kiwispec.md)"
 )
+LAMPS_HOW = (
+    "a lamp calibration is an ARC or LAMP_FLAT configuration naming its lamp in"
+    " each instrument config's optical_elements.lamp, and runs only on a telescope"
+    " with that lamp (the FLWO 60-inch's TRES; docs/pulizzi.md). On MINERVA: " + NO_LAMPS
+)
 
 
 def _no_lamps(d: Any, what: str) -> None:
-    """Refuse a lamp request explicitly, before the generic key checks."""
+    """Refuse a lamp asked for in ``extra_params``, before the generic key checks."""
     extra = d.get("extra_params") if isinstance(d, dict) else None
     if isinstance(extra, dict):
         asked = sorted(k for k in extra if str(k).lower() in LAMP_KEYS)
         if asked:
-            raise ValueError(f"{what}.extra_params.{asked[0]}: {NO_LAMPS}")
+            raise ValueError(f"{what}.extra_params.{asked[0]}: {LAMPS_HOW}")
 
 
 def _extra(d: dict[str, Any], allowed: set[str], what: str) -> dict[str, Any]:
@@ -402,7 +409,8 @@ class Constraints:
 class InstrumentConfig:
     """OCS ``exposure_time`` (s; Python ``exptime``), ``exposure_count``
     (``count``), ``optical_elements.filter`` (``filter``) and
-    ``optical_elements.calstage`` (``calstage``), and readout ``mode``;
+    ``optical_elements.calstage`` (``calstage``), ``optical_elements.lamp``
+    (``lamp``: ARC and LAMP_FLAT only), and readout ``mode``;
     robofast's ``extra_params``: ``port``, ``iodine``, ``target_counts``
     and ``light``."""
 
@@ -430,6 +438,10 @@ class InstrumentConfig:
     #: ``science``, ...), selected by the sequencer before the exposures; only
     #: telescopes whose limits list it in ``calstage`` are eligible.
     calstage: str | None = None
+    #: ARC and LAMP_FLAT only: the calibration lamp (its name on the
+    #: telescope's lamp switch); only telescopes whose limits list it in
+    #: ``lamps`` are eligible.
+    lamp: str | None = None
 
     EXTRA: ClassVar[set[str]] = {"port", "iodine", "target_counts", "light"}
 
@@ -443,7 +455,7 @@ class InstrumentConfig:
         extra = _extra(d, cls.EXTRA, what)
         oe = _check_keys(
             d.get("optical_elements") or {},
-            {"filter", "calstage"},
+            {"filter", "calstage", "lamp"},
             set(),
             f"{what}.optical_elements",
         )
@@ -464,6 +476,7 @@ class InstrumentConfig:
             else _number(counts, f"{what}.extra_params.target_counts", 1.0, 1e15),
             "" if mode is None else str(mode),
             _text(oe.get("calstage")),
+            _text(oe.get("lamp")),
         )
 
     def to_dict(self, *, light: bool = True) -> dict[str, Any]:
@@ -473,6 +486,8 @@ class InstrumentConfig:
         d["optical_elements"] = {} if self.filter is None else {"filter": self.filter}
         if self.calstage is not None:
             d["optical_elements"]["calstage"] = self.calstage
+        if self.lamp is not None:
+            d["optical_elements"]["lamp"] = self.lamp
         if self.mode:
             d["mode"] = self.mode
         extra: dict[str, Any] = {}
@@ -529,7 +544,10 @@ class Configuration:
     #: telescope's ``pa_calibration`` (docs/rotcal.md). ``SKY_FLAT``
     #: (robofast's): twilight flats opposite the Sun, ``exposure_count`` per
     #: instrument config's filter (docs/skyflats.md); the target only gates
-    #: when it is schedulable.
+    #: when it is schedulable. ``ARC`` and ``LAMP_FLAT``: spectrograph lamp
+    #: frames, each instrument config naming its lamp
+    #: (``optical_elements.lamp``); no sky light, never guided; only on a
+    #: telescope with that lamp (docs/pulizzi.md).
     type: str = "EXPOSE"
     #: ``acquisition_config`` (docs/acquisition.md): how the guider tells the
     #: target from its neighbours -- ``mode`` (AUTO, BRIGHTEST, GEOMETRY,
@@ -548,6 +566,7 @@ class Configuration:
         "POINTING_MODEL",
         "ROTATOR_CALIBRATION",
         "SKY_FLAT",
+        *LAMP_TYPES,
     )
     GUIDE_MODES: ClassVar[tuple[str, ...]] = ("", "ON", "OFF")
 
@@ -558,8 +577,6 @@ class Configuration:
         keys |= {"status", "failures"}
         _check_keys(d, keys, {"id", "target", "instrument_configs"}, what)
         _unsupported(d, {"repeat_duration": (None,)}, what)
-        if str(d.get("type") or "").upper() in LAMP_TYPES:
-            raise ValueError(f"{what}.type: {d.get('type')!r}: {NO_LAMPS}")
         _no_lamps(d, what)
         extra = _extra(d, {"allow_partial"}, what)
         allow_partial = _flag(
@@ -593,12 +610,31 @@ class Configuration:
             for i, ic in enumerate(ics)
         ]
         for i, ic in enumerate(parsed):
+            if ctype in LAMP_TYPES:
+                if ic.lamp is None:
+                    raise ValueError(
+                        f"{what}.type: {ctype!r} needs instrument_configs[{i}]"
+                        f".optical_elements.lamp: {LAMPS_HOW}"
+                    )
+                if ic.light and "light" in (ics[i].get("extra_params") or {}):
+                    raise ValueError(
+                        f"{what}.instrument_configs[{i}]: an {ctype} takes no sky light"
+                    )
+                ic.light = False
+                continue
+            if ic.lamp is not None:
+                raise ValueError(
+                    f"{what}.instrument_configs[{i}].optical_elements.lamp: only for"
+                    f" {' and '.join(LAMP_TYPES)} configurations"
+                )
             if ctype in ("DARK", "BIAS"):
                 if ic.light and "light" in (ics[i].get("extra_params") or {}):
                     raise ValueError(f"{what}.instrument_configs[{i}]: a {ctype} is not light")
                 ic.light = False
             elif ctype != "EXPOSE" and not ic.light:
                 raise ValueError(f"{what}.instrument_configs[{i}]: a {ctype} frame is light")
+        if ctype in LAMP_TYPES and guide:
+            raise ValueError(f"{what}: an {ctype} is not guided")
         if ctype in ("AUTO_FOCUS", "POINTING_MODEL", "ROTATOR_CALIBRATION") and len(parsed) != 1:
             raise ValueError(f"{what}: an {ctype} needs exactly one light instrument config")
         default = "spectrograph" if ctype == "SPECTRUM" else "imager"
@@ -636,7 +672,7 @@ class Configuration:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        light = self.type not in ("DARK", "BIAS")
+        light = self.type not in ("DARK", "BIAS", *LAMP_TYPES)
         d: dict[str, Any] = {
             "id": self.id,
             "type": self.type,

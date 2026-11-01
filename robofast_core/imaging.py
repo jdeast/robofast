@@ -59,6 +59,9 @@ from robofast_core.timeline import Timeline
 
 log = logging.getLogger(__name__)
 
+#: IMAGETYP of lamp frames (request types ARC and LAMP_FLAT; docs/pulizzi.md).
+LAMP_IMAGETYP = {"arc": "ARC", "lamp_flat": "FLAT"}
+
 __all__ = [
     "FrameWriteFailed",
     "Imaging",
@@ -346,9 +349,12 @@ class Imaging:
             telescope=telescope,
             object=obs.object or obs.name,
             obs_name=obs.name,
-            imagetyp="FOCUS"
-            if obs.kind == "autofocus"
-            else imagetyp(obs.light, obs.exptime, obs.object or obs.name),
+            imagetyp=LAMP_IMAGETYP.get(obs.kind)
+            or (
+                "FOCUS"
+                if obs.kind == "autofocus"
+                else imagetyp(obs.light, obs.exptime, obs.object or obs.name)
+            ),
             light=obs.light,
             exptime_requested=obs.exptime,
             host_start=host_start,

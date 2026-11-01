@@ -273,6 +273,7 @@ from robofast_core.clock import Clock, real_clock
 from robofast_core.devices.kiwispec_client import KiwiSpecBusy, KiwiSpecError
 from robofast_core.imagebytes import ImageArray, fits_order
 from robofast_core.imaging import FrameWriteFailed, Imaging, PendingFrame
+from robofast_core.lamps import LAMP_KINDS, LampSetup, lamps_off, switch_status
 from robofast_core.owner import DeviceError, DeviceOwner, Grant, GrantRevoked
 from robofast_core.plan import Idle, Observation, PlanProvider, as_plan
 from robofast_core.pointmodel import PointingCorrector
@@ -348,6 +349,11 @@ class ObservationFailed(Exception):
 
 class Unsupported(DeviceError):
     """An observation needs a filter or M3 port this telescope cannot select."""
+
+
+class LampOff(DeviceError):
+    """The lamp of a lamp observation went off before its frames were taken
+    (its switch's max-on limit, or switched off by hand)."""
 
 
 class ManualRefused(Exception):
@@ -489,6 +495,11 @@ class TelescopeUnit:
     #: The TRES front end's calibration stage: an Alpaca FilterWheel whose
     #: ``Names`` are its positions (docs/tres_frontend.md); optional.
     calstage: DeviceOwner | None = None
+    #: The spectrograph's calibration lamps (docs/pulizzi.md): the lamp
+    #: switch (robofast's lamp Switch server) and its setup; both needed for
+    #: ``kind="arc"`` and ``kind="lamp_flat"`` observations.
+    lamps: DeviceOwner | None = None
+    lamp_setup: LampSetup | None = None
     #: Started for observations with ``guide`` (design.md 3.4, docs/guider.md).
     guider: GuiderHook | None = None
     #: The focuser the sequencer moves (autofocus), and the autofocus
@@ -626,6 +637,8 @@ class CleanupReport:
     #: The spectrograph's abort: None (nothing of ours was running), True
     #: (it ended), False (it did not confirm).
     spectrograph_aborted: bool | None = None
+    #: Lamps switched off by the cleanup (``telescope:lamp``).
+    lamps_off: list[str] = field(default_factory=list)
 
     @property
     def all_parked(self) -> bool:
@@ -650,6 +663,8 @@ class _Generation:
     filterwheels: dict[str, Grant] = field(default_factory=dict)
     #: Calibration-stage grants (the TRES front end), per telescope.
     calstages: dict[str, Grant] = field(default_factory=dict)
+    #: Lamp-switch grants, per telescope with lamps.
+    lamps: dict[str, Grant] = field(default_factory=dict)
     #: Focuser grants, for the telescopes whose focuser the sequencer moves.
     focusers: dict[str, Grant] = field(default_factory=dict)
     #: Rotator grants, for the telescopes whose rotator the sequencer moves.
@@ -1243,6 +1258,7 @@ class Sequencer:
         state.calstages = {
             u.name: u.calstage.grant(holder) for u in units if u.calstage is not None
         }
+        state.lamps = {u.name: u.lamps.grant(holder) for u in units if u.lamps is not None}
         state.focusers = {u.name: u.focuser.grant(holder) for u in units if u.focuser is not None}
         state.rotators = {u.name: u.rotator.grant(holder) for u in units if u.rotator is not None}
         if self.spectrograph is not None:
@@ -1251,6 +1267,7 @@ class Sequencer:
             *(g for pair in grants.values() for g in pair),
             *state.filterwheels.values(),
             *state.calstages.values(),
+            *state.lamps.values(),
             *state.focusers.values(),
             *state.rotators.values(),
         )
@@ -1832,9 +1849,8 @@ class Sequencer:
         if obs.filter is not None:
             await self._select_filter(state, unit, obs.filter)
         if obs.calstage is not None:
-            # Lamps (ThAr, flats) would be switched on after this, once
-            # lamp calibrations exist (request_model.NO_LAMPS): the stage
-            # first, so no lamp light reaches the fibers through the wrong path.
+            # Before any lamp is switched on (_lamp_frames), so no lamp
+            # light reaches the fibers through the wrong path.
             await self._select_calstage(state, unit, obs.calstage)
         if obs.light and unit.focus_restore is not None:
             await self._restore_focus(state, unit)
@@ -1924,6 +1940,9 @@ class Sequencer:
         if obs.kind == "spectrograph_calibration":
             await self._spectrograph_calibration(state, unit, obs, taken)
             return
+        if obs.kind in LAMP_KINDS:
+            await self._lamp_frames(state, unit, tel, cam, obs, taken)
+            return
         await self._expose_frames(state, unit, tel, cam, obs, taken)
 
     async def _expose_frames(
@@ -1934,15 +1953,21 @@ class Sequencer:
         cam: Grant,
         obs: Observation,
         taken: list[Any],
+        check: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """``obs.count`` exposures where the telescope points now (saved,
-        with imaging), stopping at a readout boundary when preempted."""
+        with imaging), stopping at a readout boundary when preempted.
+        ``check`` runs before each exposure (and may raise to stop)."""
         cfg = self.config
         gen = state.gen
         imaging = self.imaging
+        # A lamp frame takes no sky light but opens the shutter on the lamp.
+        shutter = obs.light or obs.kind in LAMP_KINDS
         for i in range(obs.count):
             if imaging is not None:
                 imaging.check(unit.name)  # a lost frame stops the telescope first
+            if check is not None:
+                await check()
             if obs.guide and obs.light and unit.guider is not None:
                 await unit.guider.check()  # a failed guider is this telescope's error
             # From here until it is read out (downloaded, with imaging), a
@@ -1950,7 +1975,7 @@ class Sequencer:
             unit.exposing = True
             try:
                 host_start = self.clock()
-                await cam.call("StartExposure", obs.exptime, obs.light)
+                await cam.call("StartExposure", obs.exptime, shutter)
                 self._event(
                     "exposure_started", gen=gen, telescope=unit.name, index=i, exptime=obs.exptime
                 )
@@ -1994,6 +2019,129 @@ class Sequencer:
         if imaging is not None and taken:
             # Complete means on disk: the plan records the paths.
             await imaging.flush(unit.name)
+
+    # -- calibration lamps (docs/pulizzi.md) ----------------------------------------
+
+    async def _lamp_frames(
+        self,
+        state: _Generation,
+        unit: TelescopeUnit,
+        tel: Grant,
+        cam: Grant,
+        obs: Observation,
+        taken: list[Any],
+    ) -> None:
+        """An ARC or LAMP_FLAT: the calibration stage, the lamp on, its
+        warm-up, the frames, the lamp off -- also on any error, abort,
+        preemption or cancellation (and the cleanup switches every lamp off
+        again)."""
+        setup, grant, name = unit.lamp_setup, state.lamps.get(unit.name), obs.lamp
+        if setup is None or grant is None or unit.lamps is None:
+            raise Unsupported(f"{unit.name} has no lamps ({obs.kind} with lamp {name!r})")
+        assert name is not None
+        spec = setup.lamps.get(name)
+        if spec is None:
+            raise Unsupported(f"{unit.name}: no lamp {name!r} (it has {sorted(setup.lamps)})")
+        timeout = setup.switch_timeout
+        outlets = await switch_status(grant, timeout)
+        outlet = outlets.get(name)
+        if outlet is None or not outlet.get("lamp"):
+            raise Unsupported(f"{unit.name}: its lamp switch has no lamp {name!r}")
+        need = setup.duration(name, obs.exptime, obs.count)
+        if need > float(outlet["max_on"]):
+            raise ObservationFailed(
+                f"{obs.name}: {obs.count} x {obs.exptime:g} s keeps lamp {name} on for about"
+                f" {need:.0f} s, more than its max_on {float(outlet['max_on']):g} s:"
+                " split it into shorter configurations"
+            )
+        if obs.calstage is None and spec.calstage is not None:
+            await self._select_calstage(state, unit, spec.calstage)
+        for other, o in outlets.items():
+            if o.get("lamp") and o.get("on") and other != name:
+                # One lamp's light at a time.
+                await grant.call("SetSwitch", o["id"], False, timeout=timeout)
+                self._event(
+                    "lamp_off", gen=state.gen, telescope=unit.name, lamp=other, why="another lamp"
+                )
+        # Switching a lamp off is never harmful, so it does not go through
+        # the generation's grant: a fence (cancellation) must not stop it.
+        off_grant = unit.lamps.grant(f"{self.name}/lamp-off#{state.gen}")
+
+        async def still_on() -> None:
+            now = (await switch_status(grant, timeout)).get(name) or {}
+            if not now.get("on"):
+                raise LampOff(f"lamp {name} went off (its max_on, or switched off by hand)")
+
+        try:
+            await grant.call("SetSwitch", outlet["id"], True, timeout=timeout)
+            self._event("lamp_on", gen=state.gen, telescope=unit.name, lamp=name)
+            if spec.warmup > 0:
+                self._event(
+                    "lamp_warmup",
+                    gen=state.gen,
+                    telescope=unit.name,
+                    lamp=name,
+                    seconds=spec.warmup,
+                )
+                await asyncio.sleep(spec.warmup)
+            await self._expose_frames(state, unit, tel, cam, obs, taken, check=still_on)
+            await still_on()  # the last frame had its lamp throughout
+        except BaseException:
+            await self._lamp_off(state.gen, unit.name, off_grant, outlet["id"], name, timeout)
+            raise
+        if not await self._lamp_off(state.gen, unit.name, off_grant, outlet["id"], name, timeout):
+            raise LampOff(f"lamp {name} did not confirm off (the cleanup tries again)")
+
+    async def _lamp_off(
+        self, gen: int, telescope: str, grant: Grant, sid: int, name: str, timeout: float
+    ) -> bool:
+        """Switch one lamp off; bounded, and not abandoned if the caller is
+        cancelled again. False (and a critical event) if it did not confirm."""
+        task = asyncio.ensure_future(grant.call("SetSwitch", sid, False, timeout=timeout))
+        task.add_done_callback(lambda t: grant.revoke("lamp frames over"))
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            task.add_done_callback(lambda t: t.cancelled() or t.exception())
+            raise
+        except Exception as exc:
+            self._event(
+                "lamp_off_failed",
+                gen=gen,
+                telescope=telescope,
+                lamp=name,
+                error=repr(exc),
+                level="critical",
+            )
+            log.critical("%s: %s: lamp %s did not switch off: %r", self.name, telescope, name, exc)
+            return False
+        self._event("lamp_off", gen=gen, telescope=telescope, lamp=name, why="frames over")
+        return True
+
+    async def _cleanup_lamps(self, name: str, report: CleanupReport) -> None:
+        """Every lamp of telescope ``name`` off (the switch's ``LampsOff``),
+        with a grant of its own; bounded."""
+        unit = self.units.get(name)
+        if unit is None or unit.lamps is None or unit.lamp_setup is None:
+            return
+        grant = unit.lamps.grant(f"{self.name}/cleanup-lamps#{report.generation}")
+        try:
+            off = await lamps_off(grant, unit.lamp_setup.switch_timeout)
+        except Exception as exc:
+            report.errors.append(f"{name}: lamps off: {exc!r}")
+            self._event(
+                "lamp_off_failed",
+                gen=report.generation,
+                telescope=name,
+                error=repr(exc),
+                level="critical",
+            )
+            return
+        finally:
+            grant.revoke("cleanup done")
+        if off:
+            report.lamps_off += [f"{name}:{x}" for x in off]
+            self._event("lamps_off", gen=report.generation, telescope=name, lamps=off)
 
     # -- sky flats (docs/skyflats.md) ---------------------------------------------
 
@@ -3439,6 +3587,7 @@ class Sequencer:
             errors=report.errors,
             duration=report.duration,
             spectrograph_aborted=report.spectrograph_aborted,
+            lamps_off=report.lamps_off,
         )
         for err in report.errors:
             log.error("%s cleanup #%d: %s", self.name, gen, err)
@@ -3452,13 +3601,14 @@ class Sequencer:
         report: CleanupReport,
         spectrograph: asyncio.Task | None = None,
     ) -> None:
-        """Abort the exposure, stop the guider and any slew (in parallel),
-        then -- once the spectrograph's abort has ended, or after
+        """Abort the exposure, stop the guider and any slew, and switch its
+        lamps off (in parallel), then -- once the spectrograph's abort has ended, or after
         ``spectrograph_abort_wait`` -- park. Every step is bounded."""
         await asyncio.gather(
             self._cleanup_camera(name, cam, report),
             self._stop_guider(name, report),
             self._abort_slew(name, tel, report),
+            self._cleanup_lamps(name, report),
         )
         if spectrograph is not None and not spectrograph.done():
             await asyncio.wait({spectrograph}, timeout=self.config.spectrograph_abort_wait)

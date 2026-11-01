@@ -286,7 +286,14 @@ A telescope may also have a **calibration stage** (`calstage`: the FLWO
 60-inch's TRES front end, served as an Alpaca FilterWheel whose `Names` are
 its positions, `docs/tres_frontend.md`); an observation's `calstage` is
 selected the same way, bounded by `calstage_timeout`, before the exposures
-(and, once lamp calibrations exist, before any lamp is switched on).
+and before any lamp is switched on. A telescope with calibration **lamps**
+(`lamps`: the 60-inch's TRES lamps on a Pulizzi switch,
+`docs/pulizzi.md`) takes `ARC` and `LAMP_FLAT` observations without a
+lease: calibration stage, lamp on, warm-up, frames, lamp off. The lamp is
+switched off on every way out (error, preemption, cancellation, with a
+grant of its own that a fence does not revoke), every cleanup switches all
+lamps off, and the switch server itself turns off any lamp left on longer
+than its `max_on`. MINERVA has no lamps: its requests for them are refused.
 
 **Autofocus.** An observation of `kind="autofocus"` (or a request
 configuration of type `AUTO_FOCUS`) focuses its telescope on its field,
@@ -888,8 +895,13 @@ Each step is a CI-tested deliverable.
     (absolute microns), with a simulator, ConformU in CI, an optional
     Redis shim for the legacy TCS window, and the sequencer selecting an
     observation's `calstage` (built: `robofast_core/devices/tres_frontend_*`,
-    `docs/tres_frontend.md`, hardware locked until confirmed). Next: answers
-    to those questions, the lamps (a Pulizzi Switch) and the ADC, a TRES
+    `docs/tres_frontend.md`, hardware locked until confirmed). The
+    calibration lamps (a Pulizzi power controller) are served as an Alpaca
+    Switch with a simulator, a max-on limit and lamps off on a clean stop,
+    ConformU in CI, and `ARC`/`LAMP_FLAT` requests and sequencer lamp frames
+    for the 60-inch only (built: `robofast_core/devices/pulizzi*`,
+    `robofast_core/lamps.py`, `docs/pulizzi.md`, hardware locked until
+    confirmed). Next: answers to those questions, the ADC, a TRES
     camera/spectrograph service, then a supervised test on the real TCS.
     MEarth South: an Alpaca Dome server for its roll-off roof (a
     parallel-port interface box, no watchdog, so attended only), with a

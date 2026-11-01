@@ -1,0 +1,64 @@
+{
+  "_note": [
+    "Synthetic example request groups for the FLWO 60-inch's dispatch scheduler: TRES lamp calibrations",
+    "(docs/pulizzi.md; the request language is docs/request_language.md).",
+    "An ARC (ThAr) or LAMP_FLAT (incandescent) names its lamp in optical_elements.lamp: the sequencer selects",
+    "the calibration stage (the lamp's calstage in flwo60.json, unless the instrument config names one),",
+    "switches the lamp on, waits its warm-up, takes the frames and switches it off. The telescope does not",
+    "move and the dome need not open; the target is only a label (OBJECT). Exposure times are placeholders."
+  ],
+  "groups": [
+    {
+      "id": "TRES-THAR",
+      "name": "TRES ThAr, twice a night",
+      "proposal": "calibration-example",
+      "ipp_value": 1.0,
+      "operator": "SINGLE",
+      "observation_type": "NORMAL",
+      "requests": [
+        {
+          "id": "TRES-THAR-r",
+          "configurations": [
+            {
+              "id": "TRES-THAR-c",
+              "type": "ARC",
+              "instrument_type": "tres",
+              "target": {"type": "ICRS", "name": "ThAr", "ra": 0.0, "dec": 0.0},
+              "instrument_configs": [
+                {"exposure_time": 60.0, "exposure_count": 3, "optical_elements": {"lamp": "ThAr1"}}
+              ]
+            }
+          ],
+          "location": {"telescope": "tillinghast"},
+          "extra_params": {"cadence": {"min_interval": 14400, "max_per_night": 2}}
+        }
+      ]
+    },
+    {
+      "id": "TRES-FLAT",
+      "name": "TRES flat, once a night",
+      "proposal": "calibration-example",
+      "ipp_value": 1.0,
+      "operator": "SINGLE",
+      "observation_type": "NORMAL",
+      "requests": [
+        {
+          "id": "TRES-FLAT-r",
+          "configurations": [
+            {
+              "id": "TRES-FLAT-c",
+              "type": "LAMP_FLAT",
+              "instrument_type": "tres",
+              "target": {"type": "ICRS", "name": "Flat", "ra": 0.0, "dec": 0.0},
+              "instrument_configs": [
+                {"exposure_time": 30.0, "exposure_count": 5, "optical_elements": {"lamp": "Incand"}}
+              ]
+            }
+          ],
+          "location": {"telescope": "tillinghast"},
+          "extra_params": {"cadence": {"min_interval": 0, "max_per_night": 1}}
+        }
+      ]
+    }
+  ]
+}

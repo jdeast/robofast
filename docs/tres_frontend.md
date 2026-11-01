@@ -22,7 +22,7 @@ mountain".
 |---|---|---|
 | Calibration stage | PI **L-505** linear stage on a PI **C-663** Mercury Step controller. The front end connects to it as a serial port (the controller's USB, 115200 baud; an older version found it by its USB serial number) and drives it with PI's GCS command set through PI's `pipython`: on connect it switches the servo on and **references to the negative limit** (`FNL`); a move is `MOV 1 <mm>`, waited for with `waitontarget`; travel limits come from the controller (`TMN?`/`TMX?`). Named positions (`out`, `sky`, `science`) are millimetre values in its config. | this server: `filterwheel/0` + `focuser/0` |
 | Calibration-stage power | an outlet on the front end's own APC switched PDU (SNMP), which also powers the tip/tilt controller, the guide camera, the front-end computer and the star projector. The front end can power-cycle the stage. | robofast's APC PDU server (`robofast_core/devices/pdu_server.py`) can serve it; not configured here yet |
-| Calibration lamps (ThAr, incandescent) | **not** the front end: the legacy TCS window switches them itself, on a Pulizzi power switch, through a separate program | a Pulizzi Alpaca Switch (separate work); lamp calibrations stay refused (`request_model.NO_LAMPS`) until then |
+| Calibration lamps (ThAr, incandescent) | **not** the front end: the legacy TCS window switches them itself, on a Pulizzi power switch, through a separate program | the lamp Switch server (`robofast_core/devices/pulizzi_server.py`, `docs/pulizzi.md`); `ARC`/`LAMP_FLAT` requests on the 60-inch |
 | Tip/tilt | PI S-340 platform on an E-518 controller (GCS) | the guider service (`docs/guider.md`), which already has an E-518 backend |
 | Star projector | three Zaber axes (X, Y, rotation; the rotation's homing is noted as broken), an artificial star for daytime guider tests | not served (an engineering tool; a Focuser per axis if it is wanted) |
 | Guider / spectrograph focus motors | none in the front-end code. The legacy TCS window's old focus steppers are dead code (its `focus` verb moves nothing) | nothing to serve |
@@ -126,12 +126,11 @@ refused: not referenced or servo off), 7 (position out of limits), 10
 * Requests: an instrument config's `optical_elements.calstage`
   (`docs/request_language.md`). The dispatch scheduler sends it only to a
   telescope whose limits list the position in `calstage`.
-* **Lamps hook.** A TRES ThAr or flat is "stage to the calibration
-  position, lamp on, expose, lamp off". The stage half exists; the lamp half
-  waits for the Pulizzi Switch, and `ARC`/`LAMP_FLAT` requests stay refused
-  (`request_model.NO_LAMPS`) until then. The sequencer selects the stage
-  before anything else so a lamp, once added, is switched on only with the
-  stage in place.
+* **Lamps.** A TRES ThAr or flat is "stage to the calibration position,
+  lamp on, expose, lamp off" (`docs/pulizzi.md`): an `ARC` or `LAMP_FLAT`
+  selects the instrument config's `calstage`, or else the lamp's own
+  position from the telescope's `lamps` entry, before the lamp is switched
+  on, so lamp light reaches the fibers only with the stage in place.
 
 ## 6. Redis transition shim (optional, off by default)
 

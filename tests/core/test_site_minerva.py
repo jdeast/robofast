@@ -53,6 +53,7 @@ COVERED = {
     "requests.example.json",
     "sky.example.json",
     "targets.example.json",
+    "throughput.example.json",
     "too.example.json",
     "weather.yaml",
 }
@@ -341,3 +342,19 @@ def test_sky_config_loads():
     assert fiber.zp - est.zp == pytest.approx(4.225, abs=1e-3)
     # The chain's estimate agrees with T2's measured zero point (at ~1 e-/ADU).
     assert abs(est.zp_estimated - 19.70) < 0.5
+
+
+def test_throughput_config_loads():
+    """throughput.example.json: the throughput monitor (docs/throughput.md),
+    its expected zero points from sky.example.json's ports."""
+    from robofast_core.throughput import ThroughputConfig
+
+    cfg = ThroughputConfig.load(SITE / "throughput.example.json")
+    assert cfg.store.is_absolute() and cfg.status is not None
+    assert cfg.default_port == "imager" and cfg.fit_extinction
+    # T2's FAU in ADU/s (gain 1): the chain's estimate, close to the measured 19.70.
+    assert abs(cfg.expected_zp("t2", "fau", "ADU/s") - 19.70) < 0.5
+    assert cfg.expected_zp("t1", "imager", "e-/s") is not None
+    assert cfg.extinction_for("t2/fau/-") == 0.15
+    console = _json("console.example.json")["enclosures"]["aqawan1"]
+    assert console["throughput"] == str(cfg.status)

@@ -11,10 +11,12 @@ and on success
 * measures the frame's **photometric zero point** from the matched stars
   (:func:`robofast_core.astrometry.zero_point`): ``ZPMAG`` (Gaia G of a
   source giving 1 e-/s, or 1 ADU/s with no gain), ``ZPERR``, ``ZPSCAT``,
-  ``ZPNSTAR``, ``ZPUNIT``; the airmass is already ``AIRMASS``. Throughput
-  monitoring (mirrors, dew, a cover left closed) compares these with the
-  port's expected zero point;
-* returns a summary that goes into the nightly frame index (``solve``) and
+  ``ZPNSTAR``, ``ZPUNIT``; the airmass is already ``AIRMASS``. The
+  throughput monitor (:mod:`robofast_core.throughput`: mirrors, dew, a
+  cover left closed) compares these with the port's expected zero point;
+* returns a summary that goes into the nightly frame index (``solve``,
+  with the frame's conditions in ``context`` for the throughput monitor,
+  docs/throughput.md) and
   that :class:`robofast_core.imaging.Imaging` publishes to the value
   registry (``{tel}.image.zp``, ``{tel}.image.wcs_rms``, ...).
 
@@ -45,6 +47,7 @@ from astropy.io import fits
 from robofast_core.astrometry import SolveError, SolverConfig, solve_near, wcs_cards, zero_point
 from robofast_core.catalog import Catalog, CatalogUnavailable, catalog_from_config, separation
 from robofast_core.fits_writer import FrameInfo, replace_wcs
+from robofast_core.throughput import header_context
 
 log = logging.getLogger(__name__)
 
@@ -160,6 +163,10 @@ class FrameSolver:
                 out[key] = h.get(kw)
         if h.get("DATE-OBS"):
             out["date_obs"] = str(h["DATE-OBS"])
+        # The conditions, for the throughput monitor (robofast_core.throughput).
+        ctx = header_context(h)
+        ctx["sky_adu"] = round(float(np.median(data)), 1)  # raw: bias included
+        out["context"] = ctx
         exptime = _num(h, "EXPTIME") or 0.0
         gain = _num(h, "EGAIN")
         sat = _num(h, "MAXADU") or _num(h, "SATURATE")
@@ -180,6 +187,8 @@ class FrameSolver:
             am = _num(h, "AIRMASS")
             if am is not None:
                 out["zp"]["airmass"] = am
+            if exptime:
+                out["zp"]["exptime"] = exptime
         return out
 
 

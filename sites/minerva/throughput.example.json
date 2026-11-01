@@ -1,0 +1,29 @@
+{
+  "_note": [
+    "The throughput monitor (docs/throughput.md; robofast_core/throughput.py).",
+    "store: every frame's zero point, append-only JSON lines; status: what the console (and so the notifier) reads.",
+    "sky: the per-port photometry (efficiency chains, the measured T2 FAU zero point) the expected zero point comes from.",
+    "expected 'chain': efficiency is measured against the efficiency chain alone (whose factors are ESTIMATED: the ratio",
+    "is meaningful as a trend, its absolute value only once the chain is measured). 'zero_point' uses a measured zero point.",
+    "default_port: robofast's own frames carry PORT; a frame without one is the imager's.",
+    "extinction: mag per airmass, ESTIMATED (0.15 is a typical V value at ~2.3 km; Gaia G and the imager filters differ);",
+    "fit_extinction fits it per series from steady nights with an airmass range and uses the fit once it is good",
+    "(python -m robofast_core.throughput --config ... extinction prints it).",
+    "Thresholds are the defaults (alarm 10 % below the baseline; step up 5 % on 2 steady nights; step down 10 % on 4)."
+  ],
+  "store": "/var/lib/robofast/throughput/throughput.jsonl",
+  "status": "/var/lib/robofast/throughput/status.json",
+  "sky": "sky.example.json",
+  "expected": "chain",
+  "default_port": "imager",
+  "extinction": {"default": 0.15},
+  "fit_extinction": true,
+  "percentile": 80,
+  "min_frames": 3,
+  "window_days": 60,
+  "baseline_days": 30,
+  "alarm_drop": 0.10,
+  "step_up": 0.05,
+  "step_down": 0.10,
+  "longitude": -110.878977
+}

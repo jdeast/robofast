@@ -294,6 +294,10 @@ e-/s, or 1 ADU/s without `EGAIN`), `ZPERR`, `ZPSCAT`, `ZPNSTAR`, `ZPUNIT`
 mount's pointing offset), and the registry `{tel}.image.zp`,
 `{tel}.image.wcs_rms`, `wcs_offset_arcsec`, `wcs_pa`. A failure keeps the
 mount WCS (`WCSSRC = 'mount'`), adds `WCSFAIL`, and never costs the frame.
+The index's `solve` entry also carries the frame's conditions
+(`context`: temperatures, Moon, cloud sensor, the raw sky level) for the
+throughput monitor, which follows each telescope's zero points over months
+(mirror cleanliness, dew, a cover left on): docs/throughput.md.
 
 ## 7. Target vetting (`robofast_core/vetting.py`)
 
@@ -359,6 +363,9 @@ Detection rejects the ASI174's many hot pixels by their sharpness.
   `docs/pointing_model.md`.
 - astrometry.net index files on the control hosts, if a blind fallback is
   wanted.
+- ~~A throughput monitor~~: `robofast_core/throughput.py`,
+  `docs/throughput.md` (its extinction coefficients and baselines still
+  need real data).
 - The Gaia cache filled for the target list on each host; `select:
   "catalog"` turned on in the guider configs once the FAU parity and the
   solver are confirmed on the sky.

@@ -213,6 +213,7 @@ BODY = """
   </section>
   <section id="spectrograph"><h2>Spectrograph</h2><div id="spectrograph-body"></div></section>
   <section id="plan"><h2>Plan</h2><div id="plan-body"></div></section>
+  <section id="throughput" class="wide hidden"><h2>Throughput</h2><div id="throughput-body"></div></section>
   <section id="timeline" class="wide"><h2>Timeline</h2>
     <ul class="list scroll mono" id="timeline-list"></ul></section>
   <section id="requests" class="wide"><h2>Requests and ToOs</h2>
@@ -590,6 +591,24 @@ function render(doc) {
       h("ul", {class: "list scroll"}, (p.upcoming || []).map((u) => h("li", {},
         u.too ? badge("ToO", "warn") : null, " ", u.id, h("span", {class: "dim"},
           " p" + fmt(u.priority) + " " + fmt(u.submitter) + " " + fmt(u.intake) + (u.cancel_pending ? " (cancel pending)" : ""))))));
+  }));
+
+  // The throughput monitor (docs/throughput.md): shown only where configured.
+  const tp = encs.filter(([, e]) => e.throughput);
+  $("throughput").classList.toggle("hidden", !tp.length);
+  const pct = (x) => x === null || x === undefined ? "—" : (x >= 0 ? "+" : "") + fmt(100 * x, 1) + "%";
+  fill("throughput-body", tp.map(([name, e]) => {
+    const t = e.throughput, rows = Object.entries(t.series || {});
+    return h("div", {}, title(name),
+      h("p", {class: "dim"}, t.time ? "updated " + ago(t.time) : fmt(t.detail)),
+      rows.length ? h("div", {class: "tablewrap"}, h("table", {class: "targets"},
+        h("thead", {}, h("tr", {}, ["series", "last night", "efficiency", "vs baseline", "per 30 d", ""].map((x) => h("th", {}, x)))),
+        h("tbody", {}, rows.map(([k, s]) => h("tr", {},
+          h("td", {}, k), h("td", {}, fmt(s.night)),
+          h("td", {}, s.efficiency === undefined ? fmt(s.level, 3) + " mag" : fmt(s.efficiency, 3)),
+          h("td", {}, pct(s.change)), h("td", {}, pct(s.slope_per_30d)),
+          h("td", {}, s.alarm ? badge("low", "bad") : s.step_down ? badge("step down", "bad") : badge("ok", "ok"),
+            (s.events || []).length ? h("span", {class: "dim"}, " " + s.events[s.events.length - 1].night + " " + s.events[s.events.length - 1].what) : null)))))) : null);
   }));
 
   const tl = encs.flatMap(([name, e]) => (e.timeline || []).map((x) => ({...x, enc: name})));

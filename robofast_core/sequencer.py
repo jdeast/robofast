@@ -271,6 +271,7 @@ from robofast_core.imaging import FrameWriteFailed, Imaging, PendingFrame
 from robofast_core.owner import DeviceError, DeviceOwner, Grant, GrantRevoked
 from robofast_core.plan import Idle, Observation, PlanProvider, as_plan
 from robofast_core.pointmodel import PointingCorrector
+from robofast_core.recovery import RecoveryLadder, RecoveryResult
 from robofast_core.registry import ValueRegistry
 from robofast_core.rotcal import RotatorSetup
 from robofast_core.safety import LeaseRevoked, OpenLease, RecoveryRefused, SafetySupervisor
@@ -524,6 +525,9 @@ class TelescopeUnit:
     #: (docs/rotcal.md): ``kind="rotator_calibration"``.
     rotator: DeviceOwner | None = None
     pa_calibration: RotatorSetup | None = None
+    #: The recovery ladder (docs/recovery.md): what to try when one of its
+    #: devices fails, before giving up for the night.
+    recovery: RecoveryLadder | None = None
 
     @property
     def active(self) -> bool:
@@ -1029,6 +1033,9 @@ class Sequencer:
                     self.imaging.pointing[u.name] = u.pointing
             if u.pa_calibration is not None and self.imaging is not None:
                 self.imaging.pa_stores[u.name] = u.pa_calibration.store
+            if u.recovery is not None:
+                u.recovery.alarm = lambda text, u=u: self.alarm(u.name, text)
+                u.recovery.event = lambda what, u=u, **kw: self._event(what, telescope=u.name, **kw)
 
     async def run(self) -> None:
         self._wire_pointing()
@@ -1679,6 +1686,21 @@ class Sequencer:
             parked=bool(report.parked),
             errors=report.errors,
         )
+        result = await self._recover_device(state, unit, tel, cam, error)
+        if result is not None and result.exhausted:
+            unit.gave_up = True
+            self._event(
+                "giving_up",
+                telescope=unit.name,
+                errors=unit.consecutive_errors,
+                reason=f"recovery ladder exhausted ({result.device})",
+                level="critical",
+            )
+            return
+        if result is not None and result.recovered:
+            # The device is back: it gets another try (the ladder itself
+            # gives up once every rung has been used).
+            unit.consecutive_errors = min(unit.consecutive_errors, cfg.max_consecutive_errors - 1)
         if unit.consecutive_errors >= cfg.max_consecutive_errors:
             unit.gave_up = True
             self._event(
@@ -1690,6 +1712,57 @@ class Sequencer:
         else:
             unit.retry_at = time.monotonic() + cfg.error_backoff
             self._event("telescope_backoff", telescope=unit.name, seconds=cfg.error_backoff)
+
+    def _devices(
+        self, state: _Generation, unit: TelescopeUnit, tel: Grant, cam: Grant
+    ) -> dict[str, tuple[DeviceOwner, Grant]]:
+        out = {"telescope": (unit.telescope, tel), "camera": (unit.camera, cam)}
+        for kind, owner, grants in (
+            ("focuser", unit.focuser, state.focusers),
+            ("rotator", unit.rotator, state.rotators),
+            ("filterwheel", unit.filterwheel, state.filterwheels),
+        ):
+            if owner is not None and unit.name in grants:
+                out[kind] = (owner, grants[unit.name])
+        return out
+
+    async def _recover_device(
+        self, state: _Generation, unit: TelescopeUnit, tel: Grant, cam: Grant, error: str
+    ) -> RecoveryResult | None:
+        """Climb the failed device's recovery ladder, if it has one (docs/recovery.md)."""
+        ladder = unit.recovery
+        if ladder is None:
+            return None
+        devices = self._devices(state, unit, tel, cam)
+        kind = ladder.device_for(error, {k: o.name for k, (o, _) in devices.items()})
+        if kind is None:
+            return None
+        owner, grant = devices[kind]
+        self._event("recovery_start", gen=state.gen, telescope=unit.name, device=kind)
+
+        async def others(device: str, member: str) -> Any:
+            if device not in devices:
+                return None
+            return await devices[device][1].get(member)
+
+        try:
+            result = await ladder.recover(
+                kind,
+                reconnect=lambda: owner.reconnect("recovery"),
+                probe=lambda member: grant.get(member),
+                others=others,
+            )
+        except GrantRevoked:
+            return None  # fenced: the generation's cleanup takes over
+        self._event(
+            "recovery_done",
+            gen=state.gen,
+            telescope=unit.name,
+            device=kind,
+            recovered=result.recovered,
+            tried=[f"{r}: {o}" for r, o in result.tried],
+        )
+        return result
 
     async def _wait_for(
         self, probe: Callable[[], Awaitable[Any]], done: Callable[[Any], bool], timeout: float

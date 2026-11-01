@@ -204,7 +204,10 @@ processes do share a name, the supervisor still never recovers a live lease,
 recovery is idempotent, and they take turns, one lease at a time.
 
 Repeated device errors back off, then give up for the night and alarm,
-per telescope (section 3.5).
+per telescope (section 3.5). Before that, a device with a recovery policy
+climbs its recovery ladder -- reconnect, restart the vendor software,
+power-cycle its PDU outlet (`docs/recovery.md`) -- and the telescope gives
+up for the night once the ladder is used up.
 
 **Plans.** The sequencer asks a *plan provider* for each telescope's next
 observation whenever that telescope is free, and reports how each ended

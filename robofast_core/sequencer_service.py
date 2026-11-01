@@ -172,6 +172,7 @@ TELESCOPE_KEYS = {
     "pointing",
     "pa_calibration",
     "recovery",
+    "sky_flats",
 }
 
 
@@ -267,11 +268,23 @@ def build_units(
                 rotator=owners.get("rotator") if pa_cal is not None else None,
                 pa_calibration=pa_cal,
                 recovery=recovery,
+                flats=_flats(name, entry.get("sky_flats")),
             )
         )
     if not units:
         raise ValueError("the config lists no telescopes")
     return units
+
+
+def _flats(name: str, d: Any) -> Any:
+    if d is None:
+        return None
+    from robofast_core.skyflats import FlatConfig
+
+    try:
+        return FlatConfig.from_dict(d)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"telescope {name!r}: {exc}") from exc
 
 
 def load_plan(path: str | Path, names: list[str]) -> PlanProvider:

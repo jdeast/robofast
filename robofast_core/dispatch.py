@@ -1396,6 +1396,20 @@ class DispatchScheduler:
                     **self._acquisition_entry(visit, c),
                 },
             )
+        if c.type == "SKY_FLAT":
+            return Observation(
+                f"{c.target.name} [{c.id}#{visit.ic}]",
+                exptime=ic.exptime,
+                count=sum(i.count for i in c.instrument_configs),
+                object="skyflat",
+                kind="sky_flat",
+                flats={
+                    "filters": [i.filter for i in c.instrument_configs if i.filter],
+                    "count": max(i.count for i in c.instrument_configs),
+                }
+                if any(i.filter for i in c.instrument_configs)
+                else {"count": max(i.count for i in c.instrument_configs)},
+            )
         if c.type == "ROTATOR_CALIBRATION":
             return Observation(
                 f"{c.target.name} [{c.id}#{visit.ic}]",

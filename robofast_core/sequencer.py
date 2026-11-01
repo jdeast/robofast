@@ -277,6 +277,7 @@ from robofast_core.recovery import RecoveryLadder, RecoveryResult
 from robofast_core.registry import ValueRegistry
 from robofast_core.rotcal import RotatorSetup
 from robofast_core.safety import LeaseRevoked, OpenLease, RecoveryRefused, SafetySupervisor
+from robofast_core.skyflats import FlatConfig
 from robofast_core.spectra import SpectrumRecorder
 from robofast_core.timeline import Timeline
 
@@ -533,6 +534,8 @@ class TelescopeUnit:
     #: The recovery ladder (docs/recovery.md): what to try when one of its
     #: devices fails, before giving up for the night.
     recovery: RecoveryLadder | None = None
+    #: Twilight sky flats (docs/skyflats.md): ``kind="sky_flat"``.
+    flats: FlatConfig | None = None
     #: How the guider identified the last target (docs/acquisition.md).
     acquisition: dict[str, Any] | None = field(default=None, init=False)
 
@@ -812,6 +815,8 @@ class Sequencer:
         self.spectrum_records: list[dict[str, Any]] = []
         #: Pointing models built tonight (docs/pointing_model.md).
         self.pointing_models: list[Any] = []
+        #: Sky flats taken tonight: (telescope, FlatFrame).
+        self.flat_frames: list[Any] = []
         #: PA calibrations measured tonight (docs/rotcal.md).
         self.pa_calibrations: list[Any] = []
         #: The spectrograph job this sequencer started and has not seen end,
@@ -1819,6 +1824,9 @@ class Sequencer:
             if obs.kind == "pointing_model":
                 await self._pointing_run(state, unit, tel, cam, obs, taken)
                 return
+            if obs.kind == "sky_flat":
+                await self._sky_flats(state, unit, tel, cam, obs, taken)
+                return
             ra, dec = obs.ra_hours, obs.dec_deg
             if ra is None or dec is None:
                 lst = await tel.get("SiderealTime")
@@ -1965,6 +1973,77 @@ class Sequencer:
         if imaging is not None and taken:
             # Complete means on disk: the plan records the paths.
             await imaging.flush(unit.name)
+
+    # -- sky flats (docs/skyflats.md) ---------------------------------------------
+
+    async def _sky_flats(
+        self,
+        state: _Generation,
+        unit: TelescopeUnit,
+        tel: Grant,
+        cam: Grant,
+        obs: Observation,
+        taken: list[Any],
+    ) -> None:
+        """Twilight flats opposite the Sun (``kind="sky_flat"``)."""
+        from robofast_core import skyflats
+        from robofast_core.sky import Site, sky_now
+
+        if unit.flats is None:
+            raise Unsupported(f"{unit.name} has no sky_flats settings")
+        over = dict(obs.flats or {})
+        if "filters" in over and isinstance(over["filters"], list):
+            over["filters"] = {f: unit.flats.filters.get(f, 1.0) for f in over["filters"]}
+        try:
+            cfg = replace(unit.flats, **over)
+        except TypeError as exc:
+            raise ObservationFailed(f"sky flats: {exc}") from exc
+        site = Site(cfg.latitude, cfg.longitude)
+        now = self.clock()
+        ra_h, dec, _ = await asyncio.to_thread(skyflats.flat_spot, cfg.latitude, cfg.longitude, now)
+        sky0 = await asyncio.to_thread(sky_now, site, now)
+        evening = not sky0.sun_rising
+        current: dict[str, str | None] = {"filter": None}
+
+        def sun_alt() -> float:
+            return sky_now(site, self.clock()).sun_alt
+
+        async def expose(flt: str, exptime: float, off: tuple[float, float]) -> float:
+            if unit.filterwheel is not None and current["filter"] != flt:
+                await self._select_filter(state, unit, flt)
+                current["filter"] = flt
+            cosd = max(math.cos(math.radians(dec)), 1e-3)
+            ra = (ra_h + off[0] / 3600.0 / 15.0 / cosd) % 24.0
+            d = dec + off[1] / 3600.0
+            await self.slew_guard.check_slew(unit.name, ra, d)
+            await tel.call("SlewToCoordinatesAsync", ra, d)
+            await self._wait_for(
+                lambda: tel.get("Slewing"), lambda s: not s, self.config.slew_timeout
+            )
+            flat = replace(obs, filter=flt, object=f"skyflat {flt}", name=f"skyflat {flt}")
+            image = await self._take_image(state, unit, tel, cam, flat, exptime, taken, flat=True)
+            return float(np.median(image))
+
+        async def wait(seconds: float) -> None:
+            await asyncio.sleep(seconds)
+
+        frames = await skyflats.take_flats(
+            cfg,
+            evening=evening,
+            sun_alt=sun_alt,
+            expose=expose,
+            wait=wait,
+            event=lambda what, **kw: self._event(what, telescope=unit.name, **kw),
+        )
+        self.flat_frames += [(unit.name, f) for f in frames]
+        if self.imaging is not None and taken:
+            await self.imaging.flush(unit.name)
+        kept = sum(f.kept for f in frames)
+        self._event(
+            "sky_flats_done", gen=state.gen, telescope=unit.name, kept=kept, tried=len(frames)
+        )
+        if not kept:
+            raise ObservationFailed("sky flats: no frame at a usable level")
 
     # -- acquisition (docs/acquisition.md) ---------------------------------------
 

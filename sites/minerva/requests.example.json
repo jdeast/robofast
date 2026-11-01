@@ -5,7 +5,16 @@
     "target lists are not in the public minerva-control repository, so these are illustrative:",
     "well-known RV-standard stars (J2000 coordinates, rounded; ra and dec in degrees) as legacy observed",
     "them -- standing requests (extra_params.cadence) at least 3 h apart, at most 2 visits a night (the",
-    "legacy seplimit and maxobs defaults) -- plus a telluric B star and a one-shot imaging request for T2.",
+    "legacy seplimit and maxobs defaults), iodine cell in (the KiwiSpec service's default_iodine) -- plus",
+    "the iodine calibration requests and a one-shot imaging request for T2.",
+    "Iodine calibration (KiwiSpec is iodine only, JDE 2026-10-31; docs/kiwispec.md, Calibration):",
+    "  BSTAR-*: rapidly rotating B stars (nearly featureless) with the iodine cell in (extra_params.iodine",
+    "  true), for the instrumental profile. Legacy took one a night (scheduler.py, 'weight for 1 Bstar per",
+    "  night', from its 'B stars' sheet, not in the public repository). The cadence is the knob: max_per_night",
+    "  1 here, raise it for more; ipp_value sets how hard the scheduler tries.",
+    "  TEMPLATE-*: an RV star with the iodine cell OUT (extra_params.iodine false), one-shot (no cadence):",
+    "  it completes once taken. One per RV star; good seeing and low airmass matter most.",
+    "Lamp calibrations (type ARC or LAMP_FLAT, extra_params.lamp) are refused: KiwiSpec has none.",
     "Convert a real legacy targets.csv with robofast_core.request_model.from_legacy_csv, or name it",
     "as 'legacy_csv' in the dispatch plan entry (sites/minerva/dispatch.example.json)."
   ],
@@ -213,27 +222,76 @@
       ]
     },
     {
-      "id": "HD87901",
-      "name": "HD 87901 (telluric B star)",
-      "proposal": "rv-example",
-      "ipp_value": 2.0,
+      "id": "BSTAR-HD87901",
+      "name": "HD 87901 (B star through iodine)",
+      "proposal": "iodine-calibration",
+      "ipp_value": 3.0,
       "operator": "SINGLE",
       "observation_type": "NORMAL",
       "requests": [
         {
-          "id": "HD87901-tell",
+          "id": "BSTAR-HD87901-i2",
           "configurations": [
             {
-              "id": "HD87901-tell-spec",
+              "id": "BSTAR-HD87901-i2-spec",
               "type": "SPECTRUM",
               "instrument_type": "spectrograph",
               "target": {"type": "ICRS", "name": "HD 87901", "ra": 152.09298, "dec": 11.967208},
-              "instrument_configs": [{"exposure_time": 60.0, "exposure_count": 1}],
+              "instrument_configs": [{"exposure_time": 60.0, "exposure_count": 1, "extra_params": {"iodine": true}}],
               "constraints": {"max_airmass": 1.5},
               "guiding_config": {"mode": "ON"}
             }
           ],
           "extra_params": {"cadence": {"min_interval": 0.0, "max_per_night": 1}}
+        }
+      ]
+    },
+    {
+      "id": "BSTAR-HD120315",
+      "name": "HD 120315 (B star through iodine)",
+      "proposal": "iodine-calibration",
+      "ipp_value": 3.0,
+      "operator": "SINGLE",
+      "observation_type": "NORMAL",
+      "requests": [
+        {
+          "id": "BSTAR-HD120315-i2",
+          "configurations": [
+            {
+              "id": "BSTAR-HD120315-i2-spec",
+              "type": "SPECTRUM",
+              "instrument_type": "spectrograph",
+              "target": {"type": "ICRS", "name": "HD 120315", "ra": 206.885157, "dec": 49.313267},
+              "instrument_configs": [{"exposure_time": 60.0, "exposure_count": 1, "extra_params": {"iodine": true}}],
+              "constraints": {"max_airmass": 1.5},
+              "guiding_config": {"mode": "ON"}
+            }
+          ],
+          "extra_params": {"cadence": {"min_interval": 0.0, "max_per_night": 1}}
+        }
+      ]
+    },
+    {
+      "id": "TEMPLATE-HD10700",
+      "name": "HD 10700 template (iodine out)",
+      "proposal": "rv-example",
+      "ipp_value": 4.0,
+      "operator": "SINGLE",
+      "observation_type": "NORMAL",
+      "requests": [
+        {
+          "id": "TEMPLATE-HD10700-r",
+          "configurations": [
+            {
+              "id": "TEMPLATE-HD10700-spec",
+              "type": "SPECTRUM",
+              "instrument_type": "spectrograph",
+              "target": {"type": "ICRS", "name": "HD 10700", "ra": 26.017005, "dec": -15.937478},
+              "instrument_configs": [{"exposure_time": 300.0, "exposure_count": 5, "extra_params": {"iodine": false}}],
+              "constraints": {"max_airmass": 1.6},
+              "guiding_config": {"mode": "ON"}
+            }
+          ]
         }
       ]
     },

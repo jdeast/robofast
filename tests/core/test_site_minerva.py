@@ -116,10 +116,19 @@ async def test_plans_load(tmp_path):
         shutil.copy(SITE / name, tmp_path / name)
     plan = load_plan(tmp_path / "dispatch.example.json", ["t1", "t2"])
     assert plan is not None
+    # The dispatch scheduler refuses a lamp calibration, with the reason.
+    lamp = json.loads((SITE / "requests.example.json").read_text())["groups"][0]
+    lamp = {**lamp, "id": "ARC1"}
+    lamp["requests"][0]["configurations"][0]["type"] = "ARC"
+    with pytest.raises(ValueError, match="iodine only"):
+        await plan.submit(lamp)
     plan = load_plan(SITE / "calibration.example.json", ["t1", "t2"])
     first = await plan.peek("t1")
     assert first.kind == "spectrograph_calibration" and first.calibration[0]["kind"] == "bias"
     assert (await plan.peek("t2")).name == "bias"
+    # KiwiSpec is iodine only (JDE 2026-10-31): biases and darks, no lamps;
+    # slit flats only once the LED is confirmed.
+    assert {f["kind"] for f in first.calibration} == {"bias", "dark"}
     load_plan(SITE / "targets.example.json", ["t1", "t2"])
     plan_from_config(_json("aqawan1.json")["plan"], ["t1", "t2"])
     load_request_groups(SITE / "requests.example.json")

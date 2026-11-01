@@ -34,10 +34,24 @@ Any fault, or a failed read, alarms (once per change), revokes the lease and
 blocks opening. If the enclosure is not closed, that is the dangerous case:
 a second, louder alarm, and it closes (the Aqawan also reports
 ``shutterError`` then). A fault with the enclosure closed only alarms; the
-close is not re-sent. Nothing clears a fault automatically:
-:meth:`SafetySupervisor.clear_faults` is for an operator (logged with their
-name), and goes out on the supervisor's privileged grant, since
-``Action:ClearFaults`` is in :data:`ENCLOSURE_MEMBERS`.
+close is not re-sent. :meth:`SafetySupervisor.clear_faults` is for an
+operator (logged with their name), and goes out on the supervisor's
+privileged grant, since ``Action:ClearFaults`` is in
+:data:`ENCLOSURE_MEMBERS`.
+
+Automatic fault clearing (``fault_auto_clear``; MINERVA's Aqawan, JDE
+2026-10-31) is the supervisor's policy, since ``ClearFaults`` is privileged:
+
+* only while both shutters are confirmed closed (the fault channel's
+  ``shutters`` *and* ``ShutterStatus``), never while open or moving;
+* never an E-stop (the channel's ``estop``, or fault text naming one, see
+  :func:`mentions_estop`): a critical alarm instead, and an operator must
+  reset it; never an emergency-close latch (an operator's own close), and
+  not before the fault text has arrived (so an E-stop can be recognised);
+* at most once per ``fault_auto_clear_interval`` (1 h), alarming every time;
+* if the fault is back (or never went) within that interval of an automatic
+  clear, automatic clearing stops (a critical alarm) until an operator
+  clears faults (the console's ``clear_faults``).
 
 The supervisor holds the dome owner's single *privileged* grant: the owner
 refuses ``OpenShutter``/``CloseShutter`` from anyone else.
@@ -69,6 +83,7 @@ import enum
 import itertools
 import json
 import logging
+import re
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -83,6 +98,18 @@ log = logging.getLogger(__name__)
 #: Dome members only the safety supervisor may call (``Action:Name`` is one
 #: Alpaca action; ``ClearFaults`` is for an operator, through the supervisor).
 ENCLOSURE_MEMBERS = frozenset({"OpenShutter", "CloseShutter", "Action:ClearFaults"})
+
+#: A ``ClearFaults`` note starting with this is the supervisor's automatic
+#: clear (the Aqawan server then also refuses an E-stop or a latch itself).
+AUTO_CLEAR_PREFIX = "auto:"
+
+_ESTOP = re.compile(r"\be[\s_-]?stop|\bemergency[\s_-]?stop", re.IGNORECASE)
+
+
+def mentions_estop(text: object) -> bool:
+    """True if a controller's fault text names an emergency stop ("Estop
+    active", "E-STOP", "emergency stop"): never cleared automatically."""
+    return isinstance(text, str) and _ESTOP.search(text) is not None
 
 
 class Shutter(enum.IntEnum):
@@ -138,6 +165,15 @@ class SafetyConfig:
     #: with booleans ``fault`` and ``error`` (the Aqawan server's
     #: ``"Faults"``); ``None`` for a dome without one.
     fault_action: str | None = None
+    #: Clear a fault automatically (module doc): only with both shutters
+    #: confirmed closed, never an E-stop, at most once per
+    #: ``fault_auto_clear_interval``; a recurrence within that interval stops
+    #: it until an operator clears faults. Needs ``fault_action``.
+    fault_auto_clear: bool = False
+    fault_auto_clear_interval: float = 3600.0
+    #: A fault still reported this long after an automatic clear has not
+    #: cleared (the controller may take a moment to drop its flags).
+    fault_auto_clear_settle: float = 15.0
     #: While the enclosure should be open, a shutter reporting ``ERROR``
     #: (immediately) or unreadable for this long revokes the lease, closes,
     #: and blocks reopening for ``shutter_error_backoff`` seconds, so a
@@ -146,6 +182,10 @@ class SafetyConfig:
     shutter_error_backoff: float = 1800.0
 
     def __post_init__(self) -> None:
+        if self.fault_auto_clear and not self.fault_action:
+            raise ValueError("fault_auto_clear needs fault_action (the dome's fault channel)")
+        if self.fault_auto_clear_interval <= 0:
+            raise ValueError("fault_auto_clear_interval must be > 0")
         hb, timeout = self.heartbeat_interval, self.heartbeat_timeout
         if hb is not None:
             if timeout is None:
@@ -271,6 +311,14 @@ class SafetySupervisor:
         self._fault: str | None = "not read yet" if self._faults else None
         self._fault_kind: object = "not read yet"  # (fault, error), or why unknown
         self._fault_escalated = False
+        #: The enclosure reports an emergency stop (never cleared automatically).
+        self._estop: str | None = None
+        #: Automatic clearing (``fault_auto_clear``): when, how many, whether
+        #: the fault went away after the last one, and why it was stopped.
+        self._auto_cleared_at: float | None = None
+        self._auto_clears = 0
+        self._auto_clear_took = False
+        self._auto_clear_stopped: str | None = None
         self._shutter_bad_since: float | None = None
         self._shutter_hold_until: float | None = None
 
@@ -319,6 +367,11 @@ class SafetySupervisor:
         """The enclosure fault (from ``fault_action``), if any."""
         return self._fault
 
+    def critical(self) -> list[str]:
+        """Conditions that need an operator now (the console raises them as
+        critical alarms until they are gone)."""
+        return [c for c in (self._estop, self._auto_clear_stopped) if c]
+
     def status(self) -> dict[str, Any]:
         lease = self._lease
         now = time.monotonic()
@@ -327,6 +380,14 @@ class SafetySupervisor:
             "reason": self._reason,
             "open_allowed": self.open_allowed(),
             "fault": self._fault,
+            "critical": self.critical(),
+            "fault_auto_clear": None
+            if not self.config.fault_auto_clear
+            else {
+                "clears": self._auto_clears,
+                "last_ago": None if self._auto_cleared_at is None else now - self._auto_cleared_at,
+                "stopped": self._auto_clear_stopped,
+            },
             "shutter_hold_for": (
                 None
                 if self._shutter_hold_until is None or now >= self._shutter_hold_until
@@ -520,11 +581,11 @@ class SafetySupervisor:
         self.shutter = int(status)
         return self.shutter
 
-    def _alarm(self, msg: str) -> None:
+    def _alarm(self, msg: str, level: str = "alarm") -> None:
         if not self.alarms or self.alarms[-1] != msg:
             self.alarms.append(msg)
-            self.timeline.event(self.name, "alarm", msg=msg)
-            log.error("%s: %s", self.name, msg)
+            self.timeline.event(self.name, "alarm", msg=msg, level=level)
+            (log.critical if level == "critical" else log.error)("%s: %s", self.name, msg)
 
     def _want_open(self, now: float) -> bool:
         lease = self._lease
@@ -540,6 +601,7 @@ class SafetySupervisor:
         if self._faults is None:
             return
         cfg = self.config
+        data: dict[str, Any] | None = None
         try:
             raw = await self._faults.call("Action", cfg.fault_action, "", timeout=cfg.dome_timeout)
             data = json.loads(raw)
@@ -560,21 +622,106 @@ class SafetySupervisor:
         previous = self._fault
         if kind == self._fault_kind:
             self._fault = problem  # same condition; its text may have arrived
+        else:
+            self._fault, self._fault_kind = problem, kind
+            if problem is None:
+                self._fault_escalated = False
+                self.timeline.event(self.name, "enclosure_fault_cleared", was=previous)
+                log.warning("%s: enclosure fault cleared (was: %s)", self.name, previous)
+            else:
+                self._alarm(f"{problem}; not opening until it clears")
+                self._revoke_lease(problem)
+                self._wake.set()
+        faulted = data if problem is not None and kind != "unreadable" else None
+        self._note_estop(faulted)
+        if cfg.fault_auto_clear:
+            await self._auto_clear(faulted)
+
+    def _note_estop(self, data: dict[str, Any] | None) -> None:
+        """An emergency stop on the fault channel: a critical alarm, once."""
+        estop = data is not None and (
+            data.get("estop") is True
+            or mentions_estop(data.get("faults"))
+            or mentions_estop(data.get("errors"))
+        )
+        if not estop:
+            self._estop = None
             return
-        self._fault, self._fault_kind = problem, kind
-        if problem is None:
-            self._fault_escalated = False
-            self.timeline.event(self.name, "enclosure_fault_cleared", was=previous)
-            log.warning("%s: enclosure fault cleared (was: %s)", self.name, previous)
+        if self._estop is None:
+            self._estop = (
+                f"E-STOP reported by the enclosure ({self._fault}): never cleared"
+                " automatically; an operator must reset it and clear faults"
+            )
+            self._alarm(self._estop, "critical")
+
+    async def _auto_clear(self, data: dict[str, Any] | None) -> None:
+        """``fault_auto_clear``: clear a fault ourselves, by the module's rules.
+
+        ``data`` is the fault channel's reply while it reports a fault (``None``
+        when it reports none, or cannot be read).
+        """
+        cfg = self.config
+        now = time.monotonic()
+        if data is None:
+            if self._fault is None and self._auto_cleared_at is not None:
+                self._auto_clear_took = True  # it went away after our clear
             return
-        self._alarm(f"{problem}; not opening until it clears")
-        self._revoke_lease(problem)
+        if self._estop is not None or self._auto_clear_stopped is not None:
+            return
+        if data.get("emergency_close"):
+            return  # an operator's latch: only an operator releases it
+        if (data.get("fault") and not data.get("faults")) or (
+            data.get("error") and not data.get("errors")
+        ):
+            return  # wait for the fault text, so an E-stop can be recognised
+        last = self._auto_cleared_at
+        if last is not None and now - last < cfg.fault_auto_clear_interval:
+            if not self._auto_clear_took and now - last < cfg.fault_auto_clear_settle:
+                return  # the controller may not have dropped its flags yet
+            how = "is back" if self._auto_clear_took else "did not clear"
+            self._stop_auto_clear(
+                f"enclosure fault {how} {now - last:.0f} s after automatic clear"
+                f" #{self._auto_clears} ({self._fault})"
+            )
+            return
+        if data.get("shutters") != ["CLOSED", "CLOSED"]:
+            return  # never while open or moving; the enclosure loop closes it
+        if await self._shutter_status() != Shutter.CLOSED:
+            return
+        self._auto_clears += 1
+        self._auto_cleared_at, self._auto_clear_took = now, False
+        n, fault = self._auto_clears, self._fault
+        self._alarm(
+            f"automatic fault clear #{n}, enclosure closed: {fault}"
+            f" (at most one per {cfg.fault_auto_clear_interval:g} s)"
+        )
+        self.timeline.event(self.name, "fault_auto_clear", n=n, fault=fault)
+        try:
+            reply = await self._dome.call(
+                "Action",
+                "ClearFaults",
+                f"{AUTO_CLEAR_PREFIX} {self.name} automatic clear #{n}: {fault}",
+                timeout=cfg.dome_timeout,
+            )
+        except DeviceError as exc:
+            self._stop_auto_clear(f"automatic clear #{n} failed: {exc}")
+            return
+        self.timeline.event(self.name, "faults_cleared", operator=None, reply=reply, n=n)
         self._wake.set()
+
+    def _stop_auto_clear(self, why: str) -> None:
+        self._auto_clear_stopped = (
+            f"{why}; automatic fault clearing stopped: an operator must clear faults"
+            " (console clear_faults)"
+        )
+        self._alarm(self._auto_clear_stopped, "critical")
+        self.timeline.event(self.name, "fault_auto_clear_stopped", why=why)
 
     async def clear_faults(self, operator: str, reason: str) -> str:
         """An operator clears the enclosure's faults (logged with their name).
 
-        The dome refuses unless it is closed; nothing calls this automatically.
+        The dome refuses unless it is closed. A successful clear also restarts
+        automatic clearing (``fault_auto_clear``) if a recurrence stopped it.
         """
         note = f"{operator}: {reason}"
         self.timeline.event(self.name, "clear_faults", operator=operator, reason=reason)
@@ -587,6 +734,10 @@ class SafetySupervisor:
             self._alarm(f"ClearFaults by {operator} failed: {exc}")
             raise
         self.timeline.event(self.name, "faults_cleared", operator=operator, reply=reply)
+        if self._auto_clear_stopped is not None:
+            log.warning("%s: automatic fault clearing restarted by %s", self.name, operator)
+        self._auto_clear_stopped = None
+        self._auto_cleared_at, self._auto_clear_took = None, False
         self._wake.set()
         return str(reply)
 

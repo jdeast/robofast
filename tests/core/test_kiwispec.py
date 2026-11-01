@@ -86,6 +86,10 @@ def service_config(sim: KiwiSpecSim, **over) -> KiwiSpecConfig:
         "save_retry": 0.1,
         "status_interval": 0.2,
         "status_timeout": 3.0,
+        # The generic lamp kinds, for the tests of the mechanics; MINERVA's
+        # config has neither (test_minerva_is_iodine_only).
+        "lamp_frames": ["thar", "fiberflat"],
+        "slit_flat_led": True,
         **over,
     }
     return KiwiSpecConfig.from_dict(d)
@@ -755,3 +759,58 @@ def test_example_config_loads_and_is_loopback():
     config = KiwiSpecConfig.from_dict(json.loads(path.read_text()))
     server = KiwiSpecServer(config)
     assert server.kiwispec.spec.host == "127.0.0.1"
+
+
+# -- MINERVA: iodine only (JDE 2026-10-31) --------------------------------------------
+
+
+async def test_minerva_is_iodine_only(sim):
+    """No ThAr or fiber-flat lamp, and the slit-flat LED is off until confirmed:
+    the shipped configs refuse those frames, and /status says what is left."""
+    from pathlib import Path
+
+    root = Path(__file__).parents[2]
+    for path in (
+        root / "sites/minerva/kiwispec.example.json",
+        root / "deploy/kiwispec.example.json",
+    ):
+        shipped = KiwiSpecConfig.from_dict(json.loads(path.read_text()))
+        assert shipped.lamp_frames == [] and shipped.slit_flat_led is False, path
+        assert shipped.frame_kinds() == ["science", "dark", "bias"], path
+    server = await KiwiSpecServer(service_config(sim, lamp_frames=[], slit_flat_led=False)).start(
+        status_loop=False
+    )
+    try:
+        async with httpx.AsyncClient(base_url=server.url, timeout=10) as http:
+            for kind, why in (("thar", "no ThAr lamp"), ("fiberflat", "no fiber-flat lamp")):
+                r = await http.post("/expose", json={"kind": kind, "exptime": 1.0})
+                assert r.status_code == 400 and why in r.json()["error"], r.text
+                r = await http.post("/calibrate", json={"frames": [{"kind": kind, "exptime": 1}]})
+                assert r.status_code == 400 and "iodine only" in r.json()["error"]
+            r = await http.post("/expose", json={"kind": "slitflat", "exptime": 1.0})
+            assert r.status_code == 400 and "slit-flat LED" in r.json()["error"]
+            r = await http.post("/configure", json={"led": True})
+            assert r.status_code == 400 and "slit_flat_led" in r.json()["error"]
+            status = (await http.get("/status")).json()
+            assert status["frame_kinds"] == ["science", "dark", "bias"]
+            job = await run_job(
+                http, "/calibrate", {"frames": [{"kind": "bias", "exptime": 0, "n": 1}]}
+            )
+            assert job["state"] == "done", job
+        assert not sim.led_on
+    finally:
+        await server.stop()
+
+
+def test_lamp_frames_are_checked():
+    base = {"spectrograph": {"host": "127.0.0.1"}, "camera": {"host": "127.0.0.1"}}
+    with pytest.raises(ValueError, match="lamp_frames"):
+        KiwiSpecConfig.from_dict({**base, "lamp_frames": ["neon"]})
+    with pytest.raises(ValueError, match="slit_flat_led"):
+        KiwiSpecConfig.from_dict({**base, "slit_flat_led": "yes"})
+    assert KiwiSpecConfig.from_dict({**base, "lamp_frames": ["thar"]}).frame_kinds() == [
+        "science",
+        "thar",
+        "dark",
+        "bias",
+    ]

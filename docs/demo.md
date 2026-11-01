@@ -43,17 +43,20 @@ run in real seconds, shortened. The whole night is `n20261109` everywhere.
 ## The night
 
 1. **Evening calibrations** with the roof closed and no lease: KiwiSpec
-   biases, a dark, ThAr and a fiber flat through the spectrograph service.
+   biases and a dark through the spectrograph service (KiwiSpec is iodine
+   only: no ThAr or fiber flats; `docs/kiwispec.md`, section 4).
    The biases and darks are true dark frames. The imagers take a bias and
    a dark.
 2. **Twilight**: nothing is observable until the Sun is at -12 deg. The
    sequencer then asks for a lease, and the supervisor opens the roof
    (weather safe for longer than the reopen hold).
 3. **Autofocus** on each telescope before its first spectrum.
-4. **RV spectra**: six RV standards, each a `SPECTRUM` request for T1 and
-   T2. One telescope leads, the other joins, and both locate the fiber
-   with the backlight and guide. KiwiSpec exposes with the iodine cell in.
-   One target ends on the exposure meter's counts.
+4. **RV spectra**: six `SPECTRUM` requests for T1 and T2: a B star
+   through iodine (the instrumental-profile calibration), four RV
+   standards with the iodine cell in, and a template with the cell out.
+   One telescope leads, the other joins, and both locate the fiber with
+   the backlight and guide. One target ends on the exposure meter's
+   counts.
 5. **Bad weather** during the second spectrum: humidity goes to 95 %, the
    bridge reports unsafe, and the supervisor revokes the lease. The
    sequencer aborts the spectrum, stops the guiders and parks. The

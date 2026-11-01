@@ -601,25 +601,22 @@ class SafetySupervisor:
     async def request_open(self, holder: str) -> OpenLease:
         """Wait until opening is allowed, no earlier lease is outstanding, and
         every configured telescope is parked."""
-        while True:
-            # The (awaited) park check first, then the synchronous ones with
-            # no await between them and the grant: _ensure_closed commits to
-            # a close (``_close_committed``) synchronously too, so a grant and
-            # a close can never both go ahead.
-            parked = await self._telescopes_parked()
-            if (
-                parked
-                and not self._close_committed
-                and self.open_allowed()
-                and self.outstanding() is None
-            ):
-                break
+        while not (self._grantable() and await self._telescopes_parked() and self._grantable()):
+            # The second check, after the awaited park check and with no await
+            # between it and the grant: _ensure_closed commits to a close
+            # (``_close_committed``) synchronously too, so a grant and a close
+            # can never both go ahead. (The first spares the telescopes the
+            # AtPark reads while nothing could be granted anyway.)
             await asyncio.sleep(min(self.config.poll_interval, 1.0))
         lease = OpenLease(next(self._lease_ids), holder, self.config.lease_ttl)
         self._lease = lease
         self.timeline.event(self.name, "lease_granted", lease=lease.id, holder=holder)
         self._wake.set()
         return lease
+
+    def _grantable(self) -> bool:
+        """Everything but the park check that a grant needs."""
+        return not self._close_committed and self.open_allowed() and self.outstanding() is None
 
     def _revoke_lease(self, reason: str) -> None:
         lease = self._lease

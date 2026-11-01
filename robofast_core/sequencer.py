@@ -173,8 +173,9 @@ a sidecar file (:class:`~robofast_core.spectra.SpectrumRecorder`); the raw
 FITS file on the spectrograph PC is never rewritten.
 
 ``kind="spectrograph_calibration"`` observations (``light=False``: biases,
-darks, ThAr, flats through the spectrograph) are one ``POST /calibrate``
-job, taken like dark frames in the closed phase with the enclosure closed.
+darks, and any lamp frames the spectrograph has; MINERVA's KiwiSpec has
+none) are one ``POST /calibrate`` job, taken like dark frames in the closed
+phase with the enclosure closed.
 
 **Cleanup aborts the spectrum first.** Every cleanup (lease revoked,
 generation over, sequencer stopping) aborts a spectrograph job this

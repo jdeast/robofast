@@ -295,7 +295,9 @@ class CalibrationPlan(_Queues):
 
     ``darks`` is a list of ``[exptime, count]``. ``spectrograph`` is a list
     of spectrograph calibration frames, ``{"kind": "thar"|"slitflat"|
-    "fiberflat"|"bias"|"dark", "exptime": s, "n": N}``, taken as one
+    "fiberflat"|"bias"|"dark", "exptime": s, "n": N}`` (the spectrograph
+    service refuses kinds it cannot take: MINERVA's KiwiSpec takes only
+    biases and darks here, docs/kiwispec.md section 4), taken as one
     ``spectrograph_calibration`` observation by ``spectrograph_telescope``
     (default: the first telescope; the telescope itself does nothing).
     Every frame is dark (``light=False``), so the sequencer takes them in its

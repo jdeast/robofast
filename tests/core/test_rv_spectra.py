@@ -395,11 +395,10 @@ async def test_lease_revoked_mid_spectrum_aborts_it_before_parking(make_rig, tmp
 
 
 async def test_spectrograph_calibrations_take_no_lease(make_rig, tmp_path):
+    # MINERVA's (KiwiSpec is iodine only): biases and darks.
     frames = [
         {"kind": "bias", "exptime": 0, "n": 2},
         {"kind": "dark", "exptime": 0.1, "n": 1},
-        {"kind": "thar", "exptime": 0.1, "n": 1},
-        {"kind": "fiberflat", "exptime": 0.1, "n": 1},
     ]
     plan = CalibrationPlan(["t1", "t2"], biases=1, spectrograph=frames)
     rig = rv_rig(make_rig, tmp_path, plan)
@@ -409,10 +408,10 @@ async def test_spectrograph_calibrations_take_no_lease(make_rig, tmp_path):
     [(_, call)] = [c for c in rig.spec.calls if c[0] == "calibrate"]
     assert call["frames"] == frames
     kinds = [r["kind"] for r in rig.sequencer.spectrum_records]
-    assert kinds == ["bias", "bias", "dark", "thar", "fiberflat"]
-    assert [r["dark"] for r in rig.sequencer.spectrum_records][:3] == [True, True, True]
-    assert ("t1", "spectrograph calibration", "complete", 5) in plan.history
-    assert len(list(tmp_path.glob("minerva/kiwispec/n*/*.json"))) == 5
+    assert kinds == ["bias", "bias", "dark"]
+    assert [r["dark"] for r in rig.sequencer.spectrum_records] == [True, True, True]
+    assert ("t1", "spectrograph calibration", "complete", 3) in plan.history
+    assert len(list(tmp_path.glob("minerva/kiwispec/n*/*.json"))) == 3
 
 
 def test_observation_validation():

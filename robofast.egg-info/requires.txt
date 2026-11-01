@@ -1,0 +1,10 @@
+numpy
+scipy
+matplotlib
+ipdb
+astropy
+astroquery
+pywin32
+pytest
+pyyaml
+pyephem

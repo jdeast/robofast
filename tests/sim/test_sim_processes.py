@@ -17,6 +17,7 @@ import pytest
 
 from robofast_core import Observation, Sequencer, SequencerConfig, Timeline
 from robofast_core.alpaca import alpaca_owner
+from robofast_core.cancel import stop_task
 from robofast_core.heartbeat_watchdog import HeartbeatWatchdog
 from robofast_core.lease_client import RemoteSupervisor
 from robofast_core.testing.checks import await_until, wait_until
@@ -93,9 +94,9 @@ async def sequencer(omnisim, supervisor):
     )
     task = asyncio.create_task(seq.run())
     yield seq
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-    await remote.aclose()
+    # Bounded: the supervisor may still be SIGSTOPped here (the "hung" case).
+    await stop_task(task, 15.0)
+    await asyncio.wait_for(remote.aclose(), 15.0)
 
 
 async def _observing(truth) -> None:

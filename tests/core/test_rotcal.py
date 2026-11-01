@@ -44,6 +44,14 @@ from .test_pointmodel_sequencer import SITES, now, run, sky_rig
 T0 = datetime(2026, 10, 31, 6, 0, tzinfo=UTC)
 
 
+# The sequencer tests point at the sky overhead *now*, so each run solves a
+# different field. Over 40 fields at Dec 40 the solved PA scattered 0.01 deg
+# rms with a tail to 0.04 deg (and 0.053 deg once in CI), so 0.05 deg failed
+# now and then. 0.1 deg is still tight next to the errors these tests catch
+# (a flip, a sign, a calibration 85 deg off).
+SOLVE_TOL = 0.1
+
+
 def measurements(offset, sense, flip, angles, noise=0.01, seed=0):
     rng = np.random.default_rng(seed)
     return [
@@ -209,7 +217,7 @@ async def test_sequencer_calibrates_saves_and_the_next_frames_use_it(make_rig, t
     assert [h[2] for h in plan.history] == ["complete", "complete"]
     cal = store.get("t1", None)
     assert cal is not None and cal.flip and cal.sense == -1
-    assert abs((cal.offset - 33.0 + 180) % 360 - 180) < 0.05
+    assert abs((cal.offset - 33.0 + 180) % 360 - 180) < SOLVE_TOL
     assert rot.moves == [10.0, 80.0, 200.0]  # measured, then back where it was
     [ev] = rig.timeline.events("pa_calibrated")
     assert ev.detail["n"] == 2
@@ -219,9 +227,9 @@ async def test_sequencer_calibrates_saves_and_the_next_frames_use_it(make_rig, t
     assert len(light) == 2
     for h in light:
         assert h["ROTMECH"] == 200.0
-        assert h["PACALIB"] == pytest.approx((33.0 - 200.0) % 360, abs=0.05)
+        assert h["PACALIB"] == pytest.approx((33.0 - 200.0) % 360, abs=SOLVE_TOL)
         assert h["PAFLIP"] is True and h["WCSFLIP"] is True
-        assert abs((h["WCSPA"] - h["PACALIB"] + 180) % 360 - 180) < 0.05
+        assert abs((h["WCSPA"] - h["PACALIB"] + 180) % 360 - 180) < SOLVE_TOL
 
 
 async def test_wrong_calibration_falls_back_to_an_unhinted_solve(make_rig, tmp_path):
@@ -239,7 +247,7 @@ async def test_wrong_calibration_falls_back_to_an_unhinted_solve(make_rig, tmp_p
     await run(rig, imaging)
     [(_, h)] = headers(tmp_path, "t1")
     assert h["PACALIB"] == pytest.approx(160.0, abs=0.1)
-    assert h["WCSSRC"] == "robofast" and abs(h["WCSPA"] - 75.0) < 0.05
+    assert h["WCSSRC"] == "robofast" and abs(h["WCSPA"] - 75.0) < SOLVE_TOL
 
 
 async def test_guider_seeds_its_mount_matrix_from_the_pa_calibration(tmp_path):

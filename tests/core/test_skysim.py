@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 import math
 from datetime import UTC, datetime
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -30,15 +29,15 @@ from robofast_core.testing.skysim import (
     sky_world_stars,
 )
 from robofast_core.testing.starfield import Detector
+from tests.core.skydata import sky_dir
 
-DATA = Path(__file__).parent / "data" / "catalog"
 HD185144 = (293.2035, 69.6611)
 WHEN = datetime(2026, 4, 23, 9, 0, tzinfo=UTC)
 
 
 @pytest.fixture(scope="module")
 def catalog():
-    return catalog_at(DATA)
+    return catalog_at(sky_dir())
 
 
 def cam(**kw) -> SkyCamera:
@@ -241,7 +240,7 @@ def test_imaging_config_solve_entry(tmp_path):
         {
             "data_root": str(tmp_path),
             "telescopes": {"t1": {"plate_scale": 0.61}},
-            "solve": {"catalog": {"cache_dir": str(DATA), "fetch": False}},
+            "solve": {"catalog": {"cache_dir": str(sky_dir()), "fetch": False}},
         }
     )
     im = Imaging(cfg)

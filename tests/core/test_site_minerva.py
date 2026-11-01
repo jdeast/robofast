@@ -32,6 +32,7 @@ from robofast_core.supervisor_service import build as build_supervisor
 from robofast_core.timeline import Timeline
 from robofast_core.weather_bridge import build_sources, parse_config
 from robofast_core.weather_bridge import load_config as load_weather
+from tests.core.skydata import sky_dir
 
 SITE = Path(__file__).resolve().parents[2] / "sites" / "minerva"
 ARCSEC_PER_RAD = 206264.806
@@ -328,7 +329,7 @@ def test_sky_config_loads():
     from robofast_core.vetting import Vetter
 
     cfg = _json("sky.example.json")
-    cfg["catalog"] = {"cache_dir": str(SITE.parents[1] / "tests/core/data/catalog"), "fetch": False}
+    cfg["catalog"] = {"cache_dir": str(sky_dir()), "fetch": False}
     v = Vetter.from_config(cfg)
     fau2 = v.port("t2", "fau")
     assert fau2 is not None and fau2.photometry.zp == 19.70

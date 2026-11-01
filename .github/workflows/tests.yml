@@ -29,6 +29,12 @@ jobs:
     name: pytest
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Data robofast downloads from Zenodo (robofast_core/zenodo.py; the Gaia
+    # DR3 extracts are CC BY-NC, so not in this BSD repository) land here,
+    # and the cache step below keeps them between runs: Zenodo is a free
+    # academic host, so CI fetches each pinned file once per pin change.
+    env:
+      ROBOFAST_DATA_DIR: "~/.cache/robofast/data"
     strategy:
       fail-fast: false
       matrix:
@@ -42,6 +48,20 @@ jobs:
         run: |
           python -m pip install --upgrade "pip>=25.1"
           python -m pip install --group test
+      # Keyed on the one file that holds every Zenodo pin: a new pin is a new
+      # entry, and restore-keys brings back the files that did not change.
+      # Until a record is pinned there is nothing to fetch, and the tests
+      # that need real Gaia data skip (tests/core/skydata.py).
+      - name: Cache the Zenodo downloads
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/robofast/data
+          key: zenodo-${{ runner.os }}-${{ hashFiles('robofast_core/zenodo_assets.py') }}
+          restore-keys: |
+            zenodo-${{ runner.os }}-
+      - name: Fetch the pinned Zenodo data
+        continue-on-error: true
+        run: python -m robofast_core.zenodo fetch
       - name: Run unit tests
         run: python -m pytest -m "not alpaca_sim and not e2e" --durations=10
 

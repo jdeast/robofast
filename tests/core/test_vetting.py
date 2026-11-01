@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -21,8 +20,8 @@ from robofast_core.dispatch import dispatch_from_config
 from robofast_core.photometry import PortPhotometry, SkyConditions
 from robofast_core.request_model import RequestGroup
 from robofast_core.vetting import PortGeometry, Vetter, VettingConfig, vet
+from tests.core.skydata import sky_dir
 
-DATA = Path(__file__).parent / "data" / "catalog"
 WHEN = datetime(2026, 7, 1, 6, 0, tzinfo=UTC)
 HD185144 = (293.2035, 69.6611)
 FAU = PortGeometry(
@@ -38,7 +37,7 @@ FAU = PortGeometry(
 
 @pytest.fixture(scope="module")
 def catalog():
-    return catalog_at(DATA)
+    return catalog_at(sky_dir())
 
 
 @pytest.fixture(scope="module")
@@ -147,7 +146,7 @@ def _group(name: str, ra: float, dec: float, gid: str = "g1") -> dict:
 
 def _vetting_cfg(reject=()):
     return {
-        "catalog": {"cache_dir": str(DATA), "fetch": False},
+        "catalog": {"cache_dir": str(sky_dir()), "fetch": False},
         "reject": list(reject),
         "ports": {
             "fau": {

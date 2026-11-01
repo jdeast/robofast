@@ -1,21 +1,23 @@
 """The star catalog: HEALPix tiles, cone queries, proper motion, offline use.
 
-The fixture tiles (tests/core/data/catalog) are real Gaia DR3 tiles (G < 16,
-HEALPix level 7) around a few test fields; nothing here touches the network.
+The test sky (tests/core/skydata.py) is real Gaia DR3 tiles (G < 16, HEALPix
+level 7) around a few test fields once the Zenodo record is pinned, else a
+synthetic stand-in; nothing here touches the network beyond that one
+cached download.
 """
 
 from __future__ import annotations
 
 import math
+import shutil
 from datetime import UTC, datetime
-from pathlib import Path
 
 import numpy as np
 import pytest
 
 from robofast_core import catalog as cat
+from tests.core.skydata import require_gaia, sky_dir
 
-DATA = Path(__file__).parent / "data" / "catalog"
 #: The test fields (ra, dec deg): a sparse high-latitude field, HD 185144,
 #: a dense field near the plane, nu Draconis (an equal pair), tau Ceti.
 SPARSE = (212.720875, 62.522197)
@@ -27,12 +29,14 @@ TAU_CET = (26.016, -15.9375)
 
 @pytest.fixture(scope="module")
 def catalog() -> cat.Catalog:
-    return cat.catalog_at(DATA)
+    return cat.catalog_at(sky_dir())
 
 
 def test_healpix_matches_gaia_source_ids(catalog):
     # Gaia's source_id >> 35 is the level-12 nested HEALPix index of the
-    # star's (J2016) position: an independent check of ang2pix.
+    # star's (J2016) position: an independent check of ang2pix (the
+    # synthetic sky builds its ids with ang2pix, so only real data check it).
+    require_gaia()
     s = catalog.tiles.cone(*SPARSE, 0.3)
     assert len(s) > 50
     assert np.array_equal(cat.ang2pix(12, s.ra, s.dec), s.source_id >> 35)
@@ -87,16 +91,34 @@ def test_mag_limit_and_bright_stars(catalog):
 
 
 def test_missing_tile_offline_fails_clearly(tmp_path):
+    # A bright-star file dropped into the cache directory is used (how an
+    # offline host is pre-filled, docs/sky.md).
+    shutil.copyfile(sky_dir() / cat.BRIGHT_FILE, tmp_path / cat.BRIGHT_FILE)
     c = cat.catalog_at(tmp_path)
     with pytest.raises(cat.CatalogUnavailable, match="not cached"):
         c.cone(10.0, 10.0, 0.1)
-    # The bundled bright stars always answer (tau Ceti, G 3.3).
+    # The bright stars answer with no tile (tau Ceti, G 3.3).
     assert len(c.cone(*TAU_CET, 0.1, bright_only=True)) == 1
+
+
+def test_no_bright_stars_is_a_warning_not_a_failure(tmp_path, monkeypatch, caplog):
+    # Nothing in the cache directory, the record not pinned (or offline):
+    # the catalog still works from its tiles; bright_only says why it cannot.
+    monkeypatch.setenv("ROBOFAST_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("ROBOFAST_OFFLINE", "1")
+    monkeypatch.setattr(cat, "_BRIGHT", None)
+    monkeypatch.setattr(cat, "_WARNED", set())
+    tiles = cat.TileCache(sky_dir())
+    c = cat.Catalog(tiles)
+    assert c.bright is None and "bright-star" in caplog.text
+    assert len(c.cone(*SPARSE, 0.1)) > 0
+    with pytest.raises(cat.CatalogUnavailable, match="bright"):
+        c.cone(*TAU_CET, 0.1, bright_only=True)
 
 
 def test_missing_tile_is_fetched_once_and_cached(tmp_path):
     calls = []
-    src = cat.TileCache(DATA)
+    src = cat.TileCache(sky_dir())
 
     def fetch(level, pix, mag):
         calls.append(pix)
@@ -114,8 +136,9 @@ def test_missing_tile_is_fetched_once_and_cached(tmp_path):
     assert np.array_equal(a.source_id, b.source_id)
 
 
-def test_bundled_bright_stars():
-    b = cat.bright_stars()
+def test_gaia_bright_stars():
+    require_gaia()
+    b = cat.bright_stars(sky_dir() / cat.BRIGHT_FILE)
     assert 9000 < len(b) < 15000
     assert b.g.max() < 6.5
     # tau Ceti is there; Vega (G ~ 0) is not: Gaia lacks the very
@@ -205,7 +228,7 @@ def test_wds_fixture_and_parser(catalog):
 
 
 def test_catalog_from_config(tmp_path, monkeypatch):
-    c = cat.catalog_from_config({"cache_dir": str(DATA), "fetch": False})
+    c = cat.catalog_from_config({"cache_dir": str(sky_dir()), "fetch": False})
     assert c.tiles is not None and c.tiles.fetch is None
     assert len(c.cone(*SPARSE, 0.05)) > 0
     with pytest.raises(ValueError, match="unknown keys"):

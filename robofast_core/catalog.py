@@ -13,11 +13,12 @@ G, BP-RP and an estimated V) from, in order:
    no network. Gaia ``source_id`` encodes the level-12 nested HEALPix
    index of the star (``source_id >> 35``), so a tile is a ``source_id``
    range query.
-2. **The bundled bright stars** (:func:`bright_stars`): every Gaia DR3 star
-   brighter than ``G = 6.5``, shipped with the code
-   (``robofast_core/data/bright_stars.npy``), for offline use and pointing
-   models; and the brightest stars Gaia lacks (from Hipparcos via a
-   separate list, when present).
+2. **The bright stars** (:func:`bright_stars`): every Gaia DR3 star
+   brighter than ``G = 6.5`` (``bright_stars.npy``: in the cache directory,
+   else downloaded once from Zenodo, :mod:`robofast_core.zenodo`; Gaia
+   data are CC BY-NC 3.0 IGO, so not shipped in the BSD repository), for
+   offline use and pointing models; and the brightest stars Gaia lacks
+   (from Hipparcos via a separate list, when present).
 3. Optionally a **live service** (:class:`VizierSource`, needs astroquery)
    for a field nothing cached covers.
 
@@ -87,7 +88,6 @@ TILE_DTYPE = np.dtype(
         ("bp_rp", "<f4"),
     ]
 )
-_DATA = Path(__file__).with_name("data")
 _MAS = math.pi / (180.0 * 3600.0 * 1000.0)
 
 
@@ -553,7 +553,7 @@ class TileCache:
             json.dumps(
                 {
                     "catalog": "Gaia DR3 (gaiadr3.gaia_source)",
-                    "licence": "CC BY-SA 3.0 IGO; credit ESA/Gaia/DPAC (docs/sky.md)",
+                    "licence": "CC BY-NC 3.0 IGO; credit ESA/Gaia/DPAC (docs/sky.md)",
                     "epoch": GAIA_EPOCH,
                     "healpix": {"scheme": "nested", "level": self.level},
                     "mag_limit": {"band": "G", "value": self.mag_limit},
@@ -579,19 +579,53 @@ class TileCache:
 # -- the bright stars ---------------------------------------------------------------
 
 _BRIGHT: Stars | None = None
+#: The bright-star file's name, in a cache directory and in the Zenodo record.
+BRIGHT_FILE = "bright_stars.npy"
 
 
 def bright_stars(path: str | Path | None = None) -> Stars:
-    """The bundled bright-star catalog (module doc), brightest first."""
+    """The bright-star catalog (module doc), brightest first.
+
+    ``path``: a file of :data:`TILE_DTYPE` records. Default: the Gaia DR3
+    extracts' ``bright_stars.npy``, downloaded once from Zenodo into
+    :func:`robofast_core.zenodo.data_dir` (docs/sky.md). Raises
+    :class:`CatalogUnavailable` if it is not there and cannot be fetched."""
     global _BRIGHT
     if path is None and _BRIGHT is not None:
         return _BRIGHT
-    p = Path(path) if path is not None else _DATA / "bright_stars.npy"
+    if path is None:
+        from robofast_core import zenodo, zenodo_assets
+
+        try:
+            p = zenodo.fetch_file(zenodo_assets.GAIA_EXTRACTS, BRIGHT_FILE)
+        except zenodo.AssetUnavailable as exc:
+            raise CatalogUnavailable(f"bright stars: {exc}") from exc
+    else:
+        p = Path(path)
     rec = np.load(p, allow_pickle=False)
     stars = Stars.from_records(rec, source="bright").sorted()
     if path is None:
         _BRIGHT = stars
     return stars
+
+
+_WARNED: set[str] = set()
+
+
+def _default_bright(root: Path | None = None) -> Stars | None:
+    """``root/bright_stars.npy`` if present, else :func:`bright_stars`; None
+    (with one warning per reason) when neither is available: Gaia's own
+    tiles still answer, only ``bright_only`` queries and the few stars Gaia
+    lacks are lost."""
+    if root is not None and (root / BRIGHT_FILE).is_file():
+        return bright_stars(root / BRIGHT_FILE)
+    try:
+        return bright_stars()
+    except CatalogUnavailable as exc:
+        if str(exc) not in _WARNED:
+            _WARNED.add(str(exc))
+            log.warning("catalog: no bright-star list (%s)", exc)
+        return None
 
 
 # -- a live service (optional) ------------------------------------------------------
@@ -645,7 +679,8 @@ class Catalog:
     """Cone queries over the sources in order (module doc).
 
     ``tiles``: a :class:`TileCache` (or None); ``bright``: the bright-star
-    table (default the bundled one; None: none); ``live``: an optional
+    table (default: :func:`bright_stars`, or none, with a warning, if it is
+    not available; None: none); ``live``: an optional
     :class:`VizierSource`. ``bright_limit``: bright-catalog stars brighter
     than this (G) are added where Gaia has no star within
     ``bright_match`` arcsec (Gaia is incomplete for the brightest stars)."""
@@ -654,7 +689,7 @@ class Catalog:
         self,
         tiles: TileCache | None = None,
         *,
-        bright: Stars | str | None = "bundled",
+        bright: Stars | str | None = "default",
         live: VizierSource | None = None,
         bright_limit: float = 6.5,
         bright_match: float = 3.0,
@@ -662,7 +697,7 @@ class Catalog:
         doubles: DoubleStars | None = None,
     ) -> None:
         self.tiles = tiles
-        self.bright = bright_stars() if isinstance(bright, str) else bright
+        self.bright = _default_bright() if isinstance(bright, str) else bright
         self.live = live
         #: The WDS (for target vetting), when cached.
         self.doubles = doubles
@@ -689,8 +724,8 @@ class Catalog:
         """Stars within ``radius`` deg of (ra, dec) at ``epoch`` (default:
         the catalog's, J2016.0), brighter than ``mag_limit`` (G), brightest
         first. Raises :class:`CatalogUnavailable` if no source covers the
-        field (``bright_only``: the bundled bright stars alone, always
-        available)."""
+        field (``bright_only``: the bright stars alone, which need no tile
+        and no network once ``bright_stars.npy`` is in place)."""
         ep = decimal_year(epoch)
         widen = 0.0 if ep is None else abs(ep - GAIA_EPOCH) * self.max_pm / 3.6e6
         r0 = radius + widen
@@ -711,6 +746,8 @@ class Catalog:
             if gaia is None:
                 raise CatalogUnavailable("; ".join(errors) or "no catalog source configured")
             parts.append(gaia)
+        if bright_only and self.bright is None:
+            raise CatalogUnavailable("bright_only: no bright-star list (docs/sky.md)")
         if self.bright is not None:
             b = self.bright.cone(ra, dec, r0)
             if gaia is not None and len(b):
@@ -768,18 +805,21 @@ def catalog_at(
     live: bool = False,
 ) -> Catalog:
     """A :class:`Catalog` on the cache directory ``root``: its Gaia tiles,
-    the bundled bright stars plus ``root/hipparcos-not-in-gaia.npy`` (the
-    bright stars Gaia lacks) and ``root/wds.npy`` (double stars) when
+    the bright stars (``root/bright_stars.npy`` if present, else
+    :func:`bright_stars`'s download) plus ``root/hipparcos-not-in-gaia.npy``
+    (the bright stars Gaia lacks) and ``root/wds.npy`` (double stars) when
     present (``scripts/build_catalog.py`` writes them)."""
     root = Path(root)
     tiles = TileCache(root, level=level, mag_limit=mag_limit, fetch=fetch)
     b: Stars | None = None
     if bright:
-        b = bright_stars()
+        b = _default_bright(root)
         hip = root / "hipparcos-not-in-gaia.npy"
-        if hip.is_file():
+        if hip.is_file() and b is None:
+            b = bright_stars(hip)
+        elif hip.is_file() and b is not None:
             h = bright_stars(hip)
-            # Only those with no bundled (Gaia) star within 3 arcsec.
+            # Only those with no Gaia bright star within 3 arcsec.
             va, vb = _vec(h.ra, h.dec), _vec(b.ra, b.dec)
             near = np.max(va @ vb.T, axis=1) > math.cos(math.radians(3.0 / 3600.0))
             b = Stars.concat([b, h.take(~near)]).sorted()

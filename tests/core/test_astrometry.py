@@ -1,7 +1,8 @@
 """Render the real sky, solve it: the near-blind solver recovers the true
 pointing, position angle and scale (MINERVA imager and FAU fields).
 
-The scenes use the fixture Gaia tiles (tests/core/data/catalog), a mount
+The scenes use the test sky (tests/core/skydata.py: real Gaia DR3 tiles, or
+the synthetic stand-in until they are pinned), a mount
 with a TPOINT-style pointing error (so the commanded position the solver
 starts from is arcminutes off the truth), noise, sky and seeing.
 """
@@ -12,7 +13,6 @@ import math
 import time
 from dataclasses import replace
 from datetime import UTC, datetime
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -23,8 +23,8 @@ from robofast_core.photometry import PortPhotometry, SkyConditions
 from robofast_core.pointing import PointingModel
 from robofast_core.testing.skysim import SkyCamera, SkyScene
 from robofast_core.testing.starfield import Detector
+from tests.core.skydata import sky_dir
 
-DATA = Path(__file__).parent / "data" / "catalog"
 SPARSE = (212.720875, 62.522197)
 HD185144 = (293.2035, 69.6611)
 DENSE = (285.79486, 25.292175)
@@ -40,7 +40,7 @@ FAU_PHOT = PortPhotometry(
 
 @pytest.fixture(scope="module")
 def catalog():
-    return catalog_at(DATA)
+    return catalog_at(sky_dir())
 
 
 def imager(pa: float = 0.0, flip: bool = False, k1: float = 0.0) -> SkyCamera:

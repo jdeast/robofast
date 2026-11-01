@@ -390,7 +390,7 @@ the plate solver's hint and the guider's mount matrix read it.
 
 Where a telescope really points is measured, not assumed (`docs/sky.md`):
 robofast has its own star catalog (Gaia DR3 tiles cached on disk, a
-bundled bright-star list, the WDS), a near-blind plate solver that every
+bright-star list fetched once from Zenodo, the WDS), a near-blind plate solver that every
 light frame, acquisition and pointing-model run can use, and TPOINT-style
 pointing-error terms (`robofast_core/pointing.py`) that the sky simulator
 uses as the mount's "true" errors and that a pointing-model fit recovers.
@@ -893,7 +893,7 @@ Each step is a CI-tested deliverable.
     60-inch observer) is built (`docs/notifier.md`). Next: an attended
     night with both.
 
-17. The sky (built; `docs/sky.md`): the Gaia DR3 tile cache and bundled
+17. The sky (built; `docs/sky.md`): the Gaia DR3 tile cache and downloaded
     bright stars, a sky simulator with pointing errors, the near-blind
     plate solver, solved WCS and zero points in every frame. Next: target
     vetting and catalog-based acquisition, the per-port zero points

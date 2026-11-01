@@ -1061,7 +1061,13 @@ def test_the_example_config_loads(tmp_path):
 async def test_validate_vets_targets_against_the_catalog(api):
     """With ``vetting`` in the plan, validate reports what the catalog says
     (docs/sky.md): warnings, and errors for the flags the site rejects."""
-    data = ROOT / "tests" / "core" / "data" / "catalog"
+    from robofast_core.catalog import catalog_at
+    from tests.core.skydata import sky_dir
+
+    data = sky_dir()
+    # nu2 Draconis (G 4.84), 62 arcsec from its near-twin nu1 (G 4.79), at
+    # its J2016 position in the test sky.
+    nu = catalog_at(data).cone(263.056, 55.179, 0.02, mag_limit=6.0)
     enc = api.app.enclosures["aqawan1"]
     enc.plan["vetting"] = {
         "catalog": {"cache_dir": str(data), "fetch": False},
@@ -1070,9 +1076,8 @@ async def test_validate_vets_targets_against_the_catalog(api):
     }
     enc._view = None
     g = group("nu2dra", telescopes=["t1"])
-    # nu2 Draconis, 62 arcsec from its near-twin nu1 (J2016 Gaia position).
     g["requests"][0]["configurations"][0]["target"].update(
-        {"name": "nu2 Dra", "ra": 263.04518678, "dec": 55.18448602}
+        {"name": "nu2 Dra", "ra": float(nu.ra[1]), "dec": float(nu.dec[1])}
     )
     out = (await api.post("tom", "/requestgroups/validate", g)).json()
     assert not out["valid"]

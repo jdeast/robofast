@@ -186,7 +186,9 @@ class GCSAxis:
             await self._send("ERR?")
             code = _int(await self._read_answer())
         if code:
-            raise GCSError(f"{line!r}: error {code} ({ERRORS.get(code, 'see the GCS manual')})", code)
+            raise GCSError(
+                f"{line!r}: error {code} ({ERRORS.get(code, 'see the GCS manual')})", code
+            )
 
     def _value(self, lines: list[str], what: str) -> str:
         for ln in lines:

@@ -347,7 +347,9 @@ class Calstage:
         assert self.travel is not None
         lo, hi = self.travel
         if not lo <= mm <= hi:
-            raise AlpacaException(INVALID_VALUE, f"{mm:g} mm is outside the travel [{lo:g}, {hi:g}]")
+            raise AlpacaException(
+                INVALID_VALUE, f"{mm:g} mm is outside the travel [{lo:g}, {hi:g}]"
+            )
         snap = await self.snapshot(0)
         if not snap.referenced or (self.job is not None and self.job.kind == "reference"):
             raise AlpacaException(
@@ -456,7 +458,11 @@ class Calstage:
             "moving": snap.moving or job is not None,
             "job": None
             if job is None
-            else {"kind": job.kind, "target_mm": job.target, "elapsed": round(time.monotonic() - job.started, 1)},
+            else {
+                "kind": job.kind,
+                "target_mm": job.target,
+                "elapsed": round(time.monotonic() - job.started, 1),
+            },
             "referenced": snap.referenced,
             "servo": servo,
             "travel_mm": None if self.travel is None else list(self.travel),
@@ -619,9 +625,10 @@ class TRESFrontEndServer(ThreadingHTTPServer):
             }
         if tail == ["v1", "configureddevices"]:
             kinds = {"filterwheel": "FilterWheel", "focuser": "Focuser"}
+            units = {"filterwheel": "named", "focuser": "microns"}
             return [
                 {
-                    "DeviceName": f"{name} calstage ({'named' if d == 'filterwheel' else 'microns'})",
+                    "DeviceName": f"{name} calstage ({units[d]})",
                     "DeviceType": kinds[d],
                     "DeviceNumber": 0,
                     "UniqueID": f"robofast-tres-frontend-{name}-{d}-0",

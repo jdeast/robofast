@@ -182,7 +182,9 @@ class LegacyCalstageMirror:
                 self._down = False
             except (OSError, TimeoutError, RedisError) as exc:
                 if not self._down:
-                    log.warning("legacy redis: %r (retrying every %g s)", exc, self.config.poll_interval)
+                    log.warning(
+                        "legacy redis: %r (retrying every %g s)", exc, self.config.poll_interval
+                    )
                 self._down = True
             except asyncio.CancelledError:
                 raise
@@ -211,8 +213,11 @@ class LegacyCalstageMirror:
         value = await self.keys.get(self.config.command_key)
         if not self._baseline:
             self._seen, self._baseline = value, True
-            log.info("legacy redis: %s=%r at start (baseline, not acted on)",
-                     self.config.command_key, value)
+            log.info(
+                "legacy redis: %s=%r at start (baseline, not acted on)",
+                self.config.command_key,
+                value,
+            )
             return
         if value is None or value == self._seen:
             return
@@ -226,10 +231,14 @@ class LegacyCalstageMirror:
                 mm = float(text)
                 if not math.isfinite(mm):
                     raise ValueError(text)
-                log.warning("legacy redis: %s=%r: moving to %g mm", self.config.command_key, text, mm)
+                log.warning(
+                    "legacy redis: %s=%r: moving to %g mm", self.config.command_key, text, mm
+                )
                 await self._move_mm(mm)
         except ValueError:
-            log.warning("legacy redis: ignoring %s=%r (not a position)", self.config.command_key, value)
+            log.warning(
+                "legacy redis: ignoring %s=%r (not a position)", self.config.command_key, value
+            )
             return
         except Exception as exc:
             log.warning("legacy redis: %s=%r refused: %s", self.config.command_key, value, exc)

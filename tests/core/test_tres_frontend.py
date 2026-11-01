@@ -221,7 +221,9 @@ async def test_unreferenced_stage_refuses_moves_until_referenced(serve):
     assert moving_commands(s.sim) == []
     reply = await fw.put("Action", timeout=3, Action="Reference", Parameters="")
     assert "negative limit" in reply
-    assert s.sim.commands[-4:] == ["SVO? 1", "SVO 1 1", "ERR?", "FNL 1"] or "FNL 1" in s.sim.commands
+    assert (
+        s.sim.commands[-4:] == ["SVO? 1", "SVO 1 1", "ERR?", "FNL 1"] or "FNL 1" in s.sim.commands
+    )
     assert await settle(fw) == 0  # the negative limit is "out" here
     await fw.put("Position", timeout=3, Position=1)
     assert await settle(fw) == 1

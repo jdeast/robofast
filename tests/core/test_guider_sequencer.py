@@ -133,13 +133,14 @@ async def test_guider_failing_mid_observation_is_the_telescopes_error(make_rig):
 def test_configuration_guide_flag_round_trips():
     d = {
         "id": "c1",
-        "target": {"name": "HD 1", "ra_hours": 10.0, "dec_deg": 20.0},
-        "instrument_configs": [{"exptime": 30, "count": 2}],
-        "guide": True,
+        "target": {"type": "ICRS", "name": "HD 1", "ra": 150.0, "dec": 20.0},
+        "instrument_configs": [{"exposure_time": 30, "exposure_count": 2}],
+        "guiding_config": {"mode": "ON"},
     }
     c = Configuration.from_dict(d, "c")
-    assert c.guide and c.to_dict()["guide"] is True
-    assert "guide" not in Configuration.from_dict({**d, "guide": False}, "c").to_dict()
+    assert c.guide and c.to_dict()["guiding_config"] == {"mode": "ON"}
+    off = Configuration.from_dict({**d, "guiding_config": {"mode": "OFF"}}, "c")
+    assert not off.guide and off.to_dict()["guiding_config"] == {"mode": "OFF"}
 
 
 def test_sequencer_service_builds_a_guider_client():

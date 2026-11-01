@@ -11,24 +11,31 @@ A configuration of type `SPECTRUM` (`robofast_core/request_model.py`) is
 one target observed with the enclosure's spectrograph:
 
 ```json
-{"id": "HD10700-spec", "type": "SPECTRUM",
- "target": {"name": "HD 10700", "ra_hours": 1.734467, "dec_deg": -15.937478,
-            "pm_ra": -1729.7, "pm_dec": 855.3, "epoch": 2000.0, "parallax": 273.8},
- "instrument_configs": [{"exptime": 300, "count": 3, "iodine": true,
-                         "target_counts": 2e6}]}
+{"id": "HD10700-spec", "type": "SPECTRUM", "instrument_type": "spectrograph",
+ "target": {"type": "ICRS", "name": "HD 10700", "ra": 26.017005, "dec": -15.937478,
+            "proper_motion_ra": -1729.7, "proper_motion_dec": 855.3, "epoch": 2000.0,
+            "parallax": 273.8},
+ "instrument_configs": [{"exposure_time": 300, "exposure_count": 3,
+                         "extra_params": {"iodine": true, "target_counts": 2e6}}]}
 ```
 
-* Its instrument is `spectrograph` (the default for `SPECTRUM`), and the
-  telescopes that may feed it are the request's `telescopes` (or every
-  telescope whose limits list the `spectrograph` instrument).
-* It is always guided. Its instrument configs are light, with no `filter`
-  or `port`; `iodine` (true/false; absent: the spectrograph service's
-  default) and `target_counts` (exposure-meter termination, `exptime` then
-  being the maximum) are only allowed here.
-* The target's `pm_ra` (mu_alpha cos(dec)) and `pm_dec` (mas/yr), `epoch`
-  (Julian year, default 2000), `parallax` (mas) and `rv` (km/s) are
-  optional. The scheduler ignores them; the barycentric correction uses
-  the proper motion.
+(The OCS request language, `docs/request_language.md`; `ra` and `dec` in
+degrees.)
+
+* Its `instrument_type` is `spectrograph` (the default for `SPECTRUM`), and
+  the telescopes that may feed it are the request's (`location.telescope`,
+  or several in `extra_params.telescopes`), or every telescope whose limits
+  list the `spectrograph` instrument.
+* It is always guided (`guiding_config.mode` `ON`; `OFF` is refused). Its
+  instrument configs are light, with no `filter` or `port`; robofast's
+  `extra_params.iodine` (true/false; absent: the spectrograph service's
+  default) and `extra_params.target_counts` (exposure-meter termination,
+  `exposure_time` then being the maximum) are only allowed here.
+* The target's `proper_motion_ra` (mu_alpha cos(dec)) and
+  `proper_motion_dec` (mas/yr), `epoch` (Julian year, default 2000),
+  `parallax` (mas) and `extra_params.radial_velocity` (km/s) are optional.
+  The scheduler ignores them; the barycentric correction uses the proper
+  motion.
 * `from_legacy_csv` makes `SPECTRUM` configurations, and
   `sites/minerva/requests.example.json` uses them.
 

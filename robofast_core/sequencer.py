@@ -1693,7 +1693,12 @@ class Sequencer:
                     raise Unsupported(f"{unit.name} has no guider ({obs.name} asks to guide)")
                 if obs.kind == "spectrum":
                     await self._locate_fiber(state, unit)
-                await unit.guider.start(dec=dec)
+                acq = (obs.spectrum or {}).get("acquisition") or {}
+                await unit.guider.start(
+                    dec=dec,
+                    target_radec=[ra * 15.0, dec],
+                    unambiguous=bool(acq.get("unambiguous", False)),
+                )
                 self._event("guiding", gen=gen, telescope=unit.name, target=obs.name)
         if obs.kind == "autofocus":
             await self._autofocus(state, unit, tel, cam, obs, taken)

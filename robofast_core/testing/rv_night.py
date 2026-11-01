@@ -130,6 +130,10 @@ class NightSettings:
     console_port: int | None = 0
     #: Bound on the whole night (real seconds), as a safety net.
     timeout: float = 600.0
+    #: Opt-in: the imagers see the real sky (docs/sky.md) from this Gaia
+    #: tile cache (offline: fields it lacks render empty) instead of a
+    #: random star field.
+    sky_catalog: str | None = None
 
 
 def _recording_telescope(name: str, events: list[tuple[float, str, str]]) -> Any:
@@ -354,13 +358,38 @@ class SimulatedNight:
         for i, name in enumerate(NAMES):
             mount = _recording_telescope(name, self.outcome.mount_events)
             foc = SimFocuser(position=round(TRUE_FOCUS + 250 * (1 if i == 0 else -1)))
-            cam = StarfieldCamera(foc, _scene(31 + i))
+            scene = _scene(31 + i) if self.s.sky_catalog is None else self._sky_scene(mount, i)
+            cam = StarfieldCamera(foc, scene)
             cam.clock = self.clock
             self.telescopes[name] = Telescope(name, mount, cam, foc)
             devices[f"telescope/{i}"] = mount
             devices[f"camera/{i}"] = cam
         self.alpaca = FakeAlpacaServer(devices, hang_limit=10).start()
         self._stack.callback(self.alpaca.stop)
+
+    def _sky_scene(self, mount: Any, i: int) -> FocusScene:
+        """The real sky through ``mount`` (opt-in, ``sky_catalog``)."""
+        from robofast_core.catalog import catalog_at
+        from robofast_core.photometry import PortPhotometry
+        from robofast_core.testing.skysim import SkyCamera, SkyFocusScene, SkyScene
+
+        assert self.s.sky_catalog is not None
+        # Offline: fill the cache first (scripts/build_catalog.py); a field it
+        # does not cover renders empty (a fetch would stall the camera).
+        catalog = catalog_at(self.s.sky_catalog)
+        det = Detector(shape=(512, 512))
+        camera = SkyCamera(
+            (512, 512), PIXEL_SCALE, detector=det, pixel_size=PIXEL_SIZE, f_ratio=F_RATIO
+        )
+        sky = SkyScene(
+            catalog,
+            camera,
+            PortPhotometry(band="V", efficiency={"all": 0.4}),
+            site=(MINERVA.latitude, MINERVA.longitude),
+            seeing=2.0,
+            seed=31 + i,
+        )
+        return SkyFocusScene(sky, mount, self.clock, true_focus=TRUE_FOCUS, effective_exposure=1.0)
 
     async def _start_spectrograph(self) -> None:
         self.kiwi_sim = await KiwiSpecSim(
@@ -634,29 +663,33 @@ class SimulatedNight:
             [(1.0, 20), (2.0, 30), (3.5, 15), (5.0, 35), (6.5, 25), (8.0, 10)]
         ):
             gid = f"RV{i + 1}"
-            ic: dict[str, Any] = {"exptime": self.s.rv_exptime, "count": 1, "iodine": True}
+            extra: dict[str, Any] = {"iodine": True}
             if i == 2:
-                ic["target_counts"] = self.s.expmeter_rate * self.s.rv_exptime * 0.6
+                extra["target_counts"] = self.s.expmeter_rate * self.s.rv_exptime * 0.6
+            ic = {"exposure_time": self.s.rv_exptime, "exposure_count": 1, "extra_params": extra}
             groups.append(
                 {
                     "id": gid,
                     "name": f"RV standard {i + 1}",
                     "proposal": "rv-demo",
-                    "priority": 5 - 0.5 * i,
+                    "ipp_value": 5 - 0.5 * i,
                     "requests": [
                         {
                             "id": f"{gid}-r",
-                            "telescopes": list(NAMES),
+                            # Fiber feeds: every telescope may take part.
+                            "extra_params": {"telescopes": list(NAMES)},
                             "configurations": [
                                 {
                                     "id": f"{gid}-spec",
                                     "type": "SPECTRUM",
+                                    "instrument_type": "spectrograph",
                                     "target": {
+                                        "type": "ICRS",
                                         "name": f"RV{i + 1}",
-                                        "ra_hours": (lst0 + dh) % 24.0,
-                                        "dec_deg": float(dec),
-                                        "pm_ra": 100.0 * (i + 1),
-                                        "pm_dec": -50.0 * (i + 1),
+                                        "ra": (lst0 + dh) % 24.0 * 15.0,
+                                        "dec": float(dec),
+                                        "proper_motion_ra": 100.0 * (i + 1),
+                                        "proper_motion_dec": -50.0 * (i + 1),
                                         "epoch": 2000.0,
                                     },
                                     "instrument_configs": [ic],
@@ -672,24 +705,26 @@ class SimulatedNight:
                 "id": "FIELD",
                 "name": "Imaging field",
                 "proposal": "imaging-demo",
-                "priority": 20,
+                "ipp_value": 20,
                 "requests": [
                     {
                         "id": "FIELD-r",
-                        "telescopes": ["t1"],
+                        "location": {"telescope": "t1"},
                         "windows": [
                             {"start": w0.isoformat(), "end": (w0 + timedelta(hours=2)).isoformat()}
                         ],
                         "configurations": [
                             {
                                 "id": "FIELD-img",
-                                "instrument": "imager",
+                                "type": "EXPOSE",
+                                "instrument_type": "imager",
                                 "target": {
+                                    "type": "ICRS",
                                     "name": "FIELD",
-                                    "ra_hours": (lst0 + 4.5) % 24.0,
-                                    "dec_deg": 25.0,
+                                    "ra": (lst0 + 4.5) % 24.0 * 15.0,
+                                    "dec": 25.0,
                                 },
-                                "instrument_configs": [{"exptime": 0.3, "count": 2}],
+                                "instrument_configs": [{"exposure_time": 0.3, "exposure_count": 2}],
                             }
                         ],
                     }
@@ -705,26 +740,35 @@ class SimulatedNight:
             "id": "TOO1",
             "name": "Target of opportunity",
             "proposal": "too-demo",
-            "priority": 10,
-            "too": {
-                "deadline": (now + timedelta(hours=3)).isoformat(),
-                "policy": "next",
-                "priority_class": 1,
+            "ipp_value": 10,
+            # TIME_CRITICAL: ranks above every normal request, interrupts
+            # nothing (policy "next").
+            "observation_type": "TIME_CRITICAL",
+            "extra_params": {
+                "too": {
+                    "deadline": (now + timedelta(hours=3)).isoformat(),
+                    "policy": "next",
+                    "priority_class": 1,
+                }
             },
             "requests": [
                 {
                     "id": "TOO1-r",
-                    "telescopes": list(NAMES),
+                    "extra_params": {"telescopes": list(NAMES)},
                     "configurations": [
                         {
                             "id": "TOO1-spec",
                             "type": "SPECTRUM",
+                            "instrument_type": "spectrograph",
                             "target": {
+                                "type": "ICRS",
                                 "name": "TOO1",
-                                "ra_hours": (lst + 0.5) % 24.0,
-                                "dec_deg": 28.0,
+                                "ra": (lst + 0.5) % 24.0 * 15.0,
+                                "dec": 28.0,
                             },
-                            "instrument_configs": [{"exptime": self.s.rv_exptime, "count": 1}],
+                            "instrument_configs": [
+                                {"exposure_time": self.s.rv_exptime, "exposure_count": 1}
+                            ],
                         }
                     ],
                 }
@@ -1183,7 +1227,17 @@ def console_park_problems(o: Outcome) -> list[str]:
     for t, c in o.dome_log:
         if t0 <= t <= t1 + 1.0 and c.startswith(("OPEN", "CLOSE")):
             bad.append(f"the roof moved ({c}) while the console parked t2")
-    if any(e[1] == "t1" and e[2] == "park" and t0 <= e[0] <= t1 + 1.0 for e in o.mount_events):
+    # (Unless the generation ended meanwhile -- every telescope idle, or a
+    # revocation: then its cleanup parks t1 too, as it should.)
+    ended = [
+        e
+        for what in ("idle_release", "cancel_requested")
+        for e in tl.events(what, SEQUENCER)
+        if t0 <= e.t <= t1 + 1.0
+    ]
+    if not ended and any(
+        e[1] == "t1" and e[2] == "park" and t0 <= e[0] <= t1 + 1.0 for e in o.mount_events
+    ):
         bad.append("t1 parked when the console parked t2")
     if not any(e[1] == "t2" and e[2] == "park" and t0 <= e[0] <= t1 + 0.5 for e in o.mount_events):
         bad.append("t2's mount never parked for the console")
@@ -1290,6 +1344,9 @@ def main(argv: list[str] | None = None) -> int:
         help="loopback port for the observer console during the night (0: any; -1: none)",
     )
     ap.add_argument("--log-level", default="WARNING")
+    ap.add_argument(
+        "--sky", metavar="CACHE_DIR", help="imagers see the real sky from this Gaia tile cache"
+    )
     args = ap.parse_args(argv)
     logging.basicConfig(
         level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -1298,7 +1355,8 @@ def main(argv: list[str] | None = None) -> int:
         h.setLevel(args.log_level)
     out = Path(args.out)
     port = None if args.console_port < 0 else args.console_port
-    outcome = asyncio.run(simulate(out, NightSettings(scale=args.scale, console_port=port)))
+    settings = NightSettings(scale=args.scale, console_port=port, sky_catalog=args.sky)
+    outcome = asyncio.run(simulate(out, settings))
     print(summary(outcome))
     problems = check(outcome)
     for p in problems:

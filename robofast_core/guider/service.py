@@ -25,8 +25,12 @@ calibrated) or 503 (a device failed).
   centroid and FWHM, the guide window, the state. For people to look at
   (the observer console); 404 before the first frame.
 * ``POST /start`` ``{"target"?: [x, y], "mode"?: "closed"|"open",
-  "exposure"?: s, "dec"?: deg}`` -- acquire and guide; 409 if running.
-  ``dec`` is the target's declination (pulse-guide east lengths).
+  "exposure"?: s, "dec"?: deg, "target_radec"?: [ra, dec], "unambiguous"?:
+  bool}`` -- acquire and guide; 409 if running. ``dec`` is the target's
+  declination (pulse-guide east lengths). ``target_radec`` (deg) lets
+  ``select: "catalog"`` find the target by plate solving the acquisition
+  frame (needs ``catalog`` and ``solver`` in the config; docs/sky.md);
+  ``unambiguous`` allows the brightest-star fallback when it cannot.
 * ``POST /stop`` ``{"reason"?}`` -- stop (bounded); always answers.
 * ``POST /mode`` ``{"mode"}``, ``POST /target`` ``{"x", "y"}`` (moves the
   setpoint without resetting the controller), ``POST /gains`` ``{"kp",
@@ -160,6 +164,11 @@ class GuiderServiceConfig:
     #: Inline calibrations (``{"tiptilt": {...}, "mount": {...}}``), used
     #: when the calibration directory has none.
     calibrations: dict[str, Any] = field(default_factory=dict)
+    #: For ``guide.select: "catalog"`` (docs/sky.md): the star catalog
+    #: (:func:`robofast_core.catalog.catalog_from_config`) and the plate
+    #: solver's settings for this camera (:class:`robofast_core.astrometry.SolverConfig`).
+    catalog: dict[str, Any] | None = None
+    solver: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> GuiderServiceConfig:
@@ -418,6 +427,14 @@ class GuiderService:
             publisher=publisher,
         )
         self._load_calibrations()
+        self._catalog: Any = None
+        self._solver: Any = None
+        if config.solver is not None:
+            from robofast_core.astrometry import SolverConfig
+            from robofast_core.catalog import catalog_from_config
+
+            self._solver = SolverConfig.from_dict(config.solver)
+            self._catalog = catalog_from_config(config.catalog)
         host, _, port = config.listen.rpartition(":")
         self.host, self.port = host, int(port)
         self._server: asyncio.Server | None = None
@@ -594,6 +611,7 @@ class GuiderService:
                     g.config.exposure = _positive(args["exposure"], 60.0)
                 if "dec" in args and g.mount is not None:
                     g.mount.dec_deg = float(args["dec"])
+                self._set_identifier(args)
                 try:
                     g.start()
                 except GuiderError as exc:
@@ -639,6 +657,20 @@ class GuiderService:
             return 503, {"error": f"{type(exc).__name__}: {exc}"}
         except (ValueError, TypeError, KeyError) as exc:
             return 400, {"error": f"bad request: {exc!r}"}
+
+    def _set_identifier(self, args: dict[str, Any]) -> None:
+        """Catalog acquisition (``select: "catalog"``) for this start's
+        target: ``target_radec`` [ra, dec] deg and ``unambiguous`` (from
+        vetting: brightest-star fallback allowed)."""
+        g = self.guider
+        g.unambiguous = bool(args.get("unambiguous", False))
+        g.identify = None
+        radec = args.get("target_radec")
+        if radec is not None and self._solver is not None:
+            from robofast_core.guider.identify import catalog_identifier
+
+            ra, dec = (float(v) for v in radec)
+            g.identify = catalog_identifier(self._catalog, self._solver, ra, dec)
 
     def _refuse_if_busy(self) -> None:
         if self._busy is not None:

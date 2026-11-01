@@ -99,10 +99,16 @@ class GuideConfig:
     capture_radius: float = 8.0
     coarse_iterations: int = 6
     coarse_settle: float = 2.0
-    #: Acquisition picks the star nearest the target ("nearest") or the
-    #: brightest ("brightest"); a star farther than ``max_star_distance``
-    #: pixels is not taken.
+    #: Acquisition picks the star nearest the target ("nearest"), the
+    #: brightest ("brightest"), or the one at the target's catalog position
+    #: in a plate solve of the acquisition frame ("catalog":
+    #: :mod:`robofast_core.guider.identify`; with no solution, the brightest
+    #: only if the field is unambiguous, else none). A star farther than
+    #: ``max_star_distance`` pixels is not taken.
     select: str = "nearest"
+    #: "catalog": the detected star must be within this many pixels of the
+    #: predicted position.
+    identify_tolerance: float = 10.0
     max_star_distance: float = 400.0
     lost_frames: int = 10
     lost_flux_fraction: float = 0.2
@@ -132,8 +138,8 @@ class GuideConfig:
             c.acq_roi = tuple(int(v) for v in c.acq_roi)  # type: ignore[assignment]
         if c.mode not in ("closed", "open"):
             raise ValueError(f"mode {c.mode!r}: closed or open")
-        if c.select not in ("nearest", "brightest"):
-            raise ValueError(f"select {c.select!r}: nearest or brightest")
+        if c.select not in ("nearest", "brightest", "catalog"):
+            raise ValueError(f"select {c.select!r}: nearest, brightest or catalog")
         if not (0 < c.exposure <= 60 and 0 < c.acq_exposure <= 600):
             raise ValueError("exposure times out of range")
         if not 8 <= c.roi_size <= 4096:
@@ -232,6 +238,14 @@ class Guider:
         self._ref_flux: float | None = None
         self._roi: ROI | None = None
         self.on_state: Callable[[str, str], None] | None = None
+        #: For ``select: "catalog"``: the target's pixel from a plate solve
+        #: of a frame (:func:`~robofast_core.guider.identify.catalog_identifier`),
+        #: and whether brightest-star acquisition is safe without one.
+        self.identify: Callable[[Frame], tuple[float, float] | None] | None = None
+        self.unambiguous = False
+        #: Where the last acquisition frame put the target (None: unsolved).
+        self.identified: tuple[float, float] | None = None
+        self._why = ""
 
     # -- configuration --------------------------------------------------------------
 
@@ -417,10 +431,19 @@ class Guider:
             self.alarm("device_error", f"{type(exc).__name__}: {exc}")
             self._set_state("failed", f"{type(exc).__name__}: {exc}")
 
-    def _select(self, frame: Frame) -> Measurement | None:
+    def _select(self, frame: Frame, hint: tuple[float, float] | None = None) -> Measurement | None:
         c = self.config
         assert c.target is not None
         tx, ty = c.target
+        mode = c.select
+        if mode == "catalog":
+            if hint is not None:
+                mode = "hint"
+            elif self.unambiguous:
+                mode = "brightest"
+            else:
+                self._why = "target not identified (no plate solution; field ambiguous)"
+                return None
         cands = find_stars(frame.data, nsigma=5.0, max_stars=20)
         best: tuple[float, Measurement] | None = None
         near_hole = c.fiber_radius * 2 + 6
@@ -438,9 +461,18 @@ class Guider:
             d = math.hypot(m.x - tx, m.y - ty)
             if d > c.max_star_distance:
                 continue
-            key = d if c.select == "nearest" else -m.flux
+            if mode == "hint":
+                assert hint is not None
+                dh = math.hypot(m.x - hint[0], m.y - hint[1])
+                if dh > c.identify_tolerance:
+                    continue
+                key = dh
+            else:
+                key = d if mode == "nearest" else -m.flux
             if best is None or key < best[0]:
                 best = (key, m)
+        if best is None and mode == "hint":
+            self._why = "no star at the target's catalog position"
         return None if best is None else best[1]
 
     async def _acquire(self) -> Measurement | None:
@@ -453,9 +485,17 @@ class Guider:
             if self._stop.is_set():
                 return None
             frame = await self.camera.expose(c.acq_exposure, self._acq_roi(), c.gain)
-            m = self._select(frame)
+            hint = None
+            if c.select == "catalog" and self.identify is not None:
+                if isinstance(self.clock, RealClock):
+                    hint = await asyncio.to_thread(self.identify, frame)
+                else:  # simulated time: compute costs none (VirtualClock)
+                    hint = self.identify(frame)
+                self.identified = hint
+            self._why = "no star found"
+            m = self._select(frame, hint)
             if m is None:
-                self.reason = "no star found"
+                self.reason = self._why
                 await self.clock.sleep(0)
                 continue
             off = np.array(c.target) - np.array([m.x, m.y])

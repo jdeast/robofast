@@ -497,6 +497,62 @@ async def test_remote_stop_never_raises_and_start_fails_cleanly(tmp_path):
         await svc.stop()
 
 
+async def test_remote_stop_ends_a_poll_whose_cancel_was_lost():
+    """A cancel landing inside an httpx request can be lost (the request
+    returns normally). The status poll must still end, and stop() must
+    return (bounded) and pass on its own caller's cancellation: in the e2e
+    night a telescope hung for good in stop() after a spectrum, and once the
+    sequencer quarantined itself because the cancel of the generation was
+    swallowed there."""
+    remote = GuiderRemote(
+        "http://127.0.0.1:9", scope="t1", registry=ValueRegistry(), timeout=0.5, poll_interval=0.01
+    )
+    polls = lost = 0
+
+    async def status():
+        nonlocal polls, lost
+        polls += 1
+        try:
+            await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            if lost:
+                raise
+            lost += 1  # the first cancel is lost, as inside httpx
+        return {"state": "guiding", "telemetry": {}}
+
+    remote.status = status  # type: ignore[method-assign]
+    remote.started = True
+    remote._poll = asyncio.create_task(remote._poll_loop())
+    await asyncio.sleep(0.1)
+    poll = remote._poll
+    stopping = asyncio.create_task(remote.stop("done"))
+    done, _ = await asyncio.wait({stopping}, timeout=2)
+    assert done, "stop() hangs on a status poll whose cancel was lost"
+    done, _ = await asyncio.wait({poll}, timeout=1)
+    assert done, "the status poll outlives stop()"
+    n = polls
+    await asyncio.sleep(0.1)
+    assert polls == n, "the status poll goes on after stop()"
+
+    # stop()'s own caller is cancelled while it waits for that poll: the
+    # cancellation reaches the caller (stop() must not swallow it).
+    async def slow_status():
+        try:
+            await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.3)  # lost, and the request goes on a while
+        return {"state": "guiding", "telemetry": {}}
+
+    remote.status = slow_status  # type: ignore[method-assign]
+    remote._poll = asyncio.create_task(remote._poll_loop())
+    await asyncio.sleep(0.03)  # inside slow_status
+    caller = asyncio.create_task(remote.stop("done"))
+    await asyncio.sleep(0.05)  # stop() waits for the poll
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(caller, 2)
+
+
 def test_service_hardware_gate(tmp_path):
     for hw in (
         {"tiptilt": {"kind": "sxao", "port": "/dev/ttyUSB0"}},

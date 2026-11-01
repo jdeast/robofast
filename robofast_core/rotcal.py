@@ -110,6 +110,13 @@ class PACalibration:
         """The image PA (deg, [0, 360)) at a mechanical angle."""
         return float((self.offset + self.sense * float(mechanical or 0.0)) % 360.0)
 
+    def guider_pa(self, mechanical: float | None = 0.0) -> float:
+        """The PA in the guider's :func:`~robofast_core.guider.calibration.sky_matrix`
+        convention (with :attr:`parity`): a flipped field's PA is measured
+        the other way there."""
+        pa = self.pa(mechanical)
+        return (-pa) % 360.0 if self.flip else pa
+
     @property
     def parity(self) -> int:
         """The guider's convention (:func:`robofast_core.guider.calibration.sky_matrix`):
@@ -248,12 +255,12 @@ def seed_mount_matrix(cal: PACalibration, plate_scale: float | None = None) -> n
     from the PA calibration: moving the telescope east moves the stars
     west, so minus the inverse of the sky matrix
     (:func:`robofast_core.guider.calibration.sky_matrix`)."""
-    from robofast_core.guider.calibration import sky_matrix
+    from robofast_core.guider.calibration import fits_sky_matrix
 
     ps = plate_scale or cal.plate_scale
     if not ps:
         raise ValueError("seeding a mount matrix needs a plate scale")
-    return -np.linalg.inv(sky_matrix(ps, cal.pa(0.0), cal.parity))
+    return -np.linalg.inv(fits_sky_matrix(ps, cal.pa(0.0), cal.flip))
 
 
 @dataclass

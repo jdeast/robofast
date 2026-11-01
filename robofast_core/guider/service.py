@@ -409,7 +409,7 @@ class GuiderService:
             kw = {
                 "channel": r.get("channel", "tracking_data"),
                 "plate_scale": gcfg.plate_scale,
-                "pa": float(r.get("pa", self.pa_cal.pa(0.0) if self.pa_cal else 0.0)),
+                "pa": float(r.get("pa", self.pa_cal.guider_pa(0.0) if self.pa_cal else 0.0)),
             }
             publisher = (
                 TrackingPublisher(redis_client, **kw)
@@ -492,7 +492,7 @@ class GuiderService:
             seed_mount_matrix(cal, ps).tolist(),
             units="arcsec",
             plate_scale=ps,
-            pa=cal.pa(0.0),
+            pa=cal.guider_pa(0.0),
             parity=cal.parity,
             notes=f"seeded from the PA calibration measured {cal.measured}",
         )

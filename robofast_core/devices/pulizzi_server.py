@@ -674,14 +674,16 @@ def main(argv: list[str] | None = None) -> None:
     except (HardwareNotAllowed, PulizziError) as exc:
         log.error("%s", exc)
         sys.exit(2)
-    server.start()
-    where = "simulator" if server.sim is not None else config.port.device
-    print(json.dumps({"url": f"http://{server.address}", "port": where}), flush=True)
+    # The handlers first: a stop signal at any time from here on is a clean
+    # stop (lamps off), never a kill.
     stop = threading.Event()
     import signal
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
+    server.start()
+    where = "simulator" if server.sim is not None else config.port.device
+    print(json.dumps({"url": f"http://{server.address}", "port": where}), flush=True)
     stop.wait()
     server.stop()
 

@@ -278,7 +278,7 @@ def _loop(nu, *, pa_cal=30.0, flip=False, sigma=None):
         mount=m,
         mount_cal=Calibration("mount", "fau", world.mount_matrix.tolist()),
         clock=clock,
-    )  # noqa: E501
+    )
     g.acquirer = acquirer(s, ra2, dec2, pa=pa_cal, flip=flip, sigma=sigma)
     return g, world, clock
 

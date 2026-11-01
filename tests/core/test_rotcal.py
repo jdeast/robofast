@@ -95,7 +95,7 @@ def test_store_keeps_current_and_history(tmp_path):
 
 def test_mount_seed_matches_the_guider_simulator():
     cal = fit(measurements(101.3, 1, True, [0.0]), telescope="t2", port="fau")
-    world = SimWorld(plate_scale=0.2655, pa=cal.pa(0.0), parity=-1)
+    world = SimWorld(plate_scale=0.2655, pa=cal.guider_pa(0.0), parity=-1)
     assert np.allclose(seed_mount_matrix(cal, 0.2655), world.mount_matrix, atol=1e-3)
 
 
@@ -254,7 +254,7 @@ async def test_guider_seeds_its_mount_matrix_from_the_pa_calibration(tmp_path):
     svc = GuiderService(cfg)
     mc = svc.guider.mount_cal
     assert mc is not None and "PA calibration" in mc.notes
-    world = SimWorld(plate_scale=0.5, pa=cal.pa(0.0), parity=-1)
+    world = SimWorld(plate_scale=0.5, pa=cal.guider_pa(0.0), parity=-1)
     assert np.allclose(mc.m, world.mount_matrix, atol=1e-6)
 
 

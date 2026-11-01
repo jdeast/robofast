@@ -62,6 +62,14 @@ def sky_matrix(plate_scale: float, pa_deg: float, parity: int = 1) -> np.ndarray
     return plate_scale * rot @ np.diag([-float(parity), 1.0])
 
 
+def fits_sky_matrix(plate_scale: float, pa_deg: float, flip: bool) -> np.ndarray:
+    """:func:`sky_matrix` from a PA and parity in the FITS / plate-solve
+    convention (``robofast_core.fits_writer``, ``Solution.pa``/``flip``,
+    the PA calibration): there a flipped field's PA is measured the other
+    way, so it is the guider's ``sky_matrix(-pa, parity=-1)``."""
+    return sky_matrix(plate_scale, -pa_deg if flip else pa_deg, -1 if flip else 1)
+
+
 @dataclass
 class Calibration:
     device: str

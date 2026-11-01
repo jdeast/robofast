@@ -1394,6 +1394,18 @@ class DispatchScheduler:
                     **self._acquisition_entry(visit, c),
                 },
             )
+        if c.type == "ROTATOR_CALIBRATION":
+            return Observation(
+                f"{c.target.name} [{c.id}#{visit.ic}]",
+                ra_hours=c.target.ra_hours,
+                dec_deg=c.target.dec_deg,
+                exptime=ic.exptime,
+                count=1,
+                filter=ic.filter,
+                port=ic.port,
+                object=c.target.name,
+                kind="rotator_calibration",
+            )
         if c.type == "POINTING_MODEL":
             return Observation(
                 f"{c.target.name} [{c.id}#{visit.ic}]",

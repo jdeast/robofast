@@ -169,6 +169,11 @@ class GuiderServiceConfig:
     #: solver's settings for this camera (:class:`robofast_core.astrometry.SolverConfig`).
     catalog: dict[str, Any] | None = None
     solver: dict[str, Any] | None = None
+    #: The port's PA calibration (docs/rotcal.md): ``{"store": path,
+    #: "telescope": name}``. Without a measured mount calibration, the
+    #: mount's matrix is seeded from it (PA, parity, plate scale), and it
+    #: gives the Redis telemetry its PA.
+    pa_calibration: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> GuiderServiceConfig:
@@ -397,13 +402,14 @@ class GuiderService:
             calib.CalibrationStore(config.calibration_dir) if config.calibration_dir else None
         )
         gcfg = GuideConfig.from_dict({"scope": config.scope, **config.guide})
+        self.pa_cal = self._pa_calibration()
         publisher = None
         if redis_client is not None or config.redis:
             r = config.redis or {}
             kw = {
                 "channel": r.get("channel", "tracking_data"),
                 "plate_scale": gcfg.plate_scale,
-                "pa": float(r.get("pa", 0.0)),
+                "pa": float(r.get("pa", self.pa_cal.guider_pa(0.0) if self.pa_cal else 0.0)),
             }
             publisher = (
                 TrackingPublisher(redis_client, **kw)
@@ -451,11 +457,45 @@ class GuiderService:
                 cal = calib.Calibration.from_dict(
                     {"device": dev.name, "port": self.config.port, **self.config.calibrations[role]}
                 )
+            if cal is None and role == "mount" and self.pa_cal is not None:
+                cal = self._seed_mount(dev.name)
             if role == "tiptilt":
                 g.tt_cal = cal
             else:
                 g.mount_cal = cal
         self._rebuild_offloader()
+
+    def _pa_calibration(self) -> Any:
+        """The port's PA calibration, if configured and measured."""
+        pc = self.config.pa_calibration
+        if not pc:
+            return None
+        from robofast_core.rotcal import PAStore
+
+        try:
+            return PAStore(pc["store"]).get(pc["telescope"], self.config.port)
+        except (OSError, ValueError, KeyError) as exc:
+            log.error("PA calibration unreadable: %s", exc)
+            return None
+
+    def _seed_mount(self, device: str) -> calib.Calibration | None:
+        """A mount calibration from the PA calibration (docs/rotcal.md)."""
+        from robofast_core.rotcal import seed_mount_matrix
+
+        cal = self.pa_cal
+        ps = self.guider.config.plate_scale or cal.plate_scale
+        if not ps:
+            return None
+        return calib.Calibration(
+            device,
+            self.config.port,
+            seed_mount_matrix(cal, ps).tolist(),
+            units="arcsec",
+            plate_scale=ps,
+            pa=cal.guider_pa(0.0),
+            parity=cal.parity,
+            notes=f"seeded from the PA calibration measured {cal.measured}",
+        )
 
     def _rebuild_offloader(self) -> None:
         g = self.guider

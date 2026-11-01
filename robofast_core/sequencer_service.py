@@ -47,6 +47,11 @@ and optionally:
   lamp's warm-up and calibration-stage position; docs/pulizzi.md), for
   ``ARC`` and ``LAMP_FLAT`` (``kind="arc"``/``"lamp_flat"``). Every cleanup
   switches the lamps off.
+* per telescope, ``adc``: the atmospheric dispersion corrector's tracking
+  switch (robofast's ADC server's Alpaca Switch, ``docs/adc.md``): tracking
+  on and settled before light frames (a warning, not a failure, if it does
+  not settle), off (prisms neutral) at every cleanup; its state goes in
+  the FITS headers.
 * per telescope, ``focuser`` and ``rotator`` (Alpaca devices, read for
   the FITS headers). With an ``autofocus`` entry
   (:class:`~robofast_core.autofocus.AutofocusSetup`; ``docs/autofocus.md``)
@@ -185,6 +190,7 @@ TELESCOPE_KEYS = {
     "recovery",
     "sky_flats",
     "lamps",
+    "adc",
 }
 
 
@@ -209,20 +215,28 @@ def build_units(
         if unknown:
             raise ValueError(f"telescope {name!r}: unknown keys {sorted(unknown)}")
         owners: dict[str, Any] = {}
-        for kind in ("telescope", "camera", "filterwheel", "calstage", "focuser", "rotator"):
+        for kind in (
+            "telescope",
+            "camera",
+            "filterwheel",
+            "calstage",
+            "focuser",
+            "rotator",
+            "adc",
+        ):
             if kind not in entry:
                 continue
             address, number = device_address(entry[kind])
             owners[kind] = alpaca_owner(
                 f"{name}.{kind}",
-                "filterwheel" if kind == "calstage" else kind,
+                {"calstage": "filterwheel", "adc": "switch"}.get(kind, kind),
                 address,
                 timeline,
                 number=number,
                 default_timeout=command_timeout,
                 imagebytes=imagebytes,
             )
-            if kind in ("focuser", "rotator") and aux is not None:
+            if kind in ("focuser", "rotator", "adc") and aux is not None:
                 aux.setdefault(kind, {})[name] = owners[kind]
         port_action = entry.get("port_action")
         if port_action is not None and (not isinstance(port_action, str) or not port_action):
@@ -291,6 +305,7 @@ def build_units(
                 owners["camera"],
                 filterwheel=owners.get("filterwheel"),
                 calstage=owners.get("calstage"),
+                adc=owners.get("adc"),
                 lamps=lamps_owner,
                 lamp_setup=lamp_setup,
                 port_action=port_action,
@@ -395,6 +410,7 @@ def build(
         weather=weather,
         focusers=aux.get("focuser"),
         rotators=aux.get("rotator"),
+        adcs=aux.get("adc"),
         base=base,
     )
     if imaging is not None:
@@ -612,7 +628,14 @@ async def run(
             write_snapshot(seq, Path(status_file), status_interval)  # the final state
         await remote.aclose()
         for unit in seq.units.values():
-            for owner in (unit.telescope, unit.camera, unit.filterwheel, unit.calstage, unit.lamps):
+            for owner in (
+                unit.telescope,
+                unit.camera,
+                unit.filterwheel,
+                unit.calstage,
+                unit.lamps,
+                unit.adc,
+            ):
                 if owner is not None:
                     owner.close()
 

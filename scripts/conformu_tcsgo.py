@@ -30,11 +30,15 @@ SETTINGS = {
     "focuser": ROOT / "scripts" / "conformu-focuser.settings.json",
     "dome": ROOT / "scripts" / "conformu-dome.settings.json",
     "filterwheel": ROOT / "scripts" / "conformu-filterwheel.settings.json",
+    "rotator": ROOT / "scripts" / "conformu-rotator.settings.json",
+    "switch": ROOT / "scripts" / "conformu-switch.settings.json",
 }
 
 
-def run_check(conformu: str, device: str, check: str, url: str, out: Path) -> dict:
-    tag = f"{device}-{check}"
+def run_check(
+    conformu: str, device: str, check: str, url: str, out: Path, tag: str | None = None
+) -> dict:
+    tag = f"{tag or device}-{check}"
     settings = out / f"{tag}.settings.json"
     shutil.copy(SETTINGS[device], settings)  # ConformU rewrites its settings file
     results = out / f"{tag}.results.json"

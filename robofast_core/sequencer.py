@@ -308,6 +308,8 @@ __all__ = [
 log = logging.getLogger(__name__)
 
 CAMERA_IDLE = 0  # ASCOM CameraState.cameraIdle
+#: The ADC server's switch ids (robofast_core.devices.adc_server, docs/adc.md).
+ADC_TRACKING, ADC_SETTLED = 0, 1
 
 #: A pointing run's settings (docs/pointing_model.md): the telescope's
 #: ``pointing.run`` entry and an observation's ``pointing`` override them.
@@ -553,6 +555,10 @@ class TelescopeUnit:
     recovery: RecoveryLadder | None = None
     #: Twilight sky flats (docs/skyflats.md): ``kind="sky_flat"``.
     flats: FlatConfig | None = None
+    #: The atmospheric dispersion corrector's tracking switch (an Alpaca
+    #: Switch, robofast's ADC server: docs/adc.md); optional. Tracking on
+    #: once on target for light frames, off (prisms neutral) at cleanup.
+    adc: DeviceOwner | None = None
     #: How the guider identified the last target (docs/acquisition.md).
     acquisition: dict[str, Any] | None = field(default=None, init=False)
 
@@ -592,6 +598,9 @@ class SequencerConfig:
     port_timeout: float = 60.0
     #: Bound on a calibration-stage move (the legacy TRES window waits 60 s).
     calstage_timeout: float = 60.0
+    #: How long to wait for the ADC to settle on a new target (docs/adc.md);
+    #: past it the frames are taken anyway, with a warning.
+    adc_settle_timeout: float = 60.0
     #: Spectra (module doc, "Spectra"): how long the leading telescope waits
     #: for the rest of the feed to be guiding before it starts with those
     #: that are; how often each feeding telescope checks its guider and its
@@ -1890,6 +1899,8 @@ class Sequencer:
             await tel.call("SlewToCoordinatesAsync", cra, cdec)
             await self._wait_for(lambda: tel.get("Slewing"), lambda s: not s, cfg.slew_timeout)
             self._event("on_target", gen=gen, telescope=unit.name, ra=ra, dec=dec)
+            if unit.adc is not None:
+                await self._adc_track(state, unit)
             if obs.guide:
                 # Stopped in _observe_preemptible's finally and in cleanup.
                 if unit.guider is None:
@@ -2117,6 +2128,56 @@ class Sequencer:
             return False
         self._event("lamp_off", gen=gen, telescope=telescope, lamp=name, why="frames over")
         return True
+
+    # -- the ADC (docs/adc.md) ------------------------------------------------------
+
+    async def _adc_track(self, state: _Generation, unit: TelescopeUnit) -> None:
+        """ADC tracking on (it re-reads the telescope), then wait, bounded,
+        for it to report ``Settled``. A failure or a timeout is a warning
+        and the frames go ahead: the ADC sharpens the spectrum, it does not
+        make it possible."""
+        assert unit.adc is not None
+        cfg = self.config
+        grant = unit.adc.grant(f"{self.name}/adc#{state.gen}")
+        t0 = time.monotonic()
+        try:
+            await grant.call("SetSwitch", ADC_TRACKING, True)
+            await self._wait_for(
+                lambda: grant.call("GetSwitch", ADC_SETTLED), bool, cfg.adc_settle_timeout
+            )
+        except (DeviceError, TimeoutError) as exc:
+            why = "not settled in time" if isinstance(exc, TimeoutError) else repr(exc)
+            self._event(
+                "adc_not_settled",
+                gen=state.gen,
+                telescope=unit.name,
+                error=why,
+                level="warning",
+            )
+            log.warning("%s: %s: ADC %s", self.name, unit.name, why)
+            return
+        finally:
+            grant.revoke("adc settled")
+        self._event(
+            "adc_settled",
+            gen=state.gen,
+            telescope=unit.name,
+            seconds=round(time.monotonic() - t0, 1),
+        )
+
+    async def _cleanup_adc(self, name: str, report: CleanupReport) -> None:
+        """ADC tracking off: the server turns the prisms to neutral. Bounded;
+        an error is reported, not raised."""
+        unit = self.units.get(name)
+        if unit is None or unit.adc is None:
+            return
+        grant = unit.adc.grant(f"{self.name}/cleanup-adc#{report.generation}")
+        try:
+            await grant.call("SetSwitch", ADC_TRACKING, False)
+        except DeviceError as exc:
+            report.errors.append(f"{name}: ADC tracking off: {exc!r}")
+        finally:
+            grant.revoke("cleanup done")
 
     async def _cleanup_lamps(self, name: str, report: CleanupReport) -> None:
         """Every lamp of telescope ``name`` off (the switch's ``LampsOff``),
@@ -3609,6 +3670,7 @@ class Sequencer:
             self._stop_guider(name, report),
             self._abort_slew(name, tel, report),
             self._cleanup_lamps(name, report),
+            self._cleanup_adc(name, report),
         )
         if spectrograph is not None and not spectrograph.done():
             await asyncio.wait({spectrograph}, timeout=self.config.spectrograph_abort_wait)

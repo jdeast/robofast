@@ -320,6 +320,8 @@ class Aggregator:
         tels = {}
         for t in enc.telescopes:
             tels[t] = self._telescope_view(t, seq, values, holds.get(t), guider.get(t), alarm)
+            m = ((holds_doc or {}).get("manual") or {}).get(t)
+            tels[t]["manual"] = m if isinstance(m, dict) else None
         spectrograph = self._spectrograph_view(spec, spec_err, enc, alarm)
         return {
             "weather": weather,

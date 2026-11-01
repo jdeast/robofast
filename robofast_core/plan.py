@@ -64,6 +64,7 @@ KINDS = (
     "autofocus",
     "spectrum",
     "spectrograph_calibration",
+    "manual",
     "pointing_model",
     "rotator_calibration",
 )
@@ -140,6 +141,8 @@ class Observation:
     def __post_init__(self) -> None:
         if self.kind not in KINDS:
             raise ValueError(f"observation {self.name!r}: kind {self.kind!r} not in {KINDS}")
+        if self.kind == "manual" and not self.light:
+            raise ValueError(f"observation {self.name!r}: manual control needs the lease")
         if self.kind in ("autofocus", "pointing_model", "rotator_calibration") and not self.light:
             raise ValueError(f"observation {self.name!r}: a {self.kind} needs light")
         if self.pointing is not None and self.kind != "pointing_model":

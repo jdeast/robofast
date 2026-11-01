@@ -24,6 +24,8 @@ test = [
     "pytest>=8",
     "pytest-asyncio>=0.25",
     "pytest-timeout>=2.3",
+    # Parallel fast tier in CI (`-n auto`); optional locally.
+    "pytest-xdist>=3.6",
 ]
 
 [tool.pytest.ini_options]

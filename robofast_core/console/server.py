@@ -60,6 +60,7 @@ import httpx
 import numpy as np
 
 from robofast_core.api_auth import AuditLog, RateLimiter, TokenRecord, TokenStore
+from robofast_core.cancel import isolated
 from robofast_core.config import load_config
 from robofast_core.console.aggregate import Aggregator, ConsoleEnclosure, alarm_id
 from robofast_core.console.hold import MANUAL_OPS, SKY_OPS, read_done, read_holds, send_command
@@ -234,8 +235,10 @@ class SupervisorClient:
     async def call(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         if not self.allowed(method, path):
             raise NotAllowed(f"{method} /{path.strip('/')}")
-        r = await self.http.request(
-            method, f"{self.url}/{path.strip('/')}", json=body, timeout=self.timeout
+        r = await isolated(
+            self.http.request(
+                method, f"{self.url}/{path.strip('/')}", json=body, timeout=self.timeout
+            )
         )
         try:
             data = r.json()

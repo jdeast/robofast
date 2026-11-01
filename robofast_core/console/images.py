@@ -36,6 +36,7 @@ from typing import Any
 import httpx
 import numpy as np
 
+from robofast_core.cancel import isolated
 from robofast_core.console.aggregate import ConsoleEnclosure
 from robofast_core.frameview import decode_array, scale_limits
 
@@ -274,7 +275,7 @@ class ImageSources:
     async def _guider(self, enc: ConsoleEnclosure, tel: str) -> ViewFrame:
         url = f"{enc.guiders[tel]}/frame?max={self.guider_frame_max}"
         try:
-            r = await self.http.get(url, timeout=self.timeout)
+            r = await isolated(self.http.get(url, timeout=self.timeout))
         except httpx.HTTPError as exc:
             raise NoFrame(f"{tel} guider unreachable: {type(exc).__name__}") from exc
         if r.status_code != 200:

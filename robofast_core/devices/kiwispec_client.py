@@ -41,6 +41,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from robofast_core.cancel import stop_task
+
 log = logging.getLogger(__name__)
 
 #: Legacy defaults (``config/spectrograph.ini``: SERVER_PORT, CAMERA_PORT).
@@ -656,10 +658,8 @@ class SICameraClient:
 
     async def close(self) -> None:
         task, self._task = self._task, None
-        if task is not None:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
+        # Bounded, passing our own cancellation on (robofast_core.cancel).
+        await stop_task(task, self.connect_timeout)
         writer, self._writer = self._writer, None
         if writer is not None:
             writer.close()

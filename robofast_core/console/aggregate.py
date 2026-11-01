@@ -36,6 +36,7 @@ from typing import Any
 
 import httpx
 
+from robofast_core.cancel import isolated
 from robofast_core.config import device_address, load_config, telescopes
 from robofast_core.console.hold import read_holds
 
@@ -248,7 +249,7 @@ class Aggregator:
 
     async def _get(self, url: str) -> Any:
         """GET ``url`` as JSON; raises on any failure."""
-        r = await self.http.get(url, timeout=self.timeout)
+        r = await isolated(self.http.get(url, timeout=self.timeout))
         r.raise_for_status()
         return r.json()
 

@@ -54,6 +54,7 @@ from typing import Any
 import httpx
 
 from robofast_core import imagebytes
+from robofast_core.cancel import isolated
 from robofast_core.owner import DeviceError, DeviceTimeout
 
 #: One ClientID per process, as the spec suggests (a random 1..65535).
@@ -258,9 +259,9 @@ class AlpacaDevice:
         what = f"{self.label} {verb} {member}"
         try:
             if verb == "GET":
-                r = await self._http.get(member.lower(), params=args, timeout=timeout)
+                r = await isolated(self._http.get(member.lower(), params=args, timeout=timeout))
             else:
-                r = await self._http.put(member.lower(), data=args, timeout=timeout)
+                r = await isolated(self._http.put(member.lower(), data=args, timeout=timeout))
         except httpx.TimeoutException as exc:
             raise DeviceTimeout(f"{what}: no answer within {timeout} s") from exc
         except httpx.TransportError as exc:
@@ -298,12 +299,16 @@ class AlpacaDevice:
         args = {"ClientID": CLIENT_ID, "ClientTransactionID": self._next_ctid()}
         accept = f"{imagebytes.MEDIA_TYPE}, application/json" if want_bytes else "application/json"
         what = f"{self.label} GET ImageArray"
-        try:
+
+        async def fetch() -> tuple[httpx.Response, str, bytearray | bytes]:
             async with self._http.stream(
                 "GET", "imagearray", params=args, headers={"Accept": accept}, timeout=timeout
             ) as r:
                 ctype = r.headers.get("content-type", "").split(";")[0].strip().lower()
-                body = await _read_body(r)
+                return r, ctype, await _read_body(r)
+
+        try:
+            r, ctype, body = await isolated(fetch())
         except httpx.TimeoutException as exc:
             raise DeviceTimeout(f"{what}: no complete answer within {timeout} s") from exc
         except httpx.TransportError as exc:

@@ -692,6 +692,17 @@ broker outage costs only ToOs, never the night.
   always, the sequencer on failure, except for "needs an operator"
   (quarantine, give-up). A crash-looping sequencer stops being restarted and
   the supervisor's orphan alarm takes over.
+- Cancellation is never lost and a stop never hangs
+  (`robofast_core/cancel.py`). A `task.cancel()` landing inside an httpx
+  request can be lost (httpx 0.28 / anyio 4: the request returns normally),
+  so every httpx request runs through `isolated()`, in a task of its own,
+  and the caller's cancel always arrives. Each loop stopped by a cancel also
+  ends on a stop flag (or on no longer being the current task), and its
+  stopper waits for it with a bound (`stop_task()`), passing its own
+  cancellation on: never `suppress(BaseException)` around an unbounded
+  `await task`. The supervisor's final close goes out even if it is
+  cancelled again while stopping, and its heartbeat never pings after it
+  has stopped.
 - Long-running processes keep bounded in-memory state: the timeline is a
   ring buffer (`timeline_size`), and so is the alarm list.
 - No message bus (pyobs's XMPP and Rockit's Pyro were both costs in the

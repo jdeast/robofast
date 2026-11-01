@@ -9,7 +9,7 @@ that was not renewed, or no lease at all -- means "close". The supervisor
 never asks anyone before closing; it revokes the lease (which tells the
 sequencer to stop and clean up) and closes in the same step.
 
-Its loops run under one ``TaskGroup``:
+Its loops run as tasks of :meth:`SafetySupervisor.run`:
 
 * the weather loop reads the SafetyMonitor (and, if configured, the
   ObservingConditions ``TimeSinceLastUpdate``) every ``poll_interval``;
@@ -105,6 +105,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from robofast_core.cancel import stop_tasks
 from robofast_core.owner import DeviceError, DeviceOwner, Grant
 from robofast_core.timeline import Timeline
 
@@ -376,6 +377,10 @@ class SafetySupervisor:
         self._close_committed = False
         self._enforced_at: float | None = None
         self._pinged_at: float | None = None
+        #: Set as :meth:`run` stops: the loops end on it even if their cancel
+        #: was lost inside an httpx request (:mod:`robofast_core.cancel`), and
+        #: nothing may open or stay open from then on.
+        self._stopping = False
         self.shutter: int | None = None
         self.alarms: deque[str] = deque(maxlen=100)
 
@@ -399,7 +404,8 @@ class SafetySupervisor:
         grace counts then)?"""
         now = time.monotonic() if now is None else now
         return (
-            self.attended(now, keep=keep)
+            not self._stopping
+            and self.attended(now, keep=keep)
             and self._safe
             and self._fault is None
             and (self._shutter_hold_until is None or now >= self._shutter_hold_until)
@@ -725,9 +731,11 @@ class SafetySupervisor:
         return True, "safe", True
 
     async def _weather_loop(self) -> None:
-        while True:
+        while not self._stopping:
             try:
                 safe, reason, ok = await self._read_weather()
+                if self._stopping:
+                    return
                 if ok:
                     self._last_good_read = time.monotonic()
                 self._set_safety(safe, reason)
@@ -1068,7 +1076,7 @@ class SafetySupervisor:
         self._wake.set()
 
     async def _enclosure_loop(self) -> None:
-        while True:
+        while not self._stopping:
             self._wake.clear()
             try:
                 await self._enforce_once()
@@ -1093,7 +1101,9 @@ class SafetySupervisor:
         """
         cfg = self.config
         assert self._hb is not None and cfg.heartbeat_interval is not None
-        while True:
+        # No ping once run() stops, even if this task's cancel was lost: the
+        # pings would keep the hardware from closing by itself.
+        while not self._stopping:
             enforced = self._enforced_at
             age = None if enforced is None else time.monotonic() - enforced
             if age is not None and age <= cfg.heartbeat_max_loop_age:
@@ -1109,22 +1119,47 @@ class SafetySupervisor:
             await asyncio.sleep(cfg.heartbeat_interval)
 
     async def run(self) -> None:
-        """Run until cancelled. On the way out, try (bounded) to close."""
+        """Run until cancelled. On the way out, try (bounded) to close.
+
+        Stopping never hangs: the loops end on ``_stopping`` even if their
+        cancel is lost (:mod:`robofast_core.cancel`), the wait for them is
+        bounded, and the final close goes out either way, even if this task
+        is cancelled again meanwhile (that cancellation is passed on after).
+        A loop that ends by itself (it should not) stops the supervisor too,
+        closing.
+        """
         self.timeline.event(self.name, "supervisor_start", config=vars(self.config))
+        self._stopping = False
+        loops = [
+            asyncio.create_task(self._weather_loop(), name=f"{self.name}-weather"),
+            asyncio.create_task(self._enclosure_loop(), name=f"{self.name}-enclosure"),
+        ]
+        if self._hb is not None:
+            loops.append(asyncio.create_task(self._heartbeat_loop(), name=f"{self.name}-heartbeat"))
         try:
-            async with asyncio.TaskGroup() as tg:
-                tg.create_task(self._weather_loop(), name=f"{self.name}-weather")
-                tg.create_task(self._enclosure_loop(), name=f"{self.name}-enclosure")
-                if self._hb is not None:
-                    tg.create_task(self._heartbeat_loop(), name=f"{self.name}-heartbeat")
+            done, _ = await asyncio.wait(loops, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                t.result()
+            raise RuntimeError(f"{self.name}: a supervisor loop ended by itself")
         finally:
+            self._stopping = True
             self._safe = False
             self._revoke_lease("supervisor stopping")
+            again: asyncio.CancelledError | None = None
+            try:
+                await stop_tasks(loops, self.config.dome_timeout)
+            except asyncio.CancelledError as exc:  # cancelled again: close anyway
+                again = exc
             try:
                 await asyncio.wait_for(
                     self._dome.call("CloseShutter", timeout=self.config.dome_timeout),
                     self.config.dome_timeout + 1,
                 )
-            except BaseException as exc:
+            except asyncio.CancelledError as exc:
+                log.error("final CloseShutter cancelled")
+                again = exc
+            except Exception as exc:
                 log.error("final CloseShutter failed: %r", exc)
             self.timeline.event(self.name, "supervisor_stop")
+            if again is not None:
+                raise again

@@ -21,6 +21,7 @@ from typing import Any
 
 import httpx
 
+from robofast_core.cancel import isolated
 from robofast_core.console.aggregate import Aggregator, alarm_id
 
 log = logging.getLogger(__name__)
@@ -69,7 +70,7 @@ class ConsoleHealth:
 
     async def alarms(self) -> list[dict[str, Any]]:
         try:
-            r = await self.http.get(f"{self.url}/healthz", timeout=self.timeout)
+            r = await isolated(self.http.get(f"{self.url}/healthz", timeout=self.timeout))
             r.raise_for_status()
             return []
         except httpx.HTTPError as exc:

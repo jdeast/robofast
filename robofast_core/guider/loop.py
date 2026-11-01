@@ -41,7 +41,6 @@ alarms within ``alarm_repeat`` seconds are counted, not duplicated.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import math
 import statistics
@@ -53,6 +52,7 @@ from typing import Any
 
 import numpy as np
 
+from robofast_core.cancel import isolated, stop_task
 from robofast_core.guider.base import (
     ROI,
     Alarm,
@@ -184,7 +184,7 @@ def kiwispec_backlight(url: str, timeout: float = 15.0) -> Backlight:
         import httpx
 
         async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-            r = await client.post(url.rstrip("/") + "/backlight", json={"on": on})
+            r = await isolated(client.post(url.rstrip("/") + "/backlight", json={"on": on}))
         if r.status_code >= 400:
             raise GuiderError(f"backlight {on}: {r.status_code} {r.text[:200]}")
 
@@ -346,11 +346,8 @@ class Guider:
         """Stop the loop; True once it has stopped (bounded)."""
         self._stop.set()
         task = self._task
-        if task is not None and not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception, TimeoutError):
-                async with asyncio.timeout(timeout):
-                    await asyncio.shield(task)
+        # Bounded, passing our own cancellation on (robofast_core.cancel).
+        await stop_task(task, timeout)
         stopped = task is None or task.done()
         if self.state != "failed":
             self._set_state("stopped", reason)

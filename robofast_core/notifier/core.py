@@ -25,7 +25,6 @@ sink. The clock is injectable (``clock()``: seconds since the epoch).
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import re
@@ -39,6 +38,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
+from robofast_core.cancel import stop_task
 from robofast_core.console.aggregate import alarm_id
 
 log = logging.getLogger(__name__)
@@ -259,11 +259,10 @@ class SinkWorker:
             self._task = asyncio.create_task(self.run(), name=f"notifier-sink-{self.name}")
 
     async def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task
-            self._task = None
+        task, self._task = self._task, None
+        # Bounded (a send is bounded by ``timeout``), passing our own
+        # cancellation on (robofast_core.cancel).
+        await stop_task(task, self.timeout + 1.0)
 
 
 # -- alarms -------------------------------------------------------------------------------

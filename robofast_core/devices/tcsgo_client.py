@@ -57,6 +57,7 @@ import socket
 import time
 from dataclasses import dataclass, fields
 
+from robofast_core.cancel import stop_task
 from robofast_core.owner import DeviceError, DeviceTimeout
 
 log = logging.getLogger(__name__)
@@ -583,11 +584,9 @@ class TCSClient:
         return (await self.command(62))[0]
 
     async def aclose(self) -> None:
-        if self._worker is not None:
-            self._worker.cancel()
-            with contextlib.suppress(BaseException):
-                await self._worker
-            self._worker = None
+        worker, self._worker = self._worker, None
+        # Bounded, passing our own cancellation on (robofast_core.cancel).
+        await stop_task(worker, self.command_timeout)
 
     # -- the worker ----------------------------------------------------------
 
@@ -614,7 +613,10 @@ class TCSClient:
             try:
                 result = await asyncio.shield(task)
             except asyncio.CancelledError:
-                if not task.cancelled():  # the worker itself is being cancelled
+                me = asyncio.current_task()
+                if not task.cancelled() or (me is not None and me.cancelling()):
+                    # The worker itself is being cancelled (even if a
+                    # pre-emption cancelled the command at the same moment).
                     task.cancel()
                     raise
                 # Pre-empted by an urgent command (only queries are): queue it

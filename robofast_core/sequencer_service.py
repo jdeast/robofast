@@ -144,6 +144,7 @@ from typing import Any
 from robofast_core.alpaca import alpaca_owner
 from robofast_core.autofocus import AutofocusSetup
 from robofast_core.autofocus_plan import AutofocusTriggers, TriggerConfig
+from robofast_core.cancel import stop_tasks
 from robofast_core.clock import Clock, clock_from_config
 from robofast_core.config import device_address, load_config, telescopes
 from robofast_core.imaging import imaging_from_config
@@ -530,6 +531,11 @@ def write_snapshot(seq: Sequencer, path: Path, interval: float = 5.0) -> None:
         log.exception("could not write the status snapshot %s", path)
 
 
+#: How long stopping waits for a background task (the plan's, telemetry's,
+#: the status snapshot's) to end once cancelled.
+STOP_TIMEOUT = 10.0
+
+
 async def _publish(seq: Sequencer, path: Path, interval: float) -> None:
     while True:
         write_snapshot(seq, path, interval)
@@ -565,9 +571,7 @@ async def run(
     except asyncio.CancelledError:
         pass  # a signal: run() cleaned up and released the lease on its way out
     finally:
-        for t in background:
-            t.cancel()
-        await asyncio.gather(*background, return_exceptions=True)
+        await stop_tasks(background, STOP_TIMEOUT)  # bounded (robofast_core.cancel)
         if seq.imaging is not None:
             await seq.imaging.aclose()  # the frames still queued are written
             for owner in seq.imaging.owners:

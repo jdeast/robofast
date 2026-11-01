@@ -160,6 +160,36 @@ There are no commands 1, 11, 17, 21, 33, 34, 45-49, 52, 65 in the manual.
   `#14`-`#16`, `#18`, `#19`, `#22`-`#24`, `#42`, `#51`, `#53`-`#55`, `#60`,
   `#66`-`#70`.
 
+### Commands the legacy 60-inch software sends
+
+FLWO's legacy 60-inch control software (the observers' TCS window and its
+status reader) talks to TCSGalil through the TRES relay. Reading it (with
+thanks to FLWO) gives the commands robofast has to cover to replace it:
+
+| # | Legacy use | robofast | Status |
+|---|---|---|---|
+| 3 | initialize mount position | never sent (sync belongs in TCSGalil's own GUI) | not needed |
+| 6 | set target | `SlewToCoordinatesAsync` | covered |
+| 10 | target zenith (stow) | `Park` with `park_command: "zenith"` | covered |
+| 12 | 0 stop, 1 track, 2 slew | `#13`/`#12,0`, `Tracking`, `AbortSlew`, slews | covered |
+| 15 | guide rate | not sent; `guide_rate` assumed in the config | gap (small): confirm the value (question 9) |
+| 16 | set (paddle) rate | not sent | not needed (operator setting) |
+| 18 | cos(Dec) for the paddle | not sent | not needed (question 9) |
+| 20 | dome 0 manual, 1 track, 2 go to azimuth, 3 home | `Slaved`, `SlewToAzimuth`, `FindHome` | covered (`"dome": true`) |
+| 25 | read coordinates | status | covered |
+| 26 | read status | status, `Action("Status")`, `Action("Faults")` | covered |
+| 43 | dome azimuth target | `SlewToAzimuth` | covered (`"dome": true`) |
+| 57 | alt/az target | not allowed; no alt/az slews | gap (low): `SlewToAltAzAsync` = `#57` + `#12,2` |
+| 62 | read dome azimuth | `Dome.Azimuth` | covered |
+
+The legacy software never sends `#7`: on-sky offsets come from the TRES
+guider through the relay, which robofast does with `Action("Offset")`.
+The rest of what that software controls is not in TCSGalil and has no
+robofast service yet (gaps, not built): the TRES front end's calibration
+stage, the calibration lamps (a Pulizzi power switch), the atmospheric
+dispersion corrector, and the spectrograph bench (calibration box, fiber
+selector, bench focus).
+
 ## Status (`#26`)
 
 Eight unsigned bytes; bit 0 is the least significant.
@@ -263,8 +293,11 @@ not carried over:
    connection per command.)
 3. **The real command rate limit.** Is "no more than 1 per second" real? The
    example config spaces commands 0.5 s apart.
-4. **Is the 60-inch dome (rotation and shutters) wired to the TCS?** If so,
-   is the shutter order constrained (upper before lower when opening, lower
+4. **Is the 60-inch dome (rotation and shutters) wired to the TCS?** The
+   legacy software rotates the dome only with `#20`/`#43` and reads `#62`,
+   so rotation probably is. It never sends the shutter commands, so whether
+   the shutters are wired to the TCS is still unknown. If they are, is the
+   shutter order constrained (upper before lower when opening, lower
    before upper when closing, as configured)? Does `#20` need the AUTO DOME
    switch up in normal operation?
 5. ~~Is there any watchdog~~ **Answered** (JDE, 2026-10-31): none he is

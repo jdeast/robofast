@@ -93,7 +93,7 @@ their good ideas instead (section 9).
   ASCOM Remote, or a native Alpaca server, on a minimal per-telescope Windows
   PC. MaxIm is not in the control path.
 - **Devices we write servers for** (enclosures, PDUs, site weather, MEarth's
-  roof and mounts, the FLWO 60-inch's DFM TCS) are small Python Alpaca servers. Each has hard timeouts,
+  roof and mounts, the FLWO 60-inch's DFM TCS and TRES front end) are small Python Alpaca servers. Each has hard timeouts,
   soft limits and a simulator mode, and must pass ConformU in CI.
 - **Non-Alpaca instruments** (the spectrograph, iodine cell, exposure meter)
   follow the same pattern: one owning service, a small typed HTTP API, a
@@ -282,6 +282,11 @@ while the enclosure opens. A telescope without a filter wheel or a
 ordinary error of that telescope) rather than observe through the wrong
 one; the dispatch scheduler already keeps such requests off it (section
 3.7).
+A telescope may also have a **calibration stage** (`calstage`: the FLWO
+60-inch's TRES front end, served as an Alpaca FilterWheel whose `Names` are
+its positions, `docs/tres_frontend.md`); an observation's `calstage` is
+selected the same way, bounded by `calstage_timeout`, before the exposures
+(and, once lamp calibrations exist, before any lamp is switched on).
 
 **Autofocus.** An observation of `kind="autofocus"` (or a request
 configuration of type `AUTO_FOCUS`) focuses its telescope on its field,
@@ -877,9 +882,15 @@ Each step is a CI-tested deliverable.
     protocol-faithful simulator, passing ConformU in CI, and the
     weather-unsafe scenario on the `sites/flwo60/` config (built:
     `robofast_core/devices/tcsgo_*`; protocol, hardware-moving commands
-    and open questions in `docs/tcsgo.md`). Next: answers to those
-    questions, a TRES camera/spectrograph service, then a supervised
-    test on the real TCS.
+    and open questions in `docs/tcsgo.md`). The TRES front end's
+    calibration stage (a PI C-663 stage controller) is served as an Alpaca
+    FilterWheel (named positions: `out`, `sky`, `science`, ...) and Focuser
+    (absolute microns), with a simulator, ConformU in CI, an optional
+    Redis shim for the legacy TCS window, and the sequencer selecting an
+    observation's `calstage` (built: `robofast_core/devices/tres_frontend_*`,
+    `docs/tres_frontend.md`, hardware locked until confirmed). Next: answers
+    to those questions, the lamps (a Pulizzi Switch) and the ADC, a TRES
+    camera/spectrograph service, then a supervised test on the real TCS.
     MEarth South: an Alpaca Dome server for its roll-off roof (a
     parallel-port interface box, no watchdog, so attended only), with a
     simulator of its faults, passing ConformU in CI, and the

@@ -92,6 +92,11 @@ class Observation:
     #: it. A telescope without a port action fails an observation that names
     #: one (never observes through the wrong port).
     port: str | None = None
+    #: Calibration-stage position (the TRES front end's ``calstage``, an
+    #: Alpaca FilterWheel by name: docs/tres_frontend.md), selected before
+    #: the exposures; None: leave the stage alone. A telescope without a
+    #: calstage fails an observation that names one.
+    calstage: str | None = None
     #: If it is interrupted or fails part-way, only the frames not yet taken
     #: are re-taken (otherwise the whole observation is).
     allow_partial: bool = False

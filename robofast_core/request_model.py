@@ -401,9 +401,10 @@ class Constraints:
 @dataclass
 class InstrumentConfig:
     """OCS ``exposure_time`` (s; Python ``exptime``), ``exposure_count``
-    (``count``), ``optical_elements.filter`` (``filter``) and readout
-    ``mode``; robofast's ``extra_params``: ``port``, ``iodine``,
-    ``target_counts`` and ``light``."""
+    (``count``), ``optical_elements.filter`` (``filter``) and
+    ``optical_elements.calstage`` (``calstage``), and readout ``mode``;
+    robofast's ``extra_params``: ``port``, ``iodine``, ``target_counts``
+    and ``light``."""
 
     exptime: float
     count: int = 1
@@ -425,6 +426,10 @@ class InstrumentConfig:
     target_counts: float | None = None
     #: The OCS readout mode (kept, not acted on).
     mode: str = ""
+    #: Calibration-stage position (the TRES front end: ``out``, ``sky``,
+    #: ``science``, ...), selected by the sequencer before the exposures; only
+    #: telescopes whose limits list it in ``calstage`` are eligible.
+    calstage: str | None = None
 
     EXTRA: ClassVar[set[str]] = {"port", "iodine", "target_counts", "light"}
 
@@ -437,7 +442,10 @@ class InstrumentConfig:
         _no_lamps(d, what)
         extra = _extra(d, cls.EXTRA, what)
         oe = _check_keys(
-            d.get("optical_elements") or {}, {"filter"}, set(), f"{what}.optical_elements"
+            d.get("optical_elements") or {},
+            {"filter", "calstage"},
+            set(),
+            f"{what}.optical_elements",
         )
         iodine = extra.get("iodine")
         if iodine is not None:
@@ -455,6 +463,7 @@ class InstrumentConfig:
             if counts is None
             else _number(counts, f"{what}.extra_params.target_counts", 1.0, 1e15),
             "" if mode is None else str(mode),
+            _text(oe.get("calstage")),
         )
 
     def to_dict(self, *, light: bool = True) -> dict[str, Any]:
@@ -462,6 +471,8 @@ class InstrumentConfig:
         BIAS); ``extra_params.light`` is written only where it differs."""
         d: dict[str, Any] = {"exposure_time": self.exptime, "exposure_count": self.count}
         d["optical_elements"] = {} if self.filter is None else {"filter": self.filter}
+        if self.calstage is not None:
+            d["optical_elements"]["calstage"] = self.calstage
         if self.mode:
             d["mode"] = self.mode
         extra: dict[str, Any] = {}

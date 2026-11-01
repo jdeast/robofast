@@ -86,6 +86,9 @@ class Rig:
     tasks: list[asyncio.Task] = field(default_factory=list)
     #: Filter wheels (with ``filterwheels=True``), one per telescope.
     wheels: list[FakeFilterWheel] = field(default_factory=list)
+    #: Calibration stages (with ``calstages=True``): FilterWheels named
+    #: ``out``, ``sky``, ``science``, one per telescope.
+    calstages: list[FakeFilterWheel] = field(default_factory=list)
 
     @property
     def tel(self) -> FakeTelescope:
@@ -163,6 +166,7 @@ async def make_rig(lease_path):
         slew_guard=None,
         supervise_parking: bool = False,
         filterwheels: bool = False,
+        calstages: bool = False,
         port_action: str | None = None,
         imaging=None,
     ) -> Rig:
@@ -172,6 +176,11 @@ async def make_rig(lease_path):
         tels = [FakeTelescope() for _ in range(telescopes)]
         cams = [FakeCamera() for _ in range(telescopes)]
         wheels = [FakeFilterWheel() for _ in range(telescopes)] if filterwheels else []
+        stages = (
+            [FakeFilterWheel(("out", "sky", "science")) for _ in range(telescopes)]
+            if calstages
+            else []
+        )
         for t in tels:
             t.port_action = port_action
         names = [f"t{i + 1}" for i in range(telescopes)]
@@ -190,6 +199,10 @@ async def make_rig(lease_path):
             **{
                 f"{n}.filterwheel": owner(f"{n}.filterwheel", w)
                 for n, w in zip(names, wheels, strict=False)
+            },
+            **{
+                f"{n}.calstage": owner(f"{n}.calstage", w)
+                for n, w in zip(names, stages, strict=False)
             },
             "safetymonitor": owner("safetymonitor", sm),
             "observingconditions": owner("observingconditions", oc),
@@ -217,6 +230,7 @@ async def make_rig(lease_path):
                     owners[f"{n}.telescope"],
                     owners[f"{n}.camera"],
                     filterwheel=owners.get(f"{n}.filterwheel"),
+                    calstage=owners.get(f"{n}.calstage"),
                     port_action=port_action,
                 )
                 for n in names
@@ -229,6 +243,7 @@ async def make_rig(lease_path):
         )
         rig = Rig(tl, weather, dome, tels, cams, sm, oc, owners, sup, seqr, lease_path)
         rig.wheels = wheels
+        rig.calstages = stages
         rigs.append(rig)
         return rig
 

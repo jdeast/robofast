@@ -73,7 +73,9 @@ Filters and M3 ports are hard constraints too: a configuration naming a
 ``port`` is only for telescopes whose limits list it in ``ports`` (default:
 none, so it is never sent to a telescope that would observe through the
 wrong port), and one naming a ``filter`` only for telescopes whose
-``filters`` (if given) include it. The sequencer then selects them.
+``filters`` (if given) include it, and one naming a calibration-stage
+position (``optical_elements.calstage``) only for telescopes whose
+``calstage`` lists it. The sequencer then selects them.
 
 Spectra fed by several telescopes
 ---------------------------------
@@ -243,6 +245,9 @@ class TelescopeLimits:
     ports: list[str] = field(default_factory=list)
     #: Its filters; None: not checked here (the sequencer checks the wheel).
     filters: list[str] | None = None
+    #: Its calibration-stage positions (the TRES front end's ``calstage``);
+    #: a configuration naming another is not for this telescope.
+    calstage: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any], what: str) -> TelescopeLimits:
@@ -1015,6 +1020,8 @@ class DispatchScheduler:
                     and ic.filter not in limits.filters
                 ):
                     reasons.append(f"{telescope} has no filter {ic.filter!r}")
+                if ic.calstage is not None and ic.calstage not in limits.calstage:
+                    reasons.append(f"{telescope} has no calstage position {ic.calstage!r}")
         if any(c.type == "SPECTRUM" for c in configs):
             if self.spectrograph_down is not None:
                 reasons.append(f"spectrograph down ({self.spectrograph_down})")
@@ -1387,6 +1394,7 @@ class DispatchScheduler:
                 count=ic.count - visit.done,
                 allow_partial=c.allow_partial,
                 object=c.target.name,
+                calstage=ic.calstage,
                 kind="spectrum",
                 spectrum={
                     "id": f"{c.id}#{visit.ic}{suffix}@{visit.started.strftime('%Y%m%dT%H%M%S.%f')}",
@@ -1456,6 +1464,7 @@ class DispatchScheduler:
             light=ic.light,
             filter=ic.filter,
             port=ic.port,
+            calstage=ic.calstage,
             allow_partial=c.allow_partial,
             object=c.target.name,
             guide=c.guide and ic.light,

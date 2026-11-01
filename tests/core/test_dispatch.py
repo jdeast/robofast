@@ -761,3 +761,14 @@ async def test_two_toos_preempt_two_telescopes():
     await d.submit_too(group("one", too=too("now")))
     await d.submit_too(group("two", too=too("now")))
     assert [c[0] for c in p.calls] == ["t2", "t1"]  # lowest-ranked first, then the other
+
+
+async def test_a_calstage_position_is_a_hard_constraint_and_reaches_the_observation():
+    cal = {"exposure_time": 30, "optical_elements": {"calstage": "sky"}}
+    limits = {"t1": TelescopeLimits(calstage=["out", "sky", "science"]), "t2": TelescopeLimits()}
+    d = make([group("a", ics=[cal])], limits=limits)
+    assert by_id(d, "t1")["a-r"].ok
+    c = by_id(d, "t2")["a-r"]
+    assert not c.ok and "t2 has no calstage position 'sky'" in c.reasons
+    obs = await run_visit(d, "t1")
+    assert obs.calstage == "sky"

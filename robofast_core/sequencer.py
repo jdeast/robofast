@@ -259,6 +259,7 @@ from typing import Any, Protocol
 import numpy as np
 
 from robofast_core import pointmodel
+from robofast_core.alpaca_client import InvalidOperationException
 from robofast_core.autofocus import (
     FOCUS_CONTEXT,
     Autofocus,
@@ -485,6 +486,9 @@ class TelescopeUnit:
     camera: DeviceOwner
     filterwheel: DeviceOwner | None = None
     port_action: str | None = None
+    #: The TRES front end's calibration stage: an Alpaca FilterWheel whose
+    #: ``Names`` are its positions (docs/tres_frontend.md); optional.
+    calstage: DeviceOwner | None = None
     #: Started for observations with ``guide`` (design.md 3.4, docs/guider.md).
     guider: GuiderHook | None = None
     #: The focuser the sequencer moves (autofocus), and the autofocus
@@ -575,6 +579,8 @@ class SequencerConfig:
     #: Bounds on a filter wheel move and on an M3 port selection.
     filter_timeout: float = 60.0
     port_timeout: float = 60.0
+    #: Bound on a calibration-stage move (the legacy TRES window waits 60 s).
+    calstage_timeout: float = 60.0
     #: Spectra (module doc, "Spectra"): how long the leading telescope waits
     #: for the rest of the feed to be guiding before it starts with those
     #: that are; how often each feeding telescope checks its guider and its
@@ -642,6 +648,8 @@ class _Generation:
     idle_release: asyncio.Event = field(default_factory=asyncio.Event)
     #: Filter wheel grants, for the telescopes that have one.
     filterwheels: dict[str, Grant] = field(default_factory=dict)
+    #: Calibration-stage grants (the TRES front end), per telescope.
+    calstages: dict[str, Grant] = field(default_factory=dict)
     #: Focuser grants, for the telescopes whose focuser the sequencer moves.
     focusers: dict[str, Grant] = field(default_factory=dict)
     #: Rotator grants, for the telescopes whose rotator the sequencer moves.
@@ -1232,6 +1240,9 @@ class Sequencer:
         state.filterwheels = {
             u.name: u.filterwheel.grant(holder) for u in units if u.filterwheel is not None
         }
+        state.calstages = {
+            u.name: u.calstage.grant(holder) for u in units if u.calstage is not None
+        }
         state.focusers = {u.name: u.focuser.grant(holder) for u in units if u.focuser is not None}
         state.rotators = {u.name: u.rotator.grant(holder) for u in units if u.rotator is not None}
         if self.spectrograph is not None:
@@ -1239,6 +1250,7 @@ class Sequencer:
         fence = (
             *(g for pair in grants.values() for g in pair),
             *state.filterwheels.values(),
+            *state.calstages.values(),
             *state.focusers.values(),
             *state.rotators.values(),
         )
@@ -1736,6 +1748,7 @@ class Sequencer:
             ("focuser", unit.focuser, state.focusers),
             ("rotator", unit.rotator, state.rotators),
             ("filterwheel", unit.filterwheel, state.filterwheels),
+            ("calstage", unit.calstage, state.calstages),
         ):
             if owner is not None and unit.name in grants:
                 out[kind] = (owner, grants[unit.name])
@@ -1818,6 +1831,11 @@ class Sequencer:
             await self._select_port(state, unit, tel, obs.port)
         if obs.filter is not None:
             await self._select_filter(state, unit, obs.filter)
+        if obs.calstage is not None:
+            # Lamps (ThAr, flats) would be switched on after this, once
+            # lamp calibrations exist (request_model.NO_LAMPS): the stage
+            # first, so no lamp light reaches the fibers through the wrong path.
+            await self._select_calstage(state, unit, obs.calstage)
         if obs.light and unit.focus_restore is not None:
             await self._restore_focus(state, unit)
         if obs.light:
@@ -2729,20 +2747,41 @@ class Sequencer:
         if self.imaging is not None:
             self.imaging.port_selected(unit.name, port)
 
+    async def _select_named(
+        self, fw: Grant, unit: TelescopeUnit, name: str, what: str, timeout: float
+    ) -> int:
+        """Move an Alpaca FilterWheel (a filter wheel, or the calibration
+        stage) to the position called ``name``; returns its index."""
+        names = list(await fw.get("Names"))
+        if name not in names:
+            raise Unsupported(f"{unit.name}: no {what} {name!r} in {names}")
+        position = names.index(name)
+        try:
+            current = await fw.get("Position")
+        except InvalidOperationException:
+            # The calibration stage rests between named positions (moved by
+            # an absolute move): any named move starts from there.
+            current = None
+        if current != position:
+            await fw.set("Position", position)
+            # Position reads -1 while the wheel moves.
+            await self._wait_for(lambda: fw.get("Position"), lambda p: p == position, timeout)
+        return position
+
+    async def _select_calstage(self, state: _Generation, unit: TelescopeUnit, name: str) -> None:
+        stage = state.calstages.get(unit.name)
+        if stage is None:
+            raise Unsupported(f"{unit.name} has no calibration stage (calstage {name!r})")
+        await self._select_named(
+            stage, unit, name, "calstage position", self.config.calstage_timeout
+        )
+        self._event("calstage_selected", gen=state.gen, telescope=unit.name, calstage=name)
+
     async def _select_filter(self, state: _Generation, unit: TelescopeUnit, name: str) -> None:
         fw = state.filterwheels.get(unit.name)
         if fw is None:
             raise Unsupported(f"{unit.name} has no filter wheel (filter {name!r})")
-        names = list(await fw.get("Names"))
-        if name not in names:
-            raise Unsupported(f"{unit.name}: no filter {name!r} in {names}")
-        position = names.index(name)
-        if await fw.get("Position") != position:
-            await fw.set("Position", position)
-            # Position reads -1 while the wheel moves.
-            await self._wait_for(
-                lambda: fw.get("Position"), lambda p: p == position, self.config.filter_timeout
-            )
+        position = await self._select_named(fw, unit, name, "filter", self.config.filter_timeout)
         self._event("filter_selected", gen=state.gen, telescope=unit.name, filter=name)
         if self.imaging is not None:
             self.imaging.filter_selected(unit.name, name, position)

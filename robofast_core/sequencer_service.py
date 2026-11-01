@@ -38,6 +38,10 @@ and optionally:
   Alpaca ``Action`` that selects an M3 port, given the port name as its
   parameter; without it, an observation that names a port fails rather than
   use the wrong one).
+* per telescope, ``calstage``: the TRES front end's calibration stage (an
+  Alpaca FilterWheel whose ``Names`` are its positions,
+  ``docs/tres_frontend.md``); an observation's ``calstage`` is selected by
+  name before its exposures.
 * per telescope, ``focuser`` and ``rotator`` (Alpaca devices, read for
   the FITS headers). With an ``autofocus`` entry
   (:class:`~robofast_core.autofocus.AutofocusSetup`; ``docs/autofocus.md``)
@@ -165,6 +169,7 @@ TELESCOPE_KEYS = {
     "telescope",
     "camera",
     "filterwheel",
+    "calstage",
     "port_action",
     "focuser",
     "rotator",
@@ -198,13 +203,13 @@ def build_units(
         if unknown:
             raise ValueError(f"telescope {name!r}: unknown keys {sorted(unknown)}")
         owners: dict[str, Any] = {}
-        for kind in ("telescope", "camera", "filterwheel", "focuser", "rotator"):
+        for kind in ("telescope", "camera", "filterwheel", "calstage", "focuser", "rotator"):
             if kind not in entry:
                 continue
             address, number = device_address(entry[kind])
             owners[kind] = alpaca_owner(
                 f"{name}.{kind}",
-                kind,
+                "filterwheel" if kind == "calstage" else kind,
                 address,
                 timeline,
                 number=number,
@@ -261,6 +266,7 @@ def build_units(
                 owners["telescope"],
                 owners["camera"],
                 filterwheel=owners.get("filterwheel"),
+                calstage=owners.get("calstage"),
                 port_action=port_action,
                 focuser=owners.get("focuser") if autofocus is not None else None,
                 autofocus=autofocus,
@@ -580,7 +586,7 @@ async def run(
             write_snapshot(seq, Path(status_file), status_interval)  # the final state
         await remote.aclose()
         for unit in seq.units.values():
-            for owner in (unit.telescope, unit.camera, unit.filterwheel):
+            for owner in (unit.telescope, unit.camera, unit.filterwheel, unit.calstage):
                 if owner is not None:
                     owner.close()
 

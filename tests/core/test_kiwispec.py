@@ -420,7 +420,21 @@ async def test_science_exposure(http, sim):
 
 
 async def test_flux_midpoint_follows_a_ramp(http, sim):
-    sim.set_sky(lambda t: 4000.0 * t)
+    # Ramp from the moment the camera starts, not from set_sky(): the delay
+    # before the shutter opens varies on a loaded runner and would pull the
+    # midpoint below 2T/3.
+    t0 = sim.clock()
+    opened: list[float] = []
+
+    def ramp(t: float) -> float:
+        if not opened:
+            acq = sim.acquisition
+            if not acq or "start" not in acq:
+                return 0.0
+            opened.append(acq["start"])
+        return 4000.0 * max(0.0, t0 + t - opened[0])
+
+    sim.set_sky(ramp)
     job = await run_job(
         http,
         "/expose",
@@ -429,7 +443,6 @@ async def test_flux_midpoint_follows_a_ramp(http, sim):
     r = job["results"][0]
     assert job["state"] == "done", job
     assert r["iodine"]["name"] == "out"
-    # the sky clock starts a little before the shutter opens: allow for it
     assert 0.9 < r["flux_midpoint_s"] < 1.15  # 2T/3 = 1.0
 
 

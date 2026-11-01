@@ -115,6 +115,9 @@ class ImagingConfig:
     measure_fwhm: bool = False
     fwhm_box: int = 1024
     fwhm_max_age: float = 1800.0
+    #: Plate-solve light frames (:mod:`robofast_core.framesolve`; docs/sky.md):
+    #: ``{"catalog": {...}, "telescopes": {name: solver settings}}``.
+    solve: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> ImagingConfig:
@@ -243,6 +246,7 @@ class Imaging:
         weather: DeviceOwner | None = None,
         supervisor: Any = None,
         version: str | None = None,
+        base: Path | None = None,
     ) -> None:
         self.config = config
         self.timeline = timeline
@@ -257,6 +261,10 @@ class Imaging:
             longitude=None if site is None else site.get("longitude"),
             index=config.index,
         )
+        if config.solve is not None:
+            from robofast_core.framesolve import FrameSolver
+
+            self.store.solver = FrameSolver.from_config(config.solve, config.telescopes, base)
         publish_static(self.registry, site_name=config.site, site=site, version=version)
         self.telemetry = Telemetry(
             self.registry,
@@ -562,6 +570,8 @@ class Imaging:
                     file=written.relpath,
                     seconds=round(time.monotonic() - t0, 4),
                 )
+                if written.record.get("solve"):
+                    self._publish_solve(telescope, written.record["solve"])
                 if self.config.measure_fwhm and info.imagetyp == "LIGHT":
                     await self._publish_fwhm(telescope, info, image)
             except Exception as exc:
@@ -601,6 +611,36 @@ class Imaging:
             comment=f"Median star FWHM of the last frame ({n} stars)",
         )
 
+    def _publish_solve(self, telescope: str, solve: dict[str, Any]) -> None:
+        """The last frame's plate solve and zero point into the registry
+        (for the console and a future throughput monitor)."""
+        age = self.config.fwhm_max_age
+        if not solve.get("solved"):
+            self._event("plate_solve_failed", telescope=telescope, error=solve.get("error"))
+            return
+        for key, unit, comment in (
+            ("rms", "arcsec", "Plate-solve rms of the last frame"),
+            ("offset_arcsec", "arcsec", "Mount pointing minus solved, last frame"),
+            ("pa", "deg", "Solved position angle, last frame"),
+        ):
+            if solve.get(key) is not None:
+                self.registry.publish(
+                    f"{telescope}.image.wcs_{key}",
+                    solve[key],
+                    max_age=age,
+                    unit=unit,
+                    comment=comment,
+                )
+        zp = solve.get("zp")
+        if zp:
+            self.registry.publish(
+                f"{telescope}.image.zp",
+                zp["zp"],
+                max_age=age,
+                unit="mag",
+                comment=f"Zero point of the last frame (G for 1 {zp['unit']}, {zp['n']} stars)",
+            )
+
     def _alarm(self, telescope: str, message: str) -> None:
         log.critical("%s: %s", telescope, message)
         self._event("frame_write_failed", telescope=telescope, error=message, level="critical")
@@ -638,6 +678,7 @@ def imaging_from_config(
         rotators=rotators,
         weather=weather,
         supervisor=supervisor,
+        base=base,
     )
 
 

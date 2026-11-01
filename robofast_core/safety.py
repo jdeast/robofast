@@ -369,6 +369,11 @@ class SafetySupervisor:
         self._closing_since: float | None = None
         self._opening_since: float | None = None
         self._parked_for_close = False
+        #: Set when the enclosure loop commits to closing (right before
+        #: CloseShutter), cleared once the shutter reads CLOSED: no lease is
+        #: granted in between, so no sequencer unparks a telescope under a
+        #: closing roof (request_open).
+        self._close_committed = False
         self._enforced_at: float | None = None
         self._pinged_at: float | None = None
         self.shutter: int | None = None
@@ -596,9 +601,19 @@ class SafetySupervisor:
     async def request_open(self, holder: str) -> OpenLease:
         """Wait until opening is allowed, no earlier lease is outstanding, and
         every configured telescope is parked."""
-        while not (
-            self.open_allowed() and self.outstanding() is None and await self._telescopes_parked()
-        ):
+        while True:
+            # The (awaited) park check first, then the synchronous ones with
+            # no await between them and the grant: _ensure_closed commits to
+            # a close (``_close_committed``) synchronously too, so a grant and
+            # a close can never both go ahead.
+            parked = await self._telescopes_parked()
+            if (
+                parked
+                and not self._close_committed
+                and self.open_allowed()
+                and self.outstanding() is None
+            ):
+                break
             await asyncio.sleep(min(self.config.poll_interval, 1.0))
         lease = OpenLease(next(self._lease_ids), holder, self.config.lease_ttl)
         self._lease = lease
@@ -929,6 +944,7 @@ class SafetySupervisor:
                 self.timeline.event(self.name, "enclosure_closed", took=now - self._closing_since)
             self._closing_since = None
             self._parked_for_close = False
+            self._close_committed = False
             self._fault_escalated = False
             return
         if self._fault is not None and not self._fault_escalated:
@@ -937,6 +953,7 @@ class SafetySupervisor:
             name = "unknown" if status is None else Shutter(status).name
             self._alarm(f"FAULT WITH ENCLOSURE NOT CLOSED (shutter {name}): {self._fault}; closing")
         if status == Shutter.CLOSING:
+            self._close_committed = True  # however it began: no grant until CLOSED
             if self._closing_since is None:
                 self._closing_since = now
             if now - self._closing_since < cfg.shutter_timeout:
@@ -945,12 +962,16 @@ class SafetySupervisor:
             self._closing_since = now
         if cfg.park_before_close and not self._parked_for_close:
             await self._park_before_close()
-            if self._want_open(time.monotonic()):
-                # A new lease was granted while we parked (an idle release
-                # followed at once by more work): opening is wanted again,
-                # so do not close on it; the next pass keeps it open.
-                self._parked_for_close = False
-                return
+        if not self._close_committed and self._want_open(time.monotonic()):
+            # A new lease was granted while we read the shutter or parked
+            # (an idle release followed at once by more work): opening is
+            # wanted again, so do not close on it; the next pass keeps it open.
+            self._parked_for_close = False
+            return
+        # Committed: from here until the shutter reads CLOSED no lease is
+        # granted (request_open). Set with no await since the check above,
+        # so a lease granted before now was seen there, and none after.
+        self._close_committed = True
         try:
             await self._dome.call("CloseShutter", timeout=cfg.dome_timeout)
         except DeviceError as exc:

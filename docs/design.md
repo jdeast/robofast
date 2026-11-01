@@ -186,6 +186,11 @@ The only component allowed to open or close an enclosure
   granted, so nothing reopens on a telescope that a crash or a failed
   cleanup left unparked. A dead mount therefore keeps the enclosure closed
   for its neighbours too, until it is fixed or removed from the config.
+- **No lease while closing.** Once the supervisor commits to a close (after
+  park-before-close, right before `CloseShutter`), or sees the shutter
+  closing, no lease is granted until the shutter reads closed: a lease
+  granted then would let its sequencer unpark a telescope under a closing
+  roll-off roof.
 - **Enclosure faults** (a separate axis from the shutter position) alarm
   and block opening; a fault with the enclosure open closes it. Where
   configured (`fault_auto_clear`, MINERVA's Aqawan) the supervisor clears a

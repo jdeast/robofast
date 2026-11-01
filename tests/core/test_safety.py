@@ -168,6 +168,37 @@ async def test_a_new_lease_during_park_before_close_is_not_parked_or_closed_on(m
     lease.release()
 
 
+async def test_no_lease_is_granted_while_the_roof_closes(make_rig):
+    """Once the supervisor commits to closing (after park-before-close), a
+    lease asked for meanwhile waits until the roof is closed: granted at
+    once, its sequencer would unpark a telescope under the closing roof
+    (the e2e night's "CLOSE with t1 not parked (last: unpark)")."""
+    rig = make_rig(safety=dict(park_before_close=True, park_wait=1.0))
+    await rig.start(sequencer=False)
+    lease = await _open(rig)
+    sup = rig.supervisor
+    real = sup._dome.call
+    asked: dict[str, asyncio.Task] = {}
+
+    async def call(member, *args, **kwargs):
+        if member == "CloseShutter" and "req" not in asked:
+            # The next generation asks for a lease just as the close goes out
+            # (telescopes parked, weather safe, nothing outstanding).
+            asked["req"] = asyncio.create_task(sup.request_open("next"))
+            await asyncio.sleep(0.2)
+        return await real(member, *args, **kwargs)
+
+    sup._dome.call = call
+    lease.release()
+    await wait_until(lambda: "req" in asked, 3, what="the close")
+    lease2 = await asyncio.wait_for(asked["req"], 5)
+    granted = rig.timeline.events("lease_granted")[-1]
+    closed = rig.timeline.events("enclosure_closed")
+    assert closed and closed[-1].t <= granted.t, "a lease was granted while the roof closed"
+    await asyncio.wait_for(lease2.wait_open(), 5)
+    lease2.release()
+
+
 async def test_recover_only_a_dead_lease_of_the_holder_once_closed(make_rig):
     rig = make_rig()
     await rig.start(sequencer=False)

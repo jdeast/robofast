@@ -77,6 +77,28 @@ run in real seconds, shortened. The whole night is `n20261109` everywhere.
     and rising. The telescopes park, the lease is released and the
     supervisor closes the roof. Then the **morning calibrations** run.
 
+## Watching it in the observer console
+
+During the night the demo runs the observer console (`docs/console.md`)
+on loopback against the night's services, and prints its address and
+where its operator token is:
+
+```
+[    8.9 s] observer console: http://127.0.0.1:43707 (token in /tmp/rv-night/console-token.txt)
+```
+
+Open the address in a browser on the same machine (`--console-port 8400`
+fixes the port; `--console-port -1` runs without it) and paste the token
+(`demo`, scopes `read` and `operator`). You see the night as an observer
+would: the alarms (the bad weather, T2's mount), the enclosure and the
+lease, both telescopes, the guider thumbnails with the fiber and the
+centroid while they guide, the spectrograph's jobs, the sky chart with the
+RV standards rising and setting on the simulated clock, the plan, and the
+merged log. The emergency-close button and manual control work too (the
+first closes the simulated roof; nothing here touches hardware). Mid-night
+the demo reads the console's status, sky, log and a guider image itself
+and checks them (`console` in the checks).
+
 ## What to look at (in `--out`)
 
 | File | What it shows |
@@ -90,6 +112,7 @@ run in real seconds, shortened. The whole night is `n20261109` everywhere.
 | `data/minerva/kiwispec/n*/` | one JSON sidecar per spectrum and calibration frame: the telescopes, who dropped out, guide statistics, the flux-weighted midpoint, `barycentric` (BJD_TDB and the RV correction), and the index `*.spectra.jsonl` (`docs/rv_night.md`) |
 | `data/minerva/t1/n*/`, `data/minerva/t2/n*/` | FITS frames (autofocus, the imaging field, the imager calibrations) and the frame index (`docs/data.md`) |
 | `aqawan1-control/holds.json`, `aqawan1-control/done/` | the console's commands and the holds |
+| `console-audit.jsonl`, `console-token.txt` | the console's audit log; the demo operator's token |
 | `sequencer-status.json` | the last status snapshot (what the request API and the console read) |
 | `kiwispec.log`, `guider_t1.log`, `guider_t2.log`, `weather_bridge.log` | the services |
 
@@ -107,7 +130,9 @@ prints every check that failed:
 * **the interruptions**: the lease revoked for weather, the spectrum
   aborted and reported `interrupted`, then observed again; T2 dropped out
   of a spectrum that T1 finished; the console paused and resumed T2, and
-  parked T2 alone (T2 parked, T1 not, no roof command meanwhile);
+  parked T2 alone (T2 parked, T1 not, no roof command meanwhile); the
+  console answered with the night's status, sky targets, a log with the
+  supervisor's and the sequencer's entries, and a guider image;
 * **safety invariants**: the roof never opens while the weather is unsafe
   or within the reopen hold after it clears; no spectrum starts unless
   every telescope it lists is guiding; in every cleanup, every abort (the

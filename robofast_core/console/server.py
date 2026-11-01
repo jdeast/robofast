@@ -307,8 +307,11 @@ class Console:
         audit: AuditLog | None = None,
         http: httpx.AsyncClient | None = None,
         tls: bool = False,
+        clock: Any = None,
     ) -> None:
         self.enclosures = enclosures
+        #: The time for the sky view (a simulated night's clock); None: now.
+        self.clock = clock
         self.tokens = tokens
         self.config = config or ConsoleConfig()
         self.audit = audit or AuditLog(self.config.audit_log)
@@ -555,7 +558,10 @@ class Console:
                     if isinstance(s, dict)
                 }
                 try:
-                    doc["enclosures"][name] = await asyncio.to_thread(sky_for, enc, values, current)
+                    when = self.clock() if self.clock is not None else None
+                    doc["enclosures"][name] = await asyncio.to_thread(
+                        sky_for, enc, values, current, when
+                    )
                 except Exception as exc:
                     log.exception("console: the sky of %s", name)
                     doc["enclosures"][name] = {"error": f"{type(exc).__name__}: {exc}"[:200]}

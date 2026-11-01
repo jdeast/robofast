@@ -282,3 +282,18 @@ async def test_request_type_and_service_config(tmp_path):
     t1["pa_calibration"]["bogus"] = 1
     with pytest.raises(ValueError, match="t1"):
         build(config, Timeline(), base=tmp_path)
+
+
+@pytest.mark.parametrize("flip", [False, True])
+@pytest.mark.parametrize("pa", [0.0, 37.0, 101.3, 250.0])
+def test_fits_and_guider_conventions_agree(pa, flip):
+    """The PA calibration's (FITS, plate-solve) PA and parity give the same
+    pixel->sky map as the sky simulator's camera and the guider's matrix."""
+    from robofast_core.guider.calibration import fits_sky_matrix, sky_matrix
+
+    cam = SkyCamera(plate_scale=0.5, pa=pa, flip=flip)
+    assert np.allclose(cam.cd() * 3600.0, fits_sky_matrix(0.5, pa, flip), atol=1e-9)
+    cal = fit(measurements(pa, 1, flip, [0.0], noise=0.0), telescope="t", port="p")
+    assert np.allclose(
+        sky_matrix(0.5, cal.guider_pa(0.0), cal.parity), fits_sky_matrix(0.5, pa, flip), atol=1e-5
+    )

@@ -161,7 +161,7 @@ OCS_CADENCE = {
         ([*C, "constraints", "max_seeing"], 2.0, r"max_seeing.*not supported"),
         ([*C, "constraints", "extra_params"], {"min_ha": 3, "max_ha": 2}, r"min_ha >= max_ha"),
         ([*C, "status"], "DONE", r"status"),
-        ([*C, "type"], "SKY_FLAT", r"type: 'SKY_FLAT'"),
+        ([*C, "type"], "LAMP_FLAT", r"type: 'LAMP_FLAT'"),
         ([*C, "repeat_duration"], 600, r"repeat_duration.*not supported"),
         ([*C, "guiding_config"], {"mode": "AUTO"}, r"guiding_config.mode"),
         ([*C, "exposure"], 3, r"unknown keys \['exposure'\]"),

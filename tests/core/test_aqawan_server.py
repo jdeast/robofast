@@ -53,7 +53,7 @@ from robofast_core.devices.aqawan_server import (
 )
 from robofast_core.devices.aqawan_sim import AqawanSim
 from robofast_core.lease_client import RemoteSupervisor
-from robofast_core.safety import ENCLOSURE_MEMBERS
+from robofast_core.safety import AUTO_CLEAR_PREFIX, ENCLOSURE_MEMBERS, mentions_estop
 from robofast_core.supervisor_service import SupervisorServer
 from robofast_core.testing.alpaca_server import FakeAlpacaServer
 from robofast_core.testing.checks import wait_until
@@ -320,6 +320,7 @@ async def test_fault_is_a_separate_axis_from_position(make_rig):
         "error": False,
         "faults": None,
         "errors": None,
+        "estop": False,
         "shutters": ["CLOSED", "CLOSED"],
     }
     # Closed and fault: the position stays closed; the channel says fault.
@@ -328,7 +329,7 @@ async def test_fault_is_a_separate_axis_from_position(make_rig):
     assert await dome.get("ShutterStatus") == CLOSED
     f = await faults_text(dome)
     assert f["fault"] is True and "Estop active" in f["faults"]
-    assert f["shutters"] == ["CLOSED", "CLOSED"]
+    assert f["shutters"] == ["CLOSED", "CLOSED"] and f["estop"] is True
     with pytest.raises(InvalidOperationException, match="Fault=True"):
         await dome.call("OpenShutter")
     # Open and fault: shutterError; the close still goes through.
@@ -340,7 +341,7 @@ async def test_fault_is_a_separate_axis_from_position(make_rig):
     await until_status(dome, ERROR, 2)
     f = await faults_text(dome)
     assert f["fault"] is True and f["shutters"] == ["OPEN", "OPEN"]
-    assert "Motor overload" in f["faults"]
+    assert "Motor overload" in f["faults"] and f["estop"] is False
     await dome.call("CloseShutter")
     await until_status(dome, CLOSED, 5)  # closed (and still faulted)
     assert json.loads(await dome.call("Action", "Faults", ""))["fault"] is True
@@ -399,6 +400,8 @@ def test_shipped_configs():
     scfg = SafetyConfig(**site["safety"])
     assert scfg.heartbeat_timeout == 60 and scfg.heartbeat_interval <= 15
     assert scfg.fault_action == "Faults"
+    # Automatic fault clearing (JDE 2026-10-31): on, at most once an hour.
+    assert scfg.fault_auto_clear and scfg.fault_auto_clear_interval == 3600
     deploy = json.loads((ROOT / "deploy/aqawan.example.json").read_text())
     assert AqawanConfig.from_dict(deploy).interlock_doors == ()
 
@@ -686,8 +689,11 @@ async def test_supervisor_fault_while_closed_only_alarms(make_rig):
     try:
         await wait_until(lambda: (s.sup.fault or "").startswith("enclosure reports"), 3)
         await asyncio.sleep(1.0)  # many enclosure passes
-        fault_alarms = [a for a in s.sup.alarms if "Fault" in a]
+        fault_alarms = [a for a in s.sup.alarms if a.startswith("enclosure reports Fault")]
         assert len(fault_alarms) == 1, s.sup.alarms  # once, not every poll
+        # An E-stop: also one critical alarm (it is never cleared automatically).
+        assert sum(a.startswith("E-STOP") for a in s.sup.alarms) == 1
+        assert s.sup.critical() and s.sup.critical()[0].startswith("E-STOP")
         assert not any("NOT CLOSED" in a for a in s.sup.alarms)
         assert close_commands(rig.sim) == 0 and rig.sim.closed()
         assert s.sup.status()["fault"] == s.sup.fault and not s.sup.open_allowed()
@@ -779,3 +785,140 @@ async def test_supervisor_dies_aqawan_closes_itself(make_rig, tmp_path, sig):
         if sup is not None:
             sup.stop()
         fakes.stop()
+
+
+# -- automatic fault clearing (JDE 2026-10-31) ----------------------------------------
+
+AUTO = {"fault_auto_clear": True, "fault_auto_clear_interval": 60.0, "fault_auto_clear_settle": 0.5}
+
+
+def clears(sim: AqawanSim) -> int:
+    return sim.commands().count("CLEAR_FAULTS")
+
+
+@pytest.mark.parametrize(
+    "text, estop",
+    [
+        ("Estop active", True),
+        ("E-STOP pressed", True),
+        ("emergency stop", True),
+        ("Fault: e_stop", True),
+        ("Motor overload", False),
+        ("Shutter close stopped", False),
+        (None, False),
+    ],
+)
+def test_mentions_estop(text, estop):
+    assert mentions_estop(text) is estop
+
+
+def test_auto_clear_needs_the_fault_channel():
+    with pytest.raises(ValueError, match="fault_auto_clear needs fault_action"):
+        SafetyConfig(fault_auto_clear=True)
+
+
+async def test_auto_clear_once_closed_then_a_recurrence_needs_an_operator(make_rig):
+    rig = make_rig({"heartbeat_timeout": 2.0})
+    rig.sim.set_fault("Motor overload")
+    s = start_supervisor(rig, **AUTO)
+    try:
+        # Closed and faulted: cleared automatically, with an alarm.
+        await wait_until(lambda: rig.sim.fault is None, 5, what="automatic clear")
+        await wait_until(lambda: s.sup.fault is None, 3, what="fault gone")
+        assert clears(rig.sim) == 1
+        assert any(a.startswith("automatic fault clear #1") for a in s.sup.alarms)
+        assert s.timeline.events("fault_auto_clear")
+        assert s.sup.critical() == [] and s.sup.status()["fault_auto_clear"]["clears"] == 1
+        # It recurs within the interval: no second clear; a critical alarm.
+        rig.sim.set_fault("Motor overload")
+        await wait_until(lambda: s.sup.critical(), 5, what="automatic clearing stopped")
+        assert "is back" in s.sup.critical()[0] and "operator" in s.sup.critical()[0]
+        assert s.timeline.events("fault_auto_clear_stopped")
+        alarm = next(e for e in s.timeline.events("alarm") if "stopped" in e.detail["msg"])
+        assert alarm.detail["level"] == "critical"
+        await asyncio.sleep(1.0)  # many passes
+        assert clears(rig.sim) == 1 and rig.sim.fault == "Motor overload"
+        assert not s.sup.open_allowed()
+        # The console's view: a critical supervisor alarm.
+        assert s.sup.status()["critical"] == s.sup.critical()
+        # An operator clears; automatic clearing starts again.
+        await s.sup.clear_faults("jde", "checked the motor")
+        await wait_until(lambda: s.sup.fault is None, 3, what="operator clear")
+        assert s.sup.critical() == []
+        rig.sim.set_fault("Motor overload")
+        await wait_until(lambda: clears(rig.sim) == 3, 5, what="automatic clear #2")
+        assert any(a.startswith("automatic fault clear #2") for a in s.sup.alarms)
+    finally:
+        await s.stop()
+
+
+async def test_auto_clear_never_clears_an_estop(make_rig):
+    rig = make_rig({"heartbeat_timeout": 2.0})
+    rig.sim.set_fault("Estop active")  # clearable, even: still not auto-cleared
+    s = start_supervisor(rig, **AUTO)
+    try:
+        await wait_until(lambda: s.sup.critical(), 5, what="E-stop alarm")
+        assert s.sup.critical()[0].startswith("E-STOP reported by the enclosure")
+        await asyncio.sleep(1.0)
+        assert clears(rig.sim) == 0 and rig.sim.fault == "Estop active"
+        assert sum(a.startswith("E-STOP") for a in s.sup.alarms) == 1  # once
+        assert not s.timeline.events("fault_auto_clear")
+        # The server refuses an automatic clear of an E-stop by itself, too.
+        dome = rig.dome()
+        with pytest.raises(InvalidOperationException, match="E-stop"):
+            await dome.call("Action", "ClearFaults", f"{AUTO_CLEAR_PREFIX} test")
+        assert clears(rig.sim) == 0
+        # An operator resets it.
+        await s.sup.clear_faults("jde", "E-stop reset at the enclosure")
+        await wait_until(lambda: not s.sup.critical(), 3, what="E-stop gone")
+    finally:
+        await s.stop()
+
+
+async def test_auto_clear_waits_for_the_enclosure_to_close(make_rig):
+    rig = make_rig({"heartbeat_timeout": 2.0})
+    s = start_supervisor(rig, **AUTO)
+    try:
+        lease = await asyncio.wait_for(s.sup.request_open("tester"), 10)
+
+        async def renew() -> None:
+            while True:
+                lease.renew()
+                await asyncio.sleep(0.2)
+
+        renewer = asyncio.create_task(renew())
+        await asyncio.wait_for(lease.wait_open(), 15)
+        rig.sim.set_fault("Motor overload", blocks_motion=False)  # open and fault
+        await wait_until(lambda: clears(rig.sim) == 1, 10, what="automatic clear")
+        renewer.cancel()
+        cmds = rig.sim.commands()
+        # The close was commanded, and finished, before the clear.
+        assert any(c.startswith("CLOSE") for c in cmds[: cmds.index("CLEAR_FAULTS")])
+        closed_at = max(t for t, c in rig.sim.log if c.startswith("CLOSE"))
+        cleared_at = rig.opened_at("CLEAR_FAULTS")
+        assert cleared_at - closed_at >= TRAVEL * 0.9
+        assert any("FAULT WITH ENCLOSURE NOT CLOSED" in a for a in s.sup.alarms)
+        lease.release()
+    finally:
+        await s.stop()
+
+
+async def test_auto_clear_leaves_an_emergency_close_latch(make_rig):
+    """An emergency close (an operator's) is latched as a fault: only an
+    operator releases it, so it is never cleared automatically."""
+    rig = make_rig({"heartbeat_timeout": 2.0}, emergency_close={"token_sha256": ["0" * 64]})
+    gate = rig.server.aqawan.gate
+    assert gate is not None
+    gate.latched = {"time": None, "operator": "alice", "reason": "smoke", "ok": True}
+    s = start_supervisor(rig, **AUTO)
+    try:
+        await wait_until(lambda: s.sup.fault is not None, 3, what="latched fault")
+        await asyncio.sleep(1.0)
+        assert clears(rig.sim) == 0 and gate.latched is not None
+        assert not s.timeline.events("fault_auto_clear")
+        dome = rig.dome()
+        with pytest.raises(InvalidOperationException, match="latch"):
+            await dome.call("Action", "ClearFaults", f"{AUTO_CLEAR_PREFIX} test")
+        assert gate.latched is not None
+    finally:
+        await s.stop()

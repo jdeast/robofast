@@ -346,6 +346,8 @@ class Aggregator:
         lease = sup.get("lease") if isinstance(sup.get("lease"), dict) else None
         for text in sup.get("alarms") or []:
             alarm("supervisor", str(text))
+        for text in sup.get("critical") or []:  # needs an operator now
+            alarm("supervisor", str(text), "critical")
         if sup.get("fault"):
             alarm("enclosure", f"enclosure fault: {sup['fault']}")
         if lease is not None and lease.get("quarantined"):

@@ -45,6 +45,7 @@ SUPERVISOR = {
     "reason": "weather safe",
     "open_allowed": True,
     "fault": "enclosure reports Fault (motor overcurrent)",
+    "critical": ["automatic fault clearing stopped: an operator must clear faults"],
     "shutter_hold_for": None,
     "shutter": "OPEN",
     "lease": {
@@ -350,6 +351,8 @@ async def test_aggregation_from_fake_services(make_console):
     texts = {a["text"]: a for a in s["alarms"]}
     assert "cannot read shutter: timeout" in texts
     assert "enclosure fault: enclosure reports Fault (motor overcurrent)" in texts
+    stopped = texts["automatic fault clearing stopped: an operator must clear faults"]
+    assert stopped["level"] == "critical"  # the supervisor's `critical` list
     assert "would close: rain (shadow)" in texts
     assert (
         "t2 gave up for the night" in texts

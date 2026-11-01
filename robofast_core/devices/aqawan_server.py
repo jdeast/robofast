@@ -47,16 +47,21 @@ Members
   ``GetFaults``/``GetErrors`` return the PAC's text.
 * ``Action("Faults", "")`` is the fault channel (read-only): JSON
   ``{"fault": bool, "error": bool, "faults": str|null, "errors": str|null,
-  "shutters": [s1, s2]}``, from a STATUS at most ``status_max_age`` old
-  (``faults``/``errors`` are the PAC's text, once fetched). The safety
-  supervisor polls it (``SafetyConfig.fault_action``) and alarms.
+  "estop": bool, "shutters": [s1, s2]}``, from a STATUS at most
+  ``status_max_age`` old (``faults``/``errors`` are the PAC's text, once
+  fetched; ``estop`` is true when that text names an emergency stop). The
+  safety supervisor polls it (``SafetyConfig.fault_action``) and alarms.
 * ``Action("ClearFaults", note)`` sends ``CLEAR_FAULTS`` then
   ``CLEAR_ERRORS``, logged with ``note`` (who and why). It is refused unless
   both shutters are reported ``CLOSED`` and no open sequence runs. It is for
   an operator, through the supervisor (``POST /faults/clear``); the dome
   owner makes it privileged (``"Action:ClearFaults"`` in
   :data:`robofast_core.safety.ENCLOSURE_MEMBERS`), so a sequencer cannot
-  call it. Nothing clears faults automatically (not decided, 2026-10-31).
+  call it. The supervisor's automatic clear (``fault_auto_clear``, JDE
+  2026-10-31; policy in :mod:`robofast_core.safety`) sends a note starting
+  with ``auto:``; such a clear is also refused here while the PAC's text
+  names an E-stop or an emergency close is latched (only an operator
+  releases either).
 * ``OpenShutter`` is refused (``InvalidOperationException``) while the PAC
   reports a Fault or Error, or an operating mode other than ``AUTO``, and
   (only if ``interlock_doors`` names them) a door that is not ``CLOSED``.
@@ -132,6 +137,7 @@ from robofast_core.devices.aqawan_pac import (
 )
 from robofast_core.emergency import PATH as EMERGENCY_PATH
 from robofast_core.emergency import EmergencyConfig, EmergencyGate, parse_body
+from robofast_core.safety import AUTO_CLEAR_PREFIX, mentions_estop
 
 log = logging.getLogger(__name__)
 
@@ -331,26 +337,47 @@ class Aqawan:
         if latched is not None:
             # An emergency close is latched as a fault (robofast_core.emergency).
             faults = latched if faults is None else f"{faults}; {latched}"
+        errors = self._pac_text["GET_ERRORS"] if st.error else None
+        pac_faults = self._pac_text["GET_FAULTS"] if st.fault else None
         out = {
             "fault": st.fault or latched is not None,
             "error": st.error,
             "faults": faults,
-            "errors": self._pac_text["GET_ERRORS"] if st.error else None,
+            "errors": errors,
+            # The PAC's own text names an emergency stop: never auto-cleared.
+            "estop": mentions_estop(pac_faults) or mentions_estop(errors),
             "shutters": list(st.shutters),
         }
         if self.gate is not None:
             out["emergency_close"] = self.gate.latched
         return out
 
-    async def clear_faults(self, note: str) -> str:
-        """Operator only (privileged at the owner): clear the PAC's faults and
-        errors, but only with the enclosure closed. Never automatic."""
+    async def clear_faults(self, note: str, *, auto: bool = False) -> str:
+        """Privileged at the owner (an operator, or the supervisor's
+        ``fault_auto_clear`` policy): clear the PAC's faults and errors, but
+        only with the enclosure closed."""
         st = await self.status(max_age=0)
         if st.shutters != ("CLOSED", "CLOSED") or self.sequence_running:
             raise AlpacaException(
                 INVALID_OPERATION,
                 f"not clearing faults: enclosure not closed (shutters {st.shutters})",
             )
+        if auto:
+            # Defence in depth for the supervisor's policy: never an E-stop,
+            # never an operator's emergency close latch.
+            texts = (
+                self._pac_text["GET_FAULTS"] if st.fault else None,
+                self._pac_text["GET_ERRORS"] if st.error else None,
+            )
+            if any(mentions_estop(t) for t in texts):
+                raise AlpacaException(
+                    INVALID_OPERATION,
+                    f"not auto-clearing an E-stop ({'; '.join(filter(None, texts))})",
+                )
+            if self.gate is not None and self.gate.latched:
+                raise AlpacaException(
+                    INVALID_OPERATION, "not auto-clearing an emergency close latch"
+                )
         log.warning(
             "ClearFaults requested (%s); PAC Fault=%s Error=%s",
             note or "no note",
@@ -946,8 +973,10 @@ class AqawanServer(ThreadingHTTPServer):
         if key == "faults":
             return json.dumps(self._call(a.faults, "Faults"))
         if key == "clearfaults":
-            note = f"ClientID {client}: {parameters.strip() or 'no reason given'}"
-            return self._call(lambda: a.clear_faults(note), "ClearFaults")
+            text = parameters.strip()
+            note = f"ClientID {client}: {text or 'no reason given'}"
+            auto = text.startswith(AUTO_CLEAR_PREFIX)
+            return self._call(lambda: a.clear_faults(note, auto=auto), "ClearFaults")
         if key in ("getfaults", "geterrors"):
             command = "GET_FAULTS" if key == "getfaults" else "GET_ERRORS"
             return self._call(lambda: a.pac.command(command), name)

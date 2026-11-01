@@ -798,7 +798,7 @@ support is often worse. So:
 | `fault_action` | none | the dome's read-only fault channel (Aqawan: `Faults`); any fault alarms and blocks opening, and a fault with the enclosure not closed closes it |
 | `fault_auto_clear` | off (MINERVA: on) | clear a fault automatically, only with the enclosure closed, never an E-stop; a recurrence stops it until an operator clears (`docs/aqawan.md`) |
 | `fault_auto_clear_interval`, `fault_auto_clear_settle` | 1 h, 15 s | at most one automatic clear per interval; a fault still there `settle` after one counts as a recurrence |
-| `attended_only` | true without a heartbeat device | no lease unless an operator is on duty (section 3.3); FLWO 60-inch: on; MINERVA: off |
+| `attended_only` | true without a heartbeat device | no lease unless an operator is on duty (section 3.3); FLWO 60-inch and MEarth South: on; MINERVA: off |
 | `duty_ttl`, `duty_grace` | 300 s, 300 s | an operator's duty not renewed this long raises a critical alarm; after the grace, the supervisor closes |
 | `shutter_unreadable_grace` | 15 s | while open is wanted, a shutter unreadable this long revokes the lease and closes (shutterError does so at once) |
 | `shutter_error_backoff` | 30 min | no reopen after a shutter error, so a broken shutter is not cycled |
@@ -880,6 +880,11 @@ Each step is a CI-tested deliverable.
     and open questions in `docs/tcsgo.md`). Next: answers to those
     questions, a TRES camera/spectrograph service, then a supervised
     test on the real TCS.
+    MEarth South: an Alpaca Dome server for its roll-off roof (a
+    parallel-port interface box, no watchdog, so attended only), with a
+    simulator of its faults, passing ConformU in CI, and the
+    `sites/mearth_south/` config, hardware locked until confirmed on site
+    (`docs/mearth_roof.md`, which also describes the North roof).
 13. **Done:** the sequencer saves its frames (section 3.4, `docs/data.md`):
     ImageBytes download, the value registry (section 3.8), the FITS header
     builder and an atomic, never-overwriting writer with a nightly index;

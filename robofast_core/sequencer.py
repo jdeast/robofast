@@ -317,6 +317,9 @@ POINTING_RUN_DEFAULTS: dict[str, Any] = {
     "significance": 4.0,
 }
 
+#: What a target's acquisition entry passes to the guider (docs/acquisition.md).
+ACQ_KEYS = ("mode", "fallback", "companions", "tolerance")
+
 #: Preemption policies, weakest first (module doc).
 PREEMPT_POLICIES = ("next", "now-after-readout", "now")
 
@@ -529,6 +532,8 @@ class TelescopeUnit:
     #: The recovery ladder (docs/recovery.md): what to try when one of its
     #: devices fails, before giving up for the night.
     recovery: RecoveryLadder | None = None
+    #: How the guider identified the last target (docs/acquisition.md).
+    acquisition: dict[str, Any] | None = field(default=None, init=False)
 
     @property
     def active(self) -> bool:
@@ -1846,12 +1851,36 @@ class Sequencer:
                 if obs.kind == "spectrum":
                     await self._locate_fiber(state, unit)
                 acq = (obs.spectrum or {}).get("acquisition") or {}
-                await unit.guider.start(
+                extra: dict[str, Any] = {}
+                how = {k: acq[k] for k in ACQ_KEYS if k in acq}
+                if how:
+                    extra["acquisition"] = how
+                sigma = self._pointing_sigma(unit, obs.port)
+                if sigma is not None:
+                    extra["pointing_sigma"] = sigma
+                st = await unit.guider.start(
                     dec=dec,
                     target_radec=[ra * 15.0, dec],
                     unambiguous=bool(acq.get("unambiguous", False)),
+                    **extra,
                 )
-                self._event("guiding", gen=gen, telescope=unit.name, target=obs.name)
+                done = (st or {}).get("acquisition") if isinstance(st, dict) else None
+                self._acquired(unit, done)
+                self._event(
+                    "guiding",
+                    gen=gen,
+                    telescope=unit.name,
+                    target=obs.name,
+                    **(
+                        {}
+                        if not done
+                        else {
+                            "acq_method": done.get("method"),
+                            "acq_stars": done.get("stars"),
+                            "acq_trace": done.get("trace"),
+                        }
+                    ),
+                )
         if obs.kind == "autofocus":
             await self._autofocus(state, unit, tel, cam, obs, taken)
             return
@@ -1935,6 +1964,33 @@ class Sequencer:
         if imaging is not None and taken:
             # Complete means on disk: the plan records the paths.
             await imaging.flush(unit.name)
+
+    # -- acquisition (docs/acquisition.md) ---------------------------------------
+
+    @staticmethod
+    def _pointing_sigma(unit: TelescopeUnit, port: str | None) -> float | None:
+        """The pointing model's cross-validated rms (arcsec), if robofast's
+        model is in use: how far from the fiber the target can be."""
+        pc = unit.pointing
+        built = None if pc is None or not pc.enabled else pc.model_for(port)
+        if built is None or not math.isfinite(built.cv_rms):
+            return None
+        return float(built.cv_rms)
+
+    def _acquired(self, unit: TelescopeUnit, done: dict[str, Any] | None) -> None:
+        """How the guider identified the target: kept for the spectrum's
+        record and the FITS headers (ACQMETH, ACQSTARS)."""
+        unit.acquisition = done
+        if not done:
+            return
+        for name, value, kw, comment in (
+            ("acq.method", done.get("method"), "ACQMETH", "How the target was identified"),
+            ("acq.stars", done.get("stars"), "ACQSTARS", "Stars in the acquisition frame"),
+        ):
+            if value is not None:
+                self.registry.publish(
+                    f"{unit.name}.{name}", value, max_age=None, keyword=kw, comment=comment
+                )
 
     # -- pointing model (docs/pointing_model.md) --------------------------------
 
@@ -3048,6 +3104,7 @@ class Sequencer:
             "telescopes_end": end,
             "dropped": dict(session.dropped),
             "guide": stats,
+            "acquisition": {t: self.units[t].acquisition for t in feeding if t in self.units},
             "exptime": result.get("exptime"),
             "exptime_requested": result.get("exptime_requested", obs.exptime),
             "ended_by": result.get("ended_by"),

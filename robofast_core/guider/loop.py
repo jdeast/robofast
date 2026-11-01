@@ -243,6 +243,10 @@ class Guider:
         #: and whether brightest-star acquisition is safe without one.
         self.identify: Callable[[Frame], tuple[float, float] | None] | None = None
         self.unambiguous = False
+        #: The acquisition cascade for this start (docs/acquisition.md;
+        #: :class:`~robofast_core.guider.acquire.Acquirer`): when set, it alone
+        #: decides which star is the target, whatever ``select`` says.
+        self.acquirer: Any = None
         #: Where the last acquisition frame put the target (None: unsolved).
         self.identified: tuple[float, float] | None = None
         self._why = ""
@@ -436,7 +440,13 @@ class Guider:
         assert c.target is not None
         tx, ty = c.target
         mode = c.select
-        if mode == "catalog":
+        if self.acquirer is not None:
+            if hint is None:
+                last = self.acquirer.last or {}
+                self._why = f"target not identified ({last.get('method')}: {last.get('reason')})"
+                return None
+            mode = "hint"
+        elif mode == "catalog":
             if hint is not None:
                 mode = "hint"
             elif self.unambiguous:
@@ -481,12 +491,26 @@ class Guider:
         self._set_state("acquiring")
         prev: float | None = None
         worse = 0
+        exposure = c.acq_exposure
+        retried = False
         for i in range(c.coarse_iterations + 1):
             if self._stop.is_set():
                 return None
-            frame = await self.camera.expose(c.acq_exposure, self._acq_roi(), c.gain)
+            frame = await self.camera.expose(exposure, self._acq_roi(), c.gain)
             hint = None
-            if c.select == "catalog" and self.identify is not None:
+            if self.acquirer is not None:
+                if isinstance(self.clock, RealClock):
+                    hint = await asyncio.to_thread(self.acquirer, frame)
+                else:
+                    hint = self.acquirer(frame)
+                self.identified = hint
+                longer = self.acquirer.config.retry_exposure
+                if hint is None and longer and not retried:
+                    retried = True
+                    exposure = float(longer)
+                    log.info("acquisition: retrying with a %.1f s exposure", exposure)
+                    continue
+            elif c.select == "catalog" and self.identify is not None:
                 if isinstance(self.clock, RealClock):
                     hint = await asyncio.to_thread(self.identify, frame)
                 else:  # simulated time: compute costs none (VirtualClock)
@@ -683,6 +707,7 @@ class Guider:
         return {
             "state": self.state,
             "reason": self.reason,
+            "acquisition": None if self.acquirer is None else self.acquirer.summary(),
             "mode": c.mode,
             "target": list(c.target) if c.target else None,
             "roi": self._roi.as_json() if self._roi else None,

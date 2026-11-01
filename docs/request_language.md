@@ -68,7 +68,7 @@ acted on.
 | `target` | below | | |
 | `constraints` | below | | |
 | `guiding_config.mode` | `ON`, `OFF` | `guide` | ON: guide on the target. A SPECTRUM is always guided. `optional`, `exposure_time`, ... accepted, not used. Previously `guide` |
-| `acquisition_config` | | | accepted, not used (acquisition is the telescope's) |
+| `acquisition_config` | `mode`: `AUTO` (default), `BRIGHTEST`, `GEOMETRY`, `SOLVE` (= OCS `WCS`), `COORDINATES` (= OCS `OFF`); `extra_params`: `fallback`, `companions` `[{ra, dec, g}]`, `tolerance` (px) | | how the guider tells the target from its neighbours (docs/acquisition.md); `exposure_time` accepted, not used |
 | `extra_params.allow_partial`* | bool | | keep frames of an interrupted visit. Previously top level |
 | `repeat_duration` | | | refused unless null (REPEAT_* types not supported) |
 | `status`, `failures` | robofast status | | set by the scheduler; refused on submit |

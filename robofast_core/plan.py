@@ -67,6 +67,7 @@ KINDS = (
     "manual",
     "pointing_model",
     "rotator_calibration",
+    "sky_flat",
 )
 
 
@@ -137,16 +138,25 @@ class Observation:
     #: angles): overrides of the telescope's ``pa_calibration`` settings
     #: (``angles``, ``sense``).
     rotator: dict[str, Any] | None = None
+    #: For ``kind="sky_flat"`` (twilight flats, docs/skyflats.md; the target
+    #: is computed: opposite the Sun, 75 deg high): overrides of the
+    #: telescope's ``sky_flats`` settings (``filters``, ``count``, ...).
+    flats: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in KINDS:
             raise ValueError(f"observation {self.name!r}: kind {self.kind!r} not in {KINDS}")
         if self.kind == "manual" and not self.light:
             raise ValueError(f"observation {self.name!r}: manual control needs the lease")
-        if self.kind in ("autofocus", "pointing_model", "rotator_calibration") and not self.light:
+        if (
+            self.kind in ("autofocus", "pointing_model", "rotator_calibration", "sky_flat")
+            and not self.light
+        ):
             raise ValueError(f"observation {self.name!r}: a {self.kind} needs light")
         if self.pointing is not None and self.kind != "pointing_model":
             raise ValueError(f"observation {self.name!r}: 'pointing' is for kind 'pointing_model'")
+        if self.flats is not None and self.kind != "sky_flat":
+            raise ValueError(f"observation {self.name!r}: 'flats' is for kind 'sky_flat'")
         if self.rotator is not None and self.kind != "rotator_calibration":
             raise ValueError(
                 f"observation {self.name!r}: 'rotator' is for kind 'rotator_calibration'"

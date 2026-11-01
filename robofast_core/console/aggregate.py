@@ -368,6 +368,7 @@ class Aggregator:
             "open_allowed": sup.get("open_allowed"),
             "fault": sup.get("fault"),
             "shutter_hold_for": sup.get("shutter_hold_for"),
+            "duty": sup.get("duty"),
             "heartbeat_age": None if hb is None else round(float(hb), 1),
             "enforced_ago": sup.get("enforced_ago"),
             "orphaned_for": sup.get("orphaned_for"),

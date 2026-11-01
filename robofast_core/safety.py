@@ -56,6 +56,21 @@ Automatic fault clearing (``fault_auto_clear``; MINERVA's Aqawan, JDE
 The supervisor holds the dome owner's single *privileged* grant: the owner
 refuses ``OpenShutter``/``CloseShutter`` from anyone else.
 
+Attended-only enclosures
+------------------------
+An enclosure without a hardware heartbeat device has nothing that closes it
+if this process dies or hangs, so it must not run unattended (JDE
+2026-10-31; the FLWO 60-inch dome has no watchdog). ``attended_only``
+(default: true exactly when no heartbeat device is configured) makes the
+supervisor grant no lease, and so never open, unless an operator is **on
+duty**: :meth:`SafetySupervisor.duty_on` (the observer console's ``duty``
+action, audited), renewed by :meth:`SafetySupervisor.duty_renew` (the
+console page renews it while it is open). A duty not renewed for
+``duty_ttl`` raises a critical alarm; ``duty_grace`` later the supervisor
+revokes the lease and closes, as for any revocation. Going off duty
+(:meth:`SafetySupervisor.duty_off`) with the enclosure open closes it at
+once. An enclosure with a heartbeat (MINERVA's Aqawan) is unaffected.
+
 Recovering from a sequencer crash
 ---------------------------------
 A sequencer that dies holding a lease leaves it revoked (unrenewed) but never
@@ -180,8 +195,21 @@ class SafetyConfig:
     #: broken shutter is not cycled every reopen hold.
     shutter_unreadable_grace: float = 15.0
     shutter_error_backoff: float = 1800.0
+    #: No lease (so no opening) unless an operator is on duty (module doc).
+    #: ``None``: true exactly when there is no hardware heartbeat device
+    #: (``heartbeat_interval`` unset). Setting it false without a heartbeat
+    #: runs an enclosure unattended with nothing behind the supervisor.
+    attended_only: bool | None = None
+    #: An operator's duty expires (critical alarm) this long after its last
+    #: renewal, and the supervisor closes ``duty_grace`` after that.
+    duty_ttl: float = 300.0
+    duty_grace: float = 300.0
 
     def __post_init__(self) -> None:
+        if self.attended_only is None:
+            self.attended_only = self.heartbeat_interval is None
+        if self.duty_ttl <= 0 or self.duty_grace < 0:
+            raise ValueError("duty_ttl must be > 0 and duty_grace >= 0")
         if self.fault_auto_clear and not self.fault_action:
             raise ValueError("fault_auto_clear needs fault_action (the dome's fault channel)")
         if self.fault_auto_clear_interval <= 0:
@@ -321,6 +349,15 @@ class SafetySupervisor:
         self._auto_clear_stopped: str | None = None
         self._shutter_bad_since: float | None = None
         self._shutter_hold_until: float | None = None
+        #: The operator on duty (``attended_only``): name, since, last renewal.
+        self._duty: dict[str, Any] | None = None
+        self._duty_expired: str | None = None
+        if not self.config.attended_only and self._hb is None:
+            log.warning(
+                "%s: attended_only is off and there is no hardware heartbeat:"
+                " nothing closes this enclosure if the supervisor dies",
+                name,
+            )
 
         self._safe = False
         self._reason = "startup (no weather read yet)"
@@ -352,10 +389,13 @@ class SafetySupervisor:
         """The current (or last) lease."""
         return self._lease
 
-    def open_allowed(self, now: float | None = None) -> bool:
+    def open_allowed(self, now: float | None = None, *, keep: bool = False) -> bool:
+        """May the enclosure open (``keep``: stay open; an expired duty's
+        grace counts then)?"""
         now = time.monotonic() if now is None else now
         return (
-            self._safe
+            self.attended(now, keep=keep)
+            and self._safe
             and self._fault is None
             and (self._shutter_hold_until is None or now >= self._shutter_hold_until)
             and self._safe_since is not None
@@ -370,7 +410,120 @@ class SafetySupervisor:
     def critical(self) -> list[str]:
         """Conditions that need an operator now (the console raises them as
         critical alarms until they are gone)."""
-        return [c for c in (self._estop, self._auto_clear_stopped) if c]
+        return [c for c in (self._estop, self._auto_clear_stopped, self._duty_expired) if c]
+
+    # -- operator duty (attended_only) ---------------------------------------
+
+    def attended(self, now: float | None = None, *, keep: bool = False) -> bool:
+        """True unless ``attended_only`` and no operator's duty is current
+        (``keep``: or within its grace, for an enclosure already open)."""
+        cfg = self.config
+        if not cfg.attended_only:
+            return True
+        duty = self._duty
+        now = time.monotonic() if now is None else now
+        limit = cfg.duty_ttl + (cfg.duty_grace if keep else 0.0)
+        return duty is not None and now - duty["renewed"] <= limit
+
+    def duty_on(self, operator: str, reason: str = "") -> dict[str, Any]:
+        """An operator goes on duty (or takes over from another); logged."""
+        operator = operator.strip()
+        if not operator:
+            raise ValueError("going on duty needs an operator name")
+        now = time.monotonic()
+        prev = self._duty
+        self._duty = {"operator": operator, "since": now, "renewed": now}
+        self._duty_expired = None
+        self.timeline.event(
+            self.name,
+            "duty_on",
+            operator=operator,
+            reason=reason,
+            took_over=None if prev is None or prev["operator"] == operator else prev["operator"],
+        )
+        log.warning("%s: %s on duty (%s)", self.name, operator, reason or "no reason given")
+        self._wake.set()
+        return self.duty_status(now)
+
+    def duty_renew(self, operator: str) -> dict[str, Any]:
+        """The console page's renewal; only the operator on duty renews it."""
+        duty = self._duty
+        if duty is None or duty["operator"] != operator.strip():
+            raise RecoveryRefused(
+                f"{operator!r} is not on duty"
+                + ("" if duty is None else f" ({duty['operator']} is)")
+            )
+        now = time.monotonic()
+        if self._duty_expired is not None:
+            self.timeline.event(self.name, "duty_renewed_late", operator=duty["operator"])
+            self._duty_expired = None
+        duty["renewed"] = now
+        return self.duty_status(now)
+
+    def duty_off(self, operator: str, reason: str = "") -> dict[str, Any]:
+        """The operator goes off duty. With ``attended_only``, an open
+        enclosure closes at once (the lease is revoked)."""
+        duty, self._duty, self._duty_expired = self._duty, None, None
+        self.timeline.event(
+            self.name,
+            "duty_off",
+            operator=operator,
+            reason=reason,
+            was=None if duty is None else duty["operator"],
+        )
+        log.warning("%s: %s off duty (%s)", self.name, operator, reason or "no reason given")
+        if self.config.attended_only:
+            self._revoke_lease(f"operator {operator} went off duty (attended only)")
+        self._wake.set()
+        return self.duty_status()
+
+    def duty_status(self, now: float | None = None) -> dict[str, Any]:
+        now = time.monotonic() if now is None else now
+        duty = self._duty
+        cfg = self.config
+        out: dict[str, Any] = {
+            "attended_only": bool(cfg.attended_only),
+            "on_duty": None if duty is None else duty["operator"],
+            "attended": self.attended(now),
+            "ttl": cfg.duty_ttl,
+            "grace": cfg.duty_grace,
+        }
+        if duty is not None:
+            age = now - duty["renewed"]
+            out.update(
+                since_s=now - duty["since"],
+                renewed_ago=age,
+                expires_in=cfg.duty_ttl - age,
+                closes_in=None if not cfg.attended_only else cfg.duty_ttl + cfg.duty_grace - age,
+            )
+        return out
+
+    def _check_duty(self, now: float) -> None:
+        """Duty expiry: a critical alarm after ``duty_ttl``; after
+        ``duty_grace`` more, the lease is revoked (so the enclosure closes)."""
+        cfg = self.config
+        duty = self._duty
+        if not cfg.attended_only or duty is None:
+            return
+        age = now - duty["renewed"]
+        if age <= cfg.duty_ttl:
+            return
+        if self._duty_expired is None:
+            self._duty_expired = (
+                f"operator duty ({duty['operator']}) not renewed for {cfg.duty_ttl:g} s:"
+                f" this enclosure is attended only; closing in {cfg.duty_grace:g} s"
+                " unless the console renews it"
+            )
+            self._alarm(self._duty_expired, "critical")
+            self.timeline.event(self.name, "duty_expired", operator=duty["operator"])
+        if age > cfg.duty_ttl + cfg.duty_grace:
+            lease = self._lease
+            if lease is not None and lease.live:
+                self._alarm(
+                    f"operator duty ({duty['operator']}) expired; closing (attended only)",
+                    "critical",
+                )
+                self._revoke_lease(f"operator duty ({duty['operator']}) expired")
 
     def status(self) -> dict[str, Any]:
         lease = self._lease
@@ -381,6 +534,7 @@ class SafetySupervisor:
             "open_allowed": self.open_allowed(),
             "fault": self._fault,
             "critical": self.critical(),
+            "duty": self.duty_status(now),
             "fault_auto_clear": None
             if not self.config.fault_auto_clear
             else {
@@ -589,7 +743,7 @@ class SafetySupervisor:
 
     def _want_open(self, now: float) -> bool:
         lease = self._lease
-        return self.open_allowed(now) and lease is not None and lease.live
+        return self.open_allowed(now, keep=True) and lease is not None and lease.live
 
     async def _check_faults(self) -> None:
         """Read the dome's fault channel; alarm when a fault appears or changes.
@@ -745,6 +899,7 @@ class SafetySupervisor:
         await self._check_faults()
         now = time.monotonic()
         cfg = self.config
+        self._check_duty(now)
         if self._safe and (
             self._last_good_read is None or now - self._last_good_read > cfg.stale_after
         ):

@@ -190,6 +190,7 @@ dialog; the destructive ones (marked *confirm*) must also send
 | `clear_spectrograph` (*confirm*) | `enclosure` | the sequencer takes spectra again after it marked the spectrograph down (through `operator_control`; the spectrograph panel shows up/down, the failures and who waits in its queue) |
 | `clear_faults` (*confirm*) | `enclosure` | the enclosure's `ClearFaults` (the supervisor refuses unless it is closed); also releases an emergency close latch, and restarts automatic fault clearing if a recurrence stopped it (`docs/aqawan.md`) |
 | `manual` | `enclosure`, `telescope`, `op`, ... | manual control of one telescope (below; `take` needs *confirm*) |
+| `duty` | `enclosure`, `op`: `on`, `off` or `renew` | an attended-only enclosure: go on duty (you, the token's name, are the operator on duty), go off duty (an open enclosure closes), or renew (the page does this every minute while it is open; audited, not shown in the log). Below |
 | `emergency_close` (*confirm*) | `enclosure` (omit: all), `direct`, `reason` (optional) | close now, by any path that answers (below). Never rate limited |
 
 Requests and ToOs go through the request API's own code
@@ -375,13 +376,43 @@ e.g. "no focuser") show in the section, from `holds.json`'s `manual` entry.
 Manual commands count against the per-token action limit
 (`action_per_minute`, `action_burst`).
 
+## Operator duty (attended-only enclosures)
+
+An enclosure without a hardware heartbeat has nothing that closes it if the
+safety supervisor dies, so it does not run unattended (JDE, 2026-10-31; the
+FLWO 60-inch dome has no watchdog). Its supervisor has `attended_only`
+(automatic when no heartbeat device is configured; `sites/flwo60/flwo60.json`
+sets it) and grants no lease, so it never opens, unless an operator is **on
+duty**. MINERVA's Aqawan pings a hardware heartbeat and is unaffected: its
+enclosure panel says "not needed".
+
+* **On duty**: the enclosure panel's *on duty* button (`duty`, `op: "on"`,
+  with a reason; audited). Another observer pressing it takes over.
+* **Renewal**: while the console page is open, it renews the duty every
+  minute (`op: "renew"`). The panel shows who is on duty and when it was
+  last renewed.
+* **Expiry**: no renewal for `duty_ttl` (300 s at the 60-inch) raises a
+  critical alarm; after `duty_grace` more (300 s) the supervisor revokes
+  the lease and closes, as for any revocation. A renewal within the grace
+  clears the alarm.
+* **Off duty** (*off duty*, `op: "off"`): with the enclosure open, it
+  closes at once.
+
+The supervisor's `GET /status` carries `duty` (`attended_only`, `on_duty`,
+`attended`, `renewed_ago`, `expires_in`, `closes_in`); its endpoint is
+`POST /duty` (`robofast_core/supervisor_service.py`). Going on duty does
+not open anything: it only allows the supervisor's own policy to grant a
+lease.
+
 ## The console cannot open the roof
 
 Opening happens only one way: the safety supervisor opens when the weather
 has been safe for the reopen hold and a live sequencer holds a lease. The
 console can do none of that. It reaches the supervisor through
 `SupervisorClient`, whose whole list is `GET /status`, `GET /timeline`,
-`POST /close`, `POST /faults/clear` and `POST /leases/{token}/clear`; it
+`POST /close`, `POST /faults/clear`, `POST /leases/{token}/clear` and
+`POST /duty` (operator duty, which only permits the policy to grant a
+lease); it
 refuses anything else before sending it (requesting, renewing or recovering a
 lease included). It never sends the lease token to the browser. Its only
 other way to an enclosure is the dome's emergency channel, which can only

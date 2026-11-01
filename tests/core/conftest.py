@@ -42,6 +42,9 @@ from robofast_core.testing.fakes import (
 
 #: Fast timings for unit tests (seconds).
 FAST_SAFETY = dict(
+    # The fakes have no hardware heartbeat; these tests are not about
+    # operator duty (test_attended.py is).
+    attended_only=False,
     poll_interval=0.05,
     read_timeout=0.3,
     stale_after=0.6,

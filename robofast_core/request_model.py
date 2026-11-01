@@ -515,7 +515,10 @@ class Configuration:
     #: zenith at the intended time) -- the grid covers the whole sky.
     #: ``ROTATOR_CALIBRATION`` (robofast's): measure the port's PA and
     #: parity on the target's field at the rotator angles of the
-    #: telescope's ``pa_calibration`` (docs/rotcal.md).
+    #: telescope's ``pa_calibration`` (docs/rotcal.md). ``SKY_FLAT``
+    #: (robofast's): twilight flats opposite the Sun, ``exposure_count`` per
+    #: instrument config's filter (docs/skyflats.md); the target only gates
+    #: when it is schedulable.
     type: str = "EXPOSE"
     #: ``acquisition_config`` (docs/acquisition.md): how the guider tells the
     #: target from its neighbours -- ``mode`` (AUTO, BRIGHTEST, GEOMETRY,
@@ -533,6 +536,7 @@ class Configuration:
         "SPECTRUM",
         "POINTING_MODEL",
         "ROTATOR_CALIBRATION",
+        "SKY_FLAT",
     )
     GUIDE_MODES: ClassVar[tuple[str, ...]] = ("", "ON", "OFF")
 

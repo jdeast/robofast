@@ -52,7 +52,9 @@ def morning_report(out: Path) -> None:
     assert rep["requests"]["too"] == 1
     assert rep["autofocus"]["runs"] >= 2
     assert rep["spectrograph"]["science"] >= 3
-    assert set(rep["spectrograph"]["frames"]) - {"science"}, "calibration frames"
+    # KiwiSpec is iodine only (docs/kiwispec.md, section 4): no ThAr, no flats.
+    assert {"bias", "dark"} <= set(rep["spectrograph"]["frames"])
+    assert not {"thar", "fiberflat", "slitflat"} & set(rep["spectrograph"]["frames"])
     assert set(rep["guiding"]["rms_arcsec_median"]) == {"t1", "t2"}
     assert any(a["what"] == "telescope_error" for a in rep["anomalies"]), "T2's fault"
     assert {"t1", "t2"} <= set(rep["telescopes"])

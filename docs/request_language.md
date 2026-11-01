@@ -63,7 +63,7 @@ acted on.
 | JSON | Unit / values | Python | Notes |
 |---|---|---|---|
 | `id` | string | | optional on submit |
-| `type` | `EXPOSE`, `DARK`, `BIAS`, `AUTO_FOCUS`, `SPECTRUM`, `POINTING_MODEL`, `ROTATOR_CALIBRATION` | | DARK/BIAS: every frame shutter closed. `SPECTRUM` is a fiber spectrum fed by every free telescope of the request (docs/rv_night.md). `POINTING_MODEL` (robofast's) is a pointing run: `exposure_count` grid points over the sky, the target only gates when it is schedulable (docs/pointing_model.md). `ROTATOR_CALIBRATION` (robofast's) measures the port's PA and parity on the target's field (docs/rotcal.md). The OCS lamp types `ARC` and `LAMP_FLAT` (and a lamp in `extra_params`) are refused with the reason: KiwiSpec is iodine only (docs/kiwispec.md, section 4) |
+| `type` | `EXPOSE`, `DARK`, `BIAS`, `AUTO_FOCUS`, `SPECTRUM`, `POINTING_MODEL`, `ROTATOR_CALIBRATION`, `SKY_FLAT` | | DARK/BIAS: every frame shutter closed. `SPECTRUM` is a fiber spectrum fed by every free telescope of the request (docs/rv_night.md). `POINTING_MODEL` (robofast's) is a pointing run: `exposure_count` grid points over the sky, the target only gates when it is schedulable (docs/pointing_model.md). `ROTATOR_CALIBRATION` (robofast's) measures the port's PA and parity on the target's field (docs/rotcal.md). `SKY_FLAT` (robofast's): twilight flats, one instrument config per filter (docs/skyflats.md). The OCS lamp types `ARC` and `LAMP_FLAT` (and a lamp in `extra_params`) are refused with the reason: KiwiSpec is iodine only (docs/kiwispec.md, section 4) |
 | `instrument_type` | e.g. `imager`, `spectrograph` | `instrument` | the telescope must list it. Previously `instrument` |
 | `target` | below | | |
 | `constraints` | below | | |

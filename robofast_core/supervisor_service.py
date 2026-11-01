@@ -68,6 +68,11 @@ is random per process start, so after a restart every old token is unknown
   ``{"revoked": bool}``. There is no endpoint that opens.
 * ``GET /timeline?n=N`` -- the last ``N`` (at most 500) timeline entries,
   newest last, each with its wall-clock ``time``.
+* ``POST /duty`` ``{"operator", "op": "on"|"off"|"renew", "reason"?}`` --
+  an operator goes on or off duty, or renews it (the observer console's
+  ``duty`` action). With ``attended_only`` no lease is granted unless an
+  operator is on duty (:mod:`robofast_core.safety`); 409 for a renewal by
+  someone not on duty.
 * ``POST /faults/clear`` ``{"operator", "reason"}`` -- an operator clears
   the enclosure's faults (``Action("ClearFaults")`` on the supervisor's
   privileged dome grant; logged). 409 if the dome refuses, e.g. because it
@@ -204,6 +209,18 @@ class SupervisorServer:
                 return 200, {
                     "revoked": self.supervisor.operator_close(operator, str(args["reason"]))
                 }
+            if method == "POST" and parts == ["duty"]:
+                operator = str(args["operator"]).strip()
+                if not operator:
+                    raise _Error(400, "duty needs an operator name")
+                op = args.get("op")
+                if op == "on":
+                    return 200, self.supervisor.duty_on(operator, str(args.get("reason") or ""))
+                if op == "off":
+                    return 200, self.supervisor.duty_off(operator, str(args.get("reason") or ""))
+                if op == "renew":
+                    return 200, self.supervisor.duty_renew(operator)
+                raise _Error(400, 'duty: "op" is "on", "off" or "renew"')
             if method == "POST" and parts == ["faults", "clear"]:
                 operator = str(args["operator"]).strip()
                 if not operator:

@@ -158,6 +158,15 @@ The only component allowed to open or close an enclosure
 - **Hardware heartbeat behind it.** Where the enclosure controller supports
   it (the Aqawan's does), the supervisor pings it; if the pings stop, the
   hardware closes on its own. That makes every software bug survivable.
+- **No heartbeat, no unattended running.** An enclosure without a hardware
+  heartbeat device (the FLWO 60-inch dome has no watchdog, JDE 2026-10-31)
+  is `attended_only` (automatically): no lease is granted, so it never
+  opens, unless an operator is on duty. The operator checks in through the
+  observer console (`duty`, audited), and the open console page renews the
+  duty; one not renewed for `duty_ttl` raises a critical alarm, and
+  `duty_grace` later the supervisor revokes the lease and closes. Going
+  off duty closes an open enclosure. MINERVA (the Aqawan heartbeat) is
+  unaffected (`docs/console.md`, "Operator duty").
 - **A crashed sequencer's lease.** It expires and the enclosure closes, but
   it is never released, so nothing is granted until it is cleared. Only its
   restarted sequencer (`recover`, same holder name) or an operator (`clear`,
@@ -773,6 +782,8 @@ support is often worse. So:
 | `fault_action` | none | the dome's read-only fault channel (Aqawan: `Faults`); any fault alarms and blocks opening, and a fault with the enclosure not closed closes it |
 | `fault_auto_clear` | off (MINERVA: on) | clear a fault automatically, only with the enclosure closed, never an E-stop; a recurrence stops it until an operator clears (`docs/aqawan.md`) |
 | `fault_auto_clear_interval`, `fault_auto_clear_settle` | 1 h, 15 s | at most one automatic clear per interval; a fault still there `settle` after one counts as a recurrence |
+| `attended_only` | true without a heartbeat device | no lease unless an operator is on duty (section 3.3); FLWO 60-inch: on; MINERVA: off |
+| `duty_ttl`, `duty_grace` | 300 s, 300 s | an operator's duty not renewed this long raises a critical alarm; after the grace, the supervisor closes |
 | `shutter_unreadable_grace` | 15 s | while open is wanted, a shutter unreadable this long revokes the lease and closes (shutterError does so at once) |
 | `shutter_error_backoff` | 30 min | no reopen after a shutter error, so a broken shutter is not cycled |
 | `min_alt`, `max_alt` | 21°, 83° | per-telescope altitude limits (legacy MINALT, MAXALT) |

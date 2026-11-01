@@ -26,6 +26,10 @@ All bodies are JSON; errors are ``{"error": ...}`` with 400 (bad request),
   ``iodine`` default from config; exposure-meter terminated when
   ``target_counts`` is given, ``exptime`` then being the maximum),
   ``thar``, ``slitflat``, ``fiberflat``, ``dark``, ``bias`` (``exptime`` 0).
+  Only the kinds this spectrograph can take are accepted (``/status``
+  ``frame_kinds``): ``thar`` and ``fiberflat`` need ``lamp_frames``, and
+  ``slitflat`` needs ``slit_flat_led``. MINERVA's KiwiSpec has neither:
+  it is iodine only (JDE 2026-10-31; docs/kiwispec.md, "Calibration").
 * ``POST /calibrate`` ``{"frames": [{"kind", "exptime", "n"}, ...]}`` -- a
   calibration sequence as one job; 202.
 * ``GET /jobs/{id}?wait=S`` -- a job's state; waits up to ``S`` s for it to
@@ -120,7 +124,12 @@ from robofast_core.devices.kiwispec_client import (
 log = logging.getLogger(__name__)
 
 #: Frame kinds: (SI dark frame?, iodine position or None for the request's,
-#: slit-flat LED on?, uses the exposure meter?, needs telescopes?).
+#: slit-flat LED on?, uses the exposure meter?, needs telescopes?). ``thar``
+#: and ``fiberflat`` switch no lamp (legacy's lamp calls were commented out,
+#: and the server does not implement them): they only set the stage and
+#: expose, for a spectrograph whose lamps are lit some other way
+#: (``lamp_frames``). **Unavailable at MINERVA**: KiwiSpec has no ThAr or
+#: fiber-flat lamp and no way to switch to one (JDE 2026-10-31).
 KINDS: dict[str, tuple[bool, str | None, bool, bool, bool]] = {
     # legacy control.spec_equipment_check, per objname
     "science": (False, None, False, True, True),
@@ -130,6 +139,8 @@ KINDS: dict[str, tuple[bool, str | None, bool, bool, bool]] = {
     "dark": (True, "in", False, False, False),
     "bias": (True, "in", False, False, False),
 }
+#: Kinds that need a calibration lamp the service does not control.
+LAMP_KINDS = ("thar", "fiberflat")
 #: The iodine stage's named positions (the server's ``[I2POSITIONS]`` names).
 STAGE_NAMES = ("in", "flat", "out")
 #: Legacy object names in file names (``n20261031.<object>.0001.fits``).
@@ -246,6 +257,15 @@ class KiwiSpecConfig:
     heater_setpoint: float = 55.0  # legacy I2SETTEMP
     heater_tolerance: float = 0.501  # legacy I2TEMPTOL
     heater_wait: float = 10.0  # legacy: wait this long, then go on
+    #: The slit-flat LED works: slit flats (``slitflat``) and ``configure``'s
+    #: ``led: true`` are allowed. Off by default: legacy stopped slit flats in
+    #: 2023 ("Slit flat lamp is dead, skipping slit flats", control.specCalib).
+    slit_flat_led: bool = False
+    #: Lamp frames (``thar``, ``fiberflat``) this spectrograph can take; the
+    #: service switches no lamp. Default none: MINERVA's KiwiSpec is iodine
+    #: only ("There are no ThAr lamps or a way to robotically switch over.
+    #: It's all iodine." JDE 2026-10-31).
+    lamp_frames: list[str] = field(default_factory=list)
     #: Seconds the slit-flat LED must have been on before a slit flat.
     led_warmup: float = 0.0  # legacy WARMUPMINUTES = 0
     readout_time: float = 22.0  # legacy ro_time
@@ -295,7 +315,36 @@ class KiwiSpecConfig:
             d["ccd_format"] = tuple(d["ccd_format"])
         if d.get("stage_positions") is None:
             d.pop("stage_positions", None)
+        lamps = d.get("lamp_frames") or []
+        if not isinstance(lamps, list) or set(lamps) - set(LAMP_KINDS):
+            raise ValueError(f"lamp_frames: a list of {list(LAMP_KINDS)}, not {lamps!r}")
+        if not isinstance(d.get("slit_flat_led", False), bool):
+            raise ValueError("slit_flat_led must be true or false")
         return cls(**d)
+
+    def frame_kinds(self) -> list[str]:
+        """The frame kinds this spectrograph can take (module doc)."""
+        return [
+            k
+            for k in KINDS
+            if (k not in LAMP_KINDS or k in self.lamp_frames)
+            and (k != "slitflat" or self.slit_flat_led)
+        ]
+
+    def unavailable(self, kind: str) -> str | None:
+        """Why this spectrograph cannot take ``kind`` frames (None: it can)."""
+        if kind in LAMP_KINDS and kind not in self.lamp_frames:
+            lamp = "ThAr" if kind == "thar" else "fiber-flat"
+            return (
+                f"{kind} frames are not available: this spectrograph has no {lamp} lamp"
+                " (lamp_frames); MINERVA's KiwiSpec is iodine only (docs/kiwispec.md)"
+            )
+        if kind == "slitflat" and not self.slit_flat_led:
+            return (
+                "slitflat frames are not available: the slit-flat LED is not in use"
+                " (slit_flat_led false; legacy stopped slit flats in 2023)"
+            )
+        return None
 
 
 # -- jobs -----------------------------------------------------------------------------
@@ -484,6 +533,7 @@ class KiwiSpec:
             "backlight_on": self.backlight,
             "stage_request": self.last_stage_request,
             "stage_positions_live": dict(self.stage_learned),
+            "frame_kinds": self.config.frame_kinds(),
             "alarms": self.alarms(),
         }
 
@@ -691,6 +741,8 @@ class KiwiSpec:
     async def configure(self, args: dict[str, Any]) -> dict[str, Any]:
         warnings: list[str] = []
         wait, client = queue_args(args)
+        if args.get("led") and not self.config.slit_flat_led:
+            raise ValueError(str(self.config.unavailable("slitflat")))
         async with self.hold("configure", wait, client):
             self._abort.clear()
             async with asyncio.timeout(self.config.stage_timeout + 60 + self.config.led_warmup):
@@ -728,6 +780,9 @@ class KiwiSpec:
         kind = str(d.get("kind", ""))
         if kind not in KINDS:
             raise ValueError(f"kind must be one of {sorted(KINDS)}, not {kind!r}")
+        why = c.unavailable(kind)
+        if why is not None:
+            raise ValueError(why)
         exptime = 0.0 if kind == "bias" else _num(d.get("exptime"), "exptime")
         if not 0 <= exptime <= c.max_exptime:
             raise ValueError(f"exptime {exptime} outside 0..{c.max_exptime}")

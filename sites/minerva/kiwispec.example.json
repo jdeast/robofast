@@ -8,7 +8,11 @@
     "spectrograph PC is AUTHORITATIVE; the service learns the mm from the server (sites/minerva/README.md). Set",
     "stage_positions only as a cross-check, with values CONFIRMED ON THE SPECTROGRAPH PC before hardware use.",
     "heater_setpoint, heater_tolerance: spectrograph.ini I2SETTEMP, I2TEMPTOL. ccd_format, readout_mode:",
-    "spectrograph.ini [SI_SETTINGS]. telescopes: all four can feed the fiber; T3 and T4 are down (Aqawan 2)."
+    "spectrograph.ini [SI_SETTINGS]. telescopes: all four can feed the fiber; T3 and T4 are down (Aqawan 2).",
+    "Calibration (JDE 2026-10-31): KiwiSpec is iodine only -- 'There are no ThAr lamps or a way to robotically",
+    "switch over. It's all iodine.' lamp_frames is empty, so ThAr and fiber-flat frames are refused.",
+    "slit_flat_led false: slit flats are refused (legacy stopped them in 2023, 'Slit flat lamp is dead');",
+    "set it true only once the LED is confirmed working. The calibration plan: docs/kiwispec.md, Calibration."
   ],
   "name": "kiwispec",
   "listen": "127.0.0.1:8130",
@@ -17,6 +21,8 @@
   "allow_hardware": false,
   "telescopes": ["T1", "T2", "T3", "T4"],
   "stage_positions": null,
+  "slit_flat_led": false,
+  "lamp_frames": [],
   "heater_setpoint": 55.0,
   "heater_tolerance": 0.501,
   "readout_time": 22.0,

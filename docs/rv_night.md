@@ -108,8 +108,10 @@ position, as legacy did), and start guiding. Then:
   preempted only drops out. The observer console's `pause` (an operator
   hold) is such a preemption.
 * **Calibrations.** An observation of kind `spectrograph_calibration`
-  (`light=False`) is one `POST /calibrate` job: biases, darks, ThAr and
-  flats. The calibration plan's `spectrograph` list makes one (see
+  (`light=False`) is one `POST /calibrate` job: at MINERVA, biases and
+  darks only (KiwiSpec is iodine only: no ThAr or fiber flats, and slit
+  flats only once the LED is confirmed; `docs/kiwispec.md`, section 4).
+  The calibration plan's `spectrograph` list makes one (see
   `sites/minerva/calibration.example.json`), and the sequencer takes it
   with the roof closed and no lease, in its closed phase. Biases and darks
   are true dark frames (shutter closed). Legacy took them as light frames
@@ -215,8 +217,9 @@ data pointers lead to them.
 
 ## 5. What is left
 
-* ThAr and fiber-flat lamps are not switched (`docs/kiwispec.md`, question
-  3).
+* The iodine calibration is a plan, not a pipeline: B stars through
+  iodine and templates are scheduled requests (`docs/kiwispec.md`, section
+  4); nothing yet checks that a night got its B star.
 * Sharing the spectrograph between the two enclosures is first come,
   first served with a bounded wait (`docs/kiwispec.md`); the two dispatch
   schedulers do not plan around each other's spectra, and the guider's

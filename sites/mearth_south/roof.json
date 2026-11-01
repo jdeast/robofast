@@ -1,0 +1,19 @@
+{
+  "_note": [
+    "MEarth South (CTIO) roll-off roof: Alpaca Dome over the parallel-port roof interface box (docs/mearth_roof.md).",
+    "  python -m robofast_core.devices.mearth_roof_server --config sites/mearth_south/roof.json --simulate",
+    "Hardware is NOT allowed: allow_hardware stays false until every item under 'Confirm on site' in docs/mearth_roof.md is checked.",
+    "Then: allow_hardware true here AND --hardware on the command line, on the computer the roof interface box is cabled to.",
+    "port.device is a placeholder for that computer's parallel port.",
+    "open_timeout/close_timeout: legacy South values (180 s). departure_timeout is new and unconfirmed (time for the roof to leave its starting limit).",
+    "No hardware heartbeat exists on this roof: the enclosure config (mearth_south.json) is attended only."
+  ],
+  "name": "mearth-south",
+  "listen": "127.0.0.1:11150",
+  "allow_hardware": false,
+  "port": {"type": "ppdev", "device": "/dev/parport0"},
+  "open_timeout": 180,
+  "close_timeout": 180,
+  "departure_timeout": 30,
+  "poll_interval": 0.25
+}

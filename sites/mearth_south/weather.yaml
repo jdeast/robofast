@@ -1,0 +1,93 @@
+# MEarth South (CTIO) site weather bridge (robofast_core.weather_bridge).
+#
+#   python -m robofast_core.weather_bridge --config sites/mearth_south/weather.yaml --shadow
+#
+# UNCONFIRMED, NOT READY FOR USE. Limits are adapted from the MEarth
+# observing system (J. Irwin, used with permission): its roof daemon's South
+# configuration, the values in force when it was archived. There, the site's
+# own weather station (a Vaisala WXT520 on a serial port, reporting every
+# 10 s) and a serial cloud sensor (sky minus ambient temperature, plus a rain
+# flag) were read directly by the roof daemon. robofast has no reader for
+# either yet, so the `station` source below is a PLACEHOLDER: a required
+# source on loopback with nothing serving it. Until a real reader replaces
+# it, the bridge reports unsafe and nothing opens (fail closed).
+#
+# Hysteresis: "close" limits apply while the bridge's verdict is safe (the
+# legacy trigger values), "open" limits while it is not (the legacy reset
+# values). Legacy also held each alert 20 minutes after it cleared; that is
+# the supervisor's reopen_hold in mearth_south.json.
+#
+# Not expressible here yet (see docs/mearth_roof.md):
+# - legacy's dew margin (ambient at least 3 C above the dew point);
+# - legacy's humidity correction of the sky-temperature limit;
+# - legacy's separate Sun limits east (-1 deg) and west (+5 deg): -1 is used
+#   for both, which is stricter in the evening;
+# - the cloud sensor's own rain flag and its "wet" and "sensor fault" codes.
+
+site:
+  name: mearth_south
+  latitude: -30.172472   # deg N  (legacy -30 10 20.9)
+  longitude: -70.800139  # deg E  (legacy -70 48 00.5)
+  elevation: 2124.0      # m
+
+listen: 127.0.0.1:11111
+poll_interval: 10        # s; legacy WXT520 interval
+evaluate_interval: 5
+server_stale_after: 60
+max_clock_skew: 120
+# Rain holds the roof closed this long after the last rain (legacy: alerts
+# latched 20 minutes).
+rain_hold: 1200
+
+sources:
+  station:
+    # PLACEHOLDER (see the header): stands in for a reader of the WXT520 and
+    # the cloud sensor that publishes their values. Nothing listens here.
+    type: redis
+    url: redis://127.0.0.1:6379/0
+    required: true
+    stale_after: 60      # legacy wx_timeout: no data for 60 s is an alert
+    timeout: 5
+    time_key: time
+    enforce_rain: true   # legacy enforced rain at the South
+    fields:
+      temperature:    {key: temperature, unit: degC}
+      humidity:       {key: humidity, unit: percent}
+      dewpoint:       {key: dewpoint, unit: degC}
+      pressure:       {key: pressure, unit: hPa}
+      wind:           {key: wind_speed, unit: km/h}
+      wind_gust:      {key: wind_gust, unit: km/h}
+      wind_direction: {key: wind_direction, unit: deg}
+      rain_intensity: {key: rain_intensity, unit: mm/h}
+      hail_intensity: {key: hail_intensity}
+      sky:            {key: sky_minus_ambient, missing_values: [0.0]}
+    limits:
+      # legacy South roofd.cfg *_trig (close) and *_rst (open)
+      temperature:    {open: [-15.0, 35.0],   close: [-15.0, 35.0]}
+      humidity:       {open: [0.0, 75.0],     close: [0.0, 80.0]}   # winter values
+      wind:           {open: [0.0, 30.0],     close: [0.0, 35.0]}   # km/h
+      wind_gust:      {open: [0.0, 35.0],     close: [0.0, 40.0]}   # km/h
+      sky:            {open: [-999, -34.0],   close: [-999, -31.0]} # C, sky - ambient
+    rain_rates:
+      # The WXT520 reads false rain up to ~0.2 mm/h when wind shakes it;
+      # legacy closed above 0.55 mm/h, and on any hail.
+      rain_intensity: 0.55
+      hail_intensity: 0.0
+
+  sun:
+    type: sun
+    required: true
+    limits:
+      altitude: {open: [-90.0, -1.0], close: [-90.0, -1.0]}
+
+conditions:
+  temperature:    {source: station, field: temperature, unit: degC}
+  humidity:       {source: station, field: humidity, unit: percent}
+  dewpoint:       {source: station, field: dewpoint, unit: degC}
+  pressure:       {source: station, field: pressure, unit: hPa}
+  windspeed:      {source: station, field: wind, unit: km/h}
+  windgust:       {source: station, field: wind_gust, unit: km/h}
+  winddirection:  {source: station, field: wind_direction, unit: deg}
+  rainrate:       {source: station, field: rain_intensity, unit: mm/h}
+  skytemperature: {source: station, field: sky, unit: degC,
+                   description: "cloud sensor sky minus ambient (placeholder source)"}

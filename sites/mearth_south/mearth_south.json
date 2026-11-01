@@ -1,0 +1,93 @@
+{
+  "_note": [
+    "MEarth South at CTIO: eight telescopes (tel11-tel18) under one roll-off roof.",
+    "Adapted from the MEarth observing system (J. Irwin, used with permission); see docs/mearth_roof.md.",
+    "One file for the enclosure, read by both services (robofast_core/config.py):",
+    "  python -m robofast_core.supervisor_service --config sites/mearth_south/mearth_south.json",
+    "  python -m robofast_core.sequencer_service --config sites/mearth_south/mearth_south.json",
+    "Every address is a 127.0.0.1 placeholder.",
+    "dome: the MEarth roof Alpaca server (roof.json listens on 11150; hardware not allowed there until confirmed on site).",
+    "safetymonitor, observingconditions: the weather bridge (weather.yaml listens on 11111). Its station source is a placeholder: no reader for the site's weather station and cloud sensor exists yet, so the bridge reports unsafe and nothing opens.",
+    "tel11-tel18: placeholders for each telescope PC's Alpaca (ASCOM Remote) mount and camera. The legacy mounts and cameras were driven through Windows software; which Alpaca drivers serve them is to be decided.",
+    "No hardware heartbeat: the roof interface box holds its last command and has no watchdog, so nothing closes the roof if the supervisor dies. attended_only (also the default without a heartbeat): no lease, and the roof never opens, unless an operator is on duty.",
+    "park_before_close: a roll-off roof closes over the telescopes; legacy parked at alt 10, az 190 (telescope.cfg). Clearance with other park positions is unconfirmed.",
+    "fault_action Faults: a roof that timed out, never left its limit, shows both limits or neither, alarms and blocks opening (docs/mearth_roof.md). No automatic clearing (legacy never cleared its STUCK flag by itself).",
+    "reopen_hold 1200 s: legacy latched each weather alert for 20 minutes (alert_timeout).",
+    "site: legacy MEarth::Config for CTIO (-30 10 20.9, -70 48 00.5, 2124 m)."
+  ],
+  "name": "mearth_south",
+  "listen": "127.0.0.1:8150",
+  "site": {
+    "latitude": -30.172472,
+    "longitude": -70.800139,
+    "elevation": 2124.0
+  },
+  "devices": {
+    "dome": "127.0.0.1:11150",
+    "safetymonitor": "127.0.0.1:11111",
+    "observingconditions": "127.0.0.1:11111"
+  },
+  "telescopes": {
+    "tel11": {
+      "telescope": "127.0.0.1:11151/0",
+      "camera": "127.0.0.1:11151/0"
+    },
+    "tel12": {
+      "telescope": "127.0.0.1:11152/0",
+      "camera": "127.0.0.1:11152/0"
+    },
+    "tel13": {
+      "telescope": "127.0.0.1:11153/0",
+      "camera": "127.0.0.1:11153/0"
+    },
+    "tel14": {
+      "telescope": "127.0.0.1:11154/0",
+      "camera": "127.0.0.1:11154/0"
+    },
+    "tel15": {
+      "telescope": "127.0.0.1:11155/0",
+      "camera": "127.0.0.1:11155/0"
+    },
+    "tel16": {
+      "telescope": "127.0.0.1:11156/0",
+      "camera": "127.0.0.1:11156/0"
+    },
+    "tel17": {
+      "telescope": "127.0.0.1:11157/0",
+      "camera": "127.0.0.1:11157/0"
+    },
+    "tel18": {
+      "telescope": "127.0.0.1:11158/0",
+      "camera": "127.0.0.1:11158/0"
+    }
+  },
+  "safety": {
+    "park_before_close": true,
+    "park_wait": 120,
+    "attended_only": true,
+    "duty_ttl": 300,
+    "duty_grace": 300,
+    "fault_action": "Faults",
+    "reopen_hold": 1200,
+    "shutter_timeout": 200
+  },
+  "sequencer_name": "mearth_south-sequencer",
+  "command_timeout": 10,
+  "sequencer": {
+    "slew_timeout": 300,
+    "park_timeout": 300,
+    "error_backoff": 300,
+    "max_consecutive_errors": 3,
+    "idle_release_after": 900
+  },
+  "plan": {
+    "type": "calibration",
+    "biases": 10,
+    "darks": [
+      [
+        60,
+        5
+      ]
+    ]
+  }
+}

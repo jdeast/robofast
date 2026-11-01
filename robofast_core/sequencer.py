@@ -259,10 +259,12 @@ import numpy as np
 
 from robofast_core import pointmodel
 from robofast_core.autofocus import (
+    FOCUS_CONTEXT,
     Autofocus,
     AutofocusSetup,
     FocusStore,
     publish_result,
+    term_source,
 )
 from robofast_core.clock import Clock, real_clock
 from robofast_core.devices.kiwispec_client import KiwiSpecBusy, KiwiSpecError
@@ -2468,7 +2470,10 @@ class Sequencer:
 
         def values() -> dict[str, float | None]:
             snap = self.registry.snapshot()
-            return {name: snap.current(name.replace("{tel}", tel_name)) for name in model.terms}
+            names = {*model.terms, *FOCUS_CONTEXT}
+            return {
+                name: snap.current(term_source(name).replace("{tel}", tel_name)) for name in names
+            }
 
         return Autofocus(
             unit.name,
@@ -2482,6 +2487,23 @@ class Sequencer:
             values=values,
             event=lambda what, **kw: self._event(what, gen=state.gen, **kw),
             clock=self.clock,
+        )
+
+    async def _read_altitude(self, unit: TelescopeUnit, tel: Grant) -> None:
+        """The mount's altitude into the registry, for the focus model's
+        gravity term (best effort, like the temperature)."""
+        try:
+            alt = float(await tel.get("Altitude"))
+        except Exception as exc:
+            self.registry.failed(f"{unit.name}.tel.alt", repr(exc))
+            return
+        self.registry.publish(
+            f"{unit.name}.tel.alt",
+            alt,
+            max_age=300.0,
+            unit="deg",
+            keyword="ALT",
+            comment="Altitude at exposure start",
         )
 
     async def _read_focuser(self, unit: TelescopeUnit, fg: Grant) -> None:
@@ -2517,6 +2539,7 @@ class Sequencer:
         if fg is None or unit.autofocus is None:
             raise Unsupported(f"{unit.name} cannot autofocus (no focuser or autofocus config)")
         await self._read_focuser(unit, fg)
+        await self._read_altitude(unit, tel)
         cfg = self.config
         imaging = self.imaging
 

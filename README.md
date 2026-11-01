@@ -23,4 +23,8 @@ notifications by email, chat or a pager hook, [docs/notifier.md](docs/notifier.m
 
 ## License
 
-BSD 3-Clause; see [LICENSE](LICENSE).
+BSD 3-Clause; see [LICENSE](LICENSE). The repository ships no star-catalog
+data: Gaia DR3 data (ESA, CC BY-NC 3.0 IGO) are downloaded on first use,
+from the Gaia archive or from robofast's Zenodo record; see
+[docs/sky.md](docs/sky.md) ("What is downloaded, from where") and
+[docs/zenodo.md](docs/zenodo.md).

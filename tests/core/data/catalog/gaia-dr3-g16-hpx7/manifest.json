@@ -1,6 +1,7 @@
 {
- "catalog": "Gaia DR3 (gaiadr3.gaia_source)",
- "licence": "CC BY-SA 3.0 IGO; credit ESA/Gaia/DPAC (docs/sky.md)",
+ "catalog": "SYNTHETIC (not Gaia): robofast_core.testing.sky_fixture",
+ "licence": "BSD 3-Clause, like the code",
+ "seed": 20261031,
  "epoch": 2016.0,
  "healpix": {
   "scheme": "nested",

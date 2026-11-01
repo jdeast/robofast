@@ -1,0 +1,73 @@
+# Zenodo deposit metadata for the gaia_extracts record (docs/zenodo.md):
+#   python scripts/build_catalog.py bundle --out DIR
+#   python scripts/zenodo_publish.py new-record --bundle DIR \
+#       --metadata scripts/zenodo/gaia_extracts.yaml --dry-run
+# Zenodo has no licence id for CC BY-NC 3.0 IGO (its vocabulary has only
+# cc-by-nc-nd-3.0-igo), so the deposit says "other-nc" and the description
+# names the exact licence; on the draft's web page it can be replaced by a
+# custom licence entry ("Creative Commons Attribution-NonCommercial 3.0 IGO",
+# https://creativecommons.org/licenses/by-nc/3.0/igo/).
+title: Gaia DR3 star-catalog extracts for robofast
+upload_type: dataset
+version: "1.0"
+access_right: open
+license: other-nc
+creators:
+  - name: Eastman, Jason
+    affiliation: "Harvard College Observatory"
+    orcid: 0000-0003-3773-5142
+keywords:
+  - Gaia DR3
+  - star catalog
+  - robotic observatory
+  - plate solving
+  - robofast
+related_identifiers:
+  - identifier: https://github.com/jdeast/robofast
+    relation: isSupplementTo
+    resource_type: software
+  - identifier: 10.1051/0004-6361/202243940
+    relation: isDerivedFrom
+    resource_type: publication-article
+  - identifier: 10.1051/0004-6361/201629272
+    relation: references
+    resource_type: publication-article
+description: >-
+  <p>Extracts of <strong>Gaia DR3</strong> (<code>gaiadr3.gaia_source</code>)
+  read by <a href="https://github.com/jdeast/robofast">robofast</a>, an
+  open-source robotic observatory control system, which downloads them on
+  first use (pinned by size and md5) instead of shipping them in its BSD
+  3-Clause repository.</p>
+  <ul>
+  <li><code>bright_stars.npy</code>: every Gaia DR3 star with
+  <code>phot_g_mean_mag &lt; 6.5</code> (12&#8239;119 stars), brightest first;
+  used for offline cone queries, pointing models and the few bright stars a
+  field's tiles lack.</li>
+  <li><code>test_fixture_tiles.npz</code>: every Gaia DR3 star with
+  <code>G &lt; 16</code> in 30 HEALPix tiles (nested, level 7) around the
+  five test fields of robofast's test suite, one array per tile.</li>
+  <li><code>README.md</code>: provenance (the exact ADQL queries), formats,
+  licence and acknowledgement; <code>MANIFEST.txt</code>: size and md5 of
+  every file.</li>
+  </ul>
+  <p>All arrays are numpy structured arrays
+  (<code>numpy.load(path, allow_pickle=False)</code>) with
+  <code>source_id</code>, <code>ra</code>, <code>dec</code> (deg, ICRS, epoch
+  J2016.0), <code>pmra</code>, <code>pmdec</code> (mas/yr), <code>g</code>
+  and <code>bp_rp</code>. They were queried from the ESA Gaia archive
+  (https://gea.esac.esa.int/archive/) and are rebuilt reproducibly by
+  <code>python scripts/build_catalog.py bundle</code> in the robofast
+  repository.</p>
+  <p><strong>Licence.</strong> Gaia data are distributed by ESA under the
+  Creative Commons Attribution-NonCommercial 3.0 IGO licence
+  (CC BY-NC 3.0 IGO, https://creativecommons.org/licenses/by-nc/3.0/igo/;
+  https://www.cosmos.esa.int/web/gaia-users/license), and these extracts are
+  redistributed under the same licence. Credit: ESA/Gaia/DPAC.</p>
+  <p>This work has made use of data from the European Space Agency (ESA)
+  mission Gaia (https://www.cosmos.esa.int/gaia), processed by the Gaia Data
+  Processing and Analysis Consortium (DPAC,
+  https://www.cosmos.esa.int/web/gaia/dpac/consortium). Funding for the DPAC
+  has been provided by national institutions, in particular the institutions
+  participating in the Gaia Multilateral Agreement.</p>
+  <p>Please cite Gaia Collaboration, Prusti et al. 2016, A&amp;A 595, A1 and
+  Gaia Collaboration, Vallenari et al. 2023, A&amp;A 674, A1.</p>

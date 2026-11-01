@@ -59,7 +59,14 @@ from typing import Any, Protocol
 #: "failed": a device error or a refused slew.
 OUTCOMES = ("complete", "interrupted", "failed")
 #: What an observation does on its target (:attr:`Observation.kind`).
-KINDS = ("expose", "autofocus", "spectrum", "spectrograph_calibration", "pointing_model")
+KINDS = (
+    "expose",
+    "autofocus",
+    "spectrum",
+    "spectrograph_calibration",
+    "manual",
+    "pointing_model",
+)
 
 
 @dataclass
@@ -128,6 +135,8 @@ class Observation:
     def __post_init__(self) -> None:
         if self.kind not in KINDS:
             raise ValueError(f"observation {self.name!r}: kind {self.kind!r} not in {KINDS}")
+        if self.kind == "manual" and not self.light:
+            raise ValueError(f"observation {self.name!r}: manual control needs the lease")
         if self.kind in ("autofocus", "pointing_model") and not self.light:
             raise ValueError(f"observation {self.name!r}: a {self.kind} needs light")
         if self.pointing is not None and self.kind != "pointing_model":

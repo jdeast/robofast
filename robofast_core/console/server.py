@@ -62,7 +62,7 @@ import numpy as np
 from robofast_core.api_auth import AuditLog, RateLimiter, TokenRecord, TokenStore
 from robofast_core.config import load_config
 from robofast_core.console.aggregate import Aggregator, ConsoleEnclosure, alarm_id
-from robofast_core.console.hold import read_holds, send_command
+from robofast_core.console.hold import MANUAL_OPS, SKY_OPS, read_done, read_holds, send_command
 from robofast_core.console.images import ImageSources, NoFrame
 from robofast_core.console.logstream import LogStream
 from robofast_core.console.page import render_page
@@ -98,6 +98,7 @@ ACTIONS = (
     "clear_faults",
     "emergency_close",
     "clear_spectrograph",
+    "manual",
 )
 CONFIRM = ("stop", "park", "clear_lease", "clear_faults", "emergency_close", "clear_spectrograph")
 #: Actions that the per-token action rate limit never blocks (closing is the
@@ -105,7 +106,7 @@ CONFIRM = ("stop", "park", "clear_lease", "clear_faults", "emergency_close", "cl
 #: able to close).
 UNLIMITED = ("emergency_close",)
 #: Body fields copied into the audit log.
-AUDITED = ("enclosure", "telescope", "id", "reason", "direct")
+AUDITED = ("enclosure", "telescope", "id", "reason", "direct", "op")
 
 
 @dataclass
@@ -521,9 +522,7 @@ class Console:
             if audit is not None:
                 audit.update(
                     action=parts[0],
-                    **{
-                        k: body.get(k) for k in ("enclosure", "telescope", "id", "reason", "direct")
-                    },
+                    **{k: body.get(k) for k in AUDITED},
                 )
             result = await self.act(parts[0], client.name, body)
             target = body.get("telescope") or body.get("enclosure") or "all"
@@ -802,10 +801,13 @@ class Console:
         reason = body.get("reason")
         if action == "emergency_close" and (reason is None or reason == ""):
             reason = "emergency close"  # no typing on a phone in the rain
+        if action == "manual" and body.get("op") not in ("take", "release") and not reason:
+            reason = "manual control"
         if not isinstance(reason, str) or not reason.strip() or len(reason) > MAX_REASON:
             raise ApiError(400, f"reason: say why (1 to {MAX_REASON} characters)")
         reason = reason.strip()
-        if action in CONFIRM and body.get("confirm") is not True:
+        needs_confirm = action in CONFIRM or (action == "manual" and body.get("op") == "take")
+        if needs_confirm and body.get("confirm") is not True:
             raise ApiError(400, f'{action}: send "confirm": true (the page asks first)')
         if action == "ack":
             alarm = body.get("id")
@@ -814,6 +816,8 @@ class Console:
             return {"id": alarm, **self.acks.add(alarm, operator, reason)}
         if action == "emergency_close":
             return await self._emergency_close(operator, reason, body)
+        if action == "manual":
+            return await self._manual(self._enclosure(body), operator, reason, body)
         enc = self._enclosure(body)
         if action in ("pause", "resume", "stop", "park"):
             return await self._hold(enc, action, operator, reason, body.get("telescope"))
@@ -999,6 +1003,157 @@ class Console:
             }
         )
         del self.emergencies[: -self.EMERGENCIES]
+
+    # -- manual control ------------------------------------------------------------------
+
+    async def _manual(
+        self, enc: ConsoleEnclosure, operator: str, reason: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Manual control of one telescope (docs/console.md, "Manual control")."""
+        tel = body.get("telescope")
+        if tel not in enc.telescopes:
+            raise ApiError(400, f"telescope: one of {enc.telescopes}")
+        if enc.control_dir is None:
+            raise ApiError(409, f"{enc.name} has no operator_control: manual control needs it")
+        op = body.get("op")
+        out: dict[str, Any] = {"enclosure": enc.name, "telescope": tel, "op": op}
+        if op in ("take", "release"):
+            cid = send_command(
+                enc.control_dir,
+                "manual" if op == "take" else "release",
+                [tel],
+                operator=operator,
+                reason=reason,
+            )
+            done = await self._done(enc, cid)
+            out.update(command=cid, applied=done is not None)
+            if done is not None and not (done.get("result") or {}).get("ok"):
+                raise ApiError(409, f"refused: {(done.get('result') or {}).get('error')}")
+            return out
+        if op not in MANUAL_OPS:
+            raise ApiError(400, f"op: take, release or one of {MANUAL_OPS}")
+        holds = read_holds(enc.control_dir) or {}
+        session = (holds.get("manual") or {}).get(tel)
+        if not isinstance(session, dict):
+            raise ApiError(409, f"{tel} is not under manual control: take it first")
+        if session.get("operator") != operator:
+            raise ApiError(409, f"{tel} is under {session.get('operator')}'s manual control")
+        cmd = self._manual_params(op, body)
+        if op != "abort":
+            if session.get("current") is not None or session.get("queued"):
+                raise ApiError(409, f"{tel} is busy with a manual command: wait, or abort it")
+            sky = op in SKY_OPS or (op == "expose" and cmd.get("light"))
+            if sky:
+                await self._need_live_lease(enc, session)
+            if op == "slew":
+                await asyncio.to_thread(self._check_limits, enc, tel, cmd)
+        cid = send_command(
+            enc.control_dir, "command", [tel], operator=operator, reason=reason, manual=cmd
+        )
+        done = await self._done(enc, cid)
+        result = (done or {}).get("result")
+        out.update(command=cid, manual=cmd, accepted=result)
+        if result is not None and not result.get("ok"):
+            raise ApiError(409, f"refused: {result.get('error')}")
+        return out
+
+    @staticmethod
+    def _manual_params(op: str, body: dict[str, Any]) -> dict[str, Any]:
+        def num(key: str, lo: float, hi: float, default: Any = None) -> float:
+            v = body.get(key, default)
+            if isinstance(v, bool) or not isinstance(v, int | float) or not lo <= v <= hi:
+                raise ApiError(400, f"{key}: a number from {lo} to {hi}")
+            return float(v)
+
+        cmd: dict[str, Any] = {"op": op}
+        if op == "slew":
+            if isinstance(body.get("target"), str) and body["target"].strip():
+                cmd["target"] = body["target"].strip()[:80]
+            else:
+                cmd["ra_hours"] = num("ra_hours", 0.0, 24.0)
+                cmd["dec_deg"] = num("dec_deg", -90.0, 90.0)
+        elif op == "offset":
+            cmd["east_arcsec"] = num("east_arcsec", -3600.0, 3600.0, 0.0)
+            cmd["north_arcsec"] = num("north_arcsec", -3600.0, 3600.0, 0.0)
+        elif op == "focus":
+            if body.get("position") is not None:
+                cmd["position"] = num("position", -1e7, 1e7)
+            else:
+                cmd["delta"] = num("delta", -1e5, 1e5)
+        elif op == "expose":
+            cmd["exptime"] = num("exptime", 0.0, 3600.0)
+            cmd["count"] = int(num("count", 1, 50, 1))
+            light = body.get("light", True)
+            if not isinstance(light, bool):
+                raise ApiError(400, "light: true or false")
+            cmd["light"] = light
+            if isinstance(body.get("object"), str) and body["object"].strip():
+                obj = "".join(c if c.isalnum() or c in "+-_" else "_" for c in body["object"])
+                cmd["object"] = obj[:40]
+        return cmd
+
+    async def _need_live_lease(self, enc: ConsoleEnclosure, session: dict[str, Any]) -> None:
+        """Anything that needs the sky: refused unless the lease is live and
+        the manual session runs in it."""
+        try:
+            status = await self.supervisors[enc.name].call("GET", "status")
+        except (ApiError, httpx.HTTPError) as exc:
+            raise ApiError(409, f"refused: the supervisor does not answer ({exc})") from None
+        lease = status.get("lease") if isinstance(status, dict) else None
+        if not isinstance(lease, dict) or not lease.get("live") or lease.get("revoked"):
+            raise ApiError(409, "refused: the lease is not live (enclosure closed or closing)")
+        if not lease.get("opened"):
+            raise ApiError(409, "refused: the enclosure is not open yet")
+        if not session.get("active"):
+            raise ApiError(409, "refused: the manual session is not running in the lease yet")
+
+    def _check_limits(self, enc: ConsoleEnclosure, tel: str, cmd: dict[str, Any]) -> None:
+        """Resolve a target name (the dispatch plan's targets; offline) and
+        refuse a slew outside the telescope's altitude limits."""
+        from robofast_core import sky
+        from robofast_core.console.skyview import DEFAULT_LIMITS, _site
+
+        view = None
+        if enc.requests is not None:
+            try:
+                view = enc.requests.view()
+            except Exception:
+                view = None
+        if "target" in cmd:
+            want = cmd["target"].lower()
+            found = None
+            for g in view.groups.values() if view is not None else []:
+                for c in g.configurations():
+                    if c.target.name.lower() == want:
+                        found = c.target
+                        break
+                if found is not None:
+                    break
+            if found is None:
+                raise ApiError(404, f"no target named {cmd['target']!r} in the plan: give RA/Dec")
+            cmd["ra_hours"], cmd["dec_deg"] = found.ra_hours, found.dec_deg
+        site = _site(enc, view)
+        if site is None:
+            raise ApiError(409, "refused: no site configured to check the altitude limits")
+        lo, hi = DEFAULT_LIMITS
+        if view is not None and tel in view.limits:
+            lo, hi = view.limits[tel].min_alt, view.limits[tel].max_alt
+        alt = float(
+            sky.altitudes(site, [cmd["ra_hours"]], [cmd["dec_deg"]], [[datetime.now(UTC)]])[0, 0]
+        )
+        cmd["alt"] = round(alt, 2)
+        if not lo <= alt <= hi:
+            raise ApiError(409, f"refused: altitude {alt:.1f} deg is outside {lo}-{hi} deg")
+
+    async def _done(self, enc: ConsoleEnclosure, cid: str) -> dict[str, Any] | None:
+        assert enc.control_dir is not None
+        deadline = time.monotonic() + self.config.hold_ack_timeout
+        while time.monotonic() < deadline:
+            done = read_done(enc.control_dir, cid)
+            if done is not None:
+                return done
+            await asyncio.sleep(0.1)
+        return None
 
     async def _applied(self, enc: ConsoleEnclosure, cid: str) -> bool:
         assert enc.control_dir is not None

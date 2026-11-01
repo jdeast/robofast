@@ -247,6 +247,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -336,6 +337,10 @@ class ObservationFailed(Exception):
 
 class Unsupported(DeviceError):
     """An observation needs a filter or M3 port this telescope cannot select."""
+
+
+class ManualRefused(Exception):
+    """A manual command that cannot be carried out now (said to the operator)."""
 
 
 class SpectrographError(Exception):
@@ -626,6 +631,8 @@ class _Generation:
     spectra: dict[str, _Spectrum] = field(default_factory=dict)
     #: The spectrograph for this generation (None: the sequencer has none).
     spectrograph: _SpecGate | None = None
+    #: Grants made during the generation (manual control), fenced with the rest.
+    extra_grants: list[Grant] = field(default_factory=list)
 
     @property
     def closed(self) -> bool:
@@ -1218,7 +1225,9 @@ class Sequencer:
                 assert lease is not None
                 if state.spectrograph is not None:
                     state.spectrograph.revoke(f"cancelled: {lease.revoke_reason}")
-                await self._cancel_observe(gen, task, fence, lease.revoke_reason)
+                await self._cancel_observe(
+                    gen, task, (*fence, *state.extra_grants), lease.revoke_reason
+                )
             else:
                 exc = None if task.cancelled() else task.exception()
                 if exc is not None:
@@ -1241,8 +1250,10 @@ class Sequencer:
             if not task.done():  # we ourselves are being cancelled
                 if state.spectrograph is not None:
                     state.spectrograph.revoke("sequencer stopping")
-                await self._cancel_observe(gen, task, fence, "sequencer stopping")
-            for g in fence:
+                await self._cancel_observe(
+                    gen, task, (*fence, *state.extra_grants), "sequencer stopping"
+                )
+            for g in (*fence, *state.extra_grants):
                 g.revoke("generation over")
             if state.spectrograph is not None:
                 state.spectrograph.revoke("generation over")
@@ -1688,10 +1699,12 @@ class Sequencer:
     ) -> None:
         cfg = self.config
         gen = state.gen
-        imaging = self.imaging
         self._event("target_start", gen=gen, telescope=unit.name, target=obs.name)
         if obs.light and state.lease is None:
             raise RuntimeError(f"{obs.name}: light frames in a closed generation")
+        if obs.kind == "manual":
+            await self._manual(state, unit, tel, cam, obs, taken)
+            return
         if (
             obs.kind in ("spectrum", "spectrograph_calibration")
             and self.spectrograph_down is not None
@@ -1761,6 +1774,22 @@ class Sequencer:
         if obs.kind == "spectrograph_calibration":
             await self._spectrograph_calibration(state, unit, obs, taken)
             return
+        await self._expose_frames(state, unit, tel, cam, obs, taken)
+
+    async def _expose_frames(
+        self,
+        state: _Generation,
+        unit: TelescopeUnit,
+        tel: Grant,
+        cam: Grant,
+        obs: Observation,
+        taken: list[Any],
+    ) -> None:
+        """``obs.count`` exposures where the telescope points now (saved,
+        with imaging), stopping at a readout boundary when preempted."""
+        cfg = self.config
+        gen = state.gen
+        imaging = self.imaging
         for i in range(obs.count):
             if imaging is not None:
                 imaging.check(unit.name)  # a lost frame stops the telescope first
@@ -2030,6 +2059,155 @@ class Sequencer:
             cv_rms=built.cv_rms,
             n=built.n,
         )
+
+    # -- manual control (the observer console) -------------------------------
+
+    async def _manual(
+        self,
+        state: _Generation,
+        unit: TelescopeUnit,
+        tel: Grant,
+        cam: Grant,
+        obs: Observation,
+        taken: list[Any],
+    ) -> None:
+        """An operator's manual session on this telescope (module doc,
+        "Manual control"): run their commands, one at a time, until they
+        release it. Its grants are this generation's, fenced like the rest:
+        a revoked lease ends it at once."""
+        hook = getattr(self.plan, "manual_session", None)
+        session = hook(unit.name) if hook is not None else None
+        if session is None:
+            return  # released meanwhile
+        holder = f"{self.name}/manual:{session.operator}#{state.gen}"
+        mtel, mcam = unit.telescope.grant(holder), unit.camera.grant(holder)
+        state.extra_grants += [mtel, mcam]
+        self._event("manual_start", gen=state.gen, telescope=unit.name, operator=session.operator)
+        session.started(state.gen)
+        guiding = False
+        released = False
+        try:
+            while True:
+                cmd = await session.next()
+                if cmd is None:
+                    released = True
+                    return
+                op = cmd.get("op")
+                try:
+                    detail = await self._manual_command(state, unit, mtel, mcam, cmd, taken)
+                except (LeaseRevoked, GrantRevoked) as exc:
+                    session.result(cmd, False, f"interrupted: {exc}")
+                    raise
+                except asyncio.CancelledError:
+                    session.result(cmd, False, "interrupted")
+                    raise
+                except Exception as exc:
+                    session.result(cmd, False, f"{type(exc).__name__}: {exc}")
+                    self._event(
+                        "manual_command",
+                        gen=state.gen,
+                        telescope=unit.name,
+                        op=op,
+                        ok=False,
+                        error=repr(exc),
+                        level="warning",
+                    )
+                    continue
+                guiding = op == "guide_start" or (guiding and op != "guide_stop")
+                session.result(cmd, True, detail)
+                self._event(
+                    "manual_command", gen=state.gen, telescope=unit.name, op=op, ok=True, **detail
+                )
+        finally:
+            lease = state.lease
+            if released:
+                why = "released"
+            elif state.revoked or mtel.revoked or (lease is not None and lease.revoked.is_set()):
+                why = "the lease was revoked"
+            else:
+                why = "interrupted"
+            session.stopped(why)
+            if guiding and unit.guider is not None:
+                await unit.guider.stop("manual control ended")  # bounded, never raises
+            self._event("manual_end", gen=state.gen, telescope=unit.name, why=why)
+
+    async def _manual_command(
+        self,
+        state: _Generation,
+        unit: TelescopeUnit,
+        tel: Grant,
+        cam: Grant,
+        cmd: dict[str, Any],
+        taken: list[Any],
+    ) -> dict[str, Any]:
+        cfg = self.config
+        op = cmd.get("op")
+        lease = state.lease
+        sky = op in ("slew", "offset", "guide_start") or (op == "expose" and cmd.get("light", True))
+        if sky:
+            if lease is None or lease.revoked.is_set():
+                raise LeaseRevoked("no live lease")
+            if not lease.opened.is_set():
+                raise ManualRefused("the enclosure is not open yet")
+        if op in ("slew", "offset"):
+            if await tel.get("AtPark"):
+                await tel.call("Unpark")
+            await tel.set("Tracking", True)
+            if op == "offset":
+                ra = float(await tel.get("RightAscension"))
+                dec = float(await tel.get("Declination"))
+                cosd = max(1e-3, math.cos(math.radians(dec)))
+                ra = (ra + float(cmd.get("east_arcsec", 0)) / 3600.0 / 15.0 / cosd) % 24.0
+                dec = max(-90.0, min(90.0, dec + float(cmd.get("north_arcsec", 0)) / 3600.0))
+            else:
+                ra, dec = float(cmd["ra_hours"]), float(cmd["dec_deg"])
+                if unit.pointing is not None:
+                    # A target goes through robofast's pointing model like any
+                    # other slew (an offset moves the mount from where it is).
+                    await self._vendor_model_off(state, unit, tel)
+                    lst = float(await tel.get("SiderealTime"))
+                    pc = unit.pointing
+                    ra, dec, _ = pc.command(ra, dec, lst, pc.port, self.clock())
+            await self.slew_guard.check_slew(unit.name, ra, dec)
+            await tel.call("SlewToCoordinatesAsync", ra, dec)
+            await self._wait_for(lambda: tel.get("Slewing"), lambda s: not s, cfg.slew_timeout)
+            return {"ra_hours": round(ra, 6), "dec_deg": round(dec, 5)}
+        if op == "focus":
+            if state.focusers.get(unit.name) is None:
+                raise Unsupported(f"{unit.name}: the sequencer moves no focuser here")
+            af = self._focus_runner(state, unit, None, None, None, exposer=_no_exposures)
+            if cmd.get("position") is not None:
+                target = float(cmd["position"])
+            else:
+                target = float(await state.focusers[unit.name].get("Position")) + float(
+                    cmd.get("delta", 0)
+                )
+            await af.move(target)
+            return {"position": target}
+        if op == "expose":
+            light = bool(cmd.get("light", True))
+            obs = Observation(
+                f"manual-{unit.name}",
+                exptime=float(cmd["exptime"]),
+                count=int(cmd.get("count", 1)),
+                light=light,
+                object=str(cmd.get("object") or "manual"),
+            )
+            before = len(taken)
+            await self._expose_frames(state, unit, tel, cam, obs, taken)
+            files = [
+                f.path for f in taken[before:] if isinstance(f, PendingFrame) and f.path is not None
+            ]
+            return {"frames": len(taken) - before, "files": files}
+        if op in ("guide_start", "guide_stop"):
+            if unit.guider is None:
+                raise Unsupported(f"{unit.name} has no guider")
+            if op == "guide_stop":
+                await unit.guider.stop("operator")
+                return {}
+            await unit.guider.start(dec=float(await tel.get("Declination")))
+            return {}
+        raise ManualRefused(f"unknown manual command {op!r}")
 
     # -- autofocus ----------------------------------------------------------
 

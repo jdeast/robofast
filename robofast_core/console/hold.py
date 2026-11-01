@@ -71,11 +71,31 @@ from robofast_core.plan import Idle, Observation, PlanProvider
 
 log = logging.getLogger(__name__)
 
-ACTIONS = ("pause", "resume", "stop", "park", "clear_spectrograph")
+ACTIONS = (
+    "pause",
+    "resume",
+    "stop",
+    "park",
+    "clear_spectrograph",
+    "manual",
+    "release",
+    "command",
+)
 #: Actions on no telescope.
 GLOBAL_ACTIONS = ("clear_spectrograph",)
 #: The preemption each action asks for (``resume`` only wakes the telescope).
-PREEMPT_FOR = {"pause": "now-after-readout", "stop": "now", "park": "now", "resume": "next"}
+PREEMPT_FOR = {
+    "pause": "now-after-readout",
+    "stop": "now",
+    "park": "now",
+    "resume": "next",
+    "manual": "now-after-readout",
+    "release": "next",
+}
+#: Manual commands (docs/console.md, "Manual control").
+MANUAL_OPS = ("slew", "offset", "focus", "expose", "guide_start", "guide_stop", "abort")
+#: Manual commands that need the sky (a live lease and the enclosure open).
+SKY_OPS = ("slew", "offset", "guide_start")
 _NAME_RE = re.compile(r"\d{20}-[0-9a-f]{12}\.json")
 HOLDS_FILE = "holds.json"
 
@@ -97,6 +117,7 @@ def send_command(
     *,
     operator: str,
     reason: str,
+    manual: dict[str, Any] | None = None,
 ) -> str:
     """Drop one command into ``control_dir``; returns its id."""
     if action not in ACTIONS:
@@ -115,6 +136,7 @@ def send_command(
             "operator": operator,
             "reason": reason,
             "time": _now_iso(),
+            **({"manual": manual} if manual is not None else {}),
         },
     )
     return cid
@@ -129,12 +151,98 @@ def read_holds(control_dir: str | Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def read_done(control_dir: str | Path, cid: str) -> dict[str, Any] | None:
+    """The filed command ``cid`` with its ``result``, once applied."""
+    for path in (Path(control_dir) / "done").glob(f"*-{cid}.json"):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+    return None
+
+
 def _accepts_files(fn: Callable[..., Any]) -> bool:
     try:
         params = inspect.signature(fn).parameters
     except (TypeError, ValueError):
         return False
     return "files" in params or any(p.kind is p.VAR_KEYWORD for p in params.values())
+
+
+class ManualSession:
+    """One telescope under an operator's manual control: the commands
+    waiting, what the sequencer is doing with them, the latest results.
+    The sequencer runs it as a ``kind="manual"`` observation (it calls
+    :meth:`next`, :meth:`result`, :meth:`started`, :meth:`stopped`)."""
+
+    def __init__(self, telescope: str, operator: str, on_change: Callable[[], None]) -> None:
+        self.telescope = telescope
+        self.operator = operator
+        self.queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        self.active = False
+        self.generation: int | None = None
+        self.current: dict[str, Any] | None = None
+        self.results: deque[dict[str, Any]] = deque(maxlen=20)
+        self.ended = False
+        self._on_change = on_change
+
+    def state(self) -> dict[str, Any]:
+        return {
+            "operator": self.operator,
+            "active": self.active,
+            "generation": self.generation,
+            "current": self.current,
+            "queued": self.queue.qsize(),
+            "results": list(self.results),
+        }
+
+    # -- the sequencer's side --------------------------------------------------------
+
+    async def next(self) -> dict[str, Any] | None:
+        cmd = await self.queue.get()
+        self.current = cmd
+        self._on_change()
+        return cmd
+
+    def result(self, cmd: dict[str, Any] | None, ok: bool, detail: Any) -> None:
+        self.current = None
+        self.results.append(
+            {
+                "id": (cmd or {}).get("id"),
+                "op": (cmd or {}).get("op"),
+                "ok": ok,
+                "detail": detail,
+                "time": _now_iso(),
+            }
+        )
+        self._on_change()
+
+    def started(self, generation: int) -> None:
+        self.active, self.generation = True, generation
+        self._on_change()
+
+    def stopped(self, why: str) -> None:
+        self.active = False
+        # Commands left waiting are dropped: the operator sends them again
+        # once the session runs (never acted on later, out of context).
+        while not self.queue.empty():
+            cmd = self.queue.get_nowait()
+            if cmd is not None:
+                self.result(cmd, False, f"not run: manual session stopped ({why})")
+            else:
+                self.queue.put_nowait(None)  # keep the release
+                break
+        self._on_change()
+
+    # -- the console's side ------------------------------------------------------------
+
+    def submit(self, cmd: dict[str, Any]) -> None:
+        self.queue.put_nowait(cmd)
+
+    def end(self) -> None:
+        self.ended = True
+        self.queue.put_nowait(None)
 
 
 class OperatorHold:
@@ -163,6 +271,8 @@ class OperatorHold:
         self._clear_spectrograph: Callable[[str, str], Any] | None = None
         #: telescope -> {"action", "operator", "reason", "since", "command"}.
         self.holds: dict[str, dict[str, Any]] = {}
+        #: Telescopes under manual control (``action`` "manual").
+        self.manual: dict[str, ManualSession] = {}
         self.applied: deque[dict[str, Any]] = deque(maxlen=50)
         previous = read_holds(self.dir)
         if previous is not None and isinstance(previous.get("holds"), dict):
@@ -173,6 +283,9 @@ class OperatorHold:
             }
             if self.holds:
                 log.warning("operator holds carried over from %s: %s", self.dir, sorted(self.holds))
+            for t, h in self.holds.items():
+                if h.get("action") == "manual":
+                    self.manual[t] = ManualSession(t, str(h.get("operator")), self.write_state)
         self._tell_plan()
         if getattr(inner, "peek", None) is None:
             # No peek to wrap: the sequencer asks next_observation instead.
@@ -186,11 +299,19 @@ class OperatorHold:
 
     # -- the plan-provider interface -------------------------------------------------
 
-    def _held(self, telescope: str) -> Idle | None:
+    def _held(self, telescope: str) -> Observation | Idle | None:
         h = self.holds.get(telescope)
         if h is None:
             return None
+        if h["action"] == "manual":
+            # The robotic plan does not get this telescope: it observes the
+            # operator's manual session (which needs, and keeps, the lease).
+            return Observation(f"manual-{telescope}", kind="manual", object="manual")
         return Idle(self.hold_idle, f"operator {h['action']} by {h['operator']}: {h['reason']}")
+
+    def manual_session(self, telescope: str) -> ManualSession | None:
+        """The sequencer's hook for ``kind="manual"`` observations."""
+        return self.manual.get(telescope)
 
     async def next_observation(self, telescope: str) -> Observation | Idle | None:
         return self._held(telescope) or await self.inner.next_observation(telescope)
@@ -206,6 +327,8 @@ class OperatorHold:
         frames: int,
         files: list[str] | None = None,
     ) -> None:
+        if obs.kind == "manual":
+            return  # the operator's session: nothing of the robotic plan's
         if files is not None and _accepts_files(self.inner.report):
             self.inner.report(telescope, obs, outcome, frames, files=files)  # type: ignore[call-arg]
         else:
@@ -297,11 +420,20 @@ class OperatorHold:
         unknown = sorted(set(map(str, tels)) - set(self.telescopes))
         if unknown:
             raise ValueError(f"unknown telescopes {unknown}")
+        if action == "command":
+            return self._manual_command(cmd, [str(t) for t in tels], operator)
+        if action == "release":
+            for tel in map(str, tels):
+                if (self.holds.get(tel) or {}).get("action") != "manual":
+                    raise ValueError(f"{tel} is not under manual control")
         preempted = {}
         parked: dict[str, bool] = {}
         for tel in map(str, tels):
             was_held = tel in self.holds
-            if action == "resume":
+            session = self.manual.pop(tel, None)
+            if session is not None:
+                session.end()  # any change of hold ends a manual session
+            if action in ("resume", "release"):
                 self.holds.pop(tel, None)
             else:
                 self.holds[tel] = {
@@ -311,7 +443,9 @@ class OperatorHold:
                     "since": _now_iso(),
                     "command": cmd.get("id"),
                 }
-            if action == "resume" and not was_held:
+            if action == "manual":
+                self.manual[tel] = ManualSession(tel, operator, self.write_state)
+            if action in ("resume", "release") and not was_held:
                 continue
             preempted[tel] = self._stop(tel, PREEMPT_FOR[action], f"operator {action}: {reason}")
             if action == "park":
@@ -325,6 +459,41 @@ class OperatorHold:
             result["park_requested"] = parked
         self.applied.append({"id": cmd.get("id"), "action": action, "time": _now_iso()})
         return result
+
+    def _manual_command(
+        self, cmd: dict[str, Any], tels: list[str], operator: str
+    ) -> dict[str, Any]:
+        """One manual command for one telescope under manual control."""
+        if len(tels) != 1:
+            raise ValueError("a manual command is for one telescope")
+        tel = tels[0]
+        session = self.manual.get(tel)
+        m = cmd.get("manual")
+        if session is None:
+            raise ValueError(f"{tel} is not under manual control")
+        if not isinstance(m, dict) or m.get("op") not in MANUAL_OPS:
+            raise ValueError(f"manual: op one of {MANUAL_OPS}")
+        if session.operator != operator:
+            # One operator at a time: another must take control first.
+            return {
+                "ok": False,
+                "id": cmd.get("id"),
+                "error": f"under {session.operator}'s control",
+            }
+        if m["op"] == "abort":
+            # Stop what it is doing now (exposure and slew aborted; the
+            # session goes on, waiting for the next command).
+            stopped = self._stop(tel, "now", f"manual abort by {operator}")
+            return {"ok": True, "id": cmd.get("id"), "op": "abort", "preempted": stopped}
+        if not session.active:
+            return {
+                "ok": False,
+                "id": cmd.get("id"),
+                "error": "the manual session is not running (no live lease yet, or it was revoked)",
+            }
+        session.submit({**m, "id": cmd.get("id")})
+        self.applied.append({"id": cmd.get("id"), "action": "command", "time": _now_iso()})
+        return {"ok": True, "id": cmd.get("id"), "op": m["op"], "queued": True}
 
     def _apply_global(
         self, cmd: dict[str, Any], action: str, operator: str, reason: str
@@ -364,6 +533,7 @@ class OperatorHold:
                     "poll": self.poll,
                     "telescopes": self.telescopes,
                     "holds": self.holds,
+                    "manual": {t: m.state() for t, m in self.manual.items()},
                     "applied": list(self.applied),
                 },
             )
@@ -377,7 +547,7 @@ def main(argv: list[str] | None = None) -> None:
 
     ap = argparse.ArgumentParser(description="Send an operator command to a sequencer.")
     ap.add_argument("control_dir", help="the enclosure's operator_control directory")
-    ap.add_argument("action", choices=ACTIONS)
+    ap.add_argument("action", choices=[a for a in ACTIONS if a not in ("manual", "command")])
     ap.add_argument("telescopes", nargs="*")
     ap.add_argument("--operator", required=True)
     ap.add_argument("--reason", required=True)

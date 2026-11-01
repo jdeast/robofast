@@ -271,7 +271,9 @@ from robofast_core.imaging import FrameWriteFailed, Imaging, PendingFrame
 from robofast_core.owner import DeviceError, DeviceOwner, Grant, GrantRevoked
 from robofast_core.plan import Idle, Observation, PlanProvider, as_plan
 from robofast_core.pointmodel import PointingCorrector
+from robofast_core.recovery import RecoveryLadder, RecoveryResult
 from robofast_core.registry import ValueRegistry
+from robofast_core.rotcal import RotatorSetup
 from robofast_core.safety import LeaseRevoked, OpenLease, RecoveryRefused, SafetySupervisor
 from robofast_core.spectra import SpectrumRecorder
 from robofast_core.timeline import Timeline
@@ -519,6 +521,13 @@ class TelescopeUnit:
     alarms: list[str] = field(default_factory=list, init=False)
     #: The generation in which the mount's own pointing model was switched off.
     vendor_off_gen: int | None = field(default=None, init=False)
+    #: The rotator the sequencer may move, and the PA calibration setup
+    #: (docs/rotcal.md): ``kind="rotator_calibration"``.
+    rotator: DeviceOwner | None = None
+    pa_calibration: RotatorSetup | None = None
+    #: The recovery ladder (docs/recovery.md): what to try when one of its
+    #: devices fails, before giving up for the night.
+    recovery: RecoveryLadder | None = None
 
     @property
     def active(self) -> bool:
@@ -623,6 +632,8 @@ class _Generation:
     filterwheels: dict[str, Grant] = field(default_factory=dict)
     #: Focuser grants, for the telescopes whose focuser the sequencer moves.
     focusers: dict[str, Grant] = field(default_factory=dict)
+    #: Rotator grants, for the telescopes whose rotator the sequencer moves.
+    rotators: dict[str, Grant] = field(default_factory=dict)
     #: Telescopes that left the generation in the middle of a backoff.
     backing_off: set[str] = field(default_factory=set)
     errors: int = 0
@@ -794,6 +805,8 @@ class Sequencer:
         self.spectrum_records: list[dict[str, Any]] = []
         #: Pointing models built tonight (docs/pointing_model.md).
         self.pointing_models: list[Any] = []
+        #: PA calibrations measured tonight (docs/rotcal.md).
+        self.pa_calibrations: list[Any] = []
         #: The spectrograph job this sequencer started and has not seen end,
         #: and the telescope that started it.
         self._spec_job: int | None = None
@@ -1018,6 +1031,11 @@ class Sequencer:
                 u.pointing.on_alarm = lambda text, u=u: self.alarm(u.name, text)
                 if self.imaging is not None:
                     self.imaging.pointing[u.name] = u.pointing
+            if u.pa_calibration is not None and self.imaging is not None:
+                self.imaging.pa_stores[u.name] = u.pa_calibration.store
+            if u.recovery is not None:
+                u.recovery.alarm = lambda text, u=u: self.alarm(u.name, text)
+                u.recovery.event = lambda what, u=u, **kw: self._event(what, telescope=u.name, **kw)
 
     async def run(self) -> None:
         self._wire_pointing()
@@ -1200,12 +1218,14 @@ class Sequencer:
             u.name: u.filterwheel.grant(holder) for u in units if u.filterwheel is not None
         }
         state.focusers = {u.name: u.focuser.grant(holder) for u in units if u.focuser is not None}
+        state.rotators = {u.name: u.rotator.grant(holder) for u in units if u.rotator is not None}
         if self.spectrograph is not None:
             state.spectrograph = _SpecGate(self.spectrograph)
         fence = (
             *(g for pair in grants.values() for g in pair),
             *state.filterwheels.values(),
             *state.focusers.values(),
+            *state.rotators.values(),
         )
         self._gen = state
         what = "closed_start" if lease is None else "observe_start"
@@ -1666,6 +1686,21 @@ class Sequencer:
             parked=bool(report.parked),
             errors=report.errors,
         )
+        result = await self._recover_device(state, unit, tel, cam, error)
+        if result is not None and result.exhausted:
+            unit.gave_up = True
+            self._event(
+                "giving_up",
+                telescope=unit.name,
+                errors=unit.consecutive_errors,
+                reason=f"recovery ladder exhausted ({result.device})",
+                level="critical",
+            )
+            return
+        if result is not None and result.recovered:
+            # The device is back: it gets another try (the ladder itself
+            # gives up once every rung has been used).
+            unit.consecutive_errors = min(unit.consecutive_errors, cfg.max_consecutive_errors - 1)
         if unit.consecutive_errors >= cfg.max_consecutive_errors:
             unit.gave_up = True
             self._event(
@@ -1677,6 +1712,57 @@ class Sequencer:
         else:
             unit.retry_at = time.monotonic() + cfg.error_backoff
             self._event("telescope_backoff", telescope=unit.name, seconds=cfg.error_backoff)
+
+    def _devices(
+        self, state: _Generation, unit: TelescopeUnit, tel: Grant, cam: Grant
+    ) -> dict[str, tuple[DeviceOwner, Grant]]:
+        out = {"telescope": (unit.telescope, tel), "camera": (unit.camera, cam)}
+        for kind, owner, grants in (
+            ("focuser", unit.focuser, state.focusers),
+            ("rotator", unit.rotator, state.rotators),
+            ("filterwheel", unit.filterwheel, state.filterwheels),
+        ):
+            if owner is not None and unit.name in grants:
+                out[kind] = (owner, grants[unit.name])
+        return out
+
+    async def _recover_device(
+        self, state: _Generation, unit: TelescopeUnit, tel: Grant, cam: Grant, error: str
+    ) -> RecoveryResult | None:
+        """Climb the failed device's recovery ladder, if it has one (docs/recovery.md)."""
+        ladder = unit.recovery
+        if ladder is None:
+            return None
+        devices = self._devices(state, unit, tel, cam)
+        kind = ladder.device_for(error, {k: o.name for k, (o, _) in devices.items()})
+        if kind is None:
+            return None
+        owner, grant = devices[kind]
+        self._event("recovery_start", gen=state.gen, telescope=unit.name, device=kind)
+
+        async def others(device: str, member: str) -> Any:
+            if device not in devices:
+                return None
+            return await devices[device][1].get(member)
+
+        try:
+            result = await ladder.recover(
+                kind,
+                reconnect=lambda: owner.reconnect("recovery"),
+                probe=lambda member: grant.get(member),
+                others=others,
+            )
+        except GrantRevoked:
+            return None  # fenced: the generation's cleanup takes over
+        self._event(
+            "recovery_done",
+            gen=state.gen,
+            telescope=unit.name,
+            device=kind,
+            recovered=result.recovered,
+            tried=[f"{r}: {o}" for r, o in result.tried],
+        )
+        return result
 
     async def _wait_for(
         self, probe: Callable[[], Awaitable[Any]], done: Callable[[Any], bool], timeout: float
@@ -1767,6 +1853,10 @@ class Sequencer:
                 self._event("guiding", gen=gen, telescope=unit.name, target=obs.name)
         if obs.kind == "autofocus":
             await self._autofocus(state, unit, tel, cam, obs, taken)
+            return
+        if obs.kind == "rotator_calibration":
+            assert ra is not None and dec is not None
+            await self._rotator_calibration(state, unit, tel, cam, obs, taken, ra, dec)
             return
         if obs.kind == "spectrum":
             await self._spectrum(state, unit, tel, cam, obs, taken)
@@ -2059,6 +2149,99 @@ class Sequencer:
             cv_rms=built.cv_rms,
             n=built.n,
         )
+
+    # -- rotator / PA calibration (docs/rotcal.md) ------------------------------
+
+    async def _rotator_calibration(
+        self,
+        state: _Generation,
+        unit: TelescopeUnit,
+        tel: Grant,
+        cam: Grant,
+        obs: Observation,
+        taken: list[Any],
+        ra: float,
+        dec: float,
+    ) -> None:
+        """Measure the port's PA and parity against the rotator's mechanical
+        angle on the current field, save it, use it (``kind="rotator_calibration"``)."""
+        from robofast_core import rotcal
+        from robofast_core.astrometry import solve_near
+
+        setup = unit.pa_calibration
+        if setup is None or setup.solver is None or setup.catalog is None:
+            raise Unsupported(
+                f"{unit.name} cannot calibrate its PA (no pa_calibration with solver and catalog)"
+            )
+        opts = dict(obs.rotator or {})
+        rot = state.rotators.get(unit.name)
+        angles = [float(a) for a in opts.get("angles", setup.angles)]
+        start = None
+        if rot is None:
+            angles = angles[:1] or [0.0]
+        else:
+            start = float(await rot.get("MechanicalPosition"))
+        binning = int(await cam.get("BinX"))
+        cfg = replace(setup.solver, pa=None, flip=None)
+        when = self.clock()
+        # Solve near where the telescope points: the target, or the mount.
+        if unit.pointing is None:
+            ra0, dec0 = (
+                float(await tel.get("RightAscension")) * 15.0,
+                float(await tel.get("Declination")),
+            )
+        else:
+            ra0, dec0 = ra * 15.0, dec
+
+        async def move(angle: float) -> None:
+            assert rot is not None
+            await rot.call("MoveMechanical", angle)
+            await self._wait_for(lambda: rot.get("IsMoving"), lambda m: not m, setup.move_timeout)
+            if setup.settle:
+                await asyncio.sleep(setup.settle)
+            self._event("rotator_moved", telescope=unit.name, mechanical=angle)
+
+        async def expose() -> np.ndarray:
+            return await self._take_image(
+                state, unit, tel, cam, obs, obs.exptime, taken, calibration="pa"
+            )
+
+        def solve(image: np.ndarray) -> Any:
+            return solve_near(image, setup.catalog, ra0, dec0, cfg, binning=binning, epoch=when)
+
+        try:
+            cal = await rotcal.calibrate(
+                angles,
+                move=move if rot is not None else None,
+                expose=expose,
+                solve=solve,
+                telescope=unit.name,
+                port=obs.port,
+                sense=opts.get("sense", setup.sense),
+                min_measurements=min(setup.min_measurements, len(angles)),
+                event=lambda what, **kw: self._event(what, telescope=unit.name, **kw),
+                source=f"rotator calibration {obs.name}",
+            )
+        except ValueError as exc:
+            raise ObservationFailed(str(exc)) from exc
+        finally:
+            if rot is not None and start is not None:
+                await move(start)
+        setup.store.save(cal)
+        self.pa_calibrations.append(cal)
+        self._event(
+            "pa_calibrated",
+            gen=state.gen,
+            telescope=unit.name,
+            port=obs.port,
+            offset=cal.offset,
+            sense=cal.sense,
+            flip=cal.flip,
+            rms=cal.rms,
+            n=cal.n,
+        )
+        if self.imaging is not None and taken:
+            await self.imaging.flush(unit.name)
 
     # -- manual control (the observer console) -------------------------------
 

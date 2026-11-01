@@ -27,10 +27,10 @@ import numpy as np
 
 from robofast_core.catalog import Stars, separation
 from robofast_core.pointing import hadec_to_altaz
-from robofast_core.testing.fakes import FakeTelescope
+from robofast_core.testing.fakes import FakeDevice, FakeTelescope
 from robofast_core.testing.skysim import lst_deg
 
-__all__ = ["SkyMount", "SyntheticCatalog"]
+__all__ = ["SimRotator", "SkyMount", "SyntheticCatalog"]
 
 _NZ = 115  # cells in sin(dec): about 1 deg near the equator
 
@@ -155,3 +155,40 @@ class SkyMount(FakeTelescope):
             return super().Action(action, parameters)
         self.actions.append((action, parameters))
         return ""
+
+
+class SimRotator(FakeDevice):
+    """An Alpaca rotator: ``MoveMechanical`` takes ``move_time`` s;
+    ``Position`` (the sky PA it reports) is the mechanical angle plus
+    ``sky_offset``. ``image_pa(offset, sense)`` gives a scene's PA."""
+
+    def __init__(self, position: float = 0.0, move_time: float = 0.05, sky_offset: float = 0.0):
+        super().__init__()
+        self._mech = float(position) % 360.0
+        self._until = 0.0
+        self.move_time = move_time
+        self.sky_offset = sky_offset
+        self.moves: list[float] = []
+
+    @property
+    def MechanicalPosition(self) -> float:
+        return self._mech
+
+    @property
+    def Position(self) -> float:
+        return (self._mech + self.sky_offset) % 360.0
+
+    @property
+    def IsMoving(self) -> bool:
+        return self._now() < self._until
+
+    def MoveMechanical(self, angle: float) -> None:
+        self._mech = float(angle) % 360.0
+        self._until = self._now() + self.move_time
+        self.moves.append(self._mech)
+
+    def Halt(self) -> None:
+        self._until = 0.0
+
+    def image_pa(self, offset: float, sense: int = 1) -> Callable[[], float]:
+        return lambda: (offset + sense * self._mech) % 360.0

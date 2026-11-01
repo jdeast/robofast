@@ -198,6 +198,8 @@ METHODS: dict[str, tuple[str, tuple[str, ...]]] = {
     "Halt": ("PUT", ()),
     # observingconditions
     "TimeSinceLastUpdate": ("GET", ("SensorName",)),
+    # switch (a PDU outlet)
+    "SetSwitch": ("PUT", ("Id", "State")),
     # any device: a driver-specific action (the enclosure heartbeat)
     "Action": ("PUT", ("Action", "Parameters")),
 }

@@ -193,6 +193,11 @@ class DeviceOwner:
 
     # -- execution --------------------------------------------------------
 
+    def reconnect(self, why: str) -> None:
+        """Drop the device's client; the next command connects afresh (the
+        recovery ladder's first rung, robofast_core/recovery.py)."""
+        self._discard_driver(why)
+
     def _discard_driver(self, why: str) -> None:
         """Drop a driver that timed out; the next command builds a new one."""
         driver, self._driver = self._driver, None

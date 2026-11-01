@@ -1,0 +1,6 @@
+{
+  "UpdateCheck": false,
+  "SwitchEnableSet": true,
+  "SwitchReadDelay": 50,
+  "SwitchWriteDelay": 300
+}

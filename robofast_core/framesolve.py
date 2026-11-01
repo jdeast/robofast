@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -109,9 +110,29 @@ class FrameSolver:
             (_num(h, "CRPIX2") or (ny + 1) / 2.0) - 1.0,
         )
         try:
-            sol = solve_near(
-                data, self.catalog, ra, dec, cfg, binning=binning, epoch=epoch, crpix=crpix
-            )
+            sol = None
+            pa, flip = _num(h, "PACALIB"), h.get("PAFLIP")
+            if pa is not None and isinstance(flip, bool) and cfg.pa is None:
+                # The port's PA calibration (docs/rotcal.md) as the hint; the
+                # unhinted solve is the fallback if it is wrong.
+                hinted = replace(cfg, pa=pa, pa_tolerance=5.0, flip=flip)
+                try:
+                    sol = solve_near(
+                        data,
+                        self.catalog,
+                        ra,
+                        dec,
+                        hinted,
+                        binning=binning,
+                        epoch=epoch,
+                        crpix=crpix,
+                    )
+                except SolveError:
+                    sol = None
+            if sol is None:
+                sol = solve_near(
+                    data, self.catalog, ra, dec, cfg, binning=binning, epoch=epoch, crpix=crpix
+                )
         except (SolveError, CatalogUnavailable) as exc:
             h["WCSFAIL"] = (str(exc)[:68], "Plate solve failed: approximate WCS kept")
             return {"solved": False, "error": str(exc)}

@@ -347,7 +347,9 @@ Detection rejects the ASI174's many hot pixels by their sharpness.
 ## 10. What is left
 
 - Measured plate scales, PAs and parities for each MINERVA port (T2's FAU:
-  section 9); the imagers' and T1's FAU zero points; the ASI174's e-/ADU.
+  section 9), saved with `python -m robofast_core.rotcal solve`
+  (`docs/rotcal.md`); the imagers' and T1's FAU zero points; the ASI174's
+  e-/ADU.
 - ~~A pointing-model builder~~: `robofast_core/pointmodel.py`,
   `docs/pointing_model.md`.
 - astrometry.net index files on the control hosts, if a blind fallback is

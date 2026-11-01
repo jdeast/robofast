@@ -204,7 +204,10 @@ processes do share a name, the supervisor still never recovers a live lease,
 recovery is idempotent, and they take turns, one lease at a time.
 
 Repeated device errors back off, then give up for the night and alarm,
-per telescope (section 3.5).
+per telescope (section 3.5). Before that, a device with a recovery policy
+climbs its recovery ladder -- reconnect, restart the vendor software,
+power-cycle its PDU outlet (`docs/recovery.md`) -- and the telescope gives
+up for the night once the ladder is used up.
 
 **Plans.** The sequencer asks a *plan provider* for each telescope's next
 observation whenever that telescope is free, and reports how each ended
@@ -365,7 +368,10 @@ significance and cross-validated, applied to every slew (optionally with
 the vendor's model switched off), inverted for the FITS headers, with a
 rolling local correction and a nightly drift alarm. Where the mount
 software's own model is kept (PWI4 on the CDK700s, for now), robofast's
-can run disabled, measuring only.
+can run disabled, measuring only. Each port's image PA and parity against
+the rotator's mechanical angle is measured from plate solves and saved
+(`robofast_core/rotcal.py`, `docs/rotcal.md`); the frame pipeline's WCS,
+the plate solver's hint and the guider's mount matrix read it.
 
 Where a telescope really points is measured, not assumed (`docs/sky.md`):
 robofast has its own star catalog (Gaia DR3 tiles cached on disk, a

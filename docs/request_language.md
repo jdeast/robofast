@@ -49,7 +49,7 @@ acted on.
 | `location.enclosure` | name | `location` | picks the enclosure at the API |
 | `location.telescope_class` | e.g. `0m7` | `location` | must equal the API's `telescope_class` |
 | `location.site` | string | `location` | kept |
-| `extra_params.cadence`* | `min_interval` (s), `max_per_night` | `cadence` | a standing request (design.md 3.7). Previously `cadence` |
+| `extra_params.cadence`* | `min_interval` (s), `max_per_night`, `pool` (a name) | `cadence` | a standing request (design.md 3.7). With `pool`, `max_per_night` counts tonight's visits of every request in that pool (MINERVA's B stars: one a night, whichever; docs/minerva_sheet.md); `min_interval` stays per request. Previously `cadence` |
 | `extra_params.max_attempts`* | int, default 3 | | failures before FAILED. Previously top level |
 | `configuration_repeats` | int, default 1 | | the configurations repeated in order, stored expanded (ids `c.2`, `c.3`, ...) |
 | `optimization_type` | `TIME`, `AIRMASS` | | kept; the dispatch score has its own airmass term |

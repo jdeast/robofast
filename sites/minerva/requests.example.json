@@ -11,7 +11,8 @@
     "  BSTAR-*: rapidly rotating B stars (nearly featureless) with the iodine cell in (extra_params.iodine",
     "  true), for the instrumental profile. Legacy took one a night (scheduler.py, 'weight for 1 Bstar per",
     "  night', from its 'B stars' sheet, not in the public repository). The cadence is the knob: max_per_night",
-    "  1 here, raise it for more; ipp_value sets how hard the scheduler tries.",
+    "  1 in pool 'bstars' here, one B star a night whichever it is; raise it for more; ipp_value sets how hard",
+    "  the scheduler tries. robofast_core.catalogs.minerva_sheet makes these from the real sheet.",
     "  TEMPLATE-*: an RV star with the iodine cell OUT (extra_params.iodine false), one-shot (no cadence):",
     "  it completes once taken. One per RV star; good seeing and low airmass matter most.",
     "Lamp calibrations (type ARC or LAMP_FLAT) are refused here: KiwiSpec has none (no telescope lists lamps).",
@@ -242,7 +243,7 @@
               "guiding_config": {"mode": "ON"}
             }
           ],
-          "extra_params": {"cadence": {"min_interval": 0.0, "max_per_night": 1}}
+          "extra_params": {"cadence": {"min_interval": 0.0, "max_per_night": 1, "pool": "bstars"}}
         }
       ]
     },
@@ -267,7 +268,7 @@
               "guiding_config": {"mode": "ON"}
             }
           ],
-          "extra_params": {"cadence": {"min_interval": 0.0, "max_per_night": 1}}
+          "extra_params": {"cadence": {"min_interval": 0.0, "max_per_night": 1, "pool": "bstars"}}
         }
       ]
     },

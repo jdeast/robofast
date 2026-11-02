@@ -19,6 +19,10 @@ core = ["astropy>=6.1", "httpx>=0.27", "pyyaml>=6"]
 # optional Redis telemetry mirror. Every one is an optional import; the
 # simulators and the tests need none of them.
 guider-hardware = ["pyserial>=3.5", "pipython>=2.10", "zwoasi>=0.2", "redis>=5"]
+# The live fetch of MINERVA's target-list Google Sheet
+# (robofast_core/catalogs/minerva_sheet.py, docs/minerva_sheet.md), on the
+# host that fetches it only. Optional imports; the tests use a fake client.
+sheets = ["gspread>=6", "google-auth>=2"]
 test = [
     {include-group = "core"},
     "pytest>=8",

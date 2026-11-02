@@ -1,0 +1,4 @@
+name,ra (J2000 hrs),radeg (J2000 deg),dec (J2000 deg),pmra (mas/yr),pmdec (mas/yr),parallax (mas),distance (pc),rv (km/s),vmag (Johnson V),sptype,priority,vsini (km/s),exptime (sec),maxobs,seplimit,pmodeperiod(min),Amp P-mode (cm/s),fauexptime (sec),acquisition_offset_north (arcsec),acquisition_offset_east (arcsec),active,Howard (2010),finder,comment
+SYN-B1,2.0,30.0,15.0,-1.0,2.0,5.0,,10.0,4.5,B5V,3,250,60,2,,,,0.5,0,0,1,,,
+SYN-B2,14.0,210.0,-5.0,-1.0,2.0,5.0,,10.0,4.5,B5V,1,250,60,2,,,,0.5,0,0,1,,,
+SYN-B3,20.0,300.0,40.0,-1.0,2.0,5.0,,10.0,4.5,B5V,3,250,60,2,,,,0.5,0,0,0,,,

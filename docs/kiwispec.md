@@ -364,7 +364,7 @@ legacy practice (`minerva-control`: `control.specCalib`, `takeSlitFlat`,
 |---|---|---|---|
 | **Biases** | each calibration run (evening and morning), roof closed | `sites/minerva/calibration.example.json` `spectrograph`: `{"kind": "bias", "n": 11}`; true dark frames, stage `in` | `specCalib(nbias=11)` (taken as light frames: section 3) |
 | **Darks** | same | `{"kind": "dark", "exptime": 300, "n": 11}` | `specCalib(ndark=11, darkexptime=300)` |
-| **B stars through iodine** | at night, a scheduled request, once a night by default | `SPECTRUM` requests with `extra_params.iodine: true` and `extra_params.cadence` (`max_per_night: 1`; raise it, or add `min_interval`, for more), `BSTAR-*` in `sites/minerva/requests.example.json` | a rapidly rotating B star (nearly featureless) observed with the cell in, one per night: `mkschedule` put one at the start of the night, the scheduler weighted B stars up as the night ran out ("weight for 1 Bstar per night") and down once one was observed |
+| **B stars through iodine** | at night, a scheduled request, once a night by default | `SPECTRUM` requests with `extra_params.iodine: true` and `extra_params.cadence` (`max_per_night: 1` in `pool: "bstars"`, so one B star a night whichever it is; raise it for more), `BSTAR-*` in `sites/minerva/requests.example.json`, made from the real "B stars" sheet by `robofast_core.catalogs.minerva_sheet` (`docs/minerva_sheet.md`) | a rapidly rotating B star (nearly featureless) observed with the cell in, one per night: `mkschedule` put one at the start of the night, the scheduler weighted B stars up as the night ran out ("weight for 1 Bstar per night") and down once one was observed |
 | **Templates** | at night, one-shot requests, good conditions | `SPECTRUM` with `extra_params.iodine: false` (the cell out), no cadence: complete once taken (`TEMPLATE-*`) | targets observed with `i2` false (`template` targets in the schedule) |
 | **Slit flats** | only if the slit-flat LED works | `slit_flat_led: true` in the KiwiSpec config, then `{"kind": "slitflat", "exptime": 1, "n": 11}` in the calibration plan. **Off by default** | `specCalib` stopped them on 2023-06-12: "Slit flat lamp is dead, skipping slit flats" |
 | ThAr, fiber flats | never | refused: by the KiwiSpec service (not in `lamp_frames`) and by the request API (an `ARC` or `LAMP_FLAT` configuration is refused with the reason, since no MINERVA telescope lists lamps; a lamp in `extra_params` is refused everywhere) | never taken: the lamp calls were commented out, and the server's handlers do not exist |
@@ -372,7 +372,8 @@ legacy practice (`minerva-control`: `control.specCalib`, `takeSlitFlat`,
 The science spectra themselves are taken with the cell in (the service's
 `default_iodine: "in"`, or `extra_params.iodine: true`). The B stars'
 names and exposure times in the example are illustrative: the real list
-is legacy's "B stars" sheet, which is not in the public repository. The
+is legacy's "B stars" sheet, which is not in the public repository
+(`docs/minerva_sheet.md` reads it). The
 nightly biases and darks take about 65 minutes with the 22 s readout
 (the calibration unit's `TimeoutStartSec` is 2 h).
 

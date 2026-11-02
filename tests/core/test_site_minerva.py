@@ -52,6 +52,7 @@ COVERED = {
     "request_api.example.json",
     "requests.example.json",
     "sky.example.json",
+    "target_sheet.example.json",
     "targets.example.json",
     "throughput.example.json",
     "too.example.json",
@@ -358,3 +359,15 @@ def test_throughput_config_loads():
     assert cfg.extinction_for("t2/fau/-") == 0.15
     console = _json("console.example.json")["enclosures"]["aqawan1"]
     assert console["throughput"] == str(cfg.status)
+
+
+def test_target_sheet_config_loads():
+    """target_sheet.example.json: the Google Sheet reader
+    (robofast_core.catalogs.minerva_sheet; docs/minerva_sheet.md), with
+    placeholders for the sheet keys and a key path outside the repository."""
+    from robofast_core.catalogs.minerva_sheet import SheetConfig, _placeholder
+
+    cfg = SheetConfig.load(SITE / "target_sheet.example.json")
+    assert set(cfg.enabled()) == {"targets", "bstars"}
+    assert cfg.key_file is not None and cfg.key_file.is_absolute()
+    assert all(_placeholder(spec.sheet) for spec in cfg.lists.values())

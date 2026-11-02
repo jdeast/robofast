@@ -5,7 +5,8 @@
     "tcs.host is a 127.0.0.1 placeholder (a simulator: python -m robofast_core.devices.tcsgo_sim --port 5003).",
     "Real hardware needs allow_hardware: true here AND --hardware on the command line; see docs/tcsgo.md first.",
     "dome: false until it is confirmed that the 60-inch dome is wired to the TCS (docs/tcsgo.md, questions).",
-    "park_command, park_alt/park_az, focus_min/focus_max, guide_rate and min_interval are unconfirmed for the 60-inch."
+    "guide_rate 2.0 arcsec/s is what the legacy TCS window sets (#15) at startup; robofast never sends #15, so this only describes the TCS.",
+    "park_command, park_alt/park_az, focus_min/focus_max and min_interval are unconfirmed for the 60-inch."
   ],
   "name": "flwo60",
   "listen": "127.0.0.1:11140",
@@ -18,7 +19,7 @@
   "park_command": "park",
   "park_alt": 90.0,
   "park_az": 0.0,
-  "guide_rate": 5.0,
+  "guide_rate": 2.0,
   "max_offset": 1000.0,
   "offset_mode": 2,
   "focuser": true,

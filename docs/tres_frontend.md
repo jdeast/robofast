@@ -25,7 +25,8 @@ mountain".
 | Calibration lamps (ThAr, incandescent) | **not** the front end: the legacy TCS window switches them itself, on a Pulizzi power switch, through a separate program | the lamp Switch server (`robofast_core/devices/pulizzi_server.py`, `docs/pulizzi.md`); `ARC`/`LAMP_FLAT` requests on the 60-inch |
 | Tip/tilt | PI S-340 platform on an E-518 controller (GCS) | the guider service (`docs/guider.md`), which already has an E-518 backend |
 | Star projector | three Zaber axes (X, Y, rotation; the rotation's homing is noted as broken), an artificial star for daytime guider tests | not served (an engineering tool; a Focuser per axis if it is wanted) |
-| Guider / spectrograph focus motors | none in the front-end code. The legacy TCS window's old focus steppers are dead code (its `focus` verb moves nothing) | nothing to serve |
+| Telescope focus | the front end focuses the telescope itself, through the TCS (the secondary's focus commands, via the relay), and has its own autofocus routine | the TCSGO server's `focuser/0` (`docs/tcsgo.md`) and robofast's autofocus |
+| Old front end | retired with its stepper motors (JDE 2026-11-01). The legacy TCS window's `focus`/`gfoc` verbs and its focus-stepper code drove that hardware; they are dead | nothing to serve |
 
 **How calstage commands arrive today.** The legacy TCS window's
 `calstage <name>` (names `in`, `out`, `sky`, `science`, `block_sky`,
@@ -196,8 +197,9 @@ Until each is checked, `allow_hardware` stays false.
     calibration light go through the front-end stage?
 11. That the front end switches no lamps (all through the Pulizzi switch),
     and which outlets they are.
-12. Is the star projector still used? Is there any motorised focus in the
-    front end?
+12. Is the star projector still used? (Focus: answered, JDE 2026-11-01;
+    the front end focuses the telescope through the TCS, and the old front
+    end and its steppers are gone.)
 13. Should the stage be left in a particular position at the end of the
     night or when the dome closes?
 14. The TRES FITS headers: the front end recorded the stage position (name

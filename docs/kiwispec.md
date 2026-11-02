@@ -366,7 +366,7 @@ legacy practice (`minerva-control`: `control.specCalib`, `takeSlitFlat`,
 | **Darks** | same | `{"kind": "dark", "exptime": 300, "n": 11}` | `specCalib(ndark=11, darkexptime=300)` |
 | **B stars through iodine** | at night, a scheduled request, once a night by default | `SPECTRUM` requests with `extra_params.iodine: true` and `extra_params.cadence` (`max_per_night: 1`; raise it, or add `min_interval`, for more), `BSTAR-*` in `sites/minerva/requests.example.json` | a rapidly rotating B star (nearly featureless) observed with the cell in, one per night: `mkschedule` put one at the start of the night, the scheduler weighted B stars up as the night ran out ("weight for 1 Bstar per night") and down once one was observed |
 | **Templates** | at night, one-shot requests, good conditions | `SPECTRUM` with `extra_params.iodine: false` (the cell out), no cadence: complete once taken (`TEMPLATE-*`) | targets observed with `i2` false (`template` targets in the schedule) |
-| **Slit flats** | only if the slit-flat LED works | `slit_flat_led: true` in the KiwiSpec config, then `{"kind": "slitflat", "exptime": 1, "n": 11}` in the calibration plan. **Off by default** | `specCalib` stopped them on 2023-06-12: "Slit flat lamp is dead, skipping slit flats" |
+| **Slit flats** | only if the slit-flat LED works (it doesn't: dead since 2023, JDE 2026-11-01) | `slit_flat_led: true` in the KiwiSpec config, then `{"kind": "slitflat", "exptime": 1, "n": 11}` in the calibration plan. **Off by default** | `specCalib` stopped them on 2023-06-12: "Slit flat lamp is dead, skipping slit flats" |
 | ThAr, fiber flats | never | refused: by the KiwiSpec service (not in `lamp_frames`) and by the request API (an `ARC` or `LAMP_FLAT` configuration is refused with the reason, since no MINERVA telescope lists lamps; a lamp in `extra_params` is refused everywhere) | never taken: the lamp calls were commented out, and the server's handlers do not exist |
 
 The science spectra themselves are taken with the cell in (the service's
@@ -400,8 +400,9 @@ anything it records itself).
 2. **Is the chiller** (also disabled) still part of KiwiSpec?
 3. ~~ThAr and fiber flat lamps~~ **Answered** (JDE, 2026-10-31): there
    are none, and no way to switch over: KiwiSpec is iodine only (section
-   4). Still open: does the slit-flat LED work (legacy: "Slit flat lamp is
-   dead", 2023)? Until it is confirmed, `slit_flat_led` stays false.
+   4). The slit-flat LED does not work (legacy: "Slit flat lamp is dead",
+   2023; confirmed by JDE 2026-11-01), so `slit_flat_led` stays false until
+   it is repaired.
 4. **Iodine stage:** its speed and homing time? Should the service ever
    power-cycle the stage by itself (legacy did, after two failed moves)?
    (The positions are answered: the live server's values are correct, and

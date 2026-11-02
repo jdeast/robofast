@@ -61,6 +61,11 @@ setup is a configuration:
   is in the hole), falling back to a centre of mass with the hole *and its
   mirror image* masked. On a 3-pixel hole and a 4-pixel FWHM star a plain
   centre of mass is off by ~0.8 px rms; the annulus fit by ~0.01 px.
+  The annulus centroider is for a guide camera that sees the fiber as a
+  hole in a mirror (TRES). Behind a **beamsplitter** (MINERVA's FAU: a few
+  per cent of all the light, no hole) the target is a whole star and the
+  default centre of mass guides on it (`docs/offset_guiding.md`,
+  `on_target`; the simulator's `Fiber.behind_beamsplitter`).
 - **Controller** (`controller.py`): below.
 - **TipTilt** (`tiptilt.py`): `move_by(da, db)` and `home()` in the
   device's own units, with limits. Starlight Xpress AO (serial), PI E-518
@@ -384,7 +389,11 @@ the camera or the telescope.** The unit has never been commissioned.
    `latency_*`, `residual_rms` and `range_fraction`; calibrate the mount
    (`"device": "mount"`) and enable offloading.
 5. Fiber: `POST /locate` with the KiwiSpec backlight; acquire and guide on
-   the hole with the annulus centroider.
+   the target with the centre of mass (the FAU sees the whole star through
+   its beamsplitter: no hole, so not the annulus centroider). The FAU gets
+   very little light (provisionally ~0.08 %: `docs/offset_guiding.md`), so
+   expect exposures of several seconds and mount guiding rather than fast
+   tip/tilt on all but bright targets.
 
 ## What is left
 

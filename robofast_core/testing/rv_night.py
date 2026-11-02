@@ -473,11 +473,13 @@ class SimulatedNight:
                     "acq_exposure": 0.05,
                     "acq_roi": [200, 160, 240, 160],
                     "plate_scale": 0.5,
-                    "centroider": {"kind": "annulus"},
+                    # MINERVA's FAU is behind a beamsplitter: the whole
+                    # star, no fiber hole (docs/offset_guiding.md).
+                    "centroider": {"kind": "com"},
                 },
                 "sim": {
                     "star": [323.0, 241.0],
-                    "fiber": {"x": 321.5, "y": 239.5, "radius": 3.0},
+                    "fiber": {"x": 321.5, "y": 239.5, "radius": 3.0, "depth": 0.0},
                     "jitter": {"rms": 0.1, "knee": 1.0, "seed": 5 + len(name)},
                     "tt_matrix": [[0.08, 0.03], [-0.03, 0.08]],
                 },

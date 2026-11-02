@@ -372,7 +372,13 @@ dispatch scheduler chooses annulus or offset guiding from the instrument's
 guiding model (`instruments.<name>.guiding`:
 `robofast_core/guider/recommend.py`, a photon-noise prediction of each
 method's error checked against the guide loop in the simulator), and
-records the recommendation and its reason. **Seeing** comes from a
+records the recommendation and its reason. How the guide camera sees a
+target on the fiber is per instrument (`on_target`): the spill round a
+fiber hole in a mirror (`annulus`, TRES) or the whole star through a
+beamsplitter (`beamsplitter`, MINERVA's FAU, JDE 2026-11-02: "the FAU has
+no fiber hole"); offset guiding is chosen only when the target is too
+faint to see at that light, or to correct at least `min_rate` times a
+second. **Seeing** comes from a
 configured, pluggable source (`robofast_core/seeing.py`,
 `docs/seeing.md`; the dispatch plan's `seeing` entry): by default the
 guiders' live FWHM (the median over the last 30 min, stale after 15),

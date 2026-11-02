@@ -14,7 +14,9 @@
     "_legacy_seed_calibrations (NOT loaded): the mount's matrix from the plate scale at PA 0, and the AO's from",
     "ao_t2.ini as the pre-2019 legacy code used it (PLATESCALE = 40 steps per arcsec, so 0.025 arcsec/step;",
     "ROTOFFSET 45) via robofast_core.sites.minerva.guider_calibration.from_sx_legacy(0.025, 45, 0.265). Both are unverified starting points to",
-    "compare with POST /calibrate; README.md lists the conflicting alternatives."
+    "compare with POST /calibrate; README.md lists the conflicting alternatives.",
+    "The FAU has no fiber hole: a beamsplitter sends a few per cent of the light to it, so the target is a whole",
+    "star and the centroider is a plain one ('com'), not 'annulus' (docs/offset_guiding.md, on_target)."
   ],
   "name": "t2-guider",
   "scope": "t2",
@@ -31,7 +33,7 @@
     "roi_size": 64,
     "target": [948.0, 626.0],
     "fiber_radius": 3.0,
-    "centroider": {"kind": "annulus"},
+    "centroider": {"kind": "com"},
     "gains": {"kp": 0.5, "ki": 0.1, "deadband": 0.0},
     "capture_radius": 8,
     "plate_scale": 0.265

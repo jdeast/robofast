@@ -51,16 +51,28 @@ from robofast_core.testing import starfield as sf
 class Fiber:
     """A fiber entrance on the acquisition camera, seen in reflection: a
     hole (light falling on it goes into the fiber, so it is missing from the
-    image) or, with the backlight on, a bright disk."""
+    image) or, with the backlight on, a bright disk.
+
+    Behind a **beamsplitter** (MINERVA's FAU: the guide camera gets a
+    fraction of all the light, the fiber the rest) there is no hole: the
+    star is whole, ``depth`` 0 (:meth:`behind_beamsplitter`); the
+    backlit fiber still shows. The fraction the camera gets is the star's
+    ``flux`` (docs/offset_guiding.md: ``on_target``, ``light_fraction``)."""
 
     x: float
     y: float
     #: Radius in pixels.
     radius: float = 3.0
-    #: Fraction of light lost in the hole (1: the hole is black).
+    #: Fraction of light lost in the hole (1: the hole is black; 0: no
+    #: hole, a beamsplitter).
     depth: float = 1.0
     #: Electrons per pixel when backlit.
     backlight: float = 2000.0
+
+    @classmethod
+    def behind_beamsplitter(cls, x: float, y: float, radius: float = 3.0, **kw: float) -> Fiber:
+        """A fiber the guide camera sees through a beamsplitter: no hole."""
+        return cls(x, y, radius, depth=0.0, **kw)
 
 
 @dataclass

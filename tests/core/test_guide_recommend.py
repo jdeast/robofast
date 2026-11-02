@@ -36,13 +36,18 @@ MODEL = rc.GuideModel(
 
 
 def _world(clock, model, mag, *, offset_px=None, star_g=None):
-    """The target on the fiber hole; with ``offset_px``, a guide star of
+    """The target on the fiber (a hole, or behind a beamsplitter: the whole
+    star at ``light_fraction``); with ``offset_px``, a guide star of
     ``star_g`` that far from it. No image motion: what is left of the
     guiding error is the centroid noise the model predicts."""
     ps = model.plate_scale
     sky_e = model.zero_point * 10 ** (-0.4 * model.sky) * model.area * model.throughput * ps**2
     tt = SimTipTilt(clock=clock, limits=((-500.0, 500.0), (-500.0, 500.0)))
-    target_flux = model.electrons(mag, 1.0)
+    beam = model.on_target == "beamsplitter"
+    target_flux = model.electrons(mag, 1.0) * (model.light_fraction if beam else 1.0)
+    fiber = (Fiber.behind_beamsplitter if beam else Fiber)(
+        *FIBER, radius=model.fiber_diameter / 2 / ps
+    )
     if offset_px is None:
         star, flux, others = FIBER, target_flux, []
     else:
@@ -56,7 +61,7 @@ def _world(clock, model, mag, *, offset_px=None, star_g=None):
         fwhm=model.seeing / ps,
         sky=sky_e,
         read_noise=model.read_noise,
-        fiber=Fiber(*FIBER, radius=model.fiber_diameter / 2 / ps),
+        fiber=fiber,
         tiptilt=tt,
         tt_matrix=np.array([[0.1, 0.0], [0.0, 0.1]]),
         plate_scale=ps,
@@ -70,7 +75,7 @@ def _world(clock, model, mag, *, offset_px=None, star_g=None):
         acq_roi=(FIBER[0] - 80, FIBER[1] - 80, 160, 160) if offset_px is None else None,
         roi_size=48,
         fiber_radius=model.fiber_diameter / 2 / ps,
-        centroider={"kind": "annulus"},
+        centroider={"kind": "com" if beam else "annulus"},
         fwhm=model.seeing / ps,
         gains={"kp": model.kp},
         max_reacquire=0,
@@ -119,6 +124,11 @@ async def _simulated_error(model, mag, method, star_g=None, frames=60):
 
 
 GRID = (12.0, 15.0, 16.5, 17.5, 18.5)
+
+#: The same telescope with a beamsplitter in front of the fiber (MINERVA's
+#: FAU geometry): the guide camera sees the whole target at 2 % of the light.
+BEAM = rc.GuideModel(**{**MODEL.__dict__, "on_target": "beamsplitter", "light_fraction": 0.02})
+BEAM_GRID = (10.0, 12.5, 14.0, 15.5)
 
 
 async def test_the_model_agrees_with_the_simulated_guide_loop():
@@ -191,13 +201,67 @@ def test_choices_and_reasons():
 @pytest.mark.parametrize("site, instrument", [("minerva", "spectrograph"), ("flwo60", "tres")])
 def test_site_models_load_and_cross_over(site, instrument, capsys):
     """Each fiber instrument's guiding model (its dispatch example) loads,
-    prefers annulus guiding for a bright target and offset guiding for one
-    too faint to centroid, and the CLI prints the table."""
+    prefers guiding on the target when it is bright and offset guiding when
+    it is too faint to centroid, and the CLI prints the table. MINERVA's
+    FAU is behind a beamsplitter; TRES's guider sees the spill."""
     path = SITES / site / "dispatch.example.json"
     model = rc.load_model(path, instrument)
+    assert model.on_target == {"minerva": "beamsplitter", "flwo60": "annulus"}[site]
     assert rc.recommend(model, 8.0).method == "annulus"
     assert rc.recommend(model, 20.0).method == "offset"
     assert rc.main(["--config", str(path), "--instrument", instrument, "--grid", "8:20:2"]) == 0
     out = capsys.readouterr().out
-    assert out.count("\n") == 8 and "offset" in out and "annulus" in out
+    word = "target" if site == "minerva" else "annulus"
+    assert out.count("\n") == 9 and "offset" in out and word in out
     assert rc.main(["--config", str(path), "--instrument", "nope", "--mag", "10"]) == 2
+
+
+async def test_beamsplitter_model_agrees_with_the_simulated_guide_loop():
+    """Behind a beamsplitter the guider centroids the whole target (no
+    hole) at ``light_fraction`` of its light: the predicted tracking error
+    is within a factor of two of the simulated loop's, and "not found" is
+    where the simulated guider cannot hold it."""
+    rows = []
+    for mag in BEAM_GRID:
+        p = rc.predict(BEAM, mag)["annulus"]
+        rows.append((mag, p, await _simulated_error(BEAM, mag, "annulus")))
+    table = "\n".join(f"{m:5.1f} model {p.tracking:.4f} {p.found} sim {s:.4f}" for m, p, s in rows)
+    for _mag, p, sim in rows:
+        assert p.found == math.isfinite(sim), table
+        if p.found:
+            assert 0.5 < sim / p.tracking < 2.0, table
+    assert rows[0][1].found and not rows[-1][1].found, table
+
+
+def test_beamsplitter_and_cadence_reasons():
+    """The reasons say what the guider sees; offset guiding is chosen only
+    when the target is too faint to see, or to guide on often enough."""
+    bright = rc.recommend(BEAM, 10.0)
+    assert bright.method == "annulus" and "target (beamsplitter)" in bright.reason
+    assert bright.as_json()["on_target"] == "beamsplitter"
+    faint = rc.recommend(BEAM, 17.0, star_g=11.0)
+    assert faint.method == "offset" and "target (beamsplitter) is too faint" in faint.reason
+    # The whole star at 2 % is fainter than a 2.3" fiber's ~20 % spill in
+    # 1.5" seeing, but unlike the spill it does not depend on the seeing.
+    b = [rc.predict(BEAM, 14.0, seeing=x)["annulus"].snr for x in (1.0, 3.0)]
+    a = [rc.predict(MODEL, 14.0, seeing=x)["annulus"].snr for x in (1.0, 3.0)]
+    assert a[1] > 3 * a[0] and b[0] > b[1]
+    # Cadence: visible, but only with long exposures.
+    p = rc.predict(BEAM, 14.0)["annulus"]
+    assert p.found and p.rate > 0
+    slow = rc.GuideModel(**{**BEAM.__dict__, "min_rate": 2 * p.rate})
+    rec = rc.recommend(slow, 14.0, star_g=9.0)
+    assert rec.method == "offset" and "often enough" in rec.reason, rec.reason
+    assert rc.recommend(
+        rc.GuideModel(**{**BEAM.__dict__, "min_rate": p.rate / 2}), 14.0
+    ).method == ("annulus")
+    # Rates: brighter is faster; nothing found is 'never'.
+    assert rc.predict(BEAM, 12.0)["annulus"].rate > p.rate
+    assert rc.predict(BEAM, 20.0)["annulus"].rate == 0.0
+    for bad, match in (
+        ({"on_target": "prism"}, "on_target"),
+        ({"light_fraction": 0}, "light_fraction"),
+        ({"min_rate": -1}, "min_rate"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            rc.GuideModel.from_dict({**MODEL.__dict__, **bad})

@@ -29,19 +29,26 @@
       "guiding": {
         "_note": [
           "When to offset guide (robofast_core/guider/recommend.py; docs/offset_guiding.md): guide 'auto'.",
-          "CDK700 0.7 m. Sources: fiber_diameter 2.27 arcsec = the 50 um fiber core at 22 um/arcsec",
-          "(Swift et al. 2015, JATIS 1, 027002, sec. III.3); plate_scale 0.265 arcsec/px confirmed from the",
-          "FAU frames' FITS WCS; exposure 10 s (FAU frames use 8.6-15 s). The FAU's ZWO ASI174MM runs at",
-          "gain 0 (the legacy zwo.py sets ASI_GAIN=0 'for maximum dynamic range'): read_noise 6 e- and",
-          "~3.9 e-/ADU (12-bit) are ZWO DATASHEET ESTIMATES at gain 0, consistent with the measured",
-          "0.9-1.5 ADU frame noise. throughput 0.02 is UNCONFIRMED and may be much lower: in 6 recent T2 FAU",
-          "frames no spill or annulus showed within 40 arcsec of the fiber at 8 sigma. ASSUMED: obscuration.",
-          "seeing: the fallback when the guiders have nothing recent (docs/seeing.md).",
-          "Thresholds: max_error (arcsec rms), min_snr, prefer_annulus."
+          "CDK700 0.7 m. The FAU has NO fiber hole: a beamsplitter in front of the fiber sends ~2 % of the",
+          "light (the DESIGN value) to the FAU, which sees the whole star (on_target 'beamsplitter').",
+          "fiber_diameter 2.27 arcsec = the 50 um core at 22 um/arcsec (Swift et al. 2015, JATIS 1, 027002,",
+          "sec. III.3); plate_scale 0.265 arcsec/px confirmed from the FAU frames' FITS WCS.",
+          "PROVISIONAL, one star (T1, night n20230306, 5 s frames): ~500 e-/s at V 8.93, so 1 e-/s at",
+          "V ~15.7 -- an effective throughput of ~0.08 % (beamsplitter included; not the design 2 %).",
+          "zero_point here is V-band photons (8.1e9 /s/m^2 at V 0), so throughput 0.0008 with light_fraction",
+          "1 (the whole FAU field is behind the beamsplitter) reproduces that measurement. Measured FWHM",
+          "1.2-1.7 arcsec (seeing: the fallback when the guiders have nothing recent, docs/seeing.md).",
+          "The ZWO ASI174MM runs at gain 0 (legacy zwo.py: ASI_GAIN=0 'for maximum dynamic range'):",
+          "read_noise 6 e- and ~3.9 e-/ADU are ZWO DATASHEET ESTIMATES, consistent with the measured",
+          "0.9-1.5 ADU frame noise. exposure: the longest guide exposure (FAU frames use 5-15 s);",
+          "min_rate 0.1 Hz (a correction at least every 10 s, as the legacy FAU) is PROPOSED. ASSUMED: obscuration.",
+          "Thresholds: max_error (arcsec rms), min_snr, min_rate, prefer_annulus (on target preferred)."
         ],
         "aperture": 0.7, "obscuration": 0.25, "fiber_diameter": 2.27, "plate_scale": 0.265,
-        "read_noise": 6.0, "throughput": 0.02, "exposure": 10.0,
-        "sky": 21.0, "seeing": 1.8, "star_g": 10.5, "separation": 60.0,
+        "on_target": "beamsplitter", "light_fraction": 1.0,
+        "read_noise": 6.0, "zero_point": 8.1e9, "throughput": 0.0008, "exposure": 10.0,
+        "min_rate": 0.1,
+        "sky": 21.0, "seeing": 1.5, "star_g": 10.5, "separation": 60.0,
         "max_error": 0.3, "min_snr": 5.0, "prefer_annulus": 1.5
       }
     }

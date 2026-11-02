@@ -1,13 +1,21 @@
 # Offset guiding
 
 On a fiber spectrograph the guider normally guides on the target itself.
-The fiber takes the core of the star, so the guide camera sees only the
-light that *spills* round the fiber hole, as a ring. The **annulus**
-centroider (`docs/guider.md`) finds the star's centre from that ring. For a
-faint target the spill is too weak to centroid, which is common for TRES's
-faint targets and also happens on MINERVA. **Offset guiding** guides on a
-brighter star nearby instead. It holds that star at the pixel that puts
-the target on the fiber.
+What the guide camera sees of a target on the fiber depends on the
+instrument (`on_target` in its guiding model):
+
+- **a mirror round the fiber** (`annulus`; TRES): the fiber takes the core
+  of the star, so the guide camera sees only the light that *spills* round
+  the fiber hole, as a ring. The **annulus** centroider (`docs/guider.md`)
+  finds the star's centre from that ring;
+- **a beamsplitter** (`beamsplitter`; MINERVA's FAU): a beamsplitter in
+  front of the fiber sends a small fraction of all the light (about 2 % by
+  design) to the guide camera. There is no hole: the camera sees the whole
+  star, and a plain centroider (the windowed centre of mass) guides on it.
+
+For a faint target that light is too weak to centroid, or to centroid
+often enough. **Offset guiding** guides on a brighter star nearby instead.
+It holds that star at the pixel that puts the target on the fiber.
 
 Everything here runs in the simulators only. Nothing has guided a real
 telescope by an offset star yet.
@@ -104,12 +112,21 @@ photon statistics and recommends one, with the reason. Its inputs are:
 - the sky (mag/arcsec^2);
 - the seeing (FWHM);
 - the instrument's `GuideModel`: aperture, fiber diameter, guide camera
-  plate scale, read noise, dark, throughput (QE included), guide
-  exposure, the loop's `kp`, and the zero point of the guide band.
+  plate scale, read noise, dark, throughput (QE included), the longest
+  guide exposure, the loop's `kp`, the zero point of the guide band, how
+  the camera sees the target (`on_target`, `light_fraction`) and the
+  slowest acceptable correction rate (`min_rate`).
 
-**Annulus.** The spill of a Gaussian star of rms `s` centred on a fiber of
-radius `r` is `exp(-r^2/2s^2)` of its light. Its centroid error per axis
-is `annulus_factor x sqrt(s^2 + r^2) / SNR`.
+**On the target, `annulus`.** The spill of a Gaussian star of rms `s`
+centred on a fiber of radius `r` is `exp(-r^2/2s^2)` of its light. Its
+centroid error per axis is `annulus_factor x sqrt(s^2 + r^2) / SNR`.
+
+**On the target, `beamsplitter`.** The whole star, with `light_fraction`
+of the electrons an off-fiber star of the same magnitude gives (1 when, as
+at MINERVA, the whole guide field is behind the beamsplitter and
+`throughput` already includes it). Its centroid error per axis is
+`com_factor x s / SNR`. Unlike the spill, it does not grow with the
+seeing.
 
 **Offset.** The guide star's centroid error is `com_factor x s / SNR`.
 The offset's systematic error is added in quadrature:
@@ -125,13 +142,26 @@ find a star whose SNR is below `min_snr`. For `auto` the star is unknown,
 so its `star_g` and `separation` are assumed; a given star's `g` replaces
 the assumed one.
 
+**Cadence.** Each method's achievable correction rate is `1/t`, with `t`
+the shortest exposure (up to `exposure`) at which its star is found and
+its error is within `max_error`. A method slower than `min_rate` (Hz; 0:
+no requirement) does not work: a target seen only in long exposures
+cannot be guided on often enough to follow the image motion.
+
 **The choice.**
 
-1. Annulus, if its error is within `max_error` and no worse than
-   `prefer_annulus` times the offset's. Annulus guiding needs no second
-   star and has no systematic error.
-2. Otherwise offset, if it is within `max_error`.
-3. Otherwise the lesser evil, and the reason says "neither".
+1. On the target, if it works (found, within `max_error`, at least
+   `min_rate`) and is no worse than `prefer_annulus` times the offset's
+   error. Guiding on the target needs no second star and has no systematic
+   error.
+2. Otherwise offset, if it works. So offset guiding is chosen only when the
+   target is too faint to see at the light the guide camera gets of it,
+   or too faint to guide on often enough; the reason says which.
+3. Otherwise the lesser evil, and the reason says "neither works".
+
+The method's key stays `annulus` (the request language's word for guiding
+on the target, `docs/request_language.md`); the recommendation's
+`on_target` and its reason say what the guider actually sees.
 
 **Calibrated in the simulator** (`tests/core/test_guide_recommend.py`):
 
@@ -147,6 +177,11 @@ the assumed one.
   of 2. The model's "not found" is exactly where the guider cannot acquire
   or hold the star. The choice matches the method the simulated loop does
   better with.
+- The same is run for a **beamsplitter**: the whole target at 2 % of the
+  light, no hole (`Fiber.behind_beamsplitter` in the simulator), the
+  windowed centre of mass. The predicted tracking error again agrees to
+  within a factor of 2, and "not found" is where the guider cannot hold
+  the star.
 
 **The thresholds are per instrument**, in the dispatch config, under
 `instruments.<name>.guiding`:
@@ -154,22 +189,23 @@ the assumed one.
 - MINERVA's KiwiSpec: `sites/minerva/dispatch.example.json`;
 - TRES: `sites/flwo60/dispatch.example.json`.
 
-The thresholds are `max_error` (KiwiSpec 0.3", TRES 0.25"), `min_snr` (5)
-and `prefer_annulus` (1.5). Each hardware value carries its source in the
-config's `_note`:
+The thresholds are `max_error` (KiwiSpec 0.3", TRES 0.25"), `min_snr` (5),
+`min_rate` (KiwiSpec 0.1 Hz, proposed; TRES none) and `prefer_annulus`
+(1.5). Each hardware value carries its source in the config's `_note`:
 
 | Value | MINERVA (KiwiSpec, FAU) | TRES |
 |---|---|---|
-| `fiber_diameter` | 2.27": the 50 um core at 22 um/arcsec (Swift et al. 2015, JATIS 1, 027002, sec. III.3) | 2.3" (unconfirmed) |
+| `on_target` | `beamsplitter`: no fiber hole; ~2 % of the light by design | `annulus`: a mirror round the fiber |
+| `fiber_diameter` | 2.27": the 50 um core at 22 um/arcsec (Swift et al. 2015, JATIS 1, 027002, sec. III.3) | 2.3": the medium fiber, 100 um at f/6 (Fűrész 2008, PhD thesis, sec. 2.1.3); the new front end has only this fiber (MEDIUM, R~44,000) |
 | `plate_scale` | 0.265"/px, confirmed from the FAU frames' FITS WCS | 0.161"/px, tres-guider `config/zyla.ini` (Andor Zyla 4.2P) |
-| `exposure` | 10 s (FAU frames use 8.6-15 s) | 1 s (assumed) |
+| `exposure` | 10 s, the longest (FAU frames use 5-15 s) | 1 s (assumed) |
 | `read_noise` | 6 e-: ZWO ASI174MM datasheet at gain 0 (the legacy code runs gain 0); about 3.9 e-/ADU there. Datasheet estimates, consistent with the measured 0.9-1.5 ADU frame noise | 1.4 e- (assumed) |
-| `throughput` | 0.02, **unconfirmed**: six recent T2 FAU frames show no spill within 40" of the fiber at 8 sigma, so it may be much lower | 0.1 (assumed) |
+| `throughput` | 0.0008, **provisional**, with `zero_point` 8.1e9 (V-band photons) and `light_fraction` 1: one star, T1, night n20230306, ~500 e-/s at V 8.93 in 5 s frames (1 e-/s at V ~15.7), FWHM 1.2-1.7". An effective 0.08 %, beamsplitter included, far below the 2 % design | 0.1 (assumed) |
 
-With these, annulus guiding works to about V 14.5 on MINERVA (offset from
-15.0) and G 16.0 on TRES (offset from 16.5). The MINERVA crossover moves
-with the unconfirmed throughput: 13.1 at 0.5 %, 12.2 at 0.2 %, 11.4 at
-0.1 %.
+With these, MINERVA guides on the target to about V 11.0 and offset
+guides from 11.5 (the target is no longer seen in 10 s); with the assumed
+offset star (G 10.5) the offset star itself needs ~5 s exposures. TRES
+guides on the spill to about G 16.0 and offset guides from 16.5.
 
 **For `guide: "auto"`** the dispatch scheduler applies the recommendation
 when a visit starts:

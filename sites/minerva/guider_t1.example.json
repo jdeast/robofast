@@ -11,7 +11,9 @@
     "The FAU is on M3 port 2 (telescope_1.ini [PORT] FAU); 'port' names the calibration, not the port number.",
     "_legacy_seed_calibrations: the mount's matrix from the plate scale at PA 0 (legacy derotates the FAU to PA 0).",
     "It is a starting point to compare with POST /calibrate {\"device\": \"mount\"}; it is NOT loaded (keys",
-    "starting with _ are ignored). Copy it to 'calibrations' only to guide before a measured calibration exists."
+    "starting with _ are ignored). Copy it to 'calibrations' only to guide before a measured calibration exists.",
+    "The FAU has no fiber hole: a beamsplitter sends a few per cent of the light to it, so the target is a whole",
+    "star and the centroider is a plain one ('com'), not 'annulus' (docs/offset_guiding.md, on_target)."
   ],
   "name": "t1-guider",
   "scope": "t1",
@@ -28,7 +30,7 @@
     "roi_size": 64,
     "target": [949.0, 617.0],
     "fiber_radius": 3.0,
-    "centroider": {"kind": "annulus"},
+    "centroider": {"kind": "com"},
     "gains": {"kp": 0.5, "ki": 0.1, "deadband": 0.0},
     "capture_radius": 8,
     "plate_scale": 0.265

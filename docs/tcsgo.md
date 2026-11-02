@@ -31,6 +31,15 @@ Everything not in the manual is marked *assumed* or listed under
   read the reply, and closed it. Its relay (`tcsserver.py`) serialized
   clients with a lock. robofast does the same: one connection per command,
   one command at a time.
+- **The relay is the TCS's only client.** When the new TRES front end was
+  installed, the relay was added so that the front end (guiding offsets,
+  focus) and the legacy TCS window could both command the TCS without
+  colliding, and the TCS window was repointed from TCSGalil to the relay
+  (JDE 2026-11-01). While either still runs, robofast must also go through
+  the relay (its `tcs.host`/`tcs.port`), never straight to TCSGalil. Later,
+  robofast can take the relay's place: a TCSGO-compatible port that
+  serializes the legacy clients behind robofast's own ownership rules, so
+  they move over one at a time.
 - **Packets.** `#` + the command number + arguments, comma-separated, then
   `;` and a carriage return (0x0D): `#6,18.3457,35.3456,2000.0;\r`. All
   arguments are floating point; TCSGalil truncates where it needs integers.
@@ -172,7 +181,7 @@ thanks to FLWO) gives the commands robofast has to cover to replace it:
 | 6 | set target | `SlewToCoordinatesAsync` | covered |
 | 10 | target zenith (stow) | `Park` with `park_command: "zenith"` | covered |
 | 12 | 0 stop, 1 track, 2 slew | `#13`/`#12,0`, `Tracking`, `AbortSlew`, slews | covered |
-| 15 | guide rate | not sent; `guide_rate` assumed in the config | gap (small): confirm the value (question 9) |
+| 15 | guide rate (2.0 "/s, sent once at startup) | not sent; `guide_rate: 2.0` in the config to match | covered while the legacy window has set it; confirm (question 9) |
 | 16 | set (paddle) rate | not sent | not needed (operator setting) |
 | 18 | cos(Dec) for the paddle | not sent | not needed (question 9) |
 | 20 | dome 0 manual, 1 track, 2 go to azimuth, 3 home | `Slaved`, `SlewToAzimuth`, `FindHome` | covered (`"dome": true`) |
@@ -323,9 +332,11 @@ not carried over:
 8. **Offsets:** after `#7` in follow mode, should robofast send `#12,2`
    (slew to target, as now) or `#12,3` (chase)? Does a small `#7` while
    chasing move smoothly enough for TRES guiding?
-9. **Guide rate:** what is the 60-inch's guide rate (`#15`), and is "use
-   cos(Dec)" (`#18`) on? `PulseGuide` and `GuideRateRightAscension` assume
-   5"/s and no cos(Dec).
+9. **Guide rate:** the legacy TCS window sets 2.0"/s (`#15`) at startup,
+   and the shipped config matches. Is that what the TCS runs at when the
+   window isn't running (TCSGalil's own default), and is "use cos(Dec)"
+   (`#18`) on? `PulseGuide` and `GuideRateRightAscension` assume the
+   configured rate and no cos(Dec).
 10. **Focus range and direction:** the 60-inch's usable focus range in
     microns (`focus_min`/`focus_max`, now ±5000), and is "moving in"
     decreasing microns? Is there a documented focus stop (`#72` is not in
@@ -338,6 +349,7 @@ not carried over:
 14. **TCS restarts:** the legacy note says failed status queries meant
     restarting TCSGalil. Does that still happen, and should robofast alarm
     (it now reports a timeout) or attempt anything?
-15. **Who else talks to the TCS** while robofast runs (the TRES guider, the
-    observer's GUI, an ASCOM client)? TCSGalil also advertises itself as
-    ASCOM Telescope/Focuser/Dome; would talking to that be preferable?
+15. **Who else talks to the TCS** while robofast runs? Answered in part
+    (JDE 2026-11-01): the TRES front end and the legacy TCS window, both
+    through the relay. Anything else (an ASCOM client of TCSGalil's own
+    Telescope/Focuser/Dome)?

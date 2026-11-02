@@ -744,6 +744,20 @@ timeouts, limits, and policies (the first is `sites/minerva/weather.yaml`).
 minerva-control `config/*.ini` source and lists the conflicts between them.
 A new site is a new config directory plus any device servers it needs.
 
+Site code that is not configuration (a new weather source type for the
+bridge, `robofast_core.weather_sources.SOURCE_TYPES`; a new plan type,
+`robofast_core.plan.KINDS`) will plug in through the Python entry-point
+group `robofast.plugins`: a site package declares entries there in its own
+`pyproject.toml`, and robofast loads them at start-up, so a site never has
+to patch the core. The group name is reserved now; nothing reads it yet,
+and the mechanism (what an entry returns, how a name clash is refused) is
+designed when the first site needs it.
+
+robofast is packaged from `pyproject.toml` (`pip install .`): only
+`robofast_core` is installed, with a `robofast-*` console command for each
+long-running service and device server. The legacy `robofast/` directory
+stays in the repository, unpackaged.
+
 ## 4. Windows control PCs
 
 Most vendor camera and mount software is Windows-first, and its Linux

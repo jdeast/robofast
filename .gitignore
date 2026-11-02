@@ -15,3 +15,7 @@ __pycache__/
 /sites/*/too-dropbox/
 # Request-API tokens (hashed, but still) live outside the repository.
 *tokens*.json
+# Packaging output (pip install ., python -m build)
+*.egg-info/
+build/
+dist/

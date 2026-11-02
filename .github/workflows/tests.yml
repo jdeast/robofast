@@ -237,11 +237,25 @@ jobs:
       - name: Run the pre-commit hooks
         run: pre-commit run --all-files --show-diff-on-failure
 
+  # Packaging: `pip install .` into a clean venv (no checkout on the path)
+  # gives an importable robofast_core and working console scripts.
+  install:
+    name: install
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install the package into a clean venv and smoke-test it
+        run: scripts/check_install.sh "${{ runner.temp }}/install-venv"
+
   # The one check branch rules should require.
   test:
     name: test
     if: always()
-    needs: [pytest, alpaca-sim, conformu, e2e, lint]
+    needs: [pytest, alpaca-sim, conformu, e2e, lint, install]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any required job did not succeed
@@ -251,8 +265,10 @@ jobs:
           echo "conformu:   ${{ needs.conformu.result }}"
           echo "e2e:        ${{ needs.e2e.result }}"
           echo "lint:       ${{ needs.lint.result }}"
+          echo "install:    ${{ needs.install.result }}"
           test "${{ needs.pytest.result }}" = "success"
           test "${{ needs.alpaca-sim.result }}" = "success"
           test "${{ needs.conformu.result }}" = "success"
           test "${{ needs.e2e.result }}" = "success"
           test "${{ needs.lint.result }}" = "success"
+          test "${{ needs.install.result }}" = "success"

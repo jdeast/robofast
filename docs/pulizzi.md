@@ -80,10 +80,63 @@ config (`sites/flwo60/pulizzi.json`), in order.
   config lists only the four lamps, so outlets 3, 5, 6 and 8 are not
   served at all and robofast never touches them.
 * `Action("Status")`: JSON with every listed outlet (`id`, `outlet`,
-  `name`, `lamp`, `on`; for lamps `max_on`, `on_for`, `remaining`), the
-  lamps the max-on limit switched off (`tripped`), the unit's other status
-  lines, and the monitor's last error.
+  `name`, `lamp`, `on`; for lamps `max_on`, `on_for`, `remaining` and the
+  lamp hours below), the lamps the max-on limit switched off (`tripped`),
+  the unit's other status lines, the monitor's last error, and the
+  lamp-hours file and its last error (`hours_file`, `hours_error`).
 * `Action("LampsOff")`: every lamp off. Anyone may call it.
+* `Action("LampReplaced", '{"lamp": "ThAr1", "by": "who", "note": "...",
+  "hours": 0}')`: an **operator** records a new lamp (below). It switches
+  nothing. `lamp` and `by` are required; `hours` is what the new lamp has
+  already burned (default 0).
+
+### Lamp hours
+
+ThAr and incandescent lamps age as they burn, and are replaced from their
+accumulated hours, so the server keeps them
+(`robofast_core/devices/lamp_hours.py`).
+
+* **Counted from what the unit reports**, not from commands: every status
+  the server reads (its `poll_interval` monitor, and the read-back after
+  every switch) is counted, so a lamp switched on by hand, by the legacy
+  software while both coexist, or found on at startup counts from when
+  the server first sees it on until it sees it off. A start is counted
+  when a lamp is first seen on.
+* Per lamp, by name: `hours` and `cycles` (starts) over the lamp
+  position's lifetime; `since_replaced` (`hours`, `cycles`, `at`, `by`:
+  the lamp now installed; `at` null means since tracking began, the
+  earlier hours unknown); `rated_hours` (config, optional); `life_used`
+  (`since_replaced.hours / rated_hours`); `life_warning` (`"near"` from
+  90 %, `"past"` from 100 %, logged once each as a warning and an error).
+  **Hours never stop a lamp from being switched on**: replacing it is the
+  observers' decision.
+* `Action("LampReplaced")` restarts the `since_replaced` counts and keeps
+  the lifetime totals; the old lamp's hours, starts, who recorded it (with
+  the client id) and the note are appended to the file's `replacements`
+  and logged. For the lamps installed when tracking starts, record each
+  once with the hours it is believed to have (`hours`).
+* **The file** (`hours_file`): JSON, default
+  `lamp-hours/<name>.json` under the data directory (`$ROBOFAST_DATA_DIR`,
+  else `~/.cache/robofast/data`: on the site computer set
+  `ROBOFAST_DATA_DIR`, or an absolute `hours_file`, to a directory that is
+  kept and backed up); a relative `hours_file` is taken from the data
+  directory. Written atomically (temporary file, fsync, rename) on every
+  on/off, on a replacement, at a clean stop and every `hours_flush` s
+  (default 60) while a lamp burns, so a crash loses at most that much. A
+  restart that finds a lamp still on that the file says was on does not
+  count a new start; the time the server was down is not counted.
+* **Failures never get in the way of switching**: a missing file starts
+  every lamp at zero (a warning); an unreadable one is moved aside to
+  `<file>.corrupt-<time>`, kept, and counting starts again from zero (an
+  error, and `hours_error` says so until the server restarts); a failed
+  write is logged, the hours kept in memory and the write retried at the
+  next flush. Any error in the tracker is logged and the switch goes on.
+* The simulator keeps its hours in memory only, unless `hours_file` is set
+  explicitly; `--simulate` on a hardware config always does, so a
+  simulator run never adds to the real lamps' hours.
+* Not in the FITS headers: the lamp server has no path into the value
+  registry (the sequencer's). A lamp frame could carry its lamp's hours
+  from `Status` if the TRES pipeline wants them (question 13).
 
 ### Lamp safety (decided)
 
@@ -180,7 +233,8 @@ python -m robofast_core.devices.pulizzi_server --config sites/flwo60/pulizzi.jso
 prints `{"url": ..., "port": "simulator"}`. Tests:
 `tests/core/test_pulizzi.py` (the protocol client and simulator, the
 server's gate and safety behaviour, requests and dispatch, the sequencer's
-lamp frames and every switch-off path). ConformU:
+lamp frames and every switch-off path) and `tests/core/test_lamp_hours.py`
+(the lamp hours, on a fake clock and in the server). ConformU:
 `scripts/conformu_pulizzi.py` (`conformance` with switch writes, and
 `alpacaprotocol`; in CI's `conformu` job).
 
@@ -214,3 +268,8 @@ Until each is checked, `allow_hardware` stays false.
     and flat frames.
 12. That the legacy verb `lamp thar` means ThAr1 (outlet 2), and whether
     ThAr2 and Incand2 are still installed.
+13. Each installed lamp's rated life (`rated_hours`; the shipped values
+    are placeholders), the hours it has already burned and when it was
+    installed (recorded once with `LampReplaced`), where the lamp-hours
+    file lives on the site computer, and whether the TRES pipeline wants
+    a lamp's hours in its frames' headers.

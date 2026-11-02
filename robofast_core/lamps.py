@@ -20,8 +20,8 @@ lamp is switched on; an observation's own ``calstage`` wins; null: leave
 the stage alone).
 
 The switch is :mod:`robofast_core.devices.pulizzi_server` (an Alpaca
-Switch with the ``Status`` and ``LampsOff`` actions); this module reads and
-switches it through a device owner's grant.
+Switch with the ``Status``, ``LampsOff`` and ``LampReplaced`` actions);
+this module reads and switches it through a device owner's grant.
 """
 
 from __future__ import annotations

@@ -16,9 +16,24 @@ read-only (``SetSwitch`` raises ``MethodNotImplemented``), and an outlet
 not listed is not served at all.
 
 Actions: ``Action("Status", "")`` (JSON: every listed outlet's state, how
-long each lamp has been on, its limit, and the lamps the limit switched
-off) and ``Action("LampsOff", "")`` (every lamp outlet off, whoever asks:
-switching a lamp off is always allowed).
+long each lamp has been on, its limit, its hours, and the lamps the limit
+switched off), ``Action("LampsOff", "")`` (every lamp outlet off, whoever
+asks: switching a lamp off is always allowed) and
+``Action("LampReplaced", '{"lamp": ..., "by": ...}')`` (an operator records
+a new lamp: its hours start again; it switches nothing).
+
+Lamp hours
+----------
+Every status read from the unit feeds the lamp-hours tracker
+(:mod:`robofast_core.devices.lamp_hours`), so the hours count what the unit
+reports, however the lamp was switched. They are kept in ``hours_file``
+(default ``lamp-hours/<name>.json`` under the data directory,
+:func:`robofast_core.zenodo.data_dir`; a relative path is taken from
+there; the simulator keeps them in memory unless ``hours_file`` is set),
+written on every on/off and every ``hours_flush`` s while a lamp burns.
+A lamp's optional ``rated_hours`` gives a warning at 90 % and an error at
+100 %; hours never stop a lamp from being switched on, and a tracker
+failure never gets in the way of switching one off.
 
 Lamp safety
 -----------
@@ -73,6 +88,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 from robofast_core.cancel import stop_task
@@ -88,6 +104,7 @@ from robofast_core.devices.aqawan_server import (
     _bool_param,
     _Discovery,
 )
+from robofast_core.devices.lamp_hours import LampHours
 from robofast_core.devices.mearth_roof_port import HardwareNotAllowed
 from robofast_core.devices.pulizzi import (
     OUTLETS,
@@ -100,12 +117,13 @@ from robofast_core.devices.pulizzi import (
 )
 from robofast_core.devices.pulizzi_sim import PulizziSim
 from robofast_core.devices.tcsgo_server import COMMON_NAMES, _Handler, _int_param
+from robofast_core.zenodo import data_dir
 
 log = logging.getLogger(__name__)
 
 DRIVER_VERSION = "0.1.0"
 TIMEOUT = 0x502
-ACTIONS = ("Status", "LampsOff")
+ACTIONS = ("Status", "LampsOff", "LampReplaced")
 SIM_KEYS = frozenset({"on", "auto_event", "nulls"})
 #: No lamp may be configured to stay on longer than this (s).
 MAX_ON_CEILING = 4 * 3600.0
@@ -135,6 +153,8 @@ class OutletConfig:
     lamp: bool = False
     max_on: float = 1800.0
     description: str = ""
+    #: The lamp's rated life (h), for the life warnings; None: not rated.
+    rated_hours: float | None = None
 
 
 @dataclass
@@ -153,6 +173,11 @@ class PulizziConfig:
     status_max_age: float = 1.0
     #: Switch every lamp off on a clean stop.
     lamps_off_on_stop: bool = True
+    #: The lamp-hours file (relative: under the data directory); None: the
+    #: default for a real unit, none (in memory) for the simulator.
+    hours_file: str | None = None
+    #: How often the hours are written while a lamp burns (s).
+    hours_flush: float = 60.0
     request_timeout: float = 8.0
     discovery_port: int | None = None
 
@@ -197,14 +222,36 @@ class PulizziConfig:
                 and 0 < oc.max_on <= MAX_ON_CEILING
             ):
                 raise ValueError(f"outlet {oc.outlet}: max_on must be in (0, {MAX_ON_CEILING:g}] s")
+            if oc.rated_hours is not None:
+                if not oc.lamp:
+                    raise ValueError(f"outlet {oc.outlet}: rated_hours is for lamps")
+                if not (
+                    isinstance(oc.rated_hours, int | float)
+                    and not isinstance(oc.rated_hours, bool)
+                    and math.isfinite(oc.rated_hours)
+                    and oc.rated_hours > 0
+                ):
+                    raise ValueError(f"outlet {oc.outlet}: rated_hours must be a positive number")
         if len({o.outlet for o in cfg.outlets}) != len(cfg.outlets):
             raise ValueError("outlets: an outlet is listed twice")
         if len({o.name for o in cfg.outlets}) != len(cfg.outlets):
             raise ValueError("outlets: a name is used twice")
-        for name in ("poll_interval", "request_timeout", "status_max_age"):
+        if cfg.hours_file is not None and (
+            not isinstance(cfg.hours_file, str) or not cfg.hours_file
+        ):
+            raise ValueError("hours_file: a path, or null for the default")
+        for name in ("poll_interval", "request_timeout", "status_max_age", "hours_flush"):
             if getattr(cfg, name) <= 0:
                 raise ValueError(f"{name} must be positive")
         return cfg
+
+
+def hours_path(cfg: PulizziConfig) -> Path | None:
+    """Where the lamp hours are kept (module doc); None: in memory only."""
+    if cfg.hours_file is None:
+        return None if cfg.port.type == "sim" else data_dir() / "lamp-hours" / f"{cfg.name}.json"
+    p = Path(cfg.hours_file).expanduser()
+    return p if p.is_absolute() else data_dir() / p
 
 
 def make_transport(cfg: PortConfig) -> Transport:
@@ -219,7 +266,9 @@ def make_transport(cfg: PortConfig) -> Transport:
 class Lamps:
     """The outlet logic and the max-on monitor. Runs on one event loop."""
 
-    def __init__(self, unit: PulizziIPC, config: PulizziConfig) -> None:
+    def __init__(
+        self, unit: PulizziIPC, config: PulizziConfig, hours: LampHours | None = None
+    ) -> None:
         self.unit = unit
         self.config = config
         self._status: Status | None = None
@@ -232,6 +281,12 @@ class Lamps:
         self._monitor: asyncio.Task | None = None
         self._stopping = False
         self._lamps = {o.outlet: o for o in config.outlets if o.lamp}
+        #: The lamp-hours tracker (in memory unless the caller gives one with a file).
+        self.hours = hours or LampHours(
+            {o.name: o.rated_hours for o in self._lamps.values()},
+            None,
+            flush_interval=config.hours_flush,
+        )
 
     def start(self) -> None:
         self._monitor = asyncio.ensure_future(self._run_monitor())
@@ -251,6 +306,11 @@ class Lamps:
                     log.warning("lamp %s seen on; its max-on clock starts now", self._name(outlet))
             else:
                 self.on_since.pop(outlet, None)
+            if outlet in st.outlets:
+                try:
+                    self.hours.observe(self._lamps[outlet].name, st.outlets[outlet], st.at)
+                except Exception:  # never in the way of switching
+                    log.exception("lamp hours: %s", self._name(outlet))
 
     def _name(self, outlet: int) -> str:
         oc = next((o for o in self.config.outlets if o.outlet == outlet), None)
@@ -352,6 +412,37 @@ class Lamps:
                 self.last_error = str(exc)
             await asyncio.sleep(self.config.poll_interval)
 
+    async def replaced(self, parameters: str, client: int) -> dict[str, Any]:
+        """``Action("LampReplaced")``: ``{"lamp": name, "by": who, "note":
+        ..., "hours": already burned}``. Records only; switches nothing."""
+        try:
+            p = json.loads(parameters or "null")
+        except ValueError:
+            p = None
+        if not isinstance(p, dict):
+            raise AlpacaException(
+                INVALID_VALUE, 'LampReplaced: parameters are {"lamp": name, "by": who}'
+            )
+        names = sorted(o.name for o in self._lamps.values())
+        lamp, by, note, hours = p.get("lamp"), p.get("by"), p.get("note", ""), p.get("hours", 0)
+        if lamp not in names:
+            raise AlpacaException(INVALID_VALUE, f"LampReplaced: lamp must be one of {names}")
+        if not isinstance(by, str) or not by.strip():
+            raise AlpacaException(INVALID_VALUE, "LampReplaced: by (who replaced it) is required")
+        if not isinstance(note, str):
+            raise AlpacaException(INVALID_VALUE, "LampReplaced: note must be a string")
+        if (
+            isinstance(hours, bool)
+            or not isinstance(hours, int | float)
+            or not math.isfinite(hours)
+            or hours < 0
+        ):
+            raise AlpacaException(INVALID_VALUE, "LampReplaced: hours must be >= 0")
+        with contextlib.suppress(PulizziError):
+            await self.status(0)  # count the hours up to now first (not required)
+        old = self.hours.replaced(lamp, f"{by.strip()} (client {client})", note, float(hours))
+        return {"lamp": lamp, "old": old, "now": self.hours.report(lamp)}
+
     async def report(self) -> dict[str, Any]:
         st = await self.status()
         now = time.monotonic()
@@ -369,12 +460,15 @@ class Lamps:
                 entry["max_on"] = oc.max_on
                 entry["on_for"] = None if since is None else round(now - since, 1)
                 entry["remaining"] = None if since is None else round(oc.max_on - (now - since), 1)
+                entry.update(self.hours.report(oc.name))
             outlets.append(entry)
         return {
             "outlets": outlets,
             "tripped": list(self.tripped),
             "unit": st.other,
             "monitor_error": self.last_error,
+            "hours_file": None if self.hours.path is None else str(self.hours.path),
+            "hours_error": self.hours.error,
             "commands_sent": len(self.unit.sent),
         }
 
@@ -424,7 +518,13 @@ class PulizziServer(ThreadingHTTPServer):
     async def _build(self) -> Lamps:
         cfg = self.config
         unit = PulizziIPC(self.transport, name=cfg.unit_name, timeout=cfg.port.timeout)
-        return Lamps(unit, cfg)
+        hours = LampHours(
+            {o.name: o.rated_hours for o in cfg.outlets if o.lamp},
+            hours_path(cfg),
+            flush_interval=cfg.hours_flush,
+        )
+        log.info("lamp hours: %s", hours.path or "in memory only")
+        return Lamps(unit, cfg, hours)
 
     @property
     def sim(self) -> PulizziSim | None:
@@ -547,7 +647,7 @@ class PulizziServer(ThreadingHTTPServer):
         if not self.connected(client):
             raise AlpacaException(NOT_CONNECTED, f"{member}: not connected")
         if member == "action":
-            return self._action(params.get("Action", ""), client)
+            return self._action(params.get("Action", ""), params.get("Parameters", ""), client)
         if member in ("commandblind", "commandbool", "commandstring"):
             raise AlpacaException(NOT_IMPLEMENTED, f"{member} is not implemented")
         if verb == "GET":
@@ -593,13 +693,15 @@ class PulizziServer(ThreadingHTTPServer):
             raise AlpacaException(NOT_IMPLEMENTED, "names come from the config")
         raise _BadRequest(f"unknown member {verb} {member}")
 
-    def _action(self, name: str, client: int) -> str:
+    def _action(self, name: str, parameters: str, client: int) -> str:
         key = name.lower()
         if key == "status":
             return json.dumps(self._call(self.lamps.report, "Status"))
         if key == "lampsoff":
             off = self._call(lambda: self.lamps.lamps_off(f"LampsOff by client {client}"), name)
             return json.dumps({"off": off})
+        if key == "lampreplaced":
+            return json.dumps(self._call(lambda: self.lamps.replaced(parameters, client), name))
         raise AlpacaException(ACTION_NOT_IMPLEMENTED, f"action {name!r} is not supported")
 
     # -- lifecycle ---------------------------------------------------------------------
@@ -637,6 +739,10 @@ class PulizziServer(ThreadingHTTPServer):
                     log.info("server stopping: lamps off %s", off or "(none was on)")
                 except (PulizziError, AlpacaException) as exc:
                     log.critical("server stopping: a lamp may still be ON: %s", exc)
+            try:
+                self.lamps.hours.close()
+            except Exception:
+                log.exception("server stopping: lamp hours")
 
         try:
             asyncio.run_coroutine_threadsafe(down(), self._loop).result(10)
@@ -668,6 +774,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.listen:
         config.listen = args.listen
     if args.simulate:
+        if config.port.type != "sim":
+            config.hours_file = None  # the simulator's hours are not the real lamps'
         config.port.type = "sim"
     try:
         server = PulizziServer(config, hardware=args.hardware)

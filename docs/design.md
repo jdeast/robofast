@@ -910,7 +910,9 @@ Each step is a CI-tested deliverable.
     calibration lamps (a Pulizzi power controller) are served as an Alpaca
     Switch with a simulator, a max-on limit and lamps off on a clean stop,
     ConformU in CI, and `ARC`/`LAMP_FLAT` requests and sequencer lamp frames
-    for the 60-inch only (built: `robofast_core/devices/pulizzi*`,
+    for the 60-inch only, and each lamp's burning hours and starts kept
+    from what the unit reports, with a replacement record and rated-life
+    warnings (built: `robofast_core/devices/pulizzi*`, `lamp_hours.py`,
     `robofast_core/lamps.py`, `docs/pulizzi.md`, hardware locked until
     confirmed). The 60-inch's atmospheric dispersion corrector (two prism
     motors on one serial line; it serves TRES and FAST alike) is served as

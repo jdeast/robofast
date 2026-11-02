@@ -448,9 +448,13 @@ may be wrong about the 60-inch's focus.
   CANCELED; requests and groups report the OCS `state`. A request with a
   cadence (`extra_params.cadence`: `min_interval`, `max_per_night`) is
   *standing*: it returns to PENDING after each visit, as MINERVA's RV
-  targets do. Requests load from JSON files, validated with errors that
+  targets do; a cadence `pool` shares `max_per_night` among requests (one
+  B star a night, whichever). Requests load from JSON files, validated with errors that
   name the entry; `from_legacy_csv` converts a legacy MINERVA target
-  spreadsheet export, and `robofast_core.catalogs` the FLWO 60-inch's
+  spreadsheet export, `robofast_core.catalogs.minerva_sheet` reads
+  MINERVA's target and B-star lists from their Google Sheet (read only,
+  with timestamped snapshots and a fallback to the newest;
+  `docs/minerva_sheet.md`), and `robofast_core.catalogs` the FLWO 60-inch's
   telshell catalogs (`.mct` target lists, `.off` offset patterns; `.sec`
   confidential lists described but never decrypted) into an intermediate
   form shaped like the proposed target model, request groups for the
@@ -888,7 +892,11 @@ Each step is a CI-tested deliverable.
    calibrations, evening start and morning end, filter and M3-port
    selection, partial re-takes, the nightly plan record with replay);
    next a TOM Toolkit facility module (`docs/tom_facility.md`) and an
-   alert-broker client; then MEarth (collision checker).
+   alert-broker client; then MEarth (collision checker). MINERVA's
+   target and B-star lists come from their Google Sheet as request groups
+   (built: `robofast_core/catalogs/minerva_sheet.py`,
+   `docs/minerva_sheet.md`; next, the service-account key on the control
+   host and a timer running `export`).
 10. **Done:** several telescopes per enclosure (section 3.5) and the
     production sequencer entry point with its plan-provider interface.
 11. KiwiSpec spectrograph service, its clients for the legacy spectrograph

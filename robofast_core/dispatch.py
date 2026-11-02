@@ -15,7 +15,7 @@ next observation, and it decides from scratch, RTS2/POCS-style:
      the request's windows; a ToO has not passed its deadline;
    * cadence (standing requests): at least ``min_interval`` since the last
      completed visit started, and fewer than ``max_per_night`` visits since
-     local noon;
+     local noon (of the request, or of all requests sharing its ``pool``);
    * the Sun is below ``max_sun_alt`` (twilight), for anything with light
      frames;
    * for each light configuration, at the start, middle and end of its part
@@ -882,6 +882,15 @@ class DispatchScheduler:
         start = self.site.night_start(now)
         return sum(1 for t in self.visits.get(request_id, ()) if t >= start)
 
+    def pool_visits_tonight(self, pool: str, now: datetime | None = None) -> int:
+        """Tonight's visits of every request whose cadence names ``pool``."""
+        now = now or self.clock()
+        return sum(
+            self.visits_tonight(r.id, now)
+            for r in self.requests.values()
+            if r.cadence is not None and r.cadence.pool == pool
+        )
+
     # -- evaluation --------------------------------------------------------------
 
     def evaluate(
@@ -1064,7 +1073,11 @@ class DispatchScheduler:
             if last is not None and (now - last).total_seconds() < req.cadence.min_interval:
                 reasons.append("cadence: too soon after the last visit")
             n = req.cadence.max_per_night
-            if n is not None and self.visits_tonight(req.id, now) >= n:
+            pool = req.cadence.pool
+            if n is not None and pool is not None:
+                if self.pool_visits_tonight(pool, now) >= n:
+                    reasons.append(f"cadence: {n} visits of pool {pool!r} tonight already")
+            elif n is not None and self.visits_tonight(req.id, now) >= n:
                 reasons.append(f"cadence: {n} visits tonight already")
         if any(c.light for c in configs):
             sun_limit = min(

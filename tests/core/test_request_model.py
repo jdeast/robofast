@@ -398,6 +398,7 @@ def test_iodine_calibration_examples():
         [c] = r.configurations
         assert c.type == "SPECTRUM" and all(ic.iodine is True for ic in c.instrument_configs)
         assert r.cadence is not None and r.cadence.max_per_night == 1
+        assert r.cadence.pool == "bstars"  # one of them a night, whichever
     for g in templates:
         [r] = g.requests
         [c] = r.configurations

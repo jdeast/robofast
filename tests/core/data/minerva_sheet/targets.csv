@@ -1,0 +1,13 @@
+name,ra (J2000 hrs),radeg (J2000 deg),dec (J2000 deg),pmra (mas/yr),pmdec (mas/yr),parallax (mas),distance (pc),rv (km/s),vmag (Johnson V),Teff,sptype,bad_priority,priority,vsini (km/s),exptime (sec),maxobs,seplimit (sec),pmodeperiod(min),Amp P-mode (cm/s),fauexptime (sec),acquisition_offset_north (arcsec),acquisition_offset_east (arcsec),iodine,active,dtactive,tc,period,t14,Howard (2010),finder,mstar,rstar,rpearth,mpearth,k,comment
+SYN-ALPHA,1.5,22.5,20.0,10.5,-3.25,20.0,50.0,-12.3,6.5,5700,G2V,,5,,600,3,7200,,,1.5,0,0,1,1,,,,,,,,,,,,synthetic
+SYN BETA,3.25,,-10.5,10.5,-3.25,,50.0,,6.5,5700,G2V,,5,,600,,,,,,0,0,1,1,,,,,,,,,,,,
+SYN-GAMMA,n/a,,95,10.5,-3.25,20.0,50.0,-12.3,6.5,5700,G2V,,5,,600,3,7200,,,1.5,0,0,1,0,,,,,,,,,,,,synthetic
+,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+SYN-DELTA,5.0,75.0,30.0,,-3.25,20.0,50.0,-12.3,6.5,5700,G2V,,5,,600,3,7200,,,1.5,0,0,1,1,,,,,,,,,,,,synthetic
+SYN-EPSILON,6.0,90.0,31.0,10.5,-3.25,20.0,50.0,-12.3,6.5,5700,G2V,,5,,600,3,7200,,,1.5,0,0,0,1,,,,,,,,,,,,synthetic
+SYN-ZETA,7.0,105.0,32.0,10.5,-3.25,20.0,50.0,-12.3,6.5,5700,G2V,,5,,600,3,7200,,,1.5,5,0,1,1,,,,,,,,,,,,synthetic
+SYN-ALPHA,8.0,120.0,33.0,10.5,-3.25,20.0,50.0,-12.3,6.5,5700,G2V,,5,,600,3,7200,,,1.5,0,0,1,1,,,,,,,,,,,,synthetic
+SYN-ETA,9.0,136.0,34.0,10.5,-3.25,20.0,50.0,-12.3,6.5,5700,G2V,,5,,600,3,7200,,,1.5,0,0,1,1,,,,,,,,,,,,synthetic
+SYN-THETA,10.0,150.0,35.0,10.5,-3.25,20.0,50.0,-12.3,6.5,5700,G2V,,5,,600,3,7200,,,1.5,0,0,1,yes,,,,,,,,,,,,synthetic
+SYN-IOTA,11.0,165.0,36.0,10.5,-3.25,20.0,50.0,-12.3,6.5,5700,G2V,,0,,600,3,7200,,,1.5,0,0,1,1,,,,,,,,,,,,synthetic
+SYN-KAPPA,12.0,180.0,95.0,10.5,-3.25,20.0,50.0,-12.3,6.5,5700,G2V,,5,,600,3,7200,,,1.5,0,0,1,1,,,,,,,,,,,,synthetic

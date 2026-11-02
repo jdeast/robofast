@@ -11,6 +11,9 @@ line::
     python -m robofast_core.catalogs import foo.mct --to-requests   # request groups
     python -m robofast_core.catalogs check foo.mct bar.off          # validate only
     python -m robofast_core.catalogs export foo.json -o foo.mct     # back to telshell
+
+MINERVA's target and B-star lists, from their Google Sheet, are
+:mod:`.minerva_sheet` (its own command line; docs/minerva_sheet.md).
 """
 
 from robofast_core.catalogs.model import (

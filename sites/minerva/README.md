@@ -15,6 +15,7 @@ only in `instruments.json`, with `"enabled": false`.
 | `guider_t1.example.json`, `guider_t2.example.json` | `guider.service` (`GuiderServiceConfig`) |
 | `kiwispec.example.json` | `devices.kiwispec_service` (`KiwiSpecConfig`) |
 | `sky.example.json` | the dispatch plan's `vetting` entry (`vetting.Vetter`; docs/sky.md) |
+| `target_sheet.example.json` | the target-list Sheet reader (`catalogs.minerva_sheet.SheetConfig`; docs/minerva_sheet.md); placeholders for the key path and sheet keys |
 | `throughput.example.json` | the throughput monitor (`throughput.ThroughputConfig`; docs/throughput.md) |
 | `weather.yaml` | `weather_bridge` |
 | `instruments.json` | reference catalog: every legacy value, including those no module reads yet |

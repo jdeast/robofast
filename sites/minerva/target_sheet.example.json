@@ -1,0 +1,42 @@
+{
+  "_note": [
+    "MINERVA's target lists in their Google Sheet, read by robofast_core.catalogs.minerva_sheet (docs/minerva_sheet.md):",
+    "  python -m robofast_core.catalogs.minerva_sheet fetch --config target_sheet.json",
+    "  python -m robofast_core.catalogs.minerva_sheet export --config target_sheet.json -o minerva-requests.json",
+    "Copy this file to the control host and fill in the placeholders there; never commit the real values.",
+    "key_file: MINERVA's Google service-account key (JSON), mode 600, outside any repository. $ROBOFAST_MINERVA_SHEETS_KEY overrides it.",
+    "sheet: each list's spreadsheet key (the long id in the Sheet's URL; legacy minerva-control has it in",
+    "minerva_library/targetlist.py downloadList). The red-side list is a sheet of its own; it is disabled",
+    "here until it is confirmed to be wanted and an instrument_type exists for it.",
+    "snapshot_dir: omitted, snapshots go to $ROBOFAST_DATA_DIR/minerva_sheet (robofast_core.zenodo.data_dir); keep: how many."
+  ],
+  "key_file": "/etc/robofast/secrets/minerva_sheets.json",
+  "keep": 30,
+  "lists": {
+    "targets": {
+      "sheet": "<spreadsheet key of the MINERVA target list>",
+      "tab": "targets",
+      "kind": "targets",
+      "proposal": "minerva-rv",
+      "id_prefix": "RV"
+    },
+    "bstars": {
+      "sheet": "<spreadsheet key of the MINERVA target list>",
+      "tab": "B stars",
+      "kind": "bstars",
+      "proposal": "iodine-calibration",
+      "id_prefix": "BSTAR",
+      "pool": "bstars",
+      "per_night": 1
+    },
+    "red": {
+      "sheet": "<spreadsheet key of the red-side target list>",
+      "tab": "targets",
+      "kind": "targets",
+      "proposal": "minerva-red",
+      "id_prefix": "RED",
+      "instrument": "red_spectrograph",
+      "enabled": false
+    }
+  }
+}

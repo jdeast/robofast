@@ -316,6 +316,29 @@ async def test_cadence_and_nightly_max():
     assert by_id(d)["a-r"].ok
 
 
+async def test_a_cadence_pool_shares_the_nightly_maximum():
+    # One B star a night, whichever: max_per_night counts the whole pool.
+    pooled = {"min_interval": 0, "max_per_night": 1, "pool": "bstars"}
+    clock = Clock()
+    d = make(
+        [
+            group("b1", cadence=pooled, priority=2.0),
+            group("b2", cadence=pooled),
+            group("rv", cadence={"min_interval": 0, "max_per_night": 1}),
+        ],
+        clock=clock,
+    )
+    assert by_id(d)["b2-r"].ok
+    await run_visit(d)  # b1, the higher priority
+    assert d.visits_tonight("b1-r") == 1 and d.pool_visits_tonight("bstars") == 1
+    assert "1 visits of pool 'bstars' tonight" in _reasons(d, "b2-r")
+    assert by_id(d)["rv-r"].ok  # not in the pool
+    clock.t = NIGHT + timedelta(days=1)
+    assert by_id(d)["b2-r"].ok and d.pool_visits_tonight("bstars") == 0
+    with pytest.raises(ValueError, match="pool shares max_per_night"):
+        make([group("x", cadence={"pool": "bstars"})])
+
+
 async def test_one_request_on_one_telescope_at_a_time():
     d = make([group("a", count=2, ics=[ic(1), ic(2)])])
     obs = await d.next_observation("t1")

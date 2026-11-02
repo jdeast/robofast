@@ -345,6 +345,7 @@ def test_shipped_site_configs(tmp_path):
     # FLWO's legacy outlet map (docs/pulizzi.md).
     assert lamps == {"ThAr1": 2, "ThAr2": 7, "Incand": 4, "Incand2": 1}
     assert all(o.lamp for o in cfg.outlets)  # nothing else is even listed
+    assert all(o.rated_hours for o in cfg.outlets) and cfg.hours_file is None
     site = json.loads((SITE / "flwo60.json").read_text())
     (entry,) = telescopes(site).values()
     setup = LampSetup.from_dict(entry["lamps"])

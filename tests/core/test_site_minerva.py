@@ -147,7 +147,8 @@ def test_alerts_config_loads():
     from robofast.alerts.service import AlertsConfig
 
     cfg = AlertsConfig.from_dict(_json("alerts.example.json"))
-    assert len(cfg.rules) == 5 and sorted(cfg.sources) == ["gcn", "tns", "tocp"]
+    assert len(cfg.rules) == 6
+    assert sorted(cfg.sources) == ["gcn", "kmtnet", "moa", "ogle", "tns", "tocp"]
 
 
 def test_request_api_config_loads(tmp_path):

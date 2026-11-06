@@ -1,0 +1,63 @@
+{
+  "_note": [
+    "Which alerts MINERVA follows as targets of opportunity (robofast/alerts, docs/alerts.md): rules tried in",
+    "order, the first match makes the ToO; no match, the alert is dropped (logged). Imaging ToOs: the",
+    "spectrograph needs V < ~10 (the FAU sees 2% of the light), which an alert almost never is.",
+    "The token needs the 'too' scope (python -m robofast.request_api tokens add ... --scope too).",
+    "TNS and GCN need accounts: a TNS bot (bot id, name, API key) and gcn.nasa.gov client credentials.",
+    "TNOs: a moving target is observed only by a mount that can track it (PWI4's rates; not PWI2)."
+  ],
+  "api": {"url": "http://127.0.0.1:8300", "token_file": "/etc/robofast/alerts.token", "enclosure": "aqawan1"},
+  "proposal": "alerts-too",
+  "state": "/var/lib/robofast/alerts-seen.json",
+  "sources": {
+    "tocp": {"poll_seconds": 300},
+    "tns": {"poll_seconds": 300, "bot_id": 0, "bot_name": "minerva_bot", "api_key_file": "/etc/robofast/tns.key"},
+    "gcn": {
+      "client_id_file": "/etc/robofast/gcn.id",
+      "client_secret_file": "/etc/robofast/gcn.secret",
+      "topics": ["gcn.notices.swift.bat.guano", "gcn.notices.einstein_probe.wxt.alert"]
+    }
+  },
+  "rules": [
+    {
+      "name": "bright new transients (CBAT TOCP)",
+      "match": {"sources": ["tocp"], "classifications": ["PNV", "PSN", "TCP"], "max_mag": 12.0,
+                "dec": [-35.0, 80.0], "max_age_hours": 48},
+      "too": {"observation_type": "RAPID_RESPONSE", "policy": "now-after-readout", "priority_class": 2,
+              "deadline_hours": 12, "telescopes": ["t1", "t2"], "instrument_type": "imager",
+              "exposure_time": 30.0, "exposure_count": 10}
+    },
+    {
+      "name": "classified bright supernovae and novae (TNS)",
+      "match": {"sources": ["tns"], "classifications": ["SN", "Nova"], "max_mag": 15.0,
+                "dec": [-35.0, 80.0], "max_age_hours": 72},
+      "too": {"observation_type": "TIME_CRITICAL", "policy": "next", "priority_class": 1,
+              "deadline_hours": 24, "telescopes": ["t1", "t2"], "instrument_type": "imager",
+              "exposure_time": 120.0, "exposure_count": 5}
+    },
+    {
+      "name": "bursts with arcminute localizations (GCN)",
+      "match": {"sources": ["gcn"], "max_error": 0.15, "dec": [-35.0, 80.0], "max_age_hours": 2},
+      "too": {"observation_type": "RAPID_RESPONSE", "policy": "now", "priority_class": 3,
+              "deadline_hours": 3, "telescopes": ["t1", "t2"], "instrument_type": "imager",
+              "exposure_time": 60.0, "exposure_count": 20}
+    },
+    {
+      "name": "bright transients (Rubin)",
+      "match": {"sources": ["rubin"], "kind": "sidereal", "max_mag": 17.0, "dec": [-35.0, 80.0],
+                "bands": ["g", "r", "i"]},
+      "too": {"observation_type": "RAPID_RESPONSE", "policy": "now-after-readout", "priority_class": 2,
+              "deadline_hours": 6, "telescopes": ["t1", "t2"], "instrument_type": "imager",
+              "exposure_time": 120.0, "exposure_count": 5}
+    },
+    {
+      "name": "TNOs (Rubin)",
+      "match": {"sources": ["rubin"], "kind": "solar_system", "min_a": 30.0, "max_mag": 21.0,
+                "dec": [-35.0, 80.0]},
+      "too": {"observation_type": "TIME_CRITICAL", "policy": "next", "priority_class": 1,
+              "deadline_hours": 12, "telescopes": ["t1", "t2"], "instrument_type": "imager",
+              "exposure_time": 300.0, "exposure_count": 6}
+    }
+  ]
+}

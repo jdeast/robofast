@@ -40,6 +40,8 @@ guider-hardware = ["pyserial>=3.5", "pipython>=2.10", "zwoasi>=0.2", "redis>=5"]
 sheets = ["gspread>=6", "google-auth>=2"]
 # Keep in step with the `serial` dependency group below.
 serial = ["pyserial>=3.5"]
+# Keep in step with the `alerts` dependency group below.
+alerts = ["gcn-kafka>=0.3"]
 
 [project.urls]
 Homepage = "https://github.com/jdeast/robofast"
@@ -98,6 +100,10 @@ sheets = ["gspread>=6", "google-auth>=2"]
 # aux server's real ports (rfc2217://, socket://, local devices). Its "sim"
 # ports need nothing.
 serial = ["pyserial>=3.5"]
+# The GCN Kafka stream for the alert service (robofast/alerts/gcn.py,
+# docs/alerts.md), on the host that runs it only. An optional import; the
+# tests use NASA's example notices.
+alerts = ["gcn-kafka>=0.3"]
 test = [
     {include-group = "core"},
     # The serial-URL path, against simulators on loopback.

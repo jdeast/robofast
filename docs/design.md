@@ -714,20 +714,16 @@ have. A ToO that arrives during a weather hold waits; after the reopen the
 telescopes ask the plan afresh and take it first, unless its deadline has
 passed.
 
-**Alert brokers.** `robofast/rubin_alerts.py` turns a Rubin alert (the LSST
-alert schema, v11, as a broker delivers it) into a ToO request group and
-submits it through the REST API (`POST /api/toos`, a token with the `too`
-scope). Which alerts pass is the operator's config
-(`sites/minerva/rubin_alerts.example.json`): rules tried in order, each a
-`match` (sidereal or Solar System, declination, magnitude, band, semimajor
-axis, designations) and the ToO it makes (exposures, telescopes, policy,
-class, deadline); an alert no rule takes is logged and dropped. A Solar
-System alert becomes an `ORBITAL_ELEMENTS` target from the alert's own MPC
-orbit (checked against JPL Horizons: Eris, Sedna and Quaoar within 0.23"),
-observed only by a mount that can track it. Today it reads alert files; a
-broker subscription (ANTARES, Fink, Lasair, ALeRCE) or a TOM trigger feeds
-it the same alerts later. Broker credentials and alert filtering stay out
-of the control processes; a broker outage costs only ToOs, never the night.
+**Alerts.** `robofast.alerts` turns alerts from several sources into ToO
+request groups and submits them through the REST API (`POST /api/toos`, a
+token with the `too` scope): CBAT's Transient Object Confirmation Page
+(public; possible novae and supernovae, often the first report of a bright
+one), the Transient Name Server (classifications; a TNS bot), GCN (Swift,
+Einstein Probe, SVOM, Fermi notices over Kafka; gcn.nasa.gov credentials)
+and Rubin (the LSST alert schema). Which alerts pass is one set of the
+operator's rules for every source (`docs/alerts.md`). It runs as its own
+process; source credentials and alert filtering stay out of the control
+processes, and a source outage costs only ToOs, never the night.
 
 ### 3.8 State, telemetry and alarms
 

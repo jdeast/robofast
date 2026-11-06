@@ -213,7 +213,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--source", choices=sorted(PARSERS), help="submit: the files' format")
     ap.add_argument("--dry-run", action="store_true", help="print the requests; submit nothing")
     ap.add_argument("files", type=Path, nargs="*")
-    args = ap.parse_args(argv)
+    # intermixed: Python 3.12.3's argparse refuses "submit --config X FILE..." otherwise
+    args = ap.parse_intermixed_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     config = AlertsConfig.from_dict(json.loads(args.config.read_text()))
     if args.command == "check":

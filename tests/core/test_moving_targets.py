@@ -16,6 +16,7 @@ from robofast.dispatch import DispatchScheduler, TelescopeLimits
 from robofast.orbit import Orbit
 from robofast.plan import Observation, StaticPlan
 from robofast.request_model import RequestGroup, load_request_groups
+from robofast.testing.checks import wait_until
 
 MINERVA = sky.Site(31.680407, -110.878977, 2316.0)
 
@@ -273,26 +274,21 @@ def _events(rig, what):
     return rig.timeline.events(what, "seq")
 
 
-async def test_the_sequencer_repoints_at_each_exposure_without_rates(make_rig):
-    """A mount that cannot set rates (the PWI and TCS servers): pointed at the
-    place at each exposure's middle; no rate is ever set."""
+async def test_a_mount_without_rates_cannot_follow(make_rig):
+    """One way to follow: the mount's rates. A mount that cannot set them
+    (the PWI and TCS servers today) refuses the observation before it slews:
+    an Unsupported error of that telescope, no frames, no rate set."""
     plan = StaticPlan([follow_obs()], ["t1"])
-    rig = make_rig(plan=plan, seq={"follow_repoint_arcsec": 0.0})
+    rig = make_rig(plan=plan)
     await rig.start()
     await asyncio.wait_for(asyncio.shield(rig.tasks[-1]), 20)
-    assert plan.history == [("t1", "B1", "complete", 3)]
+    assert plan.history and {(t, n, out) for t, n, out, _ in plan.history} == {
+        ("t1", "B1", "failed")
+    }
     tel = rig.tels[0]
-    assert tel.rate_log == []
-    follows = _events(rig, "follow")
-    assert [e.detail["index"] for e in follows] == [0, 1, 2]
-    assert all(e.detail["repointed"] and not e.detail["mount_rates"] for e in follows)
-    # The first slew and one per exposure, each where the orbit puts it.
-    assert len(tel.slews) == 4
-    for (ra_h, dec), e in zip(tel.slews[1:], follows, strict=True):
-        assert (ra_h, dec) == pytest.approx((e.detail["ra"], e.detail["dec"]), abs=1e-6)
-    # Eros moves east: each pointing a little east of the one before.
-    ras = [ra for ra, _ in tel.slews]
-    assert ras == sorted(ras) and ras[-1] > ras[0]
+    assert tel.rate_log == [] and tel.slews == []
+    errors = _events(rig, "telescope_error")
+    assert errors and "cannot set tracking rates" in errors[0].detail["error"]
 
 
 async def test_the_sequencer_sets_the_rates_and_resets_them(make_rig):
@@ -306,7 +302,6 @@ async def test_the_sequencer_sets_the_rates_and_resets_them(make_rig):
     await asyncio.wait_for(asyncio.shield(rig.tasks[-1]), 20)
     assert plan.history == [("t1", "B1", "complete", 2)]
     follows = _events(rig, "follow")
-    assert all(e.detail["mount_rates"] for e in follows)
     dra, ddec = follows[0].detail["rate_arcsec_s"]
     dec = follows[0].detail["dec"]
     # Eros: about 90"/h in RA, 4"/h in Dec.
@@ -317,6 +312,8 @@ async def test_the_sequencer_sets_the_rates_and_resets_them(make_rig):
     assert tel.rate_log[-2:] == [("ra", 0.0), ("dec", 0.0)]
     assert (tel.RightAscensionRate, tel.DeclinationRate) == (0.0, 0.0)
     assert _events(rig, "follow_rates_reset")
+    # Pointed once; the rates follow it from there (no re-pointing).
+    assert len(tel.slews) == 1
 
 
 def test_tom_toolkits_non_sidereal_target_is_taken_unchanged():
@@ -347,7 +344,7 @@ async def test_rates_left_set_are_reset_before_a_sidereal_slew(make_rig):
     real_end = seq._follow_end
 
     async def failing_end(state, unit, t):
-        unit.follow_pointed = None  # the reset "fails": the rates stay set
+        pass  # the reset "fails": the rates stay set
 
     seq._follow_end = failing_end
     await rig.start()
@@ -358,3 +355,19 @@ async def test_rates_left_set_are_reset_before_a_sidereal_slew(make_rig):
     assert len(late) == 1
     assert (tel.RightAscensionRate, tel.DeclinationRate) == (0.0, 0.0)
     assert tel.slews[-1] == (3.0, 20.0)
+
+
+async def test_the_cleanup_resets_the_rates_before_it_parks(make_rig):
+    """An observation cut short (here: the enclosure's lease revoked
+    mid-observation) leaves no rates set: the cleanup sets them back to 0
+    before the park."""
+    plan = StaticPlan([follow_obs(count=50, exptime=0.3)], ["t1"])
+    rig = make_rig(plan=plan)
+    tel = rig.tels[0]
+    tel.CanSetRightAscensionRate = tel.CanSetDeclinationRate = True
+    await rig.start()
+    await wait_until(lambda: _events(rig, "follow"), 10, what="following")
+    rig.weather.set_safe(False)  # the supervisor revokes the lease: cleanup
+    await wait_until(lambda: rig.timeline.events("cleanup_done", "seq"), 10, what="cleanup done")
+    assert (tel.RightAscensionRate, tel.DeclinationRate) == (0.0, 0.0)
+    assert rig.sequencer.units["t1"].follow_rates is False

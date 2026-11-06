@@ -694,9 +694,9 @@ class Configuration:
         instrument = _text(d.get("instrument_type"))
         target = Target.from_dict(d["target"], f"{what}.target")
         if target.moving:
-            # The sequencer follows a moving target by re-pointing between
-            # exposures (and by the mount's rates, where it has them); a
-            # guider holding the field or a fiber would fight that.
+            # The sequencer follows a moving target with the mount's
+            # tracking rates; a guider holding the field or a fiber would
+            # fight that.
             if ctype not in MOVING_TYPES:
                 raise ValueError(
                     f"{what}.type: {ctype!r} with an ORBITAL_ELEMENTS target; robofast follows"

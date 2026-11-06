@@ -67,29 +67,23 @@ Only `EXPOSE` configurations, unguided (`guiding_config.mode` `OFF`), take
 a moving target: the guider holds a field or a fiber, which would fight
 the target's motion, so a guided or fiber configuration is refused.
 
-The sequencer slews to the target's place, and before each exposure:
+There is one way to follow: the mount's tracking rates. A telescope whose
+mount cannot set them (ASCOM `CanSetRightAscensionRate` or
+`CanSetDeclinationRate` false) refuses the observation before it slews,
+an `Unsupported` error of that telescope like any other it cannot do
+(no guider, no lamp); it is never followed some other way.
 
-1. computes the place at the exposure's middle; if it is more than
-   `follow_repoint_arcsec` (sequencer config, default 1.0) from where the
-   telescope was last pointed at it, slews there (through the pointing
-   model and the slew guard, as every slew);
-2. where the mount can set tracking rates (ASCOM
-   `CanSetRightAscensionRate` and `CanSetDeclinationRate` both true), sets
-   `RightAscensionRate` (seconds of RA per sidereal second) and
-   `DeclinationRate` (arcsec per second) to the target's motion, so it
-   stays put on the detector; they are set back to 0 (sidereal) when the
-   observation ends, however it ends.
+The sequencer slews to the target's place (through the pointing model and
+the slew guard, as every slew), and before each exposure sets
+`RightAscensionRate` (seconds of RA per sidereal second) and
+`DeclinationRate` (arcsec per second) to the target's motion at the
+exposure's middle, so it stays put on the detector. The rates go back to 0
+(sidereal) when the observation ends, in the cleanup if it is cut short,
+and, if a reset failed, before any later slew: nothing else is ever
+tracked at a comet's rates.
 
-Each step is a `follow` event (`ra`, `dec`, `moved_arcsec`, `repointed`,
-`rate_arcsec_s`, `mount_rates`) and the rates' reset a
-`follow_rates_reset` event.
-
-Without rates (robofast's PWI and TCS servers report `CanSet...Rate`
-false), the mount tracks sidereally: the target is centred at each
-exposure's middle and trails by its rate times the exposure time. P/2009
-B1 at 29"/h trails 1" in a 120 s exposure; a near-Earth asteroid passing
-close, at arcseconds per second, trails across the frame and wants a mount
-with rates.
+Each step is a `follow` event (`ra`, `dec`, `rate_arcsec_s`) and each
+reset a `follow_rates_reset` event.
 
 A plan file's observation may carry `follow` itself (`orbit` as
 `Orbit.to_dict()`, `site` with `latitude`, `longitude` and `elevation`),
@@ -101,7 +95,8 @@ for an `expose` with light and no guiding.
 - The simulated cameras (`robofast/testing`) draw the star field where the
   telescope points; they draw no comet or asteroid, so a simulated night
   shows the pointing and the timing, not the object.
-- robofast's PWI server could follow with PWI's own rate offsets, and its
-  TCS server with the TCS's "chase target" mode (`docs/tcsgo.md`, `#12`
-  mode 3); neither does yet: both report `CanSet...Rate` false, and the
-  sequencer re-points between exposures.
+- robofast's PWI and TCS servers report `CanSet...Rate` false, so no
+  MINERVA or FLWO telescope follows a moving target yet. Each could, in
+  its own wrapper and so through the same one path: the PWI server with
+  PWI4's rate offsets, the TCS server with the TCS's "chase target" mode
+  (`docs/tcsgo.md`, `#12` mode 3).

@@ -132,12 +132,14 @@ a snapshot of the scheduler (requests, state, limits, settings), so
 Targets of opportunity (design.md 3.7.1)
 ----------------------------------------
 :meth:`DispatchScheduler.submit_too` (or a JSON file dropped into
-``too_dropbox``) adds a request group whose ``observation_type`` is
-``RAPID_RESPONSE`` or ``TIME_CRITICAL`` (its ``too``: deadline, policy,
-class; :mod:`robofast.request_model`). A ToO ranks
+``too_dropbox``, then rung: ``python -m robofast.doorbell ring <dropbox>``)
+adds a request group whose ``observation_type`` is ``RAPID_RESPONSE`` or
+``TIME_CRITICAL`` (its ``too``: deadline, policy, class;
+:mod:`robofast.request_model`). A ToO ranks
 above every normal request; it is taken only when it passes the hard
 constraints; it stays pending until then, and expires at its deadline. When
-it arrives, and every ``too_poll`` seconds while it waits, the scheduler
+it arrives (a dropped file is taken in at once: its doorbell), and every
+``too_poll`` seconds while it waits, the scheduler
 looks for a telescope that can take it now:
 
 * an eligible telescope that is idle is woken (no interruption);
@@ -187,6 +189,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from robofast import sky
+from robofast.doorbell import Doorbell
 from robofast.instruments import InstrumentType, instrument_param, resolve
 from robofast.kinds import RequestMapping
 from robofast.plan import Idle, Observation
@@ -307,8 +310,13 @@ class DispatchConfig:
     setting_horizon: float = 7200.0
     #: Idle: ask again after this long when nothing is observable.
     idle_poll: float = 60.0
-    #: How often the background task re-checks waiting ToOs and the drop box.
+    #: How often the background task re-checks waiting ToOs (the drop box
+    #: is taken in as each file arrives).
     too_poll: float = 10.0
+    #: Where the drop box's doorbell listens (robofast.doorbell): loopback,
+    #: a port of the system's choosing, unless the request API runs on
+    #: another host (then an interface it reaches, and a fixed port).
+    doorbell_listen: str = "127.0.0.1:0"
     #: A ToO stays reserved for the telescope it preempted this long.
     reserve_timeout: float = 60.0
     #: Completed visits kept per request in the state file.
@@ -923,17 +931,38 @@ class DispatchScheduler:
         return accepted
 
     async def serve(self) -> None:
-        """Background task: take in dropped ToO files, expire and re-check
-        waiting ToOs, every ``too_poll`` seconds. Never raises (but for
-        cancellation)."""
-        while True:
-            try:
-                if self.dropbox is not None:
+        """Background task: take in the drop box as each file arrives
+        (its doorbell; :mod:`robofast.doorbell`), and expire and re-check waiting
+        ToOs every ``too_poll`` seconds. Never raises (but for cancellation)."""
+        intake = None
+        if self.dropbox is not None:
+            intake = asyncio.create_task(self._serve_dropbox(self.dropbox))
+        try:
+            while True:
+                try:
+                    self.check_toos()
+                except Exception:
+                    log.exception("dispatch background check")
+                await asyncio.sleep(self.config.too_poll)
+        finally:
+            if intake is not None:
+                intake.cancel()
+
+    async def _serve_dropbox(self, dropbox: Path) -> None:
+        """Take in what is in the drop box now (dropped while this process
+        was down), then each file as it arrives. A ToO is checked as it is
+        taken in (:meth:`submit_too`)."""
+        # Before the first look, so nothing slips between.
+        bell = await Doorbell.open(dropbox, self.config.doorbell_listen)
+        try:
+            while True:
+                try:
                     await self.poll_dropbox()
-                self.check_toos()
-            except Exception:
-                log.exception("dispatch background check")
-            await asyncio.sleep(self.config.too_poll)
+                except Exception:
+                    log.exception("dispatch drop box")
+                await bell.wait()
+        finally:
+            bell.close()
 
     async def poll_dropbox(self) -> list[str]:
         """Take in every ``*.json`` file in the drop box, in name order: a

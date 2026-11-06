@@ -121,10 +121,11 @@ Intake and status
 The dispatch scheduler, running in the sequencer process, is the source of
 truth. A submission or cancellation is a file renamed into the enclosure's
 drop box (``<time>-submit-<id>.json``, ``<time>-cancel-<id>.json``); the
-scheduler takes the files in, in order, every ``too_poll`` seconds (10 by
-default) and records the result in its state file, which this process reads
-(never writes). So a submission made while the sequencer is down waits in the
-drop box and is taken in when it starts. A group's ``intake`` is ``QUEUED``
+scheduler takes the files in, in order, as each one arrives (the API rings
+its doorbell after each: :mod:`robofast.doorbell`) and records the result in
+its state file, which this process reads (never writes). So a submission
+made while the sequencer is down waits in the drop box and is taken in when
+it starts. A group's ``intake`` is ``QUEUED``
 (in the drop box; ``state`` PENDING), ``ACCEPTED`` (in the scheduler's
 state; ``state`` and the configurations' ``status`` come from there),
 ``REJECTED`` (the scheduler refused it: ``error`` says why; ``state``
@@ -179,6 +180,7 @@ from robofast.api_auth import (
 from robofast.cancel import isolated
 from robofast.config import load_config, telescopes
 from robofast.dispatch import DispatchScheduler, dispatch_from_config
+from robofast.doorbell import ring
 from robofast.instruments import INSTRUMENT_TYPES, InstrumentType
 from robofast.plugins import load_config_plugins
 from robofast.request_model import NO_LAMPS, RequestGroup, upgrade_legacy
@@ -677,7 +679,7 @@ class RequestApi:
             return Response(200, self._data(client, gid))
         if route == "cancel":
             self._need(client, "submit", "too")
-            return self._cancel(client, gid)
+            return await self._cancel(client, gid)
         if route == "status":
             self._need(client, "read")
             return Response(200, await self._status())
@@ -921,6 +923,7 @@ class RequestApi:
         group.submitted = self.clock()
         d = group.to_dict()
         enc.drop("submit", group.id, d)
+        await ring(enc.dropbox)  # the scheduler takes it in now (or when it starts)
         log.info("%s: %s submitted %s", enc.name, client.name, group.id)
         d.update(
             enclosure=enc.name,
@@ -1256,7 +1259,7 @@ class RequestApi:
 
     # -- cancel ----------------------------------------------------------------------------
 
-    def _cancel(self, client: TokenRecord, gid: str | None) -> Response:
+    async def _cancel(self, client: TokenRecord, gid: str | None) -> Response:
         enc, entry = self._find(client, gid)
         is_too = entry.get("observation_type", "NORMAL") != "NORMAL"
         self._need(client, "too" if is_too else "submit")
@@ -1278,6 +1281,7 @@ class RequestApi:
                 },
             )
         enc.drop("cancel", gid, {"cancel": gid, "by": client.name})
+        await ring(enc.dropbox)
         log.info("%s: %s asked to cancel %s", enc.name, client.name, gid)
         return Response(
             202,

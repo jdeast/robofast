@@ -74,6 +74,7 @@ from robofast.devices.aqawan_server import AqawanConfig, AqawanServer
 from robofast.devices.aqawan_sim import AqawanSim
 from robofast.devices.kiwispec_sim import KiwiSpecSim, SimConfig
 from robofast.dispatch import dispatch_from_config
+from robofast.doorbell import ring
 from robofast.owner import DeviceOwner
 from robofast.plan_record import read_record
 from robofast.sequencer import Sequencer
@@ -1018,6 +1019,7 @@ class SimulatedNight:
             tmp = self.out / "TOO1.json.tmp"
             tmp.write_text(json.dumps(self._too()))
             os.replace(tmp, dropbox / "TOO1.json")
+            await ring(dropbox)
             self._note("ToO dropped into the drop box")
             # T2's mount fails in the middle of a spectrum both feed.
             n_both = len(self._both(tl))

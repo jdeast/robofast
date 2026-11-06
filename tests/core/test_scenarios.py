@@ -18,7 +18,10 @@ from robofast.testing.checks import (
     wait_until,
 )
 
-pytestmark = pytest.mark.parametrize("lease_path", ["local", "remote"])
+pytestmark = [
+    pytest.mark.parametrize("lease_path", ["local", "remote"]),
+    pytest.mark.virtual_time,
+]
 
 DEVICES = ("t1.telescope", "t1.camera")
 BOUND = 3.0  # seconds, for the fast fake timings in conftest

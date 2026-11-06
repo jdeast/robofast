@@ -15,12 +15,16 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from robofast.console.hold import OperatorHold, send_command
 from robofast.devices.kiwispec_client import KiwiSpecBusy
 from robofast.plan import Observation, StaticPlan
 from robofast.testing.checks import wait_until
 
 from .test_rv_spectra import FakeSpectrograph, events, run_to_end, rv_rig, spectrum_target
+
+pytestmark = pytest.mark.virtual_time
 
 IMAGE = {"name": "field", "exptime": 0.2, "count": 1, "ra_hours": 1.0, "dec_deg": 10.0}
 

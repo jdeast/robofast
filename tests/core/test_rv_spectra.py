@@ -16,6 +16,8 @@ from robofast.sky import Site
 from robofast.spectra import SpectrumRecorder, barycentric, propagate
 from robofast.testing.checks import wait_until
 
+pytestmark = pytest.mark.virtual_time
+
 
 def tlimits(**kw):
     """TelescopeLimits with the test suite's generic values (no defaults in core)."""

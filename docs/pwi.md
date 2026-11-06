@@ -217,6 +217,12 @@ pipeline writes `DriverInfo` into each light frame's header as `MNTSWVER`
   commanded by something else). A slew the server itself sent to a target
   inside the limits is left to PWI's own deceleration unless the mount
   passes that target by more than `limit_margin`. It never commands motion.
+  A read implying more than `glitch_speed` (default twice `slew_speed`) is
+  a bad sample, not motion: it is skipped and logged, and the next read is
+  measured from scratch (MINERVA T1 under PWI2 once reported 61.4 deg
+  altitude mid-slew from near 40, and the watch stopped a good slew). When
+  the watch stops a slew the server sent, `Slewing` raises: the slew failed,
+  and nobody mistakes where it stopped for the target.
   The jog tool applies the same coast to its own limit check.
 * **Stalled slews**: see "Quirks handled" (PWI4 at its own limit). A slew
   to an alt/az target (and a park) must make progress toward it: at least
@@ -271,7 +277,7 @@ way. Without `az_wrap_min`/`az_wrap_max` PWI chooses, as before.
 `focuser`, `rotator`, `rotator_status_port`, `ports`, `m3_timeout`,
 `m3_resend_after`, `m3_retries`, `max_offset`, `guide_rate`,
 `max_pulse_ms`, `limit_margin`, `watch_interval`, `stop_distance`,
-`slew_speed`, `stall_time`, `stall_move`, `moving_speed`,
+`slew_speed`, `glitch_speed`, `stall_time`, `stall_move`, `moving_speed`,
 `slew_report_min`, `park_tolerance`, `park_timeout`, `az_wrap_min`,
 `az_wrap_max`, `status_max_age`, `request_timeout`,
 `aperture_diameter`, `focal_length`, `max_jog_deg` (at most 10),

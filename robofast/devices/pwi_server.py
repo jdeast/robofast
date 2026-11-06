@@ -242,6 +242,11 @@ class PWIConfig:
     #: watch scales it with the square of the speed (docs/pwi.md, "Safety").
     stop_distance: float = 8.0
     slew_speed: float = 15.0
+    #: A read implying more than this (deg/s; default twice ``slew_speed``)
+    #: is a bad sample, not motion: the limit watch skips it (MINERVA T1,
+    #: 2026-11-05: PWI2 reported 61.4 deg altitude mid-slew from near 40, a
+    #: "32 deg/s" climb, and the watch stopped a good slew 7 arcmin short).
+    glitch_speed: float | None = None
     #: A slew robofast sent that PWI reports slewing but that has moved less
     #: than ``stall_move`` deg in ``stall_time`` s has failed (PWI4 stops at
     #: its own axis limits and reports slewing forever): stop, report.
@@ -332,6 +337,8 @@ class PWIConfig:
             raise ValueError("max_jog_deg must be in (0, 10]")
         if cfg.stop_distance < 0 or cfg.slew_speed <= 0:
             raise ValueError("need stop_distance >= 0 and slew_speed > 0")
+        if cfg.glitch_speed is not None and cfg.glitch_speed <= cfg.slew_speed:
+            raise ValueError("glitch_speed must be above slew_speed")
         if cfg.stall_time <= 0 or cfg.stall_move <= 0:
             raise ValueError("need stall_time > 0 and stall_move > 0")
         if cfg.m3_retries < 0 or cfg.m3_resend_after <= 0:
@@ -420,6 +427,7 @@ class PWIMount:
         self.rotator_target: float | None = None
         self.focus_target: float | None = None
         self.watch_stops = 0
+        self.watch_glitches = 0
         self.pulse_until = 0.0
         self._watch_latched = False
         self._park_task: asyncio.Task | None = None
@@ -1033,6 +1041,7 @@ class PWIMount:
             "speed_deg_s": self.speed,
             "limits": [self.config.min_alt, self.config.max_alt],
             "watch_stops": self.watch_stops,
+            "watch_glitches": self.watch_glitches,
             "homed": self.is_homed(st),
             "homed_here": sorted(self.homed_here),
             "home_record": sorted(self.home_record.axes(st)),
@@ -1077,6 +1086,22 @@ class PWIMount:
             v = (alt - last[1]) / dt if last is not None and dt > 1e-3 else 0.0
             # Where the mount would come to rest if stopped now: a stop
             # coasts up to stop_distance (6-8 deg from full speed).
+            glitch = cfg.glitch_speed or 2.0 * cfg.slew_speed
+            vm = 0.0
+            if last is not None and last[2] is not None and mech is not None and dt > 1e-3:
+                vm = (mech - last[2]) / dt
+            if abs(v) > glitch or abs(vm) > glitch:
+                # Measure the next read from scratch: this one is not motion.
+                log.warning(
+                    "limit watch: skipped a bad PWI read (altitude %.2f deg at %.1f deg/s,"
+                    " mechanical azimuth at %.1f deg/s)",
+                    alt,
+                    v,
+                    vm,
+                )
+                self.watch_glitches += 1
+                last = None
+                continue
             m = cfg.limit_margin
             near, stop, rest = self._limit_check(
                 alt, v, cfg.min_alt - m, cfg.max_alt + m, self._goto_alt
@@ -1084,9 +1109,6 @@ class PWIMount:
             what = f"altitude {alt:.2f} deg at {v:.2f} deg/s (would coast to {rest:.2f})"
             what += f" against [{cfg.min_alt}, {cfg.max_alt}]"
             if cfg.az_wrap_min is not None and cfg.az_wrap_max is not None and mech is not None:
-                vm = 0.0
-                if last is not None and last[2] is not None and dt > 1e-3:
-                    vm = (mech - last[2]) / dt
                 near_m, stop_m, rest_m = self._limit_check(
                     mech, vm, cfg.az_wrap_min - m, cfg.az_wrap_max + m, self._goto_mech
                 )
@@ -1101,8 +1123,12 @@ class PWIMount:
             elif stop and not self._watch_latched and last is not None:
                 self._watch_latched = True
                 self.watch_stops += 1
-                self._disarm_slew()
-                log.error("LIMIT: %s: stop", what)
+                if self._slew_active:
+                    # A slew of ours, stopped short: Slewing reports it failed.
+                    self._fail_slew(f"LIMIT: {what}: slew stopped")
+                else:
+                    self._disarm_slew()
+                    log.error("LIMIT: %s: stop", what)
                 with contextlib.suppress(PWIError):
                     await self._send(self.pwi.stop, "stop (limit watch)")
             last = (t, alt, mech)

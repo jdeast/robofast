@@ -9,6 +9,7 @@ hardware gate.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import socket
 import tempfile
@@ -384,6 +385,43 @@ async def test_limit_watch_leaves_a_fast_slew_to_a_target_inside_the_limits(make
     await until(lambda: _not(tel.get("Slewing", timeout=T)), timeout=10, what="slew end")
     assert abs(sim.model.state()["alt"] - 21.0) < 0.01
     assert server.mount.watch_stops == 0
+    await tel.aclose()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_limit_watch_skips_a_bad_read(make, backend):
+    """MINERVA T1, 2026-11-05: PWI2 reported 61.4 deg altitude mid-slew from
+    near 40. One read implying a speed no mount reaches is not motion: no stop."""
+    _sim, server = make(backend, sim_kw={"alt": 30.0})
+    mount = server.mount
+    real = mount.pwi.status
+    bad = {"n": 0}
+
+    async def status():
+        st = await real()
+        if mount.watch_glitches == 0 and bad["n"] < 1 and st.alt_deg is not None:
+            bad["n"] += 1
+            return dataclasses.replace(st, alt_deg=st.alt_deg - 6.0)  # "60 deg/s" down
+        return st
+
+    await asyncio.sleep(0.3)  # the watch has a baseline
+    mount.pwi.status = status
+    await until(lambda: _async(mount.watch_glitches >= 1), timeout=3, what="glitch seen")
+    await asyncio.sleep(0.5)
+    assert mount.watch_stops == 0
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_a_slew_the_limit_watch_stops_fails(make, backend):
+    sim, server = make(backend, sim_kw={"slew_rate": 5.0, "alt": 60.0})
+    tel = await device(server)
+    await tel.put("SlewToAltAzAsync", Altitude=40.0, Azimuth=90.0, timeout=T)
+    await asyncio.sleep(0.3)
+    with sim.model.lock:
+        sim.model.goto_altaz(5.0, 90.0)  # something else drives it past the target
+    with pytest.raises(Exception, match="LIMIT"):
+        await until(lambda: _not(tel.get("Slewing", timeout=T)), timeout=10, what="slew end")
+    assert server.mount.watch_stops == 1
     await tel.aclose()
 
 

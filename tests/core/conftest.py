@@ -31,6 +31,7 @@ from robofast.modes import modes_from_config
 from robofast.safety import ENCLOSURE_MEMBERS
 from robofast.sequencer import TelescopeUnit
 from robofast.supervisor_service import SupervisorServer
+from robofast.testing import virtual_time
 from robofast.testing.fakes import (
     FakeCamera,
     FakeDome,
@@ -264,3 +265,27 @@ async def make_rig(lease_path):
     yield build
     for rig in rigs:
         await rig.stop()
+
+
+# -- virtual time (robofast/testing/virtual_time.py) -------------------------------------
+
+
+def pytest_asyncio_loop_factories(config, item):
+    """A module marked ``virtual_time`` runs on a virtual-time loop; every
+    other test on the standard one."""
+    if item.get_closest_marker("virtual_time") is not None:
+        return {"virtual_time": virtual_time.new_loop}
+    return {"asyncio": asyncio.new_event_loop}
+
+
+@pytest.fixture(autouse=True)
+def _virtual_monotonic(request):
+    """``time.monotonic`` follows the virtual loop while a marked test runs."""
+    if request.node.get_closest_marker("virtual_time") is None:
+        yield
+        return
+    virtual_time.install_monotonic()
+    try:
+        yield
+    finally:
+        virtual_time.restore_monotonic()

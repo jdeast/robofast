@@ -16,6 +16,8 @@ from robofast.sequencer_service import build, build_units, load_plan
 from robofast.testing.checks import wait_until
 from robofast.timeline import Timeline
 
+pytestmark = pytest.mark.virtual_time
+
 BOUND = 3.0
 SITES = Path(__file__).resolve().parents[2] / "sites" / "minerva"
 

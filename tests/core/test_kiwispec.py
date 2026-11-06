@@ -46,6 +46,8 @@ from robofast.devices.kiwispec_service import (
 )
 from robofast.devices.kiwispec_sim import KiwiSpecSim, SimConfig
 
+pytestmark = pytest.mark.virtual_time
+
 FAST = dict(
     readout=0.2,
     stage_speed=400.0,

@@ -3,15 +3,22 @@
     "Which alerts MINERVA follows as targets of opportunity (robofast/alerts, docs/alerts.md): rules tried in",
     "order, the first match makes the ToO; no match, the alert is dropped (logged). Imaging ToOs: the",
     "spectrograph needs V < ~10 (the FAU sees 2% of the light), which an alert almost never is.",
-    "The token needs the 'too' scope (python -m robofast.request_api tokens add ... --scope too).",
+    "The token needs the 'too' scope, and 'submit' for microlensing (python -m robofast.request_api tokens add ... --scope too --scope submit).",
     "TNS and GCN need accounts: a TNS bot (bot id, name, API key) and gcn.nasa.gov client credentials.",
-    "TNOs: a moving target is observed only by a mount that can track it (PWI4's rates; not PWI2)."
+    "TNOs: a moving target is observed only by a mount that can track it (PWI4's rates; not PWI2).",
+    "Microlensing (OGLE, KMTNet, MOA): followed, not looked at once: a NORMAL group, one standing request per",
+    "cadence tier, each while the event's fit predicts that magnification (docs/alerts.md). The Bulge peaks at",
+    "29 deg from Mt Hopkins: above 21 deg with the Sun below -12, 0 h a night from November to mid-February,",
+    "0.6 h on 1 March, 2 h on 1 April."
   ],
   "api": {"url": "http://127.0.0.1:8300", "token_file": "/etc/robofast/alerts.token", "enclosure": "aqawan1"},
   "proposal": "alerts-too",
   "state": "/var/lib/robofast/alerts-seen.json",
   "sources": {
     "tocp": {"poll_seconds": 300},
+    "ogle": {"poll_seconds": 1800},
+    "kmtnet": {"poll_seconds": 1800},
+    "moa": {"poll_seconds": 1800},
     "tns": {"poll_seconds": 300, "bot_id": 0, "bot_name": "minerva_bot", "api_key_file": "/etc/robofast/tns.key"},
     "gcn": {
       "client_id_file": "/etc/robofast/gcn.id",
@@ -50,6 +57,16 @@
       "too": {"observation_type": "RAPID_RESPONSE", "policy": "now-after-readout", "priority_class": 2,
               "deadline_hours": 6, "telescopes": ["t1", "t2"], "instrument_type": "imager",
               "exposure_time": 120.0, "exposure_count": 5}
+    },
+    {
+      "name": "microlensing events near a bright peak (OGLE, KMTNet, MOA)",
+      "match": {"sources": ["ogle", "kmtnet", "moa"], "min_amax": 10.0, "peak_hours": [-24, 240],
+                "max_mag": 17.0},
+      "too": {"observation_type": "NORMAL", "telescopes": ["t1", "t2"], "instrument_type": "imager",
+              "filter": "ip", "exposure_time": 120.0, "exposure_count": 1,
+              "cadence": [{"magnified": 1.34, "min_interval": 43200, "max_per_night": 1},
+                          {"magnified": 10.0, "min_interval": 3600},
+                          {"magnified": 100.0, "min_interval": 600}]}
     },
     {
       "name": "TNOs (Rubin)",

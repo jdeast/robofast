@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import json
 import math
 from datetime import UTC, datetime, timedelta
@@ -13,9 +14,9 @@ from pathlib import Path
 
 import pytest
 
-from robofast.alerts import gcn, rubin, tns, tocp
+from robofast.alerts import gcn, kmtnet, moa, ogle, rubin, tns, tocp
 from robofast.alerts import service as service_mod
-from robofast.alerts.core import Alert, decide, submit, why_not
+from robofast.alerts.core import Alert, decide, magnification, magnified, submit, why_not
 from robofast.alerts.service import AlertsConfig, AlertService, main
 from robofast.orbit import Orbit
 from robofast.request_model import RequestGroup
@@ -228,6 +229,143 @@ def test_a_tns_object_becomes_an_alert_and_a_classified_bright_sn_is_followed():
     assert "classification" in decide(agn, rules(), NOW)[1]
 
 
+# -- microlensing: OGLE, KMTNet, MOA ---------------------------------------------------------
+
+#: The microlensing rule of MINERVA's example: its cadence tiers.
+TIERED = next(r for r in json.loads(EXAMPLE.read_text())["rules"] if "cadence" in r["too"])["too"]
+
+
+def page(name: str) -> str:
+    return (SAMPLES / name).read_text(encoding="latin-1")
+
+
+def test_ogle_ews_rows_are_read_in_the_pages_format():
+    """Made-up events in the EWS table's row format (Bulge and disk)."""
+    alerts = {a.id: a for a in ogle.parse(page("ogle_ews_synthetic.html"))}
+    assert len(alerts) == 6 and "OGLE-2026-DG-9001" in alerts and "OGLE-2026-GD-9001" in alerts
+    a = alerts["OGLE-2026-BLG-9001"]  # 17:52:10.40 -29:12:05.3, Tmax 2461105.200, blended
+    assert (a.ra, a.dec) == pytest.approx((268.0433333, -29.2014722), abs=1e-6)
+    assert a.peak == datetime(2026, 3, 5, 16, 48, tzinfo=UTC)
+    assert (a.te, a.u0, a.amax) == (24.5, 0.27, 3.804)
+    assert (a.mag, a.band) == (pytest.approx(17.6 - 0.886), "I")  # I_bl less Dmag
+    assert a.updates and a.kind == "sidereal"
+    assert alerts["OGLE-2026-DG-9001"].dec == pytest.approx(-(7 + 5 / 60 + 40 / 3600))
+    assert magnification(a.u0) == pytest.approx(a.amax, abs=0.01)  # the page's own Amax
+
+
+def test_kmtnet_lines_are_read_in_its_text_lists_format():
+    """Made-up events in the format of KMTNet's listpage.dat; t0 is HJD - 2400000."""
+    alerts = {a.id: a for a in kmtnet.parse(page("kmtnet_listpage_synthetic.dat"))}
+    assert len(alerts) == 4
+    a = alerts["KMT-2026-BLG-9035"]
+    assert a.classification == "clear" and a.aliases == ("ogle:OGLE-2026-BLG-9130",)  # not PRIME's
+    assert (a.te, a.u0) == (98.0, 0.05) and a.amax == pytest.approx(magnification(0.05))
+    assert alerts["KMT-2026-BLG-9001"].classification == "probable"
+    assert alerts["KMT-2026-BLG-9061"].ignore == "KMTNet: not microlensing"
+    # KMT-2026-BLG-9554 is OGLE-2026-BLG-9004: their fits' peaks agree, so the epochs do
+    twin = {o.id: o for o in ogle.parse(page("ogle_ews_synthetic.html"))}["OGLE-2026-BLG-9004"]
+    k = alerts["KMT-2026-BLG-9554"]
+    assert k.aliases == ("ogle:OGLE-2026-BLG-9004",)
+    assert abs((k.peak - twin.peak).total_seconds()) < 86400
+    assert 3600 * abs(k.dec - twin.dec) < 2.0
+
+
+def test_moa_rows_are_read_in_its_indexs_format():
+    """Made-up events in the format of MOA's yearly index (made from u0 0.2: Amax 5.07)."""
+    alerts = {a.id: a for a in moa.parse(page("moa_synthetic.html"))}
+    assert len(alerts) == 3
+    a = alerts["MOA-2026-BLG-9019"]  # t0 2026-04-27.50; u0 from Amax, the fit unblended
+    assert a.u0 == pytest.approx(0.2, abs=5e-4) and a.amax == 5.07
+    assert a.peak == datetime(2026, 4, 27, 12, tzinfo=UTC)
+    assert a.mag == pytest.approx(17.5 - 2.5 * math.log10(5.07))
+    assert a.time == datetime(2026, 11, 4, 12, 30, 0, 500000, tzinfo=UTC)
+
+
+def test_the_windows_are_when_the_fit_predicts_the_magnification():
+    a = Alert("ogle", "x", "x", 270.0, -29.0, peak=NOW, te=20.0, u0=0.05, amax=magnification(0.05))
+    for level in (1.34, 10.0, 15.0):
+        start, end = magnified(a, level)
+        assert end - NOW == NOW - start
+        u = math.hypot(a.u0, (end - NOW).total_seconds() / 86400 / a.te)
+        assert magnification(u) == pytest.approx(level)
+    assert magnified(a, 50.0) is None  # never that bright
+
+
+def test_an_event_before_its_peak_becomes_standing_requests_by_tier():
+    """OGLE-2026-BLG-9002 (made up: Amax 125, peak I 15.5 on 21 June) the day before."""
+    a = {o.id: o for o in ogle.parse(page("ogle_ews_synthetic.html"))}["OGLE-2026-BLG-9002"]
+    now = datetime(2026, 6, 20, 7, 0, tzinfo=UTC)
+    group, rule = decide(a, rules(), now)
+    assert rule == "microlensing events near a bright peak (OGLE, KMTNet, MOA)"
+    g = RequestGroup.from_dict(group)  # valid in the request language
+    assert group["observation_type"] == "NORMAL" and g.too is None and g.operator == "MANY"
+    reqs = {r["id"]: r for r in group["requests"]}
+    assert sorted(reqs) == [f"ogle-OGLE-2026-BLG-9002-r{k}" for k in (1, 2, 3)]
+    cads = [r["extra_params"]["cadence"] for r in reqs.values()]
+    assert cads == [{"min_interval": 43200.0, "max_per_night": 1}, {"min_interval": 3600.0},
+                    {"min_interval": 600.0}]  # fmt: skip
+    win = [(datetime.fromisoformat(r["windows"][0]["start"]),
+            datetime.fromisoformat(r["windows"][0]["end"])) for r in reqs.values()]  # fmt: skip
+    assert win[0][0] == win[1][0] == now and win[2][0] > now  # A >= 100 is still ahead
+    assert win[0][1] > win[1][1] > win[2][1] > a.peak  # nested, the narrowest last
+    conf = group["requests"][0]["configurations"][0]
+    assert conf["instrument_configs"][0]["optical_elements"] == {"filter": "ip"}
+
+
+def test_the_rules_take_microlensing_by_peak_time_and_magnification():
+    alerts = {o.id: o for o in ogle.parse(page("ogle_ews_synthetic.html"))}
+    now = datetime(2026, 11, 6, 18, 0, tzinfo=UTC)
+    soon = alerts["OGLE-2026-BLG-9003"]  # Tmax 18 Nov 16:48; umin 0.000: Amax 99999, Dmag 12.5
+    assert (soon.amax, soon.mag, soon.u0) == (None, None, 0.0)  # no peak given
+    assert "magnitude None" in decide(soon, rules(), soon.peak)[1]
+    assert "peak (t0" in decide(alerts["OGLE-2026-BLG-9002"], rules(), now)[1]  # June
+    low = alerts["OGLE-2026-BLG-9001"]
+    assert "peak magnification" in decide(low, rules(), low.peak)[1]  # A 3.8
+    ignored = {k.id: k for k in kmtnet.parse(page("kmtnet_listpage_synthetic.dat"))}
+    gone = ignored["KMT-2026-BLG-9061"]
+    assert "not microlensing" in decide(gone, rules(), gone.peak)[1]
+
+
+async def test_a_refit_event_is_followed_once_and_once_across_surveys(tmp_path):
+    """KMT-2026-BLG-9554 is OGLE-2026-BLG-9004 (KMT names it; OGLE's own fit on
+    the page has umin 0.000, no peak: here a refit gives it one). Made-up events."""
+    state = tmp_path / "seen.json"
+    o = {a.id: a for a in ogle.parse(page("ogle_ews_synthetic.html"))}
+    k = {a.id: a for a in kmtnet.parse(page("kmtnet_listpage_synthetic.dat"))}
+    kmt = k["KMT-2026-BLG-9554"]  # u0 0.045: A 22.2
+    now = kmt.peak - timedelta(days=2)
+    svc = AlertService(config(state=str(state)), dry_run=True)
+    first = dataclasses.replace(kmt, u0=0.5, amax=magnification(0.5))  # an earlier fit: A 2.2
+    await svc.handle([first], prime=True, now=now)  # never primed: it updates
+    assert svc.submitted == [] and "kmtnet:KMT-2026-BLG-9554" not in svc.seen
+    await svc.handle([kmt], now=now)  # refit: now it is taken
+    assert [g["id"] for g in svc.submitted] == ["kmtnet-KMT-2026-BLG-9554"]
+    end = max(r["windows"][0]["end"] for r in svc.submitted[0]["requests"])
+    assert json.loads(state.read_text())["ids"]["kmtnet:KMT-2026-BLG-9554"] == end
+    # OGLE's name for the star, once its fit has a peak: by position (OGLE names no twin)
+    refit = dataclasses.replace(o["OGLE-2026-BLG-9004"], u0=0.045, amax=22.2, mag=16.0)
+    assert decide(refit, rules(), now)[0] is not None
+    again = AlertService(config(state=str(state)), dry_run=True)  # a restart
+    await again.handle([kmt, refit], now=now)
+    assert again.submitted == []
+    # the other way round: OGLE's followed first, KMTNet's alias names it
+    other = AlertService(config(state=str(tmp_path / "other.json")), dry_run=True)
+    await other.handle([refit], now=now)
+    await other.handle([dataclasses.replace(kmt, ra=0.0, dec=0.0)], now=now)  # not by position
+    assert [g["id"] for g in other.submitted] == ["ogle-OGLE-2026-BLG-9004"]
+
+
+def test_a_seen_file_of_the_previous_release_still_loads(tmp_path):
+    from robofast.alerts.core import Seen
+
+    path = tmp_path / "seen.json"
+    path.write_text(json.dumps({"tocp:PNV x": NOW.isoformat()}))
+    seen = Seen(path).load()
+    assert "tocp:PNV x" in seen and seen.where == {}
+    seen.save(NOW)
+    assert json.loads(path.read_text()) == {"ids": {"tocp:PNV x": NOW.isoformat()}, "where": {}}
+
+
 # -- the rules and the config ----------------------------------------------------------------
 
 
@@ -252,6 +390,20 @@ def test_the_first_matching_rule_wins():
         ({"rules": [{"match": {"sources": ["ztf"]}, "too": {}}]}, "sources"),
         ({"sources": {"gcn": {"client_id_file": "x", "client_secret_file": "y"}}}, "topics"),
         ({"sources": {"tocp": {"poll": 1}}}, "unknown keys"),
+        ({"rules": [{"match": {"peak_hours": [5, 1]}, "too": TIERED}]}, "peak_hours"),
+        (
+            {"rules": [{"match": {}, "too": {**TIERED, "observation_type": "TIME_CRITICAL"}}]},
+            "NORMAL",
+        ),
+        ({"rules": [{"match": {}, "too": {**TIERED, "cadence": []}}]}, "list of tiers"),
+        (
+            {"rules": [{"match": {}, "too": {**TIERED, "cadence": [{"min_interval": 60}]}}]},
+            "magnified",
+        ),
+        (
+            {"rules": [{"match": {}, "too": {**TIERED, "cadence": [{"magnified": 2, "x": 1}]}}]},
+            "unknown",
+        ),
         ({"bogus": 1}, "unknown keys"),
     ],
 )
@@ -370,3 +522,56 @@ async def test_an_alert_end_to_end_through_the_request_api_into_the_scheduler(
     sched.report("t1", base, "interrupted", 0)
     obs = await sched.next_observation("t1")
     assert obs.name.startswith("Rubin 77 [rubin-1001-c") and (obs.exptime, obs.count) == (120.0, 5)
+
+
+async def test_a_microlensing_event_end_to_end_through_the_request_api_into_the_scheduler(
+    api,  # noqa: F811 (the request API tests' fixture)
+    tmp_path,
+):
+    """OGLE-2026-BLG-9002 (made up) the night before its peak (MINERVA, 20 June 2026,
+    local midnight): one NORMAL group through the real request API (a token
+    with the submit scope) into the scheduler, its tiers each a standing
+    request: the nightly one once, the hourly one again only after an hour."""
+    api.clock.t = datetime(2026, 6, 20, 7, 0, tzinfo=UTC)
+    sched = api.scheduler()
+    await sched.poll_dropbox()
+    serve = asyncio.create_task(sched.serve())
+    token = tmp_path / "alerts.token"
+    token.write_text(api.tokens["tom"])  # read, submit
+    d = json.loads(EXAMPLE.read_text())
+    d["api"] = {"url": api.server.url, "token_file": str(token)}
+    rule = next(r for r in d["rules"] if "cadence" in r["too"])
+    rule["too"]["telescopes"] = ["t1"]
+    del rule["too"]["filter"]  # the rig's t1 lists no filters
+    cfg = AlertsConfig.from_dict(d)
+    alert = {o.id: o for o in ogle.parse(page("ogle_ews_synthetic.html"))}["OGLE-2026-BLG-9002"]
+    gid = "ogle-OGLE-2026-BLG-9002"
+    try:
+        group, _ = decide(alert, cfg.rules, api.clock())
+        reply = await asyncio.to_thread(submit, group, cfg.api)
+        assert reply["intake"] == "QUEUED" and not reply.get("too")
+
+        async def accepted():
+            return (await api.get("tom", f"/requestgroups/{gid}")).json()["intake"] == "ACCEPTED"
+
+        for _ in range(250):
+            if await accepted():
+                break
+            await asyncio.sleep(0.02)
+        assert await accepted()
+    finally:
+        serve.cancel()
+    taken = []
+    for _ in range(3):  # the nightly tier, the hourly tier, then neither
+        obs = await sched.next_observation("t1")
+        if not getattr(obs, "name", "").startswith("OGLE-2026-BLG-9002"):  # Idle, or another
+            break
+        taken.append(obs.name.split("[")[1].split("#")[0])
+        sched.report("t1", obs, "complete", obs.count)
+    assert sorted(taken) == [f"{gid}-c1", f"{gid}-c2"]  # the 10-min tier opens tomorrow
+    api.clock.advance(1800)
+    obs = await sched.next_observation("t1")
+    assert not getattr(obs, "name", "").startswith("OGLE-2026-BLG-9002")  # too soon
+    api.clock.advance(1900)
+    obs = await sched.next_observation("t1")
+    assert f"[{gid}-c2" in getattr(obs, "name", "")  # the hourly tier, not the nightly

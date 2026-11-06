@@ -1,10 +1,11 @@
 """The alert service: sources to the operator's rules to ToO requests.
 
 ``python -m robofast.alerts run --config alerts.json`` runs the configured
-sources until stopped; ``submit --source rubin|gcn|tns FILE...`` puts alert
-files through the same rules (``--dry-run``: print the requests, submit
-nothing and write nothing: the ``state`` file is read, never written);
-``check`` loads the config and says what it would run.
+sources until stopped; ``submit --source SOURCE FILE...`` puts alert files
+(Rubin, GCN and TNS JSON; a polled source's saved page) through the same
+rules (``--dry-run``: print the requests, submit nothing and write nothing:
+the ``state`` file is read, never written); ``check`` loads the config and
+says what it would run.
 
 The config (``sites/minerva/alerts.example.json``)::
 
@@ -13,6 +14,7 @@ The config (``sites/minerva/alerts.example.json``)::
      "state": "/var/lib/robofast/alerts-seen.json",
      "sources": {
        "tocp": {"poll_seconds": 300},
+       "ogle": {"poll_seconds": 1800}, "kmtnet": {...}, "moa": {...},
        "tns": {"poll_seconds": 300, "bot_id": 0, "bot_name": "...", "api_key_file": "..."},
        "gcn": {"client_id_file": "...", "client_secret_file": "...", "topics": [...]}},
      "rules": [...]}
@@ -25,6 +27,13 @@ would be submitted again).
 At its first start a polled source (TOCP, TNS) only marks what is already
 listed as seen, so the page's history is never submitted. TOCP and TNS
 offer no push, so they are polled; GCN is a Kafka stream (pushed).
+
+The microlensing surveys (OGLE, KMTNet, MOA) are polled pages that refit
+their events in place, so they are handled differently: their page is
+never primed (the rules' ``peak_hours`` keep the season's history out), an
+event no rule takes is looked at again at the next poll (a refit can raise
+its magnification), and once one survey's name for a star is followed,
+another's (its alias, or within 2 arcsec) is not followed again.
 """
 
 from __future__ import annotations
@@ -40,7 +49,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from robofast.alerts import gcn, rubin, tns, tocp
+from robofast.alerts import gcn, kmtnet, moa, ogle, rubin, tns, tocp
 from robofast.alerts.core import (
     Alert,
     ApiConfig,
@@ -50,6 +59,7 @@ from robofast.alerts.core import (
     decide,
     load_rules,
     submit,
+    utc,
 )
 
 log = logging.getLogger("robofast.alerts")
@@ -58,7 +68,12 @@ SOURCE_KEYS = {
     "tocp": {"poll_seconds", "url"},
     "tns": {"poll_seconds", "bot_id", "bot_name", "api_key_file"},
     "gcn": {"client_id_file", "client_secret_file", "topics"},
+    "ogle": {"poll_seconds", "url"},
+    "kmtnet": {"poll_seconds", "url"},
+    "moa": {"poll_seconds", "url"},
 }
+#: The polled pages: their parser and fetcher.
+PAGES = {"tocp": tocp, "ogle": ogle, "kmtnet": kmtnet, "moa": moa}
 
 
 @dataclass
@@ -87,6 +102,11 @@ class AlertsConfig:
         )
 
 
+def _page(mod, url: str | None):
+    """Fetch and parse one polled page (its module's own URL unless ``url``)."""
+    return lambda: mod.parse(mod.fetch(url) if url else mod.fetch())
+
+
 def _secret(path: str) -> str:
     return Path(path).read_text().strip()
 
@@ -100,20 +120,34 @@ class AlertService:
             self.seen.prepare()  # OSError now, with the reason, not after the work
         self.submitted: list[dict[str, Any]] = []
 
-    async def handle(self, alerts: list[Alert], *, prime: bool = False) -> None:
-        """Each new alert through the rules (``prime``: only mark them seen)."""
-        now = datetime.now(UTC)
+    async def handle(
+        self, alerts: list[Alert], *, prime: bool = False, now: datetime | None = None
+    ) -> None:
+        """Each new alert through the rules (``prime``: only mark them seen,
+        except those that update)."""
+        now = now or datetime.now(UTC)
         for a in alerts:
             key = f"{a.source}:{a.id}"
             if key in self.seen:
                 continue
-            self.seen.add(key, now)
-            if prime:
-                continue
+            if a.updates:
+                twin = self.seen.twin(a)
+                if twin is not None:
+                    self.seen.add(key, now)
+                    log.info("%s %s: the same star as %s (followed)", a.source, a.id, twin)
+                    continue
+            else:
+                self.seen.add(key, now)
+                if prime:
+                    continue
             group, why = decide(a, self.config.rules, now, self.config.proposal)
             if group is None:
-                log.info("%s %s: not followed (%s)", a.source, a.id, why)
+                say = log.debug if a.updates else log.info  # a refit page lists it again
+                say("%s %s: not followed (%s)", a.source, a.id, why)
                 continue
+            if a.updates:  # kept until its last window ends (then keep_days)
+                ends = [utc(w["end"]) for r in group["requests"] for w in r.get("windows", [])]
+                self.seen.add(key, max([now, *filter(None, ends)]), where=(a.ra, a.dec))
             if self.dry_run:
                 print(json.dumps(group, indent=1), flush=True)
                 self.submitted.append(group)
@@ -175,13 +209,10 @@ class AlertService:
     async def run(self) -> None:
         tasks = []
         for name, s in self.config.sources.items():
-            if name == "tocp":
-                url = s.get("url", tocp.URL)
+            if name in PAGES:
                 tasks.append(
                     self._poll(
-                        "tocp",
-                        lambda u=url: tocp.parse(tocp.fetch(u)),
-                        float(s.get("poll_seconds", 300)),
+                        name, _page(PAGES[name], s.get("url")), float(s.get("poll_seconds", 300))
                     )
                 )
             elif name == "tns":
@@ -199,10 +230,15 @@ class AlertService:
         await asyncio.gather(*tasks)
 
 
+def _gcn_file(d: dict[str, Any]) -> Alert:
+    return gcn.from_gcn(d.get("$schema", "gcn.notices.file.json"), d)
+
+
 PARSERS = {
-    "rubin": lambda d: [rubin.from_rubin(d)],
-    "gcn": lambda d: [gcn.from_gcn(d.get("$schema", "gcn.notices.file.json"), d)],
-    "tns": lambda d: [tns.from_tns(d)],
+    "rubin": lambda t: [rubin.from_rubin(json.loads(t))],
+    "gcn": lambda t: [_gcn_file(json.loads(t))],
+    "tns": lambda t: [tns.from_tns(json.loads(t))],
+    **{name: mod.parse for name, mod in PAGES.items()},
 }
 
 
@@ -229,7 +265,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "submit":
         if not args.source or not args.files:
             ap.error("submit needs --source and alert files")
-        alerts = [a for f in args.files for a in PARSERS[args.source](json.loads(f.read_text()))]
+        alerts = [
+            a
+            for f in args.files
+            for a in PARSERS[args.source](f.read_bytes().decode("utf-8", "replace"))
+        ]
         asyncio.run(service.handle(alerts))
         return 0
     with contextlib.suppress(KeyboardInterrupt):

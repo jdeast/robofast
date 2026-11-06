@@ -1,7 +1,9 @@
 """The safety supervisor: the only component allowed to open or close.
 
 Policy, in one paragraph: the enclosure is open only while (a) the weather
-has been *continuously* safe for ``reopen_hold`` seconds, and (b) a live
+has been *continuously* safe for ``reopen_hold`` seconds, confirmed by a
+reading *taken* after the hold ended (so an open never goes out on a
+verdict older than a weather change; it waits for the next poll), and (b) a live
 sequencer holds an unexpired, unrevoked :class:`OpenLease`. Anything else
 -- unsafe weather, a weather reading that errors or times out, weather data
 older than ``stale_after``, no successful read for ``stale_after``, a lease
@@ -543,6 +545,8 @@ class SafetySupervisor:
         self._reason = "startup (no weather read yet)"
         self._safe_since: float | None = None
         self._last_good_read: float | None = None
+        #: When the latest safe reading was *taken* (its read started).
+        self._safe_read_at: float | None = None
         self._lease: OpenLease | None = None
         self._lease_ids = itertools.count(1)
         self._wake = asyncio.Event()
@@ -764,6 +768,9 @@ class SafetySupervisor:
             and (self._shutter_hold_until is None or now >= self._shutter_hold_until)
             and self._safe_since is not None
             and now - self._safe_since >= self.config.reopen_hold
+            # A reading taken after the hold ended, not the one before it.
+            and self._safe_read_at is not None
+            and self._safe_read_at >= self._safe_since + self.config.reopen_hold
         )
 
     @property
@@ -1132,12 +1139,15 @@ class SafetySupervisor:
     async def _weather_loop(self) -> None:
         while not self._stopping:
             try:
+                taken = time.monotonic()
                 safe, reason, ok = await self._read_weather()
                 if self._stopping:
                     return
                 if ok:
                     self._last_good_read = time.monotonic()
                 self._set_safety(safe, reason)
+                if safe:
+                    self._safe_read_at = taken
             except Exception as exc:  # never let the loop die
                 log.exception("weather loop")
                 self._set_safety(False, f"weather loop error: {exc!r}")

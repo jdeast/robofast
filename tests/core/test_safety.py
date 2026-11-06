@@ -10,6 +10,8 @@ import pytest
 from robofast.safety import RecoveryRefused
 from robofast.testing.checks import wait_until
 
+pytestmark = pytest.mark.virtual_time
+
 
 async def _open(rig, holder="test"):
     lease = await asyncio.wait_for(rig.supervisor.request_open(holder), 5)

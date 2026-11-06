@@ -20,6 +20,8 @@ from robofast.testing.checks import (
     wait_until,
 )
 
+pytestmark = pytest.mark.virtual_time
+
 DEVICES = ("t1.telescope", "t1.camera", "t2.telescope", "t2.camera")
 BOUND = 3.0
 

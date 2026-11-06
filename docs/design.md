@@ -640,7 +640,8 @@ may be wrong about the 60-inch's focus.
   every configuration not yet finished; an observation in progress
   finishes, then its visit ends. A TOM uses TOM Toolkit's own
   `OCSFacility` with settings only (`docs/tom_facility.md`); not supported
-  yet: time accounting per proposal, non-sidereal targets, a
+  yet: time accounting per proposal, non-sidereal targets other than
+  comets and minor planets (`docs/moving_targets.md`), a
   transparency constraint, dither/mosaic expansion, an archive
   (`max_seeing` is honored: `docs/seeing.md`).
 - Configured as the enclosure's plan entry, `{"type": "dispatch", "site":

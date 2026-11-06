@@ -76,7 +76,9 @@ acted on.
 | `repeat_duration` | | | refused unless null (REPEAT_* types not supported) |
 | `status`, `failures` | robofast status | | set by the scheduler; refused on submit |
 
-### Target (`type: ICRS` only)
+### Target (`type: ICRS` or `ORBITAL_ELEMENTS`)
+
+`ICRS` (sidereal):
 
 | JSON | Unit | Python | Notes |
 |---|---|---|---|
@@ -89,7 +91,21 @@ acted on.
 | `parallax` | mas | | |
 | `extra_params.radial_velocity`* | km/s | `rv` | previously `rv` |
 
-`ORBITAL_ELEMENTS`, `HOUR_ANGLE` and `SATELLITE` targets are refused.
+`ORBITAL_ELEMENTS` (a comet or minor planet; docs/moving_targets.md):
+
+| JSON | Unit | Notes |
+|---|---|---|
+| `name` | | |
+| `scheme` | `MPC_MINOR_PLANET`, `MPC_COMET`, `JPL_MINOR_PLANET` | the major-planet and `ASA_*` schemes refused |
+| `epochofel` | MJD (TT) | the elements' epoch |
+| `orbinc`, `longascnode`, `argofperih` | deg, ecliptic J2000 | |
+| `eccentricity` | | `MPC_MINOR_PLANET`: at most 0.9 |
+| `meandist`, `meananom` | au, deg | `MPC_MINOR_PLANET` |
+| `perihdist`, `epochofperih` | au, MJD (TT) | `MPC_COMET`, `JPL_MINOR_PLANET` |
+
+Only an unguided `EXPOSE` configuration takes one. The scheduler places it
+at each decision, the sequencer follows it (docs/moving_targets.md).
+`HOUR_ANGLE` and `SATELLITE` targets are refused.
 
 ### InstrumentConfig
 

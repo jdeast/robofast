@@ -259,6 +259,7 @@ means the twins take turns, each generation ending with its own cleanup.
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import logging
 import math
@@ -266,12 +267,12 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Protocol
 
 import numpy as np
 
-from robofast import pointmodel
+from robofast import pointmodel, sky
 from robofast.adc import ADCSwitches
 from robofast.alpaca_client import InvalidOperationException
 from robofast.autofocus import (
@@ -291,6 +292,7 @@ from robofast.instruments import SpectrographBusy, SpectrographError, Spectrogra
 from robofast.kinds import OBSERVATION_KINDS, KindRun
 from robofast.lamps import LampSetup, lamps_off, switch_status
 from robofast.modes import ModeGate
+from robofast.orbit import Orbit
 from robofast.owner import DeviceError, DeviceOwner, Grant, GrantRevoked
 from robofast.plan import Idle, Observation, PlanProvider, as_plan
 from robofast.pointmodel import PointingCorrector
@@ -323,6 +325,54 @@ __all__ = [
 ]
 
 log = logging.getLogger(__name__)
+
+
+def _follow_orbit(obs: Observation) -> tuple[Orbit, Any]:
+    """A moving target's orbit and site (``obs.follow``)."""
+    assert obs.follow is not None
+    st = obs.follow["site"]
+    return _parsed_follow(
+        tuple(sorted(obs.follow["orbit"].items())),
+        (float(st["latitude"]), float(st["longitude"]), float(st.get("elevation", 0.0))),
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _parsed_follow(
+    orbit: tuple[tuple[str, Any], ...], site: tuple[float, float, float]
+) -> tuple[Orbit, Any]:
+    return Orbit(**dict(orbit)), sky.Site(*site).location
+
+
+def _follow_place(obs: Observation, when: datetime) -> tuple[float, float]:
+    """A moving target's place at ``when``: (ra hours, dec deg)."""
+    orbit, location = _follow_orbit(obs)
+    ra, dec = orbit.place(when, location)
+    return ra / 15.0, dec
+
+
+def _follow_rate(obs: Observation, when: datetime) -> tuple[float, float]:
+    """A moving target's motion at ``when``: (dRA cos Dec, dDec) arcsec/s."""
+    orbit, location = _follow_orbit(obs)
+    return orbit.rate(when, location)
+
+
+def _separation_arcsec(ra1_h: float, dec1: float, ra2_h: float, dec2: float) -> float:
+    a1, d1, a2, d2 = (math.radians(x) for x in (ra1_h * 15.0, dec1, ra2_h * 15.0, dec2))
+    h = math.sin((d2 - d1) / 2) ** 2 + math.cos(d1) * math.cos(d2) * math.sin((a2 - a1) / 2) ** 2
+    return math.degrees(2.0 * math.asin(min(1.0, math.sqrt(h)))) * 3600.0
+
+
+async def _can_set_rates(tel: Grant) -> bool:
+    """The mount takes RA and Dec tracking rates (ASCOM ``CanSet...Rate``);
+    a driver that cannot say counts as no."""
+    try:
+        return bool(await tel.get("CanSetRightAscensionRate")) and bool(
+            await tel.get("CanSetDeclinationRate")
+        )
+    except Exception:
+        return False
+
 
 #: A pointing run's settings (docs/pointing_model.md): the telescope's
 #: ``pointing.run`` entry and an observation's ``pointing`` override them.
@@ -526,6 +576,11 @@ class TelescopeUnit:
     wake: asyncio.Event = field(default_factory=asyncio.Event, init=False)
     #: An exposure has been started and not yet read out.
     exposing: bool = field(default=False, init=False)
+    #: Following a moving target: where it was last pointed (ra hours, dec
+    #: deg), and whether the mount's RA/Dec rates were set (then they are
+    #: set back to 0, sidereal, when the observation ends).
+    follow_pointed: tuple[float, float] | None = field(default=None, init=False)
+    follow_rates: bool = field(default=False, init=False)
     #: Waiting out an :class:`~robofast.plan.Idle`.
     idle: bool = field(default=False, init=False)
     #: ``time.monotonic()`` since when the plan has answered only Idle (None:
@@ -576,6 +631,10 @@ class TelescopeUnit:
 class SequencerConfig:
     poll_interval: float = 0.5
     slew_timeout: float = 120.0
+    #: A moving target (docs/moving_targets.md) is pointed again before an
+    #: exposure when its place at the exposure's middle is more than this
+    #: far (arcsec) from where the telescope was last pointed at it.
+    follow_repoint_arcsec: float = 1.0
     #: Allowance on top of the exposure time for readout before giving up.
     readout_margin: float = 60.0
     lease_renew_interval: float = 10.0
@@ -1649,6 +1708,8 @@ class Sequencer:
             if obs.guide and unit.guider is not None:
                 await unit.guider.stop("observation ended")  # bounded, never raises
                 self._event("guiding_stopped", gen=state.gen, telescope=unit.name)
+            if obs.follow is not None:
+                await self._follow_end(state, unit, tel)
 
     async def _stop_observation(
         self,
@@ -1888,7 +1949,6 @@ class Sequencer:
         obs: Observation,
         taken: list[Any],
     ) -> None:
-        cfg = self.config
         gen = state.gen
         if self._sequence_cleanups.get(unit.name):
             # A sequence cut short (a preemption) still cleaning up: let it
@@ -1931,30 +1991,15 @@ class Sequencer:
                 await handler.run(run)
                 return
             ra, dec = obs.ra_hours, obs.dec_deg
+            if obs.follow is not None:
+                ra, dec = _follow_place(obs, self.clock())
             if ra is None or dec is None:
                 lst = await tel.get("SiderealTime")
                 lat = await tel.get("SiteLatitude")
                 ra, dec = (lst - 0.5) % 24.0, max(-89.0, min(89.0, lat - 10.0))
-            cra, cdec = ra, dec
-            if unit.pointing is not None:
-                await self._vendor_model_off(state, unit, tel)
-                lst = float(await tel.get("SiderealTime"))
-                cra, cdec, applied = unit.pointing.command(
-                    ra, dec, lst, obs.port, self.clock(), guided=obs.guide
-                )
-                self._event(
-                    "pointing_applied",
-                    gen=gen,
-                    telescope=unit.name,
-                    ra=ra,
-                    dec=dec,
-                    commanded_ra=round(cra, 7),
-                    commanded_dec=round(cdec, 6),
-                    **applied,
-                )
-            await self.slew_guard.check_slew(unit.name, cra, cdec)
-            await tel.call("SlewToCoordinatesAsync", cra, cdec)
-            await self._wait_for(lambda: tel.get("Slewing"), lambda s: not s, cfg.slew_timeout)
+            await self._slew(state, unit, tel, obs, ra, dec)
+            if obs.follow is not None:
+                unit.follow_pointed = (ra, dec)
             self._event("on_target", gen=gen, telescope=unit.name, ra=ra, dec=dec)
             if unit.adc is not None:
                 await self._adc_track(state, unit)
@@ -2007,6 +2052,105 @@ class Sequencer:
             run.ra, run.dec = ra, dec
         await handler.run(run)
 
+    async def _slew(
+        self,
+        state: _Generation,
+        unit: TelescopeUnit,
+        tel: Grant,
+        obs: Observation,
+        ra: float,
+        dec: float,
+    ) -> None:
+        """Slew to (``ra`` hours, ``dec`` deg) through the pointing model and
+        the slew guard, and wait for the slew to end. Rates a moving target
+        left set (their reset failed) are set back to 0 first, or the slew
+        fails: a sidereal target is never tracked at a comet's rates."""
+        if unit.follow_rates and obs.follow is None:
+            await tel.set("RightAscensionRate", 0.0)
+            await tel.set("DeclinationRate", 0.0)
+            unit.follow_rates = False
+            self._event("follow_rates_reset", gen=state.gen, telescope=unit.name, late=True)
+        cra, cdec = ra, dec
+        if unit.pointing is not None:
+            await self._vendor_model_off(state, unit, tel)
+            lst = float(await tel.get("SiderealTime"))
+            cra, cdec, applied = unit.pointing.command(
+                ra, dec, lst, obs.port, self.clock(), guided=obs.guide
+            )
+            self._event(
+                "pointing_applied",
+                gen=state.gen,
+                telescope=unit.name,
+                ra=ra,
+                dec=dec,
+                commanded_ra=round(cra, 7),
+                commanded_dec=round(cdec, 6),
+                **applied,
+            )
+        await self.slew_guard.check_slew(unit.name, cra, cdec)
+        await tel.call("SlewToCoordinatesAsync", cra, cdec)
+        await self._wait_for(lambda: tel.get("Slewing"), lambda s: not s, self.config.slew_timeout)
+
+    async def _follow(
+        self, state: _Generation, unit: TelescopeUnit, tel: Grant, obs: Observation, index: int
+    ) -> None:
+        """Before exposure ``index`` of a moving target: point again if its
+        place at the exposure's middle has moved more than
+        ``follow_repoint_arcsec`` from the last pointing, and set the mount's
+        RA/Dec rates to its motion where the mount can (ASCOM
+        ``CanSetRightAscensionRate`` and ``CanSetDeclinationRate``);
+        otherwise the mount tracks sidereally and the target trails by its
+        rate times the exposure time (docs/moving_targets.md)."""
+        assert obs.follow is not None
+        mid = self.clock() + timedelta(seconds=obs.exptime / 2.0)
+        ra, dec = _follow_place(obs, mid)
+        moved = None
+        if unit.follow_pointed is not None:
+            moved = _separation_arcsec(*unit.follow_pointed, ra, dec)
+        if moved is None or moved > self.config.follow_repoint_arcsec:
+            await self._slew(state, unit, tel, obs, ra, dec)
+            unit.follow_pointed = (ra, dec)
+        dra, ddec = _follow_rate(obs, mid)
+        rates = await _can_set_rates(tel)
+        if rates:
+            # ASCOM: RightAscensionRate in seconds of RA per sidereal
+            # second, DeclinationRate in arcsec per SI second.
+            ra_rate = dra / math.cos(math.radians(dec)) / 15.0 * sky.SIDEREAL
+            await tel.set("RightAscensionRate", ra_rate)
+            await tel.set("DeclinationRate", ddec)
+            unit.follow_rates = True
+        self._event(
+            "follow",
+            gen=state.gen,
+            telescope=unit.name,
+            index=index,
+            ra=round(ra, 7),
+            dec=round(dec, 6),
+            moved_arcsec=None if moved is None else round(moved, 3),
+            repointed=moved is None or moved > self.config.follow_repoint_arcsec,
+            rate_arcsec_s=[round(dra, 7), round(ddec, 7)],
+            mount_rates=rates,
+        )
+
+    async def _follow_end(self, state: _Generation, unit: TelescopeUnit, tel: Grant) -> None:
+        """A moving target's observation ended: the mount's rates back to 0
+        (sidereal), bounded, never raises; if that fails they stay marked
+        set, and the next slew resets them before it moves (:meth:`_slew`)."""
+        unit.follow_pointed = None
+        if not unit.follow_rates:
+            return
+        try:
+            async with asyncio.timeout(10.0):
+                await tel.set("RightAscensionRate", 0.0)
+                await tel.set("DeclinationRate", 0.0)
+            unit.follow_rates = False
+            self._event("follow_rates_reset", gen=state.gen, telescope=unit.name)
+        except Exception as exc:  # still set: the next slew resets them first (_slew)
+            log.error("%s: resetting the tracking rates: %r", unit.name, exc)
+            self._event(
+                "follow_rates_reset_failed", gen=state.gen, telescope=unit.name, error=repr(exc)
+            )
+
     async def _expose_frames(
         self,
         state: _Generation,
@@ -2032,6 +2176,8 @@ class Sequencer:
                 await check()
             if obs.guide and obs.light and unit.guider is not None:
                 await unit.guider.check()  # a failed guider is this telescope's error
+            if obs.follow is not None and obs.light:
+                await self._follow(state, unit, tel, obs, i)
             # From here until it is read out (downloaded, with imaging), a
             # "now-after-readout" preemption waits for this exposure.
             unit.exposing = True

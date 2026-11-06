@@ -92,8 +92,10 @@ at the end of the request's window. Normal requests are ranked by
 - **Time accounting.** Proposals are a static list; no time is allocated,
   charged or refunded, and `ipp_value` is a plain priority (no IPP
   debit/credit).
-- Non-sidereal targets (`ORBITAL_ELEMENTS`, ...),
-  `min_transparency`, `REPEAT_*` configuration types and `repeat_duration`,
+- Non-sidereal targets other than comets and minor planets (`ORBITAL_ELEMENTS`
+  with `MPC_MINOR_PLANET`, `MPC_COMET` or `JPL_MINOR_PLANET` is taken, unguided
+  `EXPOSE` only: docs/moving_targets.md; `JPL_MAJOR_PLANET`, `SATELLITE` and
+  `HOUR_ANGLE` are not), `min_transparency`, `REPEAT_*` configuration types and `repeat_duration`,
   rotator modes, regions of interest; the dither and mosaic expansion
   endpoints (`/api/configurations/dither/`, `/api/requests/mosaic/`; the
   form falls back to the unexpanded request); `DIRECT` and `REAL_TIME`

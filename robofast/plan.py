@@ -107,6 +107,12 @@ class Observation:
     #: ``target``: ``{"ra", "dec"}`` deg and proper motion; ``site``, for
     #: differential refraction). None: guide on the target itself.
     guide_offset: dict[str, Any] | None = None
+    #: A moving target (an OCS ORBITAL_ELEMENTS target; docs/moving_targets.md):
+    #: ``orbit`` (:meth:`robofast.orbit.Orbit.to_dict`) and ``site``
+    #: (``latitude``, ``longitude`` deg E, ``elevation`` m). The sequencer
+    #: points at its place at each exposure's middle and, where the mount
+    #: can set them, tracks at its rates. None: a sidereal target.
+    follow: dict[str, Any] | None = None
     #: What to do on the target: ``"expose"`` (``count`` frames),
     #: ``"autofocus"`` (focus the telescope there: :mod:`robofast.autofocus`;
     #: ``exptime`` and ``count`` come from the telescope's autofocus config),
@@ -178,6 +184,8 @@ class Observation:
                 raise ValueError(f"observation {self.name!r}: guide_offset without guide")
             if not isinstance(self.guide_offset, dict) or "target" not in self.guide_offset:
                 raise ValueError(f"observation {self.name!r}: guide_offset needs its target")
+        if self.follow is not None:
+            _check_follow(self)
         for f in _KIND_FIELDS:
             if getattr(self, f) is None or f in kind.fields:
                 continue
@@ -195,6 +203,25 @@ class Observation:
         if unknown:
             raise ValueError(f"observation {d.get('name')!r}: unknown keys {sorted(unknown)}")
         return cls(**d)
+
+
+def _check_follow(obs: Observation) -> None:
+    """A moving target's ``follow``: a light, unguided ``expose`` whose
+    orbit and site parse (so a plan file's mistake fails at load)."""
+    from robofast.orbit import Orbit
+
+    what = f"observation {obs.name!r}: follow"
+    f = obs.follow
+    if not isinstance(f, dict) or set(f) != {"orbit", "site"}:
+        raise ValueError(f"{what}: expected {{'orbit', 'site'}}")
+    if obs.kind != "expose" or not obs.light or obs.guide:
+        raise ValueError(f"{what}: only for an unguided light 'expose'")
+    try:
+        Orbit(**f["orbit"])
+        site = f["site"]
+        float(site["latitude"]), float(site["longitude"])
+    except (TypeError, KeyError, ValueError) as exc:
+        raise ValueError(f"{what}: {exc}") from None
 
 
 #: Observation fields that belong to one kind or a few (each kind's

@@ -69,13 +69,14 @@ import logging
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, ClassVar
 
 from robofast.instruments import instrument_params
 from robofast.kinds import ObservationKind, kind_for_request, request_types
+from robofast.orbit import Orbit
 from robofast.plugins import Registry
 
 log = logging.getLogger(__name__)
@@ -242,10 +243,19 @@ def _text(value: Any) -> str | None:
     return None if value is None or value == "" else str(value)
 
 
+#: The configuration types that take an ORBITAL_ELEMENTS target.
+MOVING_TYPES = ("EXPOSE",)
+
+
 @dataclass
 class Target:
     """A sidereal (OCS ``ICRS``) target: ``ra`` and ``dec`` in degrees at
-    ``epoch``.
+    ``epoch``; or a comet or minor planet (OCS ``ORBITAL_ELEMENTS``), whose
+    ``orbit`` (:class:`robofast.orbit.Orbit`) gives its place at a time.
+    An orbital target's ``ra`` and ``dec`` are its place at the last
+    :meth:`update_place` (the dispatch scheduler's, at each decision), so
+    every reader of a sidereal target's coordinates reads the moving one's
+    too; the sequencer recomputes the place at each exposure.
 
     The astrometry after ``dec`` is optional. Scheduling ignores it; a
     spectrum's barycentric correction (:mod:`robofast.spectra`) uses it:
@@ -266,6 +276,7 @@ class Target:
     epoch: float | None = None
     parallax: float | None = None
     rv: float | None = None
+    orbit: Orbit | None = None
 
     #: Python name: (JSON name, range).
     _ASTROMETRY: ClassVar[dict[str, tuple[str, tuple[float, float]]]] = {
@@ -284,14 +295,31 @@ class Target:
     def dec_deg(self) -> float:
         return self.dec
 
+    @property
+    def moving(self) -> bool:
+        """An orbital-elements target (its place changes with time)."""
+        return self.orbit is not None
+
+    def update_place(self, when: datetime, location: Any = None) -> None:
+        """Set an orbital target's ``ra``/``dec`` to its place at ``when``
+        from ``location`` (an astropy ``EarthLocation``; None: geocentric).
+        A sidereal target is left as it is."""
+        if self.orbit is not None:
+            self.ra, self.dec = self.orbit.place(when, location)
+
     @classmethod
     def from_dict(cls, d: Any, what: str) -> Target:
+        ttype = d.get("type") or "ICRS" if isinstance(d, dict) else "ICRS"
+        if ttype == "ORBITAL_ELEMENTS":
+            return cls._from_orbital(d, what)
         keys = {"type", "name", "ra", "dec", "extra_params"}
         keys |= {j for j, _ in cls._ASTROMETRY.values()}
         _check_keys(d, keys, {"name", "ra", "dec"}, what)
-        ttype = d.get("type") or "ICRS"
         if ttype != "ICRS":
-            raise ValueError(f"{what}.type: {ttype!r}; robofast takes only ICRS (sidereal) targets")
+            raise ValueError(
+                f"{what}.type: {ttype!r}; robofast takes ICRS (sidereal) and"
+                " ORBITAL_ELEMENTS targets"
+            )
         extra = _extra(d, {"radial_velocity"}, what)
         kw = {
             py: _number(d[js], f"{what}.{js}", *rng)
@@ -310,7 +338,21 @@ class Target:
             **kw,
         )
 
+    @classmethod
+    def _from_orbital(cls, d: dict[str, Any], what: str) -> Target:
+        """An OCS ``ORBITAL_ELEMENTS`` target (robofast.orbit's schemes)."""
+        keys = {"type", "name", "scheme", "extra_params", *Orbit.RANGES}
+        _check_keys(d, keys, {"name", "scheme"}, what)
+        _extra(d, set(), what)
+        orbit = Orbit.from_target(d, what, _number)
+        # The place at the elements' epoch until the scheduler sets it.
+        epoch = datetime(1858, 11, 17, tzinfo=UTC) + timedelta(days=orbit.epochofel)
+        ra, dec = orbit.place(epoch)
+        return cls(str(d["name"]), ra, dec, orbit=orbit)
+
     def to_dict(self) -> dict[str, Any]:
+        if self.orbit is not None:
+            return {"type": "ORBITAL_ELEMENTS", "name": self.name, **self.orbit.to_dict()}
         d: dict[str, Any] = {"type": "ICRS", "name": self.name, "ra": self.ra, "dec": self.dec}
         for py, (js, _) in self._ASTROMETRY.items():
             if getattr(self, py) is not None:
@@ -650,9 +692,24 @@ class Configuration:
                     " configurations"
                 )
         instrument = _text(d.get("instrument_type"))
+        target = Target.from_dict(d["target"], f"{what}.target")
+        if target.moving:
+            # The sequencer follows a moving target by re-pointing between
+            # exposures (and by the mount's rates, where it has them); a
+            # guider holding the field or a fiber would fight that.
+            if ctype not in MOVING_TYPES:
+                raise ValueError(
+                    f"{what}.type: {ctype!r} with an ORBITAL_ELEMENTS target; robofast follows"
+                    f" a moving target for {', '.join(MOVING_TYPES)} only"
+                )
+            if guide:
+                raise ValueError(
+                    f"{what}.guiding_config.mode: ON with an ORBITAL_ELEMENTS target; robofast"
+                    " follows a moving target unguided (send OFF)"
+                )
         return cls(
             str(d["id"]),
-            Target.from_dict(d["target"], f"{what}.target"),
+            target,
             instrument,
             parsed,
             Constraints.from_dict(d.get("constraints"), f"{what}.constraints"),

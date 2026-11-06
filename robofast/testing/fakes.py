@@ -180,6 +180,37 @@ class FakeTelescope(FakeDevice):
         self.DriverInfo = "FakeTelescope 1.0"
         self.Altitude = 60.0
         self.Azimuth = 120.0
+        #: ASCOM tracking-rate offsets (set only where the Can... say so).
+        self.CanSetRightAscensionRate = False
+        self.CanSetDeclinationRate = False
+        self._ra_rate = 0.0
+        self._dec_rate = 0.0
+        #: Every rate set, in order: (RightAscensionRate, DeclinationRate).
+        self.rate_log: list[tuple[str, float]] = []
+        #: Every SlewToCoordinatesAsync, in order: (ra hours, dec deg).
+        self.slews: list[tuple[float, float]] = []
+
+    @property
+    def RightAscensionRate(self) -> float:
+        return self._ra_rate
+
+    @RightAscensionRate.setter
+    def RightAscensionRate(self, value: float) -> None:
+        if not self.CanSetRightAscensionRate:
+            raise FakeDeviceError("PropertyNotImplemented: RightAscensionRate")
+        self._ra_rate = float(value)
+        self.rate_log.append(("ra", self._ra_rate))
+
+    @property
+    def DeclinationRate(self) -> float:
+        return self._dec_rate
+
+    @DeclinationRate.setter
+    def DeclinationRate(self, value: float) -> None:
+        if not self.CanSetDeclinationRate:
+            raise FakeDeviceError("PropertyNotImplemented: DeclinationRate")
+        self._dec_rate = float(value)
+        self.rate_log.append(("dec", self._dec_rate))
 
     @property
     def RightAscension(self) -> float:
@@ -228,6 +259,7 @@ class FakeTelescope(FakeDevice):
             raise FakeDeviceError("parked")
         self.ra, self.dec = ra, dec
         self._slew_until = self._now() + self._slew_time
+        self.slews.append((ra, dec))
 
     #: The Alpaca Action that selects an M3 port (None: no port selection);
     #: its parameter is the port name, one of ``ports``.

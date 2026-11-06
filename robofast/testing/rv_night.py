@@ -1248,7 +1248,9 @@ def safety_violations(o: Outcome) -> list[str]:
                 tels = e.detail["telescopes"]
                 if not tels or not all(guiding.get(t) for t in tels):
                     bad.append(f"{tag}: spectrum {e.detail['spectrum']} started unguided: {tels}")
-    # 3. Every abort before park, in each cleanup.
+    # 3. Every abort before park, in each cleanup: a telescope's camera
+    #    before that telescope parks (the telescopes clean up in parallel),
+    #    the spectrograph (fed by all of them) before any parks.
     for tag, tl in o.timelines.items():
         for start in tl.events("cleanup_start", SEQUENCER):
             gen = start.detail["gen"]
@@ -1257,19 +1259,24 @@ def safety_violations(o: Outcome) -> list[str]:
             )
             t_end = done.t if done else float("inf")
             span = [e for e in tl.entries() if start.t <= e.t <= t_end]
-            parks = [
-                e.t
-                for e in span
-                if e.kind == "command" and e.what == "Park" and e.outcome == "sent"
+            parks: dict[str, float] = {}
+            aborts: dict[str, float] = {}
+            spec_aborts = [
+                e.t for e in span if e.kind == "event" and e.what == "spectrograph_aborted"
             ]
-            aborts = [
-                e.t
-                for e in span
-                if (e.kind == "command" and e.what in ("AbortExposure", "StopExposure"))
-                or (e.kind == "event" and e.what == "spectrograph_aborted")
-            ]
-            if parks and aborts and max(aborts) > min(parks):
-                bad.append(f"{tag} cleanup #{gen}: an abort after a park")
+            for e in span:
+                if e.kind != "command" or e.device is None:
+                    continue
+                tel = e.device.split(".")[0]
+                if e.what == "Park" and e.outcome == "sent":
+                    parks[tel] = min(parks.get(tel, e.t), e.t)
+                elif e.what in ("AbortExposure", "StopExposure"):
+                    aborts[tel] = max(aborts.get(tel, e.t), e.t)
+            late = sorted(t for t, at in aborts.items() if t in parks and at > parks[t])
+            if parks and spec_aborts and max(spec_aborts) > min(parks.values()):
+                late.append("spectrograph")
+            if late:
+                bad.append(f"{tag} cleanup #{gen}: an abort after a park ({', '.join(late)})")
     # 4. Every park before close: at each CLOSE command after the roof had
     #    opened, every mount's last motion was a park, completed.
     opened = False

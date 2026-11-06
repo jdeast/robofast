@@ -282,6 +282,7 @@ from robofast.autofocus import (
     publish_result,
     term_source,
 )
+from robofast.camera_state import CAMERA_IDLE, image_ready
 from robofast.cancel import stop_task
 from robofast.clock import Clock, real_clock
 from robofast.imagebytes import ImageArray, fits_order
@@ -323,7 +324,6 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
-CAMERA_IDLE = 0  # ASCOM CameraState.cameraIdle
 #: A pointing run's settings (docs/pointing_model.md): the telescope's
 #: ``pointing.run`` entry and an observation's ``pointing`` override them.
 POINTING_RUN_DEFAULTS: dict[str, Any] = {
@@ -2054,7 +2054,7 @@ class Sequencer:
                         ids=self._ids(unit.name),
                     )
                 await self._wait_for(
-                    lambda: cam.get("ImageReady"), bool, obs.exptime + cfg.readout_margin
+                    lambda: image_ready(cam.get), bool, obs.exptime + cfg.readout_margin
                 )
                 frame: Any = i
                 if exposure is not None:
@@ -2572,7 +2572,7 @@ class Sequencer:
                     ids=self._ids(unit.name),
                 )
             await self._wait_for(
-                lambda: cam.get("ImageReady"), bool, exptime + self.config.readout_margin
+                lambda: image_ready(cam.get), bool, exptime + self.config.readout_margin
             )
             if exposure is not None:
                 assert imaging is not None
@@ -3097,7 +3097,7 @@ class Sequencer:
                         ids=self._ids(unit.name),
                     )
                 await self._wait_for(
-                    lambda: cam.get("ImageReady"), bool, exptime + cfg.readout_margin
+                    lambda: image_ready(cam.get), bool, exptime + cfg.readout_margin
                 )
                 if exposure is not None:
                     assert imaging is not None

@@ -30,6 +30,7 @@ from typing import Any
 
 import numpy as np
 
+from robofast.camera_state import image_ready
 from robofast.guider.base import (
     ROI,
     Clock,
@@ -114,7 +115,7 @@ class AlpacaCamera:
         t_start = self.clock.now()
         await d.call("StartExposure", exposure, True, timeout=self.timeout)
         deadline = t_start + exposure + self.timeout
-        while not await d.get("ImageReady", timeout=self.timeout):
+        while not await image_ready(lambda m: d.get(m, timeout=self.timeout)):
             if self.clock.now() > deadline:
                 raise GuiderError(f"{self.name}: no image within {exposure + self.timeout:.1f} s")
             await self.clock.sleep(self.poll)

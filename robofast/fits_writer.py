@@ -27,8 +27,10 @@ Times are UTC from the camera: ``DATE-OBS`` is the camera's
 ``EXPTIME`` its ``LastExposureDuration``. Nothing is ever derived from
 local time plus an offset (the legacy ``fix_fits.py`` assumed UTC = local +
 7 h and rewrote raw files in place; neither happens here). If the camera
-does not report a start time, the host's UTC time of ``StartExposure`` is
-used and ``TIMESRC`` says so.
+does not report a start time, or reports one more than
+:data:`MAX_CLOCK_SKEW` from the host's (NTP) time of ``StartExposure`` (a
+PC clock that drifted, or a driver reporting local time), the host's time
+is used and ``TIMESRC`` says so; ``CLKSKEW`` still records the camera's.
 
 Registry values (:mod:`robofast.registry`) go in under their own
 keywords, units in the comments. A stale value is written *undefined*, with
@@ -58,6 +60,11 @@ from robofast.plan_record import night_of
 from robofast.registry import Snapshot, Value
 
 log = logging.getLogger(__name__)
+
+#: [s] Largest believable ``LastExposureStartTime - DATE-CMD``. Beyond it
+#: the camera's clock is wrong (MINERVA 2026-11-05: an Andor driver on a
+#: PC 30 s fast reported local time, 7 h off) and the host's time is used.
+MAX_CLOCK_SKEW = 5.0
 
 #: Order of the registry scopes in a header (then the per-telescope ones).
 _SCOPE_ORDER = ("site", "software", "enclosure", "weather", "sky")
@@ -267,7 +274,8 @@ def build_header(
 
     # Times: the camera's, in UTC.
     cam_start = parse_camera_time(get(cam + "last_start", end))
-    if cam_start is not None:
+    skew = None if cam_start is None else (cam_start - info.host_start).total_seconds()
+    if cam_start is not None and skew is not None and abs(skew) <= MAX_CLOCK_SKEW:
         date_obs, timesrc = cam_start, "camera"
     else:
         date_obs, timesrc = info.host_start.astimezone(UTC), "host"
@@ -287,9 +295,8 @@ def build_header(
     _card(h, "DATE-CMD", iso_ms(info.host_start), "Host UTC when StartExposure was sent")
     _card(h, "EXPTIME", float(exptime), "[s] Exposure time (camera)")
     _card(h, "EXPREQ", float(info.exptime_requested), "[s] Requested exposure time")
-    if cam_start is not None:
-        skew = (cam_start - info.host_start).total_seconds()
-        _card(h, "CLKSKEW", round(skew, 3), "[s] DATE-OBS minus DATE-CMD")
+    if skew is not None:
+        _card(h, "CLKSKEW", round(skew, 3), "[s] Camera start time minus DATE-CMD")
 
     # What it is.
     _card(h, "OBJECT", info.object, "Target name")

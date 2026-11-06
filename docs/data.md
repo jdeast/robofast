@@ -95,9 +95,12 @@ All times are UTC. `DATE-OBS` is the camera's `LastExposureStartTime`,
 which ASCOM defines as UTC. It is written with milliseconds: `CCYY-MM-DDThh:mm:ss.sss`.
 `EXPTIME` is the camera's `LastExposureDuration`. Nothing is ever computed
 as local time plus an offset. If the camera does not report a start time,
-`DATE-OBS` is the host's UTC time just before `StartExposure` and `TIMESRC`
-is `host`. `DATE-CMD` (the host's time when the command was sent) and
-`CLKSKEW` (`DATE-OBS - DATE-CMD`) are always written, so a camera clock
+or reports one more than 5 s from the host's time of `StartExposure`
+(`MAX_CLOCK_SKEW`: a Windows PC whose clock drifted, or a driver that reports
+local time, as MINERVA T1's Andor driver does), `DATE-OBS` is the host's UTC
+time just before `StartExposure` and `TIMESRC` is `host`. The host keeps NTP
+time; the camera PCs may not. `DATE-CMD` (the host's time when the command was sent) and
+`CLKSKEW` (the camera's start time minus `DATE-CMD`) are always written, so a camera clock
 that drifts is visible. Some cameras report whole seconds (OmniSim does),
 which makes `CLKSKEW` negative by up to a second.
 
@@ -131,7 +134,7 @@ name the snapshot that a value comes from.
 | `TIMESRC` | | `camera` or `host` (see Times) |
 | `MJD-OBS`, `JD` | derived | at `DATE-OBS`, UTC |
 | `DATE-CMD` | host | UTC when `StartExposure` was sent |
-| `CLKSKEW` | derived | [s] `DATE-OBS - DATE-CMD` |
+| `CLKSKEW` | derived | [s] camera start time - `DATE-CMD` |
 | `EXPTIME` | camera | [s] `LastExposureDuration` (requested time if absent) |
 | `EXPREQ` | plan | [s] requested exposure time |
 | `OBJECT` | plan | target name |

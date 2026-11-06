@@ -150,6 +150,20 @@ def test_header_without_a_camera_time_uses_the_host_clock():
     assert h["DATE-OBS"] == "2026-11-14T05:06:07.891" and h["TIMESRC"] == "host"
 
 
+@pytest.mark.parametrize("offset", [timedelta(hours=-7), timedelta(seconds=30)])
+def test_a_camera_clock_far_off_the_hosts_is_not_used(offset):
+    # MINERVA T1, 2026-11-05: local time (7 h off) from a PC 30 s fast.
+    r = registry()
+    cam_start = T0 + offset + timedelta(seconds=0.2)
+    r.publish(
+        "t1.camera.last_start", cam_start.strftime("%Y-%m-%dT%H:%M:%S.%f"), max_age=60, measured=T0
+    )
+    h, date_obs = fw.build_header(info(r), (48, 32))
+    assert h["TIMESRC"] == "host" and h["DATE-OBS"] == "2026-11-14T05:06:07.891"
+    assert date_obs == T0
+    assert h["CLKSKEW"] == pytest.approx((cam_start - T0).total_seconds(), abs=1e-3)
+
+
 def test_parse_camera_time_variants():
     assert fw.parse_camera_time("2026-01-02T03:04:05") == datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
     assert fw.parse_camera_time("2026-01-02T03:04:05.5Z").microsecond == 500000

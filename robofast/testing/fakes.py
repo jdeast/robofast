@@ -279,13 +279,17 @@ class FakeFilterWheel(FakeDevice):
 class FakeCamera(FakeDevice):
     """A camera whose image is ``NumX x NumY`` UInt16 pixels (value: the
     exposure number), with the state members the frame pipeline reads.
-    ``image_error`` makes ``ImageArray`` raise; ``download_time`` delays it."""
+    ``image_error`` makes ``ImageArray`` raise; ``download_time`` delays it.
+    ``stale_ready`` acts like Andor's ASCOM driver: ``ImageReady`` stays true
+    (the previous image) while the next exposure runs."""
 
     def __init__(self, numx: int = 32, numy: int = 24) -> None:
         super().__init__()
         self._state = 0
         self._ends = 0.0
         self._ready = False
+        self._image = 0  # the exposure number of the image held
+        self.stale_ready = False
         self.exposures_started = 0
         self.exposures_aborted = 0
         self.Name = "FakeCamera"
@@ -321,7 +325,7 @@ class FakeCamera(FakeDevice):
         if not self._ready:
             raise FakeDeviceError("no image available")
         self.downloads += 1
-        data = np.full((self.NumX, self.NumY), self.exposures_started, dtype="<u2")
+        data = np.full((self.NumX, self.NumY), self._image, dtype="<u2")
         data[self.NumX - 1, 0] = 1000  # x = last, y = 0: FITS row 0, last column
         return ImageArray(data, 8, "imagebytes", data.nbytes + 44)
 
@@ -334,6 +338,7 @@ class FakeCamera(FakeDevice):
         if self._state == 2 and self._now() >= self._ends:
             self._state = 0
             self._ready = True
+            self._image = self.exposures_started
 
     @property
     def CameraState(self) -> int:
@@ -350,7 +355,7 @@ class FakeCamera(FakeDevice):
         if self._state != 0:
             raise FakeDeviceError("camera busy")
         self._state = 2
-        self._ready = False
+        self._ready = self._ready and self.stale_ready
         self._ends = self._now() + duration
         self.exposures_started += 1
         start = self.clock()
@@ -369,6 +374,7 @@ class FakeCamera(FakeDevice):
         if self._state != 0:
             self._state = 0
             self._ready = True
+            self._image = self.exposures_started
 
 
 class FakeWeather:

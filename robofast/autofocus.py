@@ -74,6 +74,7 @@ from typing import Any
 
 import numpy as np
 
+from robofast.camera_state import image_ready
 from robofast.focusfit import (
     FitError,
     fit_hyperbola,
@@ -618,7 +619,7 @@ def camera_exposer(
     async def expose(exptime: float) -> np.ndarray:
         await cam.call("StartExposure", exptime, True)
         async with asyncio.timeout(exptime + readout_margin):
-            while not await cam.get("ImageReady"):
+            while not await image_ready(cam.get):
                 await asyncio.sleep(poll)
         image = await cam.get("ImageArray", timeout=download_timeout)
         if isinstance(image, ImageArray):

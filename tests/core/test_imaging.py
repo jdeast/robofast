@@ -128,6 +128,26 @@ async def test_frames_are_saved_with_complete_headers_and_reported(make_rig, tmp
     assert len(rig.timeline.events("frame_written")) == 10
 
 
+async def test_a_stale_image_ready_is_not_saved_again(make_rig, tmp_path):
+    # Andor's driver (MINERVA T1, 2026-11-05): ImageReady stays true from the
+    # previous image while the next exposure runs. Each frame must be its own.
+    plan = StaticPlan(
+        [{"name": "field", "ra_hours": 0.7, "dec_deg": 41.3, "exptime": 0.2, "count": 3}],
+        ["t1"],
+    )
+    rig = make_rig(telescopes=1, plan=plan)
+    rig.cams[0].stale_ready = True
+    imaging = attach(rig, tmp_path)
+    await run_night(rig, imaging)
+
+    assert plan.history == [("t1", "field", "complete", 3)]
+    pixels = []
+    for path, _ in headers(tmp_path, "t1"):
+        with fits.open(path) as hdul:
+            pixels.append(int(hdul[0].data[0, 0]))
+    assert pixels == [1, 2, 3]
+
+
 async def test_a_lost_frame_stops_that_telescope_and_alarms(make_rig, tmp_path):
     plan = StaticPlan(
         [

@@ -55,6 +55,7 @@ COVERED = {
     "kiwispec_aux.example.json",
     "request_api.example.json",
     "requests.example.json",
+    "rubin_alerts.example.json",
     "sky.example.json",
     "target_sheet.example.json",
     "targets.example.json",
@@ -140,6 +141,13 @@ async def test_plans_load(tmp_path):
     plan_from_config(_json("aqawan1.json")["plan"], ["t1", "t2"])
     load_request_groups(SITE / "requests.example.json")
     load_request_groups([_json("too.example.json")])
+
+
+def test_rubin_alerts_config_loads():
+    from robofast.rubin_alerts import AlertConfig
+
+    cfg = AlertConfig.from_dict(_json("rubin_alerts.example.json"))
+    assert [r.name for r in cfg.rules] == ["bright transients", "TNOs"]
 
 
 def test_request_api_config_loads(tmp_path):

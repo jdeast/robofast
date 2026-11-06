@@ -714,16 +714,20 @@ have. A ToO that arrives during a weather hold waits; after the reopen the
 telescopes ask the plan afresh and take it first, unless its deadline has
 passed.
 
-**Alert brokers, later.** No broker client yet, only the hook. A small
-separate process will subscribe to a broker that filters the Rubin alert
-stream (ANTARES, Fink, Lasair, ALeRCE, ...) or take triggers from a TOM
-(TOM Toolkit's facility interface, via the REST API), apply the site's own
-filter (brightness, declination, a human in the loop or not), and turn each
-accepted alert into a ToO request group: coordinates, a deadline from the
-science case, a class and a policy. It submits it through the REST API or
-the drop box, and reads its status back for the broker or TOM. Broker
-credentials and alert filtering stay out of the control processes; a
-broker outage costs only ToOs, never the night.
+**Alert brokers.** `robofast/rubin_alerts.py` turns a Rubin alert (the LSST
+alert schema, v11, as a broker delivers it) into a ToO request group and
+submits it through the REST API (`POST /api/toos`, a token with the `too`
+scope). Which alerts pass is the operator's config
+(`sites/minerva/rubin_alerts.example.json`): rules tried in order, each a
+`match` (sidereal or Solar System, declination, magnitude, band, semimajor
+axis, designations) and the ToO it makes (exposures, telescopes, policy,
+class, deadline); an alert no rule takes is logged and dropped. A Solar
+System alert becomes an `ORBITAL_ELEMENTS` target from the alert's own MPC
+orbit (checked against JPL Horizons: Eris, Sedna and Quaoar within 0.23"),
+observed only by a mount that can track it. Today it reads alert files; a
+broker subscription (ANTARES, Fink, Lasair, ALeRCE) or a TOM trigger feeds
+it the same alerts later. Broker credentials and alert filtering stay out
+of the control processes; a broker outage costs only ToOs, never the night.
 
 ### 3.8 State, telemetry and alarms
 

@@ -1,0 +1,40 @@
+{
+  "_note": [
+    "Which Rubin alerts MINERVA follows as targets of opportunity (robofast/rubin_alerts.py): rules tried in",
+    "order, the first match makes the ToO; no match, the alert is dropped (logged). The token needs the 'too'",
+    "scope (python -m robofast.request_api tokens add ... --scope too). TNOs: a moving target is observed only",
+    "by a mount that can track it (PWI4's rates; not PWI2): until then MINERVA's telescopes refuse it."
+  ],
+  "api": {"url": "http://127.0.0.1:8300", "token_file": "/etc/robofast/rubin-alerts.token", "enclosure": "aqawan1"},
+  "proposal": "rubin-too",
+  "rules": [
+    {
+      "name": "bright transients",
+      "match": {"kind": "sidereal", "max_mag": 17.0, "dec": [-35.0, 80.0], "bands": ["g", "r", "i"]},
+      "too": {
+        "observation_type": "RAPID_RESPONSE",
+        "policy": "now-after-readout",
+        "priority_class": 2,
+        "deadline_hours": 6,
+        "telescopes": ["t1", "t2"],
+        "instrument_type": "imager",
+        "exposure_time": 120.0,
+        "exposure_count": 5
+      }
+    },
+    {
+      "name": "TNOs",
+      "match": {"kind": "solar_system", "min_a": 30.0, "max_mag": 21.0, "dec": [-35.0, 80.0]},
+      "too": {
+        "observation_type": "TIME_CRITICAL",
+        "policy": "next",
+        "priority_class": 1,
+        "deadline_hours": 12,
+        "telescopes": ["t1", "t2"],
+        "instrument_type": "imager",
+        "exposure_time": 300.0,
+        "exposure_count": 6
+      }
+    }
+  ]
+}

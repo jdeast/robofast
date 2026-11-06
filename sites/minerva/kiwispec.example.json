@@ -25,8 +25,8 @@
     "switch over. It's all iodine.' lamp_frames is empty, so ThAr and fiber-flat frames are refused.",
     "slit_flat_led false: slit flats are refused (legacy stopped them in 2023, 'Slit flat lamp is dead');",
     "set it true only once the LED is confirmed working. The calibration plan: docs/kiwispec.md, Calibration.",
-    "ccd_temp_max -78: the CCD setpoint is -80 C (JDE 2026-11-05; the cooler cannot reach the old -90 with the",
-    "current coolant), so the refuse-to-expose window is -95..-78.",
+    "ccd_setpoint -80, ccd_operational_temp -75 (JDE 2026-11-05; the cooler cannot reach the old -90 with the",
+    "current coolant): sent to the camera's RAM at every connection; the refuse-to-expose window is -95..-78.",
     "backlight false: the backlight's servo stopped answering (2026-11); the guiders use the fiber positions in",
     "their configs, and the service sends no backlight command."
   ],
@@ -52,6 +52,8 @@
   "camera_restart": true,
   "camera_restart_after": 2,
   "chiller": null,
+  "ccd_setpoint": -80.0,
+  "ccd_operational_temp": -75.0,
   "ccd_temp_max": -78.0,
   "backlight": false
 }

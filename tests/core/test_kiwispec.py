@@ -22,6 +22,7 @@ from robofast.devices.kiwispec_client import (
     FORBIDDEN,
     HEADER_CHUNK,
     HardwareNotAllowed,
+    KiwiSpecError,
     KiwiSpecFailed,
     KiwiSpecProtocolError,
     KiwiSpecRefused,
@@ -34,6 +35,7 @@ from robofast.devices.kiwispec_client import (
     header_chunks,
     parse_camera_status,
     parse_si_packet,
+    si_temp_raw,
 )
 from robofast.devices.kiwispec_service import (
     KiwiSpecConfig,
@@ -884,3 +886,42 @@ def test_lamp_frames_are_checked():
         "dark",
         "bias",
     ]
+
+
+async def test_the_ccd_setpoint_is_sent_at_every_connection(http, sim):
+    """The setpoint and SI's Operational Temp go to the camera's RAM (1045)
+    with the readout set-up, before the first frame; the CCD regulates there."""
+    job = await run_job(http, "/expose", {"kind": "bias", "count": 1})
+    assert job["state"] == "done", job
+    assert sim.config_params == {
+        "CCD Temperature Setpoint": si_temp_raw(-80.0),
+        "Operational Temp": si_temp_raw(-75.0),
+    }
+    assert sim.ccd_temp() == pytest.approx(-80.0, abs=0.06)
+
+
+async def test_an_unknown_configuration_parameter_is_refused(sim):
+    cam = SICameraClient("127.0.0.1", sim.camera_port, command_timeout=1.0)
+    try:
+        with pytest.raises(KiwiSpecError, match="6003"):
+            await cam.set_config_param("Temperature Setpoint", 1931)
+        assert sim.config_params == {}
+    finally:
+        await cam.close()
+
+
+def test_si_temperatures_are_tenths_of_a_kelvin():
+    assert si_temp_raw(-80.0) == 1931 and si_temp_raw(-90.15) == 1830
+    assert si_temp_raw(-75.0) == 1981
+
+
+@pytest.mark.parametrize(
+    ("over", "error"),
+    [
+        ({"ccd_setpoint": -80.0, "ccd_temp_max": -85.0}, "inside ccd_temp_min"),
+        ({"ccd_setpoint": -80.0, "ccd_operational_temp": -82.0}, "above ccd_setpoint"),
+    ],
+)
+def test_ccd_temperature_settings_are_checked(sim, over, error):
+    with pytest.raises(ValueError, match=error):
+        service_config(sim, **over)

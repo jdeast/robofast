@@ -89,6 +89,7 @@ from robofast.devices.kiwispec_client import (
     FN_SET_ACQ_MODE,
     FN_SET_ACQ_TYPE,
     FN_SET_CCD_FORMAT,
+    FN_SET_CONFIG_PARAM,
     FN_SET_COOLER,
     FN_SET_EXPTIME,
     FN_SET_READOUT_MODE,
@@ -119,6 +120,10 @@ UNDEFINED = frozenset(
 FAULTS = frozenset(
     {"hang", "garble", "drop", "camera_hang", "camera_wedged", "ccd_warm", "stage_stuck"}
 )
+
+
+#: The SI Configuration parameter names the simulator takes (SI's own: 6260C.cfg).
+SI_CONFIG_PARAMS = ("CCD Temperature Setpoint", "Operational Temp", "Low Temp Limit")
 
 
 @dataclass
@@ -215,6 +220,8 @@ class KiwiSpecSim:
         # heater
         self.heater_on = True
         self.heater_setpoint = c.heater_setpoint
+        #: SI Configuration parameters set over TCP (1045), by name.
+        self.config_params: dict[str, int] = {}
         self._heater_temp = c.heater_start
         self._heater_t = now
         # lamps
@@ -285,7 +292,11 @@ class KiwiSpecSim:
     def ccd_temp(self) -> float:
         if "ccd_warm" in self.faults or not self.cooler_on:
             return self.config.ccd_warm_temp
-        return self.config.ccd_temp
+        raw = self.config_params.get("CCD Temperature Setpoint")
+        # Regulated: at the commanded setpoint, unless it cannot cool that far.
+        return (
+            self.config.ccd_temp if raw is None else max(raw / 10.0 - 273.15, self.config.ccd_temp)
+        )
 
     # -- lifecycle --------------------------------------------------------------
 
@@ -774,6 +785,13 @@ class KiwiSpecSim:
             self.cooler_on = bool(params[0])
         elif func in (FN_SET_READOUT_MODE, FN_SET_CCD_FORMAT):
             pass
+        elif func == FN_SET_CONFIG_PARAM:
+            value = struct.unpack(">i", params[:4])[0]
+            name = params[4:].split(b"\0", 1)[0].decode("ascii", "replace")
+            if name not in SI_CONFIG_PARAMS:
+                await self._send(w, self._done(func, err=6003))  # "Parameter not found"
+                return
+            self.config_params[name] = value
         elif func == FN_GET_STATUS:
             # The real camera's form: 16 big-endian float32s (kiwispec_client).
             values = [0.0] * 16

@@ -143,6 +143,7 @@ from robofast.devices.kiwispec_client import (
     SICameraClient,
     SpecServerClient,
     StagePosition,
+    si_temp_raw,
 )
 from robofast.devices.kiwispec_fits import FitsRewriteError, standardize
 from robofast.devices.kiwispec_flux import FluxLog, fau_flux, parse_frames
@@ -328,10 +329,10 @@ class KiwiSpecConfig:
     #: The meter's own reading period (legacy: 1 reading/s).
     expmeter_period: float = 1.0
     expmeter_max_failures: int = 3
-    #: Refuse an exposure with the CCD outside these (C). Legacy setpoint
-    #: -90 C, "operational" -85 C (SI PARAM62, PARAM63).
+    #: Refuse an exposure with the CCD outside these (C); ccd_temp_max above
+    #: ccd_setpoint.
     ccd_temp_min: float = -95.0
-    ccd_temp_max: float = -85.0
+    ccd_temp_max: float = -78.0
     check_ccd_temp: bool = True
     #: Spectrograph pressure threshold (mbar; legacy 0.006), and whether a
     #: pressure above it is an ``"alarm"`` (``/status`` ``alarms``: the
@@ -386,6 +387,13 @@ class KiwiSpecConfig:
     #: The SI camera set-up legacy sent at start (initialize_si).
     readout_mode: int = 3
     ccd_format: tuple[int, int, int, int, int, int] = (50, 2090, 1, 0, 2052, 1)
+    #: The CCD's cooling setpoint and SI's "Operational Temp" (C, its warning
+    #: and popup threshold), sent at every connection with the readout set-up
+    #: (SI Configuration parameters, into the camera's RAM; the EEPROM keeps
+    #: -90 and -85, and is never written). -80 since 2026-11-05: with the
+    #: chiller at 21 C the CCD holds about -80.5 at full cooling (docs/kiwispec.md).
+    ccd_setpoint: float = -80.0
+    ccd_operational_temp: float = -75.0
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> KiwiSpecConfig:
@@ -419,6 +427,11 @@ class KiwiSpecConfig:
             extra = set(raw) - {"dir", "rewrite", "wait"}
             if extra:
                 raise ValueError(f"raw_fits: unknown keys {sorted(extra)}")
+        setpoint = float(d.get("ccd_setpoint", -80.0))
+        if not setpoint < float(d.get("ccd_operational_temp", -75.0)):
+            raise ValueError("ccd_operational_temp must be above ccd_setpoint")
+        if not float(d.get("ccd_temp_min", -95.0)) < setpoint < float(d.get("ccd_temp_max", -78.0)):
+            raise ValueError("ccd_setpoint must be inside ccd_temp_min..ccd_temp_max")
         if d.get("chiller") is not None:
             build_chiller(d["chiller"])  # fail at load, not at the first read
         if d.get("aux") is not None:
@@ -843,6 +856,8 @@ class KiwiSpec:
         c = self.config
         await self.camera.set_readout_mode(c.readout_mode)
         await self.camera.set_ccd_format(*c.ccd_format)
+        await self.camera.set_config_param("CCD Temperature Setpoint", si_temp_raw(c.ccd_setpoint))
+        await self.camera.set_config_param("Operational Temp", si_temp_raw(c.ccd_operational_temp))
         await self.camera.set_cooler(True)
         self._camera_ready = True
 

@@ -226,8 +226,19 @@ bound and every frame an overall bound. It differs from legacy on purpose:
   raw file ("The raw file").
 - **The file name is sent again just before `save_image`**: a server that
   restarted mid-exposure has forgotten it.
+- **The CCD setpoint** (`ccd_setpoint`, default -80 C) and SI's
+  "Operational Temp" (`ccd_operational_temp`, -75 C: SI's warning and popup
+  threshold) are sent at every connection to SI Image, with the readout mode
+  and format: SI function 1045 "Set any Configuration Parameter" (SI Image
+  manual 6.3.15; 1044 sets only Readout & Format parameters, hence its
+  Error 6003). They go to the camera's RAM, in effect until SI Image
+  initializes the camera again (it reads them back from the EEPROM, which
+  keeps -90 and -85 and is never written), so robofast re-sends them each
+  time. Read back with function 1048 (the 32 Readout & Format and 32
+  Configuration parameters; CP14 the setpoint, CP15 Operational Temp, in
+  tenths of a kelvin).
 - **A warm CCD refuses the exposure** (outside `ccd_temp_min..ccd_temp_max`,
-  default -95..-85 C).
+  default -95..-78 C).
 - **Backlight:** with the legacy exposure meter in use, it is paused before
   the backlight goes on and resumed after (legacy had this commented out).
 - **No exposure meter.** The flux record comes from the FAU guide frames
@@ -620,10 +631,10 @@ Answered (JDE, 2026-10-31 to 2026-11-02), and how robofast follows:
    frame (as the simulator assumes), and is the file at `C:/IMAGES/I`
    complete when `Acquire`'s Done arrives? Is the SI header's `TIME` the
    shutter open/close, so the midpoint can be referred to it?
-7. **CCD temperature limits** to refuse an exposure (default -95..-85 C,
-   from PARAM62/PARAM63)? MINERVA's site config uses -95..-78: the setpoint
-   is to be -80 C (JDE 2026-11-05), since the cooler holds about -80.5 with
-   the current coolant (-84 in April 2026; it has not reached the old -90). ~~The pressure alarm~~ **Answered:** 0.006 mbar,
+7. ~~CCD temperature limits~~ **Answered:** the setpoint is -80 C (JDE
+   2026-11-05; the cooler holds about -80.5 at full power with the chiller
+   at 21 C), set by robofast at every connection ("The CCD setpoint"); an
+   exposure is refused outside -95..-78. ~~The pressure alarm~~ **Answered:** 0.006 mbar,
    configurable, and downgradable to a warning while the spectrograph is
    isolated from its pump ("Vacuum").
 8. ~~The PC's clock~~ **MST without daylight saving** (`pc_utc_offset_hours`).

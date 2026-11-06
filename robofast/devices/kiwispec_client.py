@@ -519,6 +519,8 @@ FN_SET_ACQ_TYPE = 1036
 FN_ACQUIRE = 1037
 FN_SET_READOUT_MODE = 1042
 FN_SET_CCD_FORMAT = 1043
+#: Set any Configuration parameter (camera RAM, never the EEPROM; SI manual 6.3.15).
+FN_SET_CONFIG_PARAM = 1045
 FN_SET_COOLER = 1046
 
 HEADER_FMT = ">IBB"  # length, packet id, camera id
@@ -534,6 +536,11 @@ def si_command(func: int, params: bytes = b"") -> bytes:
     """One command packet (camera id 1, as the legacy client always sent)."""
     head = struct.calcsize(COMMAND_FMT)
     return struct.pack(COMMAND_FMT, head + len(params), PKT_COMMAND, 1, func, len(params)) + params
+
+
+def si_temp_raw(celsius: float) -> int:
+    """An SI Configuration temperature: tenths of a kelvin."""
+    return round((celsius + 273.15) * 10.0)
 
 
 def acquire_params() -> bytes:
@@ -796,6 +803,15 @@ class SICameraClient:
 
     async def set_ccd_format(self, so: int, sl: int, sb: int, po: int, pl: int, pb: int) -> None:
         await self.command(FN_SET_CCD_FORMAT, struct.pack(">6i", so, sl, sb, po, pl, pb))
+
+    async def set_config_param(self, name: str, value: int) -> None:
+        """One Configuration parameter by its SI name (``CCD Temperature
+        Setpoint``, ...), into the camera's RAM: in effect until SI Image
+        initializes the camera again (it reads the EEPROM back then), so the
+        service sends it at every connection. Never written to the EEPROM."""
+        await self.command(
+            FN_SET_CONFIG_PARAM, struct.pack(">i", value) + name.encode("ascii") + b"\0"
+        )
 
     async def set_cooler(self, on: bool) -> None:
         await self.command(FN_SET_COOLER, struct.pack(">B", 1 if on else 0))

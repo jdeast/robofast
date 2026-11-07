@@ -147,3 +147,24 @@ def test_runs_where_the_event_loop_has_no_signal_handlers(device, tmp_path, caps
     main(_args(device, tmp_path, "--no-enclosure", "--yes"))
     entry = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["first_light"]
     assert entry["solve"]["solved"]
+
+
+def test_an_enclosure_with_unsafe_weather_stays_closed_and_says_why(device, tmp_path, capsys):
+    from robofast.testing.fakes import FakeDome, FakeSafetyMonitor, FakeWeather
+
+    weather = FakeWeather(safe=False)
+    dome = FakeDome()
+    enclosure = FakeAlpacaServer({"dome": dome, "safetymonitor": FakeSafetyMonitor(weather)})
+    enclosure.start()
+    a = enclosure.address
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main(_args(device, tmp_path, "--dome", f"{a}/0", "--safety-monitor", f"{a}/0",
+                       "--timeout", "15"))  # fmt: skip
+    finally:
+        enclosure.stop()
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "not done after 15 s" in err and "SafetyMonitor.IsSafe=False" in err
+    assert device.camera.exposures_started == 0  # nothing exposed
+    assert dome.state() == 1  # closed

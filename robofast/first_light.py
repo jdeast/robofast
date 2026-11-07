@@ -216,6 +216,8 @@ def _waiting(sup: Any) -> str:
     out = f"the supervisor: {st['reason']}; opening allowed: {st['open_allowed']}"
     if st.get("lease") is None:
         out += "; no lease granted"
+        if sup.alarms:
+            out += f" (its last alarm: {sup.alarms[-1]})"
     hold = sup.config.reopen_hold
     if sup.enclosure and st["safe"] and not st["open_allowed"]:
         out += f" (an enclosure opens after {hold:g} s of safe weather: safety.reopen_hold)"

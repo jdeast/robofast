@@ -51,6 +51,9 @@ or what it must never guess:
 It stops, naming what, when a device cannot report what it needs (a mount
 that does not know its focal length, a camera with no pixel size), when
 more than one telescope answers, and when the operator does not say yes.
+A mount that cannot park gets no lease (the supervisor grants none until
+every telescope reports parked): first light gives up after `--timeout`,
+saying so in the supervisor's words.
 
 ## The catalog
 

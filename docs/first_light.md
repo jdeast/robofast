@@ -61,6 +61,14 @@ saying so in the supervisor's words.
 downloaded on first use and cached; docs/sky.md, "What is downloaded, from
 where"); `--catalog-dir` its cache.
 
+Before the telescope moves, first light downloads the tiles its four
+frames' solves will read (the calibration's three points, laid out as the
+pointing run lays them from `--site` and this computer's clock, and the
+zenith), and says how many: a tile downloaded inside a solve would hold
+the command until it arrived, past `--timeout` and Ctrl-C. `--timeout`
+counts from the start (after the duty question), the download included.
+Once cached, a run downloads nothing.
+
 ## On the simulated telescope
 
 `robofast.testing.sky_device` is a telescope and camera on a simulated
@@ -87,4 +95,4 @@ for them once (`catalog_from_config(...).cone(ra, dec, 0.55)` around each:
 the zenith at that instant's sidereal time, and the calibration's three
 points, `pointmodel.sky_grid`), and every run after renders from it.
 A real camera needs none of this: only the solver reads the catalog, and
-it downloads what it lacks as it solves.
+first light downloads its tiles before it starts (above).

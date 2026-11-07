@@ -344,8 +344,8 @@ def test_frames_that_do_not_solve_are_said_and_stop_it_soon(device, tmp_path, ca
 
 
 def test_first_light_asks_eight_matched_stars_of_a_solve(device, tmp_path):
-    """Jason's solver accepts 4 matched stars by default; a sparse field can
-    then solve falsely (room 118, F12). First light asks 8, for the
+    """The solver accepts 4 matched stars by default; a sparse field can
+    then solve falsely. First light asks 8, for the
     calibration's points and for the first-light frame."""
     from robofast import first_light
 
@@ -447,7 +447,7 @@ class _NeverParks(FakeTelescope):
 
 
 def test_a_mount_that_never_parks_is_named_in_the_last_line(tmp_path, capsys):
-    """Room 118, S1: no lease is granted until every telescope is parked;
+    """No lease is granted until every telescope is parked;
     the last line says so, in the supervisor's words."""
     tel, cam = _NeverParks(), FakeCamera()
     tel.FocalLength = 0.5

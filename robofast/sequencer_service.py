@@ -719,12 +719,15 @@ async def run(
     *,
     status_file: str | Path | None = None,
     status_interval: float = 5.0,
+    handle_signals: bool = True,
 ) -> None:
-    """Run until the plan is done, an operator is needed, or a signal."""
+    """Run until the plan is done, an operator is needed, or a signal
+    (``handle_signals`` false: the caller handles them, and cancels this
+    task to stop it; :mod:`robofast.first_light`)."""
     task = asyncio.current_task()
     assert task is not None
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
+    for sig in (signal.SIGTERM, signal.SIGINT) if handle_signals else ():
         # Windows' loops have none: Ctrl-C reaches asyncio.run, which cancels.
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, task.cancel)

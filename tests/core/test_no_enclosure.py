@@ -254,3 +254,44 @@ async def test_a_killed_supervisor_parks_the_telescope(tmp_path):
         for s in services:
             s.stop()
         server.stop()
+
+
+async def test_a_dead_sequencer_leaves_no_telescope_unparked(tmp_path):
+    """Nothing can close, so a sequencer that dies mid-exposure must not
+    leave the telescope tracking: the supervisor revokes its lease (not
+    renewed) and, when it is not released, parks the telescope itself."""
+    tel, cam = FakeTelescope(), FakeCamera()
+    server = FakeAlpacaServer({"telescope": tel, "camera": cam}).start()
+    a = server.address
+    config = {
+        "name": "classroom",
+        "enclosure": "none",
+        "listen": "127.0.0.1:0",
+        "telescopes": {"t1": {"telescope": f"{a}/0", "camera": f"{a}/0"}},
+        "safety": {**SAFETY, "park_wait": 4.0},
+    }
+    services = []
+    try:
+        sup = SupervisorProcess(config, tmp_path)
+        services.append(sup)
+        async with httpx.AsyncClient(trust_env=False) as client:
+            r = await client.post(f"{sup.url}/duty", json={"operator": "teacher", "op": "on"})
+            r.raise_for_status()
+        config.update(
+            sequencer_name="seq",
+            supervisor_url=sup.url,
+            sequencer=FAST_SEQ,
+            lease_client=FAST_REMOTE,
+            plan={"type": "static", "targets": [{"name": "target", "exptime": 30, "count": 1000}]},
+        )
+        seq = SequencerProcess(config, tmp_path)
+        services.append(seq)
+        await wait_until(lambda: cam.exposures_started >= 1 and not tel._parked, timeout=30)
+        seq.signal(signal.SIGKILL)
+        # lease_ttl (1 s) to revoke, park_wait / 2 for its cleanup, then the park
+        t = await wait_until(lambda: tel._parked, timeout=15)
+        assert t < 1.0 + 4.0 + 5.0, t
+    finally:
+        for s in services:
+            s.stop()
+        server.stop()

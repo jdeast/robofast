@@ -32,6 +32,12 @@ enclosure"):
   when the operator goes off duty, when the duty is not renewed
   (`duty_ttl`, then `duty_grace`), when the lease is not renewed, and when
   the supervisor stops.
+* If the sequencer cannot park (it died, or its cleanup does not finish),
+  its lease is revoked and not released: the supervisor then parks the
+  telescopes itself, with a critical alarm: at once when the lease lapsed
+  (not renewed: the sequencer is silent), after `safety.park_wait / 2` for
+  the sequencer's own cleanup otherwise. Nothing closes over them, so no one
+  else would.
 * A lease is granted only once every telescope reports parked, and a dead
   sequencer's lease is recovered only once every telescope reports parked
   (with an enclosure: once it is closed).

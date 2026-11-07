@@ -91,22 +91,26 @@ while it runs that way (the morning report lists them).
 
 No enclosure
 ------------
-A telescope with no dome and no roof (a classroom telescope on a tripod)
-has nothing to open or close, and no safety monitor: ``dome`` and
+A telescope with no dome and no roof (a classroom telescope on a tripod) has
+nothing to open or close, and no safety monitor: ``dome`` and
 ``safety_monitor`` both None (the enclosure config's ``"enclosure":
 "none"``, :mod:`robofast.supervisor_service`). Its sky is always open, so
-the supervisor's one safety action is the lease: it grants one only while
-an operator is on duty (the ``attended_only`` floor, which may not be
-lowered), and revokes it, so the sequencer stops and parks, when the
-operator goes off duty, the duty expires, the lease is not renewed or
-the supervisor stops. Nobody reads the weather: the operator on duty
-judges the sky, and ``reason`` says so (:data:`NO_ENCLOSURE_TEXT`). A
-hardware heartbeat, ``fault_action``, ``park_before_close``, an
-unattended opt-in, observing conditions and a mode that only watches the
-enclosure need an enclosure, and are refused; so is any mode that may
-observe with nobody on duty, and a supervisor with no telescopes. A lease
-of a dead sequencer is recovered once every telescope reports parked (with
-an enclosure: once it is closed).
+the supervisor's one safety action is the lease: it grants one only while an
+operator is on duty (the ``attended_only`` floor, which may not be lowered),
+and revokes it, so the sequencer stops and parks, when the operator goes off
+duty, the duty expires, the lease is not renewed or the supervisor stops. A
+lease revoked and not released (a sequencer that died, or does not clean up)
+leaves no one to park: the supervisor parks the telescopes itself, as it
+does before a roll-off roof closes: at once for a lease that lapsed (not
+renewed: its sequencer is silent), after ``park_wait / 2`` for the cleanup
+otherwise; a critical alarm either way. Nobody reads the weather: the
+operator on duty judges the sky, and ``reason`` says so
+(:data:`NO_ENCLOSURE_TEXT`). A hardware heartbeat, ``fault_action``,
+``park_before_close``, an unattended opt-in, observing conditions and a mode
+that only watches the enclosure need an enclosure, and are refused; so is
+any mode that may observe with nobody on duty, and a supervisor with no
+telescopes. A lease of a dead sequencer is recovered once every telescope
+reports parked (with an enclosure: once it is closed).
 
 Operating modes
 ---------------
@@ -597,6 +601,9 @@ class SafetySupervisor:
         self._closing_since: float | None = None
         self._opening_since: float | None = None
         self._parked_for_close = False
+        #: The id of the last lease revoked for not being renewed (its holder
+        #: is silent: no cleanup will come; "No enclosure" in the module doc).
+        self._lapsed: int | None = None
         #: The park-before-close interlock (``require_park_before_close``):
         #: an operator's emergency close (why; cleared once closed), and a
         #: routine close held back by unparked telescopes (why, since when,
@@ -1426,6 +1433,7 @@ class SafetySupervisor:
         lease = self._lease
         if lease is not None and lease.live and lease.expired(now):
             self._revoke_lease(f"lease not renewed within {lease.ttl} s")
+            self._lapsed = lease.id  # its holder is not heard from
         orphaned_for = self._orphan_age(now)
         if lease is not None and orphaned_for is not None and orphaned_for > cfg.orphan_timeout:
             self._alarm(
@@ -1436,6 +1444,7 @@ class SafetySupervisor:
         self._note_would_open(now)
         if not self.enclosure:
             self._open_sky(now)
+            await self._park_orphaned()
         elif self._watching():
             await self._watch()
         elif self._want_open(now):
@@ -1450,8 +1459,35 @@ class SafetySupervisor:
         if lease is None or not lease.live:
             self._emergency_close = None  # its revocation was the whole close
         if self._want_open(now) and lease is not None and not lease.opened.is_set():
+            self._parked_for_close = False
             lease.opened.set()
             self.timeline.event(self.name, "sky_open", lease=lease.id, reason=NO_ENCLOSURE_TEXT)
+
+    async def _park_orphaned(self) -> None:
+        """No enclosure: a lease revoked and not released (its sequencer dead
+        or stuck) leaves no one to park the telescopes, and nothing closes
+        over them: the supervisor parks them itself, as before a roll-off
+        roof closes (:meth:`_park_before_close`), once per lease, with an
+        alarm at once. A lease that lapsed (not renewed: its holder is not
+        heard from) is parked at once; one revoked for another reason gives
+        the sequencer's cleanup ``park_wait / 2`` first."""
+        lease = self._lease
+        if (
+            lease is None
+            or lease.live
+            or lease.released.is_set()
+            or not lease.opened.is_set()
+            or self._parked_for_close
+        ):
+            return
+        lapsed = self._lapsed == lease.id
+        self._alarm(
+            f"lease #{lease.id} ({lease.holder}) revoked and not released"
+            f"{' (not renewed: its sequencer is silent)' if lapsed else ''}: no enclosure,"
+            " so the supervisor parks the telescopes",
+            "critical",
+        )
+        await self._park_before_close(wait_cleanup=not lapsed)
 
     def _note_would_open(self, now: float) -> None:
         """A mode that may not open: record when it *would* open or close
@@ -1584,13 +1620,13 @@ class SafetySupervisor:
                 shutter=None if status is None else Shutter(status).name,
             )
 
-    async def _park_before_close(self) -> None:
+    async def _park_before_close(self, *, wait_cleanup: bool = True) -> None:
         """Roll-off roofs: give the sequencer's cleanup a bounded chance to
-        park, then park every telescope ourselves (in parallel), then close
-        regardless."""
+        park (``wait_cleanup``), then park every telescope ourselves (in
+        parallel), then close regardless."""
         cfg = self.config
         lease = self._lease
-        if lease is not None and not lease.released.is_set():
+        if wait_cleanup and lease is not None and not lease.released.is_set():
             try:
                 await asyncio.wait_for(lease.released.wait(), cfg.park_wait / 2)
             except TimeoutError:

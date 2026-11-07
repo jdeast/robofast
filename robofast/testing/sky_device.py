@@ -14,7 +14,10 @@ management API (:class:`~robofast.testing.alpaca_server.FakeAlpacaServer`),
 and reports the ``FocalLength`` and ``PixelSizeX``/``PixelSizeY`` that give
 its sky's plate scale, so :mod:`robofast.discover` reads them. The mount
 points with ``--pointing-error`` (TPOINT terms, arcsec), which a pointing
-run measures. It prints one JSON line (its address and discovery port) and
+run measures. ``--time`` holds its sky at one UTC instant (its mount's
+sidereal time and the stars it shows), so every run sees the same fields:
+the way to fill a real catalog's cache once and render from it after. It
+prints one JSON line (its address, discovery port and process id) and
 serves until stopped; it is a registered robofast simulator, so the
 hardware gate accepts it.
 
@@ -36,6 +39,7 @@ import math
 import os
 import signal
 import threading
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -122,8 +126,10 @@ class SkyDevice:
         host: str = "127.0.0.1",
         port: int = 0,
         discovery_port: int | None = 0,
+        clock: Callable[[], datetime] = now,
     ) -> None:
-        self.mount = SkyMount(now, latitude, longitude, slew_time=0.5)
+        self.clock = clock
+        self.mount = SkyMount(clock, latitude, longitude, slew_time=0.5)
         #: What the mount reports (m): the focal length that, with the
         #: camera's pixels, gives the sky's plate scale.
         self.mount.FocalLength = ARCSEC_PER_UM_PER_MM * pixel_size / plate_scale / 1000.0
@@ -138,7 +144,7 @@ class SkyDevice:
             sky_mag=21.0,
             seeing=2.5,
         )
-        scene = SkyFocusScene(self.sky, self.mount, now, effective_exposure=10.0)
+        scene = SkyFocusScene(self.sky, self.mount, clock, effective_exposure=10.0)
         self.focuser = SimFocuser(position=20000)
         self.camera = StarfieldCamera(self.focuser, scene)
         self.camera.PixelSizeX = self.camera.PixelSizeY = pixel_size
@@ -166,6 +172,12 @@ class SkyDevice:
         self.server.stop()
 
 
+def _held(text: str) -> Callable[[], datetime]:
+    t = datetime.fromisoformat(text)
+    t = t.replace(tzinfo=UTC) if t.tzinfo is None else t.astimezone(UTC)
+    return lambda: t
+
+
 def _terms(text: str) -> dict[str, float]:
     out = {}
     for part in filter(None, text.split(",")):
@@ -180,6 +192,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--catalog-dir", help="the catalog's cache directory")
     ap.add_argument("--site", default="42.38,-71.13", help="LAT,LON (deg north, deg east)")
     ap.add_argument("--pointing-error", default="IH=150,ID=-40,NP=20", help="TPOINT terms, arcsec")
+    ap.add_argument("--time", help="hold the sky at this UTC instant (ISO 8601)")
     ap.add_argument("--listen", default="127.0.0.1:0", help="HOST:PORT for Alpaca")
     ap.add_argument("--discovery-port", type=int, default=32227, help="UDP port (0: any)")
     args = ap.parse_args(argv)
@@ -196,6 +209,7 @@ def main(argv: list[str] | None = None) -> None:
         host=host,
         port=int(port),
         discovery_port=args.discovery_port,
+        clock=_held(args.time) if args.time else now,
     ).start()
     print(
         json.dumps(

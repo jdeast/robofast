@@ -53,8 +53,10 @@ def test_one_command_to_a_solved_first_light_frame(device, tmp_path, capsys):
     assert solve["solved"] and solve["n_matched"] >= 10 and solve["rms"] < 1.0
     target = json.loads((tmp_path / "run" / "observatory.json").read_text())["plan"]["targets"][1]
     off = separation(solve["ra"], solve["dec"], target["ra_hours"] * 15, target["dec_deg"]) * 3600
-    assert off < 5.0, off  # the pointing calibration's model put it on the axis
-    assert set(entry["model"]) >= {"IH", "ID"}
+    # The calibration fits the zero points only (IH, ID): the injected NP
+    # (20") stays uncorrected, so the frame lands within that, not on the axis.
+    assert off < 25.0, off
+    assert set(entry["model"]) == {"IH", "ID"}  # the zero points only
     printed = next(ln for ln in out.splitlines() if ln.startswith("first light frame: "))
     assert Path(printed.removeprefix("first light frame: ")).is_file()  # the printed path opens
     assert device.mount.AtPark  # parked at the end

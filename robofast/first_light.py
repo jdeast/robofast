@@ -137,7 +137,8 @@ def first_light_config(
                 "kind": "pointing_model",
                 "count": 3,
                 "exptime": exptime,
-                "pointing": {"min_points": 3},
+                # Three points carry the zero points only (docs/pointing_model.md).
+                "pointing": {"min_points": 3, "terms": ["IH", "ID"]},
             },
             # The zenith is filled in when the run starts (``_zenith``).
             {"name": "first-light", "ra_hours": None, "dec_deg": lat, "exptime": exptime},

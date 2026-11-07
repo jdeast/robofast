@@ -284,3 +284,14 @@ def test_the_zenith_is_the_sites_not_the_mounts(device, tmp_path, capsys):
     zenith_ra = _lst_hours((lat, lon, 0.0), taken) * 15.0
     assert separation(solve["ra"], solve["dec"], zenith_ra, lat) < 1.0
     assert "arcmin from the zenith" in out
+
+
+def test_a_server_without_a_device_list_is_named_and_passed(device, tmp_path, capsys):
+    """As robofast-discover does: a server that gives no device list is named,
+    and first light goes on with the others."""
+    main(_args(device, tmp_path, "--no-enclosure", "--yes",
+               "--server", "127.0.0.1:9", "--server", device.address))  # fmt: skip
+    captured = capsys.readouterr()
+    assert "first light: 127.0.0.1:9: no device list" in captured.err
+    assert "Traceback" not in captured.err
+    assert json.loads(captured.out.strip().splitlines()[-1])["first_light"]["solve"]["solved"]

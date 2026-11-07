@@ -133,8 +133,8 @@ def first_light_config(
     config["site"] = {"latitude": lat, "longitude": lon, "elevation": elev}
     if plugins:
         config["plugins"] = list(plugins)
-    # Jason's solver accepts 4 matched stars by default; a sparse field can
-    # solve falsely with so few (room 118, F12): first light asks 8.
+    # The solver accepts 4 matched stars by default; a sparse field can
+    # solve falsely with so few: first light asks 8.
     config["images"]["solve"] = {
         "catalog": dict(catalog),
         "telescopes": {tel: {"min_matches": MIN_MATCHES}},

@@ -40,6 +40,10 @@ The code this repository started from (the earlier, Windows-era `robofast/`
 package) was removed on 2026-11-04; its last tree is the git tag
 `legacy-robofast`.
 
+To find the Alpaca devices on your network and write a starter config
+for a first exposure (one bias), run `robofast-discover --write
+observatory.json`; see [docs/discover.md](docs/discover.md).
+
 To see robofast run a whole simulated MINERVA RV night
 on your machine, see [docs/demo.md](docs/demo.md).
 

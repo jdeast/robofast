@@ -260,3 +260,27 @@ def test_ctrl_c_where_the_loop_has_no_signal_handlers(device, tmp_path, capsys, 
         main(_args(device, tmp_path, "--no-enclosure", "--yes"))
     err = capsys.readouterr().err
     assert exc.value.code == 1 and "first light: stopped; the telescope parked" in err, err
+
+
+def test_the_zenith_is_the_sites_not_the_mounts(device, tmp_path, capsys):
+    """The mount's sidereal time is not read (its clock or site may be off):
+    with the mount's clock 24 min fast, the frame is still at the zenith of
+    the site given, by this computer's clock."""
+    from datetime import UTC, datetime
+
+    from robofast.catalog import separation
+    from robofast.first_light import _lst_hours
+
+    mount_cls = type(device.mount)
+    true_lst = mount_cls.SiderealTime.fget
+    device.mount.__class__ = type(
+        "FastClockMount", (mount_cls,), {"SiderealTime": property(lambda s: true_lst(s) + 0.4)}
+    )
+    main(_args(device, tmp_path, "--no-enclosure", "--yes"))
+    out = capsys.readouterr().out
+    solve = json.loads(out.strip().splitlines()[-1])["first_light"]["solve"]
+    taken = datetime.fromisoformat(solve["date_obs"]).replace(tzinfo=UTC)
+    lat, lon = (float(v) for v in SITE.split(","))
+    zenith_ra = _lst_hours((lat, lon, 0.0), taken) * 15.0
+    assert separation(solve["ra"], solve["dec"], zenith_ra, lat) < 1.0
+    assert "arcmin from the zenith" in out

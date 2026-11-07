@@ -45,6 +45,7 @@ import json
 import logging
 import signal
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -146,6 +147,14 @@ def _zenith(config: dict[str, Any], lst_hours: float) -> None:
     for t in config["plan"]["targets"]:
         if t["name"] == "first-light":
             t["ra_hours"] = round(lst_hours % 24.0, 5)
+
+
+def _lst_hours(site: tuple[float, float, float], when: datetime) -> float:
+    """Local apparent sidereal time (hours) at ``site`` (lat, lon, elev), ``when``."""
+    from robofast.sky import Site, offline_iers, sky_now
+
+    offline_iers()
+    return sky_now(Site(site[0], site[1], site[2]), when).lst_hours
 
 
 def _site(text: str) -> tuple[float, float, float]:
@@ -371,14 +380,10 @@ def main(argv: list[str] | None = None) -> None:
         if answer.strip().lower() not in ("y", "yes"):
             print("first light: not started", file=sys.stderr)
             sys.exit(1)
-    # The zenith now, from the mount's own sidereal time (read-only).
-    scope = next(d for d in devices if d.spec == config["telescopes"][tel]["telescope"])
-    try:
-        (lst,) = discover.read_members(scope, ["SiderealTime"])
-    except discover.OpticsUnavailable as exc:
-        print(f"first light: {exc}", file=sys.stderr)
-        sys.exit(1)
-    _zenith(config, float(lst))
+    # The zenith now, from the site given and this computer's clock (the
+    # mount's own site and clock are not read: docs/first_light.md).
+    planned = datetime.now(UTC)
+    _zenith(config, _lst_hours(site, planned))
     workdir.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(config, indent=2) + "\n")
     print(f"wrote {path}")
@@ -408,15 +413,19 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
     solve = entry["solve"]
     target_ra, target_dec = config["plan"]["targets"][1]["ra_hours"] * 15.0, site[0]
-    off = separation(float(solve["ra"]), float(solve["dec"]), target_ra, target_dec) * 3600.0
+    ra, dec = float(solve["ra"]), float(solve["dec"])
+    off = separation(ra, dec, target_ra, target_dec) * 3600.0
+    taken = datetime.fromisoformat(str(solve["date_obs"])).replace(tzinfo=UTC)
+    zenith = separation(ra, dec, _lst_hours(site, taken) * 15.0, site[0])
     terms = ", ".join(f'{k} {v:+.1f}"' for k, v in entry["model"].items())
     root = Path(config["images"]["data_root"])
     if entry.get("enclosure"):
         print(f"first light: enclosure {entry['enclosure']}")
     print(f"first light frame: {(root if root.is_absolute() else workdir / root) / entry['file']}")
     print(
-        f"  solved: RA {float(solve['ra']):.5f} Dec {float(solve['dec']):+.5f} deg,"
-        f" {off:.1f} arcsec from the zenith target; pointing model {terms}"
+        f"  solved: RA {ra:.5f} Dec {dec:+.5f} deg, {off:.1f} arcsec from its target (the"
+        f" zenith at {planned:%H:%M:%S} UTC), {zenith * 60:.1f} arcmin from the zenith"
+        f" at {taken:%H:%M:%S} UTC, when it was taken; pointing model {terms}"
     )
     print(json.dumps({"first_light": entry}))
 

@@ -109,6 +109,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import secrets
@@ -481,7 +482,9 @@ async def serve(config: dict[str, Any], supervisor: SafetySupervisor) -> None:
     assert task is not None
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, task.cancel)
+        # Windows' loops have none: Ctrl-C reaches asyncio.run, which cancels.
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, task.cancel)
     print(json.dumps({"url": server.url, "epoch": server.epoch}), flush=True)
     try:
         await supervisor.run()  # closes (bounded) when cancelled

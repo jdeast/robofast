@@ -188,6 +188,14 @@ async def _read_optics(telescope: Device, camera: Device, timeout: float) -> tup
     return focal_m, px, py
 
 
+def read_members(d: Device, members: list[str], timeout: float = 5.0) -> list[Any]:
+    """Read ``members`` of ``d`` (connected for the reads if it is not, as
+    :func:`read_optics` does); :class:`OpticsUnavailable` naming the one
+    that cannot be read."""
+    with httpx.Client(timeout=timeout, trust_env=False) as client:
+        return _read(client, d, members)
+
+
 def read_optics(telescope: Device, camera: Device, timeout: float = 5.0) -> dict[str, float]:
     """``{"plate_scale": arcsec per unbinned pixel, "focal_length": mm}``
     from the telescope's ``FocalLength`` (m) and the camera's ``PixelSizeX``

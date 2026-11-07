@@ -49,6 +49,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from robofast import discover
 from robofast.catalog import separation
 from robofast.timeline import Timeline
@@ -352,7 +354,15 @@ def main(argv: list[str] | None = None) -> None:
     if not servers:
         print(f"no Alpaca server answered discovery at {args.address}", file=sys.stderr)
         sys.exit(1)
-    devices = [d for s in servers for d in discover.configured_devices(s)]
+    devices: list[discover.Device] = []
+    for server in servers:  # as robofast-discover: a server with no device list is named
+        try:
+            devices += discover.configured_devices(server)
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+            print(f"first light: {server}: no device list ({exc!r})", file=sys.stderr)
+    if not devices:
+        print("first light: no Alpaca device answered", file=sys.stderr)
+        sys.exit(1)
     for d in devices:
         print(f"found {d.type:<20} {d.spec:<24} {d.name}")
     catalog: dict[str, Any] = {"source": args.catalog}

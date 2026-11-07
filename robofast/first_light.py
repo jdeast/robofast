@@ -96,13 +96,14 @@ def first_light_config(
     :func:`robofast.discover.starter_config` (with the optics read from the
     devices), and what the operator said (``site``; ``enclosure`` None: no
     enclosure, else ``{"dome": spec, "safetymonitor": spec}``)."""
+    found = [d for d in devices if d.type == "Telescope"]
+    if len(found) != 1:  # before anything is read from, or connected on, any of them
+        raise FirstLightError(
+            f"first light runs one telescope; {len(found)} answered"
+            f" ({', '.join(d.spec for d in found) or 'none'})"
+        )
     config = discover.starter_config(devices, name, optics=True)
     scopes = config["telescopes"]
-    if len(scopes) != 1:
-        raise FirstLightError(
-            f"first light runs one telescope; {len(scopes)} answered"
-            f" ({', '.join(d.spec for d in devices if d.type == 'Telescope') or 'none'})"
-        )
     (tel,) = scopes
     if "camera" not in scopes[tel]:
         raise FirstLightError(f"{tel}: no camera paired with the telescope (see the device list)")

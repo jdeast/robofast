@@ -295,3 +295,29 @@ def test_a_server_without_a_device_list_is_named_and_passed(device, tmp_path, ca
     assert "first light: 127.0.0.1:9: no device list" in captured.err
     assert "Traceback" not in captured.err
     assert json.loads(captured.out.strip().splitlines()[-1])["first_light"]["solve"]["solved"]
+
+
+def test_two_telescopes_are_refused_before_any_is_read(tmp_path, capsys):
+    """Nothing is read from, or connected on, a telescope first light will
+    not run: two answer, so it refuses before reading either's optics."""
+
+    class Counted(FakeTelescope):
+        reads = 0
+
+        @property
+        def FocalLength(self) -> float:
+            type(self).reads += 1
+            return 0.5
+
+    devices = {}
+    for n in (0, 1):
+        devices[f"telescope/{n}"], devices[f"camera/{n}"] = Counted(), FakeCamera()
+    server = FakeAlpacaServer(devices).start()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main(["--site", SITE, "--no-enclosure", "--yes", "--server", server.address,
+                  "--dir", str(tmp_path / "run")])  # fmt: skip
+    finally:
+        server.stop()
+    assert exc.value.code == 1 and "first light runs one telescope; 2" in capsys.readouterr().err
+    assert Counted.reads == 0

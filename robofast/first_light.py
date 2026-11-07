@@ -2,7 +2,7 @@
 
 ::
 
-    pip install robofast
+    pip install .          # the repository or a wheel built from it (not on PyPI yet)
     python -m robofast --site 42.38,-71.13 --no-enclosure      # or: robofast ...
 
 One command, for a classroom or a first night: it finds the telescope and

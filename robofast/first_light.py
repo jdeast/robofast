@@ -151,6 +151,18 @@ def _first_light_frame(data_root: Path, tel: str) -> dict[str, Any] | None:
     return None
 
 
+def _waiting(sup: Any) -> str:
+    """What the supervisor says, for a first light that did not finish."""
+    st = sup.status()
+    out = f"the supervisor: {st['reason']}; opening allowed: {st['open_allowed']}"
+    if st.get("lease") is None:
+        out += "; no lease granted"
+    hold = sup.config.reopen_hold
+    if sup.enclosure and st["safe"] and not st["open_allowed"]:
+        out += f" (an enclosure opens after {hold:g} s of safe weather: safety.reopen_hold)"
+    return out
+
+
 async def run(
     config: dict[str, Any], workdir: Path, operator: str, *, timeout: float = 1800.0
 ) -> dict[str, Any]:
@@ -180,7 +192,7 @@ async def run(
     try:
         await asyncio.wait_for(asyncio.shield(seq_task), timeout)
     except TimeoutError as exc:
-        raise FirstLightError(f"not done after {timeout:g} s") from exc
+        raise FirstLightError(f"not done after {timeout:g} s; {_waiting(sup)}") from exc
     finally:
         if not seq_task.done():
             seq_task.cancel()

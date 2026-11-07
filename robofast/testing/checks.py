@@ -99,6 +99,11 @@ def assert_generations_disjoint(timeline: Timeline, sequencer: str) -> None:
         assert gen in finished and finished[gen] < nxt, f"gen {gen} not finished before {gen + 1}"
         assert gen in cleaned and cleaned[gen] < nxt, f"gen {gen} not cleaned before {gen + 1}"
         for prefix in (f"{sequencer}/observe#{gen}", f"{sequencer}/cleanup#{gen}"):
-            late = timeline.commands(source_prefix=prefix, outcome="sent", since=nxt)
+            late = [
+                e
+                for e in timeline.commands(source_prefix=prefix, outcome="sent", since=nxt)
+                # "seq/observe#1" is not "seq/observe#10"
+                if not e.source[len(prefix) : len(prefix) + 1].isdigit()
+            ]
             assert not late, f"{prefix} sent after generation {gen + 1} started: {late}"
         assert t_start < nxt

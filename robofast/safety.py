@@ -2,8 +2,9 @@
 
 Policy, in one paragraph: the enclosure is open only while (a) the weather
 has been *continuously* safe for ``reopen_hold`` seconds, confirmed by a
-reading *taken* after the hold ended (so an open never goes out on a
-verdict older than a weather change; it waits for the next poll), and (b) a live
+reading *taken* after the hold ended and acted on in the enclosure pass that
+reading wakes (so an open never goes out on a verdict older than a weather
+change; it waits for the next poll), and (b) a live
 sequencer holds an unexpired, unrevoked :class:`OpenLease`. Anything else
 -- unsafe weather, a weather reading that errors or times out, weather data
 older than ``stale_after``, no successful read for ``stale_after``, a lease
@@ -547,6 +548,11 @@ class SafetySupervisor:
         self._last_good_read: float | None = None
         #: When the latest safe reading was *taken* (its read started).
         self._safe_read_at: float | None = None
+        #: Safe readings so far, and how many the enclosure loop has seen: an
+        #: open goes out only in the pass right after a new safe reading.
+        self._safe_reads = 0
+        self._safe_reads_seen = 0
+        self._fresh_reading = False
         self._lease: OpenLease | None = None
         self._lease_ids = itertools.count(1)
         self._wake = asyncio.Event()
@@ -1148,6 +1154,8 @@ class SafetySupervisor:
                 self._set_safety(safe, reason)
                 if safe:
                     self._safe_read_at = taken
+                    self._safe_reads += 1
+                    self._wake.set()  # the enclosure loop acts on it now
             except Exception as exc:  # never let the loop die
                 log.exception("weather loop")
                 self._set_safety(False, f"weather loop error: {exc!r}")
@@ -1621,6 +1629,10 @@ class SafetySupervisor:
         # Re-check immediately before the command: the status read awaited.
         if not self._want_open(time.monotonic()):
             return
+        # Open only in the pass a new safe reading woke: on a later pass
+        # (a lease grant's, a poll's) the weather may have changed since it.
+        if not self._fresh_reading:
+            return
         try:
             await self._dome.call("OpenShutter", timeout=cfg.dome_timeout)
         except DeviceError as exc:
@@ -1657,6 +1669,8 @@ class SafetySupervisor:
     async def _enclosure_loop(self) -> None:
         while not self._stopping:
             self._wake.clear()
+            self._fresh_reading = self._safe_reads != self._safe_reads_seen
+            self._safe_reads_seen = self._safe_reads
             try:
                 await self._enforce_once()
             except Exception as exc:  # never let the loop die

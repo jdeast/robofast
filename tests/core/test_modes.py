@@ -25,6 +25,8 @@ from robofast.registry import Telemetry, ValueRegistry
 from robofast.testing.checks import wait_until
 from robofast.testing.processes import ROOT
 
+pytestmark = pytest.mark.virtual_time
+
 # -- the definitions -----------------------------------------------------------------
 
 

@@ -3061,6 +3061,7 @@ class Sequencer:
             telescope=unit.name,
             port=obs.port,
             significance=run["significance"],
+            min_points=run["min_points"],
             when=self.clock(),
         )
         built.note = f"pointing run {obs.name}"

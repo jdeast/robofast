@@ -116,7 +116,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from robofast.alpaca import alpaca_owner
-from robofast.config import device_address, load_config, telescopes
+from robofast.config import device_address, load_config, require_keys, telescopes
 from robofast.modes import ModeStore, mode_path, modes_from_config
 from robofast.owner import DeviceError
 from robofast.safety import (
@@ -369,8 +369,12 @@ def build(
     config: dict[str, Any], timeline: Timeline, *, mode_store: ModeStore | None = None
 ) -> SafetySupervisor:
     """A supervisor wired to the Alpaca devices named in ``config``; its
-    mode kept in ``mode_store`` (default: the config's ``mode_file``)."""
+    mode kept in ``mode_store`` (default: the config's ``mode_file``). A
+    missing ``devices``, ``devices.dome`` or ``devices.safetymonitor`` is a
+    ValueError naming it (docs/design.md 3.10)."""
+    require_keys(config, ["devices"])
     devices = config["devices"]
+    require_keys(devices, ["dome", "safetymonitor"], "devices")
     scfg = SafetyConfig(**config.get("safety", {}))
     modes = modes_from_config(
         config, attended_floor=bool(scfg.attended_only), fault_action=bool(scfg.fault_action)
@@ -418,8 +422,7 @@ def build(
     )
 
 
-async def serve(config: dict[str, Any]) -> None:
-    supervisor = build(config, Timeline(maxlen=config.get("timeline_size", 10000)))
+async def serve(config: dict[str, Any], supervisor: SafetySupervisor) -> None:
     host, _, port = config.get("listen", "127.0.0.1:8100").rpartition(":")
     server = await SupervisorServer(supervisor, host, int(port)).start()
     task = asyncio.current_task()
@@ -442,9 +445,13 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(
         level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    config = load_config(args.config)
     try:
-        asyncio.run(serve(config))
+        config = load_config(args.config)
+        supervisor = build(config, Timeline(maxlen=config.get("timeline_size", 10000)))
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        ap.error(f"{args.config}: {exc!r}")
+    try:
+        asyncio.run(serve(config, supervisor))
     except asyncio.CancelledError:
         pass
 

@@ -3,8 +3,8 @@
 `robofast-discover` (`robofast/discover.py`) finds the ASCOM Alpaca
 devices on the network and writes a starter enclosure config from what
 they report, so a new telescope gets to its first exposure without the
-addresses typed by hand. It reads only: no device is connected, and no
-device member is read or set.
+addresses typed by hand. Listing reads only the management API; writing
+reads the plate scale from the telescope and camera (step 2).
 
 ## 1. Find the devices
 
@@ -44,7 +44,17 @@ It never overwrites a file. What it writes:
 | `telescopes.t1`, `t2`, ... | each Telescope, with the Camera, FilterWheel, Focuser and Rotator of the same device number on the same server; for a lone telescope, the only one of a type |
 | `images` | frames under `data/` next to the config (without `images` the sequencer saves nothing) |
 | `plan` | one bias: `{"type": "calibration", "biases": 1}` |
+| `images.telescopes.tN` | `plate_scale` (arcsec per unbinned pixel: 206.265 x the camera's `PixelSizeX` in um / the telescope's `FocalLength` in mm) and `focal_length` (mm) |
 | `name`, `listen` | `--name`; the supervisor on `127.0.0.1:8100` |
+
+For the plate scale it reads the telescope's `FocalLength` and the
+camera's `PixelSizeX` and `PixelSizeY`; a device that reports itself not
+connected is connected for the read and disconnected after (nothing else
+is set). A device that cannot report one (an Alpaca error, a focal length
+of 0 or less, pixels that are not square) stops `--write` with an error
+naming the device and the member, and nothing is written. Many mounts do
+not know the focal length of the telescope on them: then write the
+`plate_scale` yourself, with `--no-optics`.
 
 What it **never** writes, because it is the operator's (SAFETY.md):
 `devices` (the dome, the safety monitor, the weather), `limits`, `site`,
@@ -85,3 +95,36 @@ site's own entries.
 `tests/core/test_discover.py` runs these steps on loopback against fakes
 behind `FakeAlpacaServer` (which answers the management API, and discovery
 with `discovery_port`).
+
+## 4. A first pointing calibration
+
+With the site's coordinates and a catalog (docs/sky.md), two or three
+plate solves measure the pointing's zero points (docs/pointing_model.md,
+"A first calibration"). Add a `pointing` entry to the telescope, with the
+plate scale step 2 wrote:
+
+```json
+"t1": {"telescope": "...", "camera": "...",
+       "pointing": {"latitude": 42.38, "longitude": -71.13,
+                    "solver": {"plate_scale": 3.71277},
+                    "catalog": {}}}
+```
+
+and make the plan's first observation the calibration:
+
+```json
+"plan": {"type": "static", "targets": [
+  {"name": "first-pointing", "kind": "pointing_model", "count": 3, "exptime": 5,
+   "pointing": {"min_points": 3}}]}
+```
+
+The catalog's defaults download Gaia DR3 tiles on first use (docs/sky.md,
+"What is downloaded, from where"). The run takes light frames, so it waits
+for the supervisor's lease, as every light observation does
+(docs/modes.md). It slews to three points between `min_alt` and `max_alt`
+(25 and 85 deg by default) computed from the latitude you wrote, so the
+latitude and longitude must be right: robofast does not read them from the
+mount.
+
+`tests/core/test_discover_optics.py` runs it on the simulated sky with the
+plate scale read from the simulated telescope and camera over Alpaca.

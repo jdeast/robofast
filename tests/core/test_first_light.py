@@ -360,6 +360,81 @@ def test_first_light_asks_eight_matched_stars_of_a_solve(device, tmp_path):
     assert config["images"]["solve"]["telescopes"]["t1"]["min_matches"] == 8
 
 
+def _counted_source(name, calls, device, delay=0.0):
+    """A catalog source with the synthetic sky's stars that records, for
+    each tile fetched, how many exposures the camera had started."""
+    import dataclasses
+    import time
+
+    from robofast.catalog import CATALOG_SOURCES
+    from robofast.testing.sky_device import register
+
+    register()
+    synthetic = CATALOG_SOURCES["synthetic"]
+
+    def fetcher(url):
+        fetch = synthetic.fetcher(url)
+
+        def counted(level, pix, mag_limit):
+            time.sleep(delay)
+            calls.append(device.camera.exposures_started)
+            return fetch(level, pix, mag_limit)
+
+        return counted
+
+    CATALOG_SOURCES.register(
+        name,
+        dataclasses.replace(
+            synthetic, name=name, directory=name + "-g{mag:g}-hpx{level}", fetcher=fetcher
+        ),
+    )
+
+
+def test_the_catalog_is_fetched_before_the_telescope_moves(device, tmp_path, capsys):
+    """F13: a tile downloaded inside a solve held the process past its
+    timeout (asyncio.run waits for the solve's thread). First light fetches
+    the four fields' tiles first, saying so."""
+    from robofast.catalog import CATALOG_SOURCES
+
+    calls: list[int] = []
+    _counted_source("counted-f13a", calls, device)
+    try:
+        args = _args(device, tmp_path, "--no-enclosure", "--yes")
+        args[args.index("--catalog") + 1] = "counted-f13a"
+        args[args.index("--catalog-dir") + 1] = str(tmp_path / "first-light-catalog")
+        main(args)
+    finally:
+        CATALOG_SOURCES.unregister("counted-f13a")
+    out = capsys.readouterr().out
+    assert '"first_light"' in out
+    assert "fetching the catalog" in out, out
+    assert calls, "no tile was fetched"
+    assert set(calls) == {0}, calls  # every tile before the first exposure
+
+
+def test_a_timeout_while_the_catalog_downloads_exits_on_time(device, tmp_path, capsys):
+    import time
+
+    from robofast.catalog import CATALOG_SOURCES
+
+    calls: list[int] = []
+    _counted_source("counted-f13b", calls, device, delay=1.0)
+    args = _args(device, tmp_path, "--no-enclosure", "--yes", "--timeout", "3")
+    args[args.index("--catalog") + 1] = "counted-f13b"
+    args[args.index("--catalog-dir") + 1] = str(tmp_path / "first-light-catalog")
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main(args)
+    finally:
+        CATALOG_SOURCES.unregister("counted-f13b")
+    took = time.monotonic() - t0
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and "catalog" in err, err
+    assert took < 5.0, took  # not held by the download
+    assert device.camera.exposures_started == 0
+
+
 class _NeverParks(FakeTelescope):
     @property
     def AtPark(self) -> bool:  # type: ignore[override]

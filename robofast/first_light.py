@@ -29,8 +29,8 @@ whether the sky is clear and whether they will stay with the telescope
 (``--yes`` answers yes). Their duty lasts while the command runs; Ctrl-C,
 or the end, takes them off duty, and the telescope parks.
 
-The catalog is ``--catalog`` (default ``gaia``: Gaia DR3 tiles, downloaded
-on first use; docs/sky.md). ``--plugin`` loads plug-ins first (the
+The catalog is ``--catalog`` (default ``gaia``: Gaia DR3 tiles, docs/sky.md),
+downloaded for the four frames before the telescope moves. ``--plugin`` loads plug-ins first (the
 simulated telescope's ``synthetic`` sky: ``--plugin
 robofast.testing.sky_device:register --catalog synthetic``).
 """
@@ -45,6 +45,8 @@ import json
 import logging
 import signal
 import sys
+import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -62,6 +64,10 @@ EXPTIME = 5.0
 
 #: Fewest matched stars for a solve, the calibration's and the frame's.
 MIN_MATCHES = 8
+
+#: Margin (deg) on each field's catalog cone: the calibration's points are
+#: slewed to a minute or two after they are laid out, and the sky turns.
+FIELD_MARGIN = 0.25
 
 #: Give up once this many calibration points went unsolved with none solved
 #: (two pointing runs of three): the frames will not solve.
@@ -173,6 +179,100 @@ def _lst_hours(site: tuple[float, float, float], when: datetime) -> float:
     return sky_now(Site(site[0], site[1], site[2]), when).lst_hours
 
 
+def _fields(config: dict[str, Any], site: tuple[float, float, float], when: datetime):
+    """(ra, dec) deg of the frames first light takes, as the pointing run
+    lays out its points (:func:`robofast.pointmodel.sky_grid`, from the site
+    given and this computer's clock), and the zenith frame."""
+    from robofast import pointmodel
+    from robofast.sequencer import POINTING_RUN_DEFAULTS
+
+    (tel,) = config["telescopes"]
+    pc = config["telescopes"][tel]["pointing"]
+    cal, zenith = config["plan"]["targets"]
+    run = {**POINTING_RUN_DEFAULTS, **pc.get("run", {}), **cal.get("pointing", {})}
+    lst = _lst_hours(site, when) * 15.0
+    avoid = []
+    if run["moon_distance"]:
+        from robofast.sky import Site, sky_now
+
+        moon = sky_now(Site(site[0], site[1], site[2]), when).moon
+        avoid.append((float(moon.ra.deg), float(moon.dec.deg), float(run["moon_distance"])))
+    grid = pointmodel.sky_grid(
+        cal["count"],
+        min_alt=run["min_alt"],
+        max_alt=run["max_alt"],
+        latitude=site[0],
+        lst=lst,
+        avoid=avoid,
+        max_hour_angle=run["max_hour_angle"],
+        min_dec=run["min_dec"],
+        max_dec=run["max_dec"],
+    )
+    fields = [pointmodel.grid_radec(az, alt, site[0], lst) for az, alt in grid]
+    return [*fields, (zenith["ra_hours"] * 15.0, zenith["dec_deg"])]
+
+
+def _field_radius(plate_scale: float, size: tuple[int, int]) -> float:
+    """The catalog cone (deg) the solver reads around a frame's centre
+    (:func:`robofast.astrometry.solve_near`), with :data:`FIELD_MARGIN`."""
+    from robofast.astrometry import SolverConfig
+
+    c = SolverConfig(plate_scale=plate_scale)
+    half_diag = 0.5 * (size[0] ** 2 + size[1] ** 2) ** 0.5 * plate_scale / 3600.0
+    return half_diag * (1 + c.scale_tolerance) + c.search_radius + FIELD_MARGIN
+
+
+def _fetch_catalog(
+    catalog: dict[str, Any], fields, radius: float, timeout: float, said: float | None = None
+) -> int:
+    """Download the catalog tiles the solver will read for ``fields``
+    before the telescope moves (a tile downloaded inside a solve holds the
+    process until it arrives, past any timeout or Ctrl-C). Returns how many
+    were fetched; :class:`FirstLightError` if they do not arrive within
+    ``timeout`` s (``said``: the ``--timeout`` given, for the message), or
+    cannot be downloaded."""
+    from robofast.catalog import catalog_from_config
+
+    store = catalog_from_config(catalog).tiles
+    if store is None or store.fetch is None:
+        return 0
+    tiles = list(dict.fromkeys(p for ra, dec in fields for p in store.missing(ra, dec, radius)))
+    if not tiles:
+        return 0
+    print(
+        f"first light: fetching the catalog for its {len(fields)} fields: {len(tiles)} tiles"
+        f" ({store.source.title}; cached in {store.directory})",
+        flush=True,
+    )
+    done: list[int] = []
+    failed: list[BaseException] = []
+
+    def fetch() -> None:
+        try:
+            for p in tiles:
+                store.tile(p)
+                done.append(p)
+        except Exception as exc:  # said, below
+            failed.append(exc)
+
+    # A daemon thread: a download still in flight at the deadline, or at
+    # Ctrl-C, does not hold the process.
+    worker = threading.Thread(target=fetch, name="catalog", daemon=True)
+    worker.start()
+    deadline = time.monotonic() + timeout
+    while worker.is_alive() and time.monotonic() < deadline:
+        worker.join(0.2)
+    if failed:
+        raise FirstLightError(f"the catalog: {failed[0]!r} ({len(done)} of {len(tiles)} tiles)")
+    if worker.is_alive():
+        raise FirstLightError(
+            f"the catalog did not download within {said or timeout:g} s ({len(done)} of"
+            f" {len(tiles)} tiles; the telescope did not move): run it again, or give"
+            " a longer --timeout"
+        )
+    return len(tiles)
+
+
 def _site(text: str) -> tuple[float, float, float]:
     parts = [float(v) for v in text.split(",")]
     if len(parts) not in (2, 3):
@@ -248,13 +348,16 @@ async def run(
     *,
     timeout: float = 1800.0,
     stop: asyncio.Event | None = None,
+    started: float | None = None,
 ) -> dict[str, Any]:
     """Run first light on ``config`` (already written in ``workdir``);
     return the first-light frame's index entry, with its solve. Raises
     :class:`FirstLightError` saying what stopped it; ``stop`` set (Ctrl-C),
     or this task cancelled (Ctrl-C where the loop has no signal handlers),
     stops the sequencer, whose cleanup parks, and raises
-    :class:`FirstLightStopped` saying whether every telescope parked."""
+    :class:`FirstLightStopped` saying whether every telescope parked.
+    ``timeout`` counts from ``started`` (:func:`time.monotonic`; default
+    now)."""
     from robofast import sequencer_service, supervisor_service
 
     tl = Timeline(maxlen=20000)
@@ -282,7 +385,8 @@ async def run(
     try:
         stop_wait = asyncio.create_task(stop.wait(), name="stop")
         unsolvable = asyncio.create_task(_unsolvable(tl), name="unsolvable")
-        done, _ = await asyncio.wait({seq_task, stop_wait, unsolvable}, timeout=timeout,
+        left = timeout - (time.monotonic() - started) if started is not None else timeout
+        done, _ = await asyncio.wait({seq_task, stop_wait, unsolvable}, timeout=max(1.0, left),
                                      return_when=asyncio.FIRST_COMPLETED)  # fmt: skip
         stop_wait.cancel()
         unsolvable.cancel()
@@ -374,6 +478,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--timeout", type=float, default=1800.0, help="give up after (s)")
     ap.add_argument("--log-level", default="WARNING")
     args = ap.parse_args(argv)
+    started = time.monotonic()  # --timeout counts from here
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(message)s")
     try:
         site = _site(args.site)
@@ -431,6 +536,7 @@ def main(argv: list[str] | None = None) -> None:
         if answer.strip().lower() not in ("y", "yes"):
             print("first light: not started", file=sys.stderr)
             sys.exit(1)
+        started = time.monotonic()  # the time taken to answer is not counted
     # The zenith now, from the site given and this computer's clock (the
     # mount's own site and clock are not read: docs/first_light.md).
     planned = datetime.now(UTC)
@@ -438,6 +544,22 @@ def main(argv: list[str] | None = None) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(config, indent=2) + "\n")
     print(f"wrote {path}")
+    camera = next(
+        d for d in devices if d.type == "Camera" and d.spec == config["telescopes"][tel]["camera"]
+    )
+    try:
+        size = discover.read_members(camera, ["CameraXSize", "CameraYSize"])
+        radius = _field_radius(config["images"]["telescopes"][tel]["plate_scale"], size)
+        left = args.timeout - (time.monotonic() - started)
+        fields = _fields(config, site, planned)
+        _fetch_catalog(config["images"]["solve"]["catalog"], fields, radius, left, args.timeout)
+    except (FirstLightError, discover.OpticsUnavailable) as exc:
+        print(f"first light: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("first light: stopped while fetching the catalog; the telescope did not move",
+              file=sys.stderr)  # fmt: skip
+        sys.exit(1)
     print("first light: a pointing calibration (3 plate solves), then one frame at the zenith")
 
     async def go() -> dict[str, Any]:
@@ -448,7 +570,9 @@ def main(argv: list[str] | None = None) -> None:
             # cancels this task, and run() treats that as the same stop.
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, stop.set)
-        return await run(config, workdir, args.operator, timeout=args.timeout, stop=stop)
+        return await run(
+            config, workdir, args.operator, timeout=args.timeout, stop=stop, started=started
+        )
 
     try:
         entry = asyncio.run(go())

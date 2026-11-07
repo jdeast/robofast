@@ -49,6 +49,7 @@ Homepage = "https://github.com/jdeast/robofast"
 # The long-running services and device servers. Each is also
 # `python -m <module>`; the two spellings run the same main().
 [project.scripts]
+robofast = "robofast.first_light:main"
 robofast-supervisor = "robofast.supervisor_service:main"
 robofast-mode = "robofast.modes:main"
 robofast-sequencer = "robofast.sequencer_service:main"

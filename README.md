@@ -14,6 +14,19 @@ it to me so other users can use (and improve) it.
 **robofast moves real hardware and is not safety-certified: read
 [SAFETY.md](SAFETY.md) before deploying it.**
 
+## First light
+
+With a telescope and camera plugged into this computer (ASCOM Alpaca):
+
+```
+pip install robofast
+python -m robofast --site LAT,LON --no-enclosure
+```
+
+finds them, reads their plate scale, writes the config, calibrates the
+pointing from three plate solves and takes one plate-solved light frame:
+[docs/first_light.md](docs/first_light.md).
+
 ## Install
 
 robofast installs as a Python package (Python 3.12 or later):

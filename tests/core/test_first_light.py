@@ -1,0 +1,149 @@
+"""``python -m robofast``: first light, from a telescope plugged in to a
+solved light frame, with no file written by hand (robofast.first_light,
+docs/first_light.md). The telescope is robofast's simulated one on the
+synthetic sky (robofast.testing.sky_device), found by Alpaca discovery on
+loopback."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from robofast.catalog import separation
+from robofast.first_light import main
+from robofast.testing.alpaca_server import FakeAlpacaServer
+from robofast.testing.fakes import FakeCamera, FakeTelescope
+from robofast.testing.sky_device import SkyDevice
+
+SITE = "42.38,-71.13"
+
+
+@pytest.fixture
+def device(tmp_path):
+    d = SkyDevice(
+        catalog={"cache_dir": str(tmp_path / "sky")},
+        pointing_error={"IH": 150.0, "ID": -40.0, "NP": 20.0},
+    ).start()
+    yield d
+    d.stop()
+
+
+def _args(device, tmp_path, *extra):
+    return [
+        "--site", SITE,
+        "--address", "127.0.0.1",
+        "--discovery-port", str(device.discovery_port),
+        "--dir", str(tmp_path / "run"),
+        "--plugin", "robofast.testing.sky_device:register",
+        "--catalog", "synthetic",
+        "--catalog-dir", str(tmp_path / "sky"),
+        "--exptime", "1",
+        *extra,
+    ]  # fmt: skip
+
+
+def test_one_command_to_a_solved_first_light_frame(device, tmp_path, capsys):
+    main(_args(device, tmp_path, "--no-enclosure", "--yes"))
+    out = capsys.readouterr().out
+    entry = json.loads(out.strip().splitlines()[-1])["first_light"]
+    solve = entry["solve"]
+    assert solve["solved"] and solve["n_matched"] >= 10 and solve["rms"] < 1.0
+    target = json.loads((tmp_path / "run" / "observatory.json").read_text())["plan"]["targets"][1]
+    off = separation(solve["ra"], solve["dec"], target["ra_hours"] * 15, target["dec_deg"]) * 3600
+    assert off < 5.0, off  # the pointing calibration's model put it on the axis
+    assert set(entry["model"]) >= {"IH", "ID"}
+    printed = next(ln for ln in out.splitlines() if ln.startswith("first light frame: "))
+    assert Path(printed.removeprefix("first light frame: ")).is_file()  # the printed path opens
+    assert device.mount.AtPark  # parked at the end
+    config = json.loads((tmp_path / "run" / "observatory.json").read_text())
+    assert config["enclosure"] == "none" and "devices" not in config
+    assert config["images"]["telescopes"]["t1"]["plate_scale"] == pytest.approx(1.5, rel=1e-4)
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [
+        (["--yes"], "one of the arguments --no-enclosure --dome is required"),
+        (["--dome", "127.0.0.1:9/0", "--yes"], "--dome needs --safety-monitor"),
+    ],
+)
+def test_what_is_never_guessed_must_be_said(device, tmp_path, capsys, extra, message):
+    with pytest.raises(SystemExit) as exc:
+        main(_args(device, tmp_path, *extra))
+    assert exc.value.code == 2 and message in capsys.readouterr().err
+
+
+def test_the_site_is_required(device, tmp_path, capsys):
+    args = _args(device, tmp_path, "--no-enclosure", "--yes")
+    i = args.index("--site")
+    with pytest.raises(SystemExit) as exc:
+        main(args[:i] + args[i + 2 :])
+    assert exc.value.code == 2 and "--site" in capsys.readouterr().err
+
+
+def test_an_existing_config_is_not_overwritten(device, tmp_path, capsys):
+    (tmp_path / "run").mkdir()
+    (tmp_path / "run" / "observatory.json").write_text("{}")
+    with pytest.raises(SystemExit) as exc:
+        main(_args(device, tmp_path, "--no-enclosure", "--yes"))
+    assert exc.value.code == 2 and "not overwritten" in capsys.readouterr().err
+    assert (tmp_path / "run" / "observatory.json").read_text() == "{}"
+
+
+def test_no_operator_no_start(device, tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+    with pytest.raises(SystemExit) as exc:
+        main(_args(device, tmp_path, "--no-enclosure"))
+    assert exc.value.code == 1 and "not started" in capsys.readouterr().err
+    assert device.camera.exposures_started == 0 and device.mount.AtPark
+
+
+def test_a_camera_without_a_pixel_size_stops_naming_it(tmp_path, capsys):
+    tel, cam = FakeTelescope(), FakeCamera()
+    tel.FocalLength = 0.5
+    del cam.PixelSizeX
+    server = FakeAlpacaServer({"telescope": tel, "camera": cam}).start()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main(["--site", SITE, "--no-enclosure", "--yes", "--server", server.address,
+                  "--dir", str(tmp_path / "run")])  # fmt: skip
+    finally:
+        server.stop()
+    assert exc.value.code == 1
+    assert "PixelSizeX" in capsys.readouterr().err
+    assert not (tmp_path / "run").exists()
+
+
+def test_two_telescopes_are_not_chosen_between(tmp_path, capsys):
+    devices = {}
+    for n in (0, 1):
+        t, c = FakeTelescope(), FakeCamera()
+        t.FocalLength = 0.5
+        devices[f"telescope/{n}"], devices[f"camera/{n}"] = t, c
+    server = FakeAlpacaServer(devices).start()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main(["--site", SITE, "--no-enclosure", "--yes", "--server", server.address,
+                  "--dir", str(tmp_path / "run")])  # fmt: skip
+    finally:
+        server.stop()
+    assert exc.value.code == 1 and "first light runs one telescope; 2" in capsys.readouterr().err
+
+
+def test_runs_where_the_event_loop_has_no_signal_handlers(device, tmp_path, capsys, monkeypatch):
+    """Windows' asyncio loops have no ``add_signal_handler`` (they raise
+    NotImplementedError; Ctrl-C arrives as KeyboardInterrupt instead):
+    first light runs there all the same. Stood in for here by a loop that
+    raises as Windows' does."""
+
+    def unavailable(self, *args, **kwargs):
+        raise NotImplementedError
+
+    from asyncio import unix_events
+
+    monkeypatch.setattr(unix_events._UnixSelectorEventLoop, "add_signal_handler", unavailable)
+    main(_args(device, tmp_path, "--no-enclosure", "--yes"))
+    entry = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["first_light"]
+    assert entry["solve"]["solved"]

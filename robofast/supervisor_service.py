@@ -27,6 +27,8 @@ fields)::
                  "fault_action": "Faults"}
     }
 
+A telescope with no enclosure says ``"enclosure": "none"`` instead of naming
+a dome and a safety monitor (:func:`build`; docs/no_enclosure.md).
 ``observingconditions``, ``telescopes`` (needed for ``park_before_close``;
 no lease is granted unless every one reports ``AtPark``) and ``heartbeat``
 are optional; ``mode`` and ``modes`` are the enclosure's operating modes
@@ -116,7 +118,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from robofast.alpaca import alpaca_owner
-from robofast.config import device_address, load_config, telescopes
+from robofast.config import device_address, load_config, require_keys, telescopes
 from robofast.modes import ModeStore, mode_path, modes_from_config
 from robofast.owner import DeviceError
 from robofast.safety import (
@@ -369,11 +371,39 @@ def build(
     config: dict[str, Any], timeline: Timeline, *, mode_store: ModeStore | None = None
 ) -> SafetySupervisor:
     """A supervisor wired to the Alpaca devices named in ``config``; its
-    mode kept in ``mode_store`` (default: the config's ``mode_file``)."""
-    devices = config["devices"]
+    mode kept in ``mode_store`` (default: the config's ``mode_file``). A
+    missing ``devices``, ``devices.dome`` or ``devices.safetymonitor`` is a
+    ValueError naming it (docs/design.md 3.10).
+
+    ``"enclosure": "none"`` says the telescope has no enclosure and no
+    safety monitor (:mod:`robofast.safety`, "No enclosure"): ``devices``
+    then names none of the enclosure's devices, and ``telescopes`` names at
+    least one (revoking the lease parks them: the one safety action left)."""
+    enclosure = config.get("enclosure")
+    if enclosure not in (None, "none"):
+        raise ValueError(f'enclosure: {enclosure!r}: "none" (no enclosure) or leave it out')
+    if enclosure is None:
+        require_keys(config, ["devices"])
+        devices = config["devices"]
+        require_keys(devices, ["dome", "safetymonitor"], "devices")
+    else:
+        devices = config.get("devices") or {}
+        given = [
+            k for k in ("dome", "safetymonitor", "observingconditions", "heartbeat") if k in devices
+        ]
+        if given:
+            raise ValueError(
+                f'enclosure "none": devices.{", devices.".join(given)} given; remove'
+                ' them, or remove "enclosure" if the telescope has an enclosure'
+            )
+        if not telescopes(config):
+            raise ValueError('enclosure "none": telescopes: name at least one telescope')
     scfg = SafetyConfig(**config.get("safety", {}))
     modes = modes_from_config(
-        config, attended_floor=bool(scfg.attended_only), fault_action=bool(scfg.fault_action)
+        config,
+        attended_floor=bool(scfg.attended_only),
+        fault_action=bool(scfg.fault_action),
+        enclosure=enclosure is None,
     )
     if mode_store is None:
         mode_store = ModeStore(mode_path(config))
@@ -406,8 +436,10 @@ def build(
         )
     return SafetySupervisor(
         config.get("name", "safety"),
-        dome=owner("dome", "dome", True, privileged_members=enclosure_members(scfg)),
-        safety_monitor=owner("safetymonitor", "safetymonitor", True),
+        dome=None
+        if enclosure
+        else owner("dome", "dome", True, privileged_members=enclosure_members(scfg)),
+        safety_monitor=None if enclosure else owner("safetymonitor", "safetymonitor", True),
         observing_conditions=owner("observingconditions", "observingconditions"),
         telescopes=scopes,
         heartbeat=heartbeat,
@@ -418,8 +450,7 @@ def build(
     )
 
 
-async def serve(config: dict[str, Any]) -> None:
-    supervisor = build(config, Timeline(maxlen=config.get("timeline_size", 10000)))
+async def serve(config: dict[str, Any], supervisor: SafetySupervisor) -> None:
     host, _, port = config.get("listen", "127.0.0.1:8100").rpartition(":")
     server = await SupervisorServer(supervisor, host, int(port)).start()
     task = asyncio.current_task()
@@ -442,9 +473,13 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(
         level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    config = load_config(args.config)
     try:
-        asyncio.run(serve(config))
+        config = load_config(args.config)
+        supervisor = build(config, Timeline(maxlen=config.get("timeline_size", 10000)))
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        ap.error(f"{args.config}: {exc!r}")
+    try:
+        asyncio.run(serve(config, supervisor))
     except asyncio.CancelledError:
         pass
 

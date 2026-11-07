@@ -89,6 +89,29 @@ enclosure panel, in the sequencer's snapshot and the request API's status)
 and an ``unwatched`` event every ``unwatched_warning_interval`` seconds
 while it runs that way (the morning report lists them).
 
+No enclosure
+------------
+A telescope with no dome and no roof (a classroom telescope on a tripod) has
+nothing to open or close, and no safety monitor: ``dome`` and
+``safety_monitor`` both None (the enclosure config's ``"enclosure":
+"none"``, :mod:`robofast.supervisor_service`). Its sky is always open, so
+the supervisor's one safety action is the lease: it grants one only while an
+operator is on duty (the ``attended_only`` floor, which may not be lowered),
+and revokes it, so the sequencer stops and parks, when the operator goes off
+duty, the duty expires, the lease is not renewed or the supervisor stops. A
+lease revoked and not released (a sequencer that died, or does not clean up)
+leaves no one to park: the supervisor parks the telescopes itself, as it
+does before a roll-off roof closes: at once for a lease that lapsed (not
+renewed: its sequencer is silent), after ``park_wait / 2`` for the cleanup
+otherwise; a critical alarm either way. Nobody reads the weather: the
+operator on duty judges the sky, and ``reason`` says so
+(:data:`NO_ENCLOSURE_TEXT`). A hardware heartbeat, ``fault_action``,
+``park_before_close``, an unattended opt-in, observing conditions and a mode
+that only watches the enclosure need an enclosure, and are refused; so is
+any mode that may observe with nobody on duty, and a supervisor with no
+telescopes. A lease of a dead sequencer is recovered once every telescope
+reports parked (with an enclosure: once it is closed).
+
 Operating modes
 ---------------
 The enclosure's mode (:mod:`robofast.modes`, docs/modes.md) is held
@@ -380,6 +403,13 @@ class SafetyConfig:
         return self.heartbeat_interval is None and not self.attended_only
 
 
+#: Why a telescope with no enclosure may observe: it is the reason in its
+#: status, in place of a weather verdict (module doc, "No enclosure").
+NO_ENCLOSURE_TEXT = (
+    "no enclosure and no weather sensor: the sky is open while an operator is on duty,"
+    " and the operator judges the weather"
+)
+
 #: The warning shown wherever an enclosure runs unattended with no watchdog.
 UNWATCHED_TEXT = (
     "NO WATCHDOG: this enclosure may open with nobody on duty, and nothing closes it"
@@ -472,8 +502,8 @@ class SafetySupervisor:
         self,
         name: str,
         *,
-        dome: DeviceOwner,
-        safety_monitor: DeviceOwner,
+        dome: DeviceOwner | None,
+        safety_monitor: DeviceOwner | None,
         timeline: Timeline,
         observing_conditions: DeviceOwner | None = None,
         telescopes: Sequence[DeviceOwner] = (),
@@ -492,6 +522,7 @@ class SafetySupervisor:
             {},
             attended_floor=bool(self.config.attended_only),
             fault_action=bool(self.config.fault_action),
+            enclosure=dome is not None,
         )
         self._mode_store = mode_store or ModeStore(None)
         self.mode, self._mode_record, why = self._mode_store.load(self.modes)
@@ -509,8 +540,23 @@ class SafetySupervisor:
         self._intervening: str | None = None
         #: The safety monitor's last successful verdict, if unsafe.
         self._unsafe_verdict: str | None = None
-        self._dome = dome.grant(name, privileged=True)
-        self._sm = safety_monitor.grant(name)
+        if (dome is None) != (safety_monitor is None):
+            raise ValueError(
+                "a dome and a safety monitor go together; with neither, the telescope has"
+                " no enclosure (module doc, 'No enclosure')"
+            )
+        #: False: no enclosure (module doc): nothing to open or close.
+        self.enclosure = dome is not None
+        if not self.enclosure:
+            self._check_no_enclosure()
+            if observing_conditions is not None:
+                raise ValueError("no enclosure: no observing conditions to read")
+            if not telescopes:
+                raise ValueError(
+                    "no enclosure: name the telescopes (revoking the lease parks them)"
+                )
+        self._dome = dome.grant(name, privileged=True) if dome is not None else None
+        self._sm = safety_monitor.grant(name) if safety_monitor is not None else None
         self._oc = observing_conditions.grant(name) if observing_conditions else None
         self._tels = [t.grant(name) for t in telescopes]
         if self.config.park_before_close and not self._tels:
@@ -519,7 +565,9 @@ class SafetySupervisor:
             raise ValueError("a heartbeat device and heartbeat_interval go together")
         self._hb = heartbeat.grant(f"{name}/heartbeat") if heartbeat else None
         # Read-only, so not privileged.
-        self._faults = dome.grant(f"{name}/faults") if self.config.fault_action else None
+        self._faults = (
+            dome.grant(f"{name}/faults") if dome is not None and self.config.fault_action else None
+        )
         #: What is wrong with the enclosure (``None``: nothing, or no fault
         #: channel). Unknown until the first good read.
         self._fault: str | None = "not read yet" if self._faults else None
@@ -542,7 +590,7 @@ class SafetySupervisor:
         self._unwatched_warned: float | None = None
 
         self._safe = False
-        self._reason = "startup (no weather read yet)"
+        self._reason = "startup (no weather read yet)" if self.enclosure else NO_ENCLOSURE_TEXT
         self._safe_since: float | None = None
         self._last_good_read: float | None = None
         #: When the latest safe reading was *taken* (its read started).
@@ -553,6 +601,9 @@ class SafetySupervisor:
         self._closing_since: float | None = None
         self._opening_since: float | None = None
         self._parked_for_close = False
+        #: The id of the last lease revoked for not being renewed (its holder
+        #: is silent: no cleanup will come; "No enclosure" in the module doc).
+        self._lapsed: int | None = None
         #: The park-before-close interlock (``require_park_before_close``):
         #: an operator's emergency close (why; cleared once closed), and a
         #: routine close held back by unparked telescopes (why, since when,
@@ -584,6 +635,34 @@ class SafetySupervisor:
         log.warning("%s: mode %s", name, self.mode)
         if self.config.unwatched:
             self._warn_unwatched("start", time.monotonic())
+
+    def _check_no_enclosure(self) -> None:
+        """Refuse what needs an enclosure (module doc, "No enclosure")."""
+        cfg = self.config
+        needs = [
+            what
+            for what, set_ in (
+                ("heartbeat_interval (a hardware heartbeat)", cfg.heartbeat_interval is not None),
+                ("fault_action (a fault channel)", bool(cfg.fault_action)),
+                ("park_before_close", cfg.park_before_close),
+                ("attended_only false", cfg.attended_only is False),
+                ("allow_unattended_without_watchdog", cfg.allow_unattended_without_watchdog),
+            )
+            if set_
+        ]
+        if needs:
+            raise ValueError(f"no enclosure: {', '.join(needs)} needs an enclosure")
+        watch = [n for n, p in self.modes.modes.items() if p.enclosure == "watch"]
+        if watch:
+            raise ValueError(f"no enclosure: mode(s) {', '.join(watch)} only watch an enclosure")
+        # The operator on duty is the only judge of the sky: no mode may let a
+        # lease be granted, or go on, with nobody on duty (the attended floor).
+        alone = [n for n, p in self.modes.modes.items() if unattended(p)]
+        if alone:
+            raise ValueError(
+                f"no enclosure: mode(s) {', '.join(alone)} may observe with nobody on duty"
+                " (they need attended_only true and duty_expiry 'close')"
+            )
 
     # -- the operating mode (module doc) -----------------------------------------
 
@@ -763,7 +842,13 @@ class SafetySupervisor:
             not self._stopping
             and (ignore_mode or (p.open and p.enclosure == "command"))
             and (ignore_mode or self.attended(now, keep=keep))
-            and self._safe
+            and (not self.enclosure or self._weather_allows(now))
+        )
+
+    def _weather_allows(self, now: float) -> bool:
+        """The weather and the enclosure's own state allow opening."""
+        return (
+            self._safe
             and self._fault is None
             and (self._shutter_hold_until is None or now >= self._shutter_hold_until)
             and self._safe_since is not None
@@ -1084,7 +1169,10 @@ class SafetySupervisor:
             return False  # released already (a newer lease implies it)
         if lease.live:
             raise RecoveryRefused(f"lease #{lease_id} is live")
-        if await self._shutter_status() != Shutter.CLOSED:
+        if not self.enclosure:
+            if not await self._telescopes_parked():
+                raise RecoveryRefused("no enclosure: telescopes not confirmed parked yet")
+        elif await self._shutter_status() != Shutter.CLOSED:
             raise RecoveryRefused("enclosure not confirmed closed yet")
         if lease.released.is_set():
             return False  # a concurrent recover/clear won the race during the read
@@ -1305,7 +1393,10 @@ class SafetySupervisor:
 
         The dome refuses unless it is closed. A successful clear also restarts
         automatic clearing (``fault_auto_clear``) if a recurrence stopped it.
+        With no enclosure there is nothing to clear: a DeviceError.
         """
+        if self._dome is None:
+            raise DeviceError("no enclosure: no faults to clear")
         note = f"{operator}: {reason}"
         self.timeline.event(self.name, "clear_faults", operator=operator, reason=reason)
         log.warning("%s: ClearFaults by %s", self.name, note)
@@ -1342,6 +1433,7 @@ class SafetySupervisor:
         lease = self._lease
         if lease is not None and lease.live and lease.expired(now):
             self._revoke_lease(f"lease not renewed within {lease.ttl} s")
+            self._lapsed = lease.id  # its holder is not heard from
         orphaned_for = self._orphan_age(now)
         if lease is not None and orphaned_for is not None and orphaned_for > cfg.orphan_timeout:
             self._alarm(
@@ -1350,12 +1442,52 @@ class SafetySupervisor:
                 " or have an operator clear it"
             )
         self._note_would_open(now)
-        if self._watching():
+        if not self.enclosure:
+            self._open_sky(now)
+            await self._park_orphaned()
+        elif self._watching():
             await self._watch()
         elif self._want_open(now):
             await self._ensure_open()
         else:
             await self._ensure_closed()
+
+    def _open_sky(self, now: float) -> None:
+        """No enclosure: a live lease that may observe is open at once (there
+        is nothing to command); anything else has already been revoked."""
+        lease = self._lease
+        if lease is None or not lease.live:
+            self._emergency_close = None  # its revocation was the whole close
+        if self._want_open(now) and lease is not None and not lease.opened.is_set():
+            self._parked_for_close = False
+            lease.opened.set()
+            self.timeline.event(self.name, "sky_open", lease=lease.id, reason=NO_ENCLOSURE_TEXT)
+
+    async def _park_orphaned(self) -> None:
+        """No enclosure: a lease revoked and not released (its sequencer dead
+        or stuck) leaves no one to park the telescopes, and nothing closes
+        over them: the supervisor parks them itself, as before a roll-off
+        roof closes (:meth:`_park_before_close`), once per lease, with an
+        alarm at once. A lease that lapsed (not renewed: its holder is not
+        heard from) is parked at once; one revoked for another reason gives
+        the sequencer's cleanup ``park_wait / 2`` first."""
+        lease = self._lease
+        if (
+            lease is None
+            or lease.live
+            or lease.released.is_set()
+            or not lease.opened.is_set()
+            or self._parked_for_close
+        ):
+            return
+        lapsed = self._lapsed == lease.id
+        self._alarm(
+            f"lease #{lease.id} ({lease.holder}) revoked and not released"
+            f"{' (not renewed: its sequencer is silent)' if lapsed else ''}: no enclosure,"
+            " so the supervisor parks the telescopes",
+            "critical",
+        )
+        await self._park_before_close(wait_cleanup=not lapsed)
 
     def _note_would_open(self, now: float) -> None:
         """A mode that may not open: record when it *would* open or close
@@ -1488,13 +1620,13 @@ class SafetySupervisor:
                 shutter=None if status is None else Shutter(status).name,
             )
 
-    async def _park_before_close(self) -> None:
+    async def _park_before_close(self, *, wait_cleanup: bool = True) -> None:
         """Roll-off roofs: give the sequencer's cleanup a bounded chance to
-        park, then park every telescope ourselves (in parallel), then close
-        regardless."""
+        park (``wait_cleanup``), then park every telescope ourselves (in
+        parallel), then close regardless."""
         cfg = self.config
         lease = self._lease
-        if lease is not None and not lease.released.is_set():
+        if wait_cleanup and lease is not None and not lease.released.is_set():
             try:
                 await asyncio.wait_for(lease.released.wait(), cfg.park_wait / 2)
             except TimeoutError:
@@ -1711,10 +1843,10 @@ class SafetySupervisor:
         """
         self.timeline.event(self.name, "supervisor_start", config=vars(self.config))
         self._stopping = False
-        loops = [
-            asyncio.create_task(self._weather_loop(), name=f"{self.name}-weather"),
-            asyncio.create_task(self._enclosure_loop(), name=f"{self.name}-enclosure"),
-        ]
+        loops = []
+        if self._sm is not None:  # none with no enclosure (module doc)
+            loops.append(asyncio.create_task(self._weather_loop(), name=f"{self.name}-weather"))
+        loops.append(asyncio.create_task(self._enclosure_loop(), name=f"{self.name}-enclosure"))
         if self._hb is not None:
             loops.append(asyncio.create_task(self._heartbeat_loop(), name=f"{self.name}-heartbeat"))
         try:
@@ -1732,7 +1864,9 @@ class SafetySupervisor:
             except asyncio.CancelledError as exc:  # cancelled again: close anyway
                 again = exc
             try:
-                if self._watching():
+                if self._dome is None:
+                    log.info("%s: no enclosure: no final close", self.name)
+                elif self._watching():
                     log.warning(
                         "%s: mode %s commands nothing: no final close", self.name, self.mode
                     )

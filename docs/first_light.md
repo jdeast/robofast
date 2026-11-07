@@ -4,7 +4,7 @@ From a telescope and camera plugged into this computer to a plate-solved
 light frame (`robofast/first_light.py`):
 
 ```sh
-pip install robofast
+pip install .        # this repository, or a wheel built from it (robofast is not on PyPI yet)
 python -m robofast --site 42.38,-71.13 --no-enclosure
 ```
 

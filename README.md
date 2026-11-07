@@ -19,12 +19,13 @@ it to me so other users can use (and improve) it.
 With a telescope and camera plugged into this computer (ASCOM Alpaca):
 
 ```
-pip install robofast
+pip install .        # this repository, or a wheel built from it: robofast is not on PyPI yet
 python -m robofast --site LAT,LON --no-enclosure
 ```
 
 finds them, reads their plate scale, writes the config, calibrates the
-pointing from three plate solves and takes one plate-solved light frame:
+pointing's zero points from three plate solves and takes one plate-solved
+light frame:
 [docs/first_light.md](docs/first_light.md).
 
 ## Install

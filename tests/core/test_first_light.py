@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from robofast import discover
 from robofast.catalog import separation
 from robofast.first_light import main
 from robofast.testing.alpaca_server import FakeAlpacaServer
@@ -323,3 +324,37 @@ def test_two_telescopes_are_refused_before_any_is_read(tmp_path, capsys):
         server.stop()
     assert exc.value.code == 1 and "first light runs one telescope; 2" in capsys.readouterr().err
     assert Counted.reads == 0
+
+
+def test_frames_that_do_not_solve_are_said_and_stop_it_soon(device, tmp_path, capsys):
+    """A plate scale 10 % off (beyond the solver's tolerance): no frame
+    solves. First light says so, with the solver's errors, and stops after
+    two pointing runs with nothing solved instead of waiting out --timeout."""
+    import time
+
+    device.mount.FocalLength *= 1.1
+    t0 = time.monotonic()
+    with pytest.raises(SystemExit) as exc:
+        main(_args(device, tmp_path, "--no-enclosure", "--yes", "--timeout", "120"))
+    took = time.monotonic() - t0
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and "did not solve" in err, err
+    assert "matched" in err or "no match" in err, err  # the solver's own words
+    assert took < 60, took
+
+
+def test_first_light_asks_eight_matched_stars_of_a_solve(device, tmp_path):
+    """Jason's solver accepts 4 matched stars by default; a sparse field can
+    then solve falsely (room 118, F12). First light asks 8, for the
+    calibration's points and for the first-light frame."""
+    from robofast import first_light
+
+    config = first_light.first_light_config(
+        discover.configured_devices(device.address),
+        site=(42.38, -71.13, 0.0),
+        enclosure=None,
+        catalog={"source": "synthetic"},
+        plugins=[],
+    )
+    assert config["telescopes"]["t1"]["pointing"]["solver"]["min_matches"] == 8
+    assert config["images"]["solve"]["telescopes"]["t1"]["min_matches"] == 8

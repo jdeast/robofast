@@ -402,6 +402,9 @@ POINTING_RUN_DEFAULTS: dict[str, Any] = {
     "settle": 2.0,
     "min_points": 12,
     "significance": 4.0,
+    #: Fixed TPOINT terms (None: chosen by pointmodel.select_terms); a first
+    #: calibration from a few points fixes the zero points (docs/pointing_model.md).
+    "terms": None,
 }
 
 #: What a target's acquisition entry passes to the guider (docs/acquisition.md).
@@ -3314,6 +3317,7 @@ class Sequencer:
             port=obs.port,
             significance=run["significance"],
             min_points=run["min_points"],
+            terms=run["terms"],
             when=self.clock(),
         )
         built.note = f"pointing run {obs.name}"

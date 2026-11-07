@@ -13,6 +13,12 @@ in that order. Names match case-insensitively. The fakes' faults apply:
 HTTP 500, and a :class:`FakeDeviceError` is an Alpaca driver error (0x500).
 A camera's ``ImageArray`` (an :class:`~robofast.imagebytes.ImageArray`)
 goes out as ImageBytes when the client accepts it, else as Alpaca JSON.
+
+The Alpaca management API (``/management/apiversions``,
+``/management/v1/description``, ``/management/v1/configureddevices``)
+lists the fakes as a real Alpaca server lists its devices; with
+``discovery_port`` it also answers Alpaca UDP discovery, so
+:mod:`robofast.discover` finds it as it would a device plugged in.
 """
 
 from __future__ import annotations
@@ -28,10 +34,28 @@ from urllib.parse import parse_qs, urlparse
 from robofast import hwgate
 from robofast import imagebytes as ib
 from robofast.alpaca_client import METHODS
+from robofast.devices.aqawan_server import _Discovery
 from robofast.testing.fakes import FakeDevice, FakeDeviceError
 from robofast.weather_server import NOT_IMPLEMENTED, _alpaca
 
 log = logging.getLogger(__name__)
+
+
+_TYPES = {
+    t.lower(): t
+    for t in (
+        "Camera",
+        "CoverCalibrator",
+        "Dome",
+        "FilterWheel",
+        "Focuser",
+        "ObservingConditions",
+        "Rotator",
+        "SafetyMonitor",
+        "Switch",
+        "Telescope",
+    )
+}
 
 
 def _decode(text: str) -> Any:
@@ -75,11 +99,18 @@ class _Handler(BaseHTTPRequestHandler):
             form = parse_qs(body, keep_blank_values=True)
             params.update({k.lower(): v[0] for k, v in form.items()})
         parts = [p for p in url.path.lower().split("/") if p]
+        ctid = int(params.get("clienttransactionid", 0) or 0)
+        if parts[:1] == ["management"] and self.command == "GET":
+            value = self.server.management(parts[1:])
+            if value is None:
+                self._send(400, {"error": f"unknown path {self.path}"})
+            else:
+                self._send(200, _alpaca(value, ctid=ctid))
+            return
         device = self.server.devices.get("/".join(parts[2:4])) if len(parts) == 5 else None
         if parts[:2] != ["api", "v1"] or device is None:
             self._send(400, {"error": f"unknown path {self.path}"})
             return
-        ctid = int(params.get("clienttransactionid", 0) or 0)
         deadline = time.monotonic() + self.server.hang_limit
         while device._hung.is_set() and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -135,6 +166,7 @@ class FakeAlpacaServer(ThreadingHTTPServer):
         host: str = "127.0.0.1",
         port: int = 0,
         hang_limit: float = 30.0,
+        discovery_port: int | None = None,
     ) -> None:
         super().__init__((host, port), _Handler)
         #: A robofast simulator: the hardware gate accepts it (hwgate).
@@ -142,6 +174,11 @@ class FakeAlpacaServer(ThreadingHTTPServer):
         self.devices = {k.lower() if "/" in k else f"{k.lower()}/0": d for k, d in devices.items()}
         self.hang_limit = hang_limit
         self._thread: threading.Thread | None = None
+        #: Alpaca UDP discovery on ``discovery_port`` (0: any free port), on
+        #: the server's own host; None: off.
+        self.discovery: _Discovery | None = None
+        if discovery_port is not None:
+            self.discovery = _Discovery(host, discovery_port, self.server_address[1])
 
     @property
     def address(self) -> str:
@@ -155,7 +192,35 @@ class FakeAlpacaServer(ThreadingHTTPServer):
             return
         super().handle_error(request, client_address)
 
+    def management(self, tail: list[str]) -> Any:
+        """The management API's value for ``/management/<tail>``; None: unknown."""
+        if tail == ["apiversions"]:
+            return [1]
+        if tail == ["v1", "description"]:
+            return {
+                "ServerName": "robofast fakes",
+                "Manufacturer": "robofast",
+                "ManufacturerVersion": "test",
+                "Location": "loopback",
+            }
+        if tail == ["v1", "configureddevices"]:
+            entries = []
+            for key, device in self.devices.items():
+                kind, _, number = key.partition("/")
+                entries.append(
+                    {
+                        "DeviceName": f"{type(device).__name__} {number}",
+                        "DeviceType": _TYPES.get(kind, kind),
+                        "DeviceNumber": int(number),
+                        "UniqueID": f"robofast-fake-{self.server_address[1]}-{kind}-{number}",
+                    }
+                )
+            return entries
+        return None
+
     def start(self) -> FakeAlpacaServer:
+        if self.discovery is not None:
+            self.discovery.start()
         self._thread = threading.Thread(target=self.serve_forever, name="fake-alpaca", daemon=True)
         self._thread.start()
         return self
@@ -165,6 +230,8 @@ class FakeAlpacaServer(ThreadingHTTPServer):
             d.unhang()
         self.shutdown()
         self.server_close()
+        if self.discovery is not None:
+            self.discovery.stop()
         self.registration.close()
         if self._thread is not None:
             self._thread.join(timeout=5)

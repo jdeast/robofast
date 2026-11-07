@@ -24,9 +24,13 @@ python -m robofast --site 42.38,-71.13 --no-enclosure
    process: a first pointing calibration from three plate solves
    (docs/pointing_model.md, "A first calibration"), then one light frame
    at the zenith, plate-solved (docs/sky.md);
-6. prints the frame, where it points, how far that is from the target, and
+6. with an enclosure, takes you off duty and waits until the supervisor
+   reads it closed (bounded by `safety.shutter_timeout`; if it does not
+   close, it exits 1 saying so);
+7. prints the frame, where it points, how far that is from the target, and
    the pointing model, and exits 0. Anything that stops it exits 1 and
-   says what.
+   says what, with what the supervisor says (weather, the reopen hold, the
+   lease) if it was waiting.
 
 The frames and their index are under `first-light/data/` (docs/data.md),
 the pointing model under `first-light/pointing/`. The config it wrote is

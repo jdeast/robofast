@@ -203,3 +203,60 @@ def test_an_enclosure_is_closed_when_it_returns(device, tmp_path, capsys, monkey
     assert json.loads(out.strip().splitlines()[-1])["first_light"]["solve"]["solved"]
     assert state == 1, state  # closed, not closing
     assert "enclosure closed" in out
+
+
+def _ctrl_c_after_the_first_exposure(device):
+    import os
+    import signal
+    import threading
+    import time
+
+    def interrupt() -> None:
+        deadline = time.monotonic() + 120
+        while device.camera.exposures_started < 1 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.3)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    threading.Thread(target=interrupt, daemon=True).start()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGINT to itself: POSIX only")
+def test_ctrl_c_stops_parks_and_says_so(device, tmp_path, capsys):
+    _ctrl_c_after_the_first_exposure(device)
+    with pytest.raises(SystemExit) as exc:
+        main(_args(device, tmp_path, "--no-enclosure", "--yes"))
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and "first light: stopped; the telescope parked" in err, err
+    assert device.mount.AtPark
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGINT to itself: POSIX only")
+def test_ctrl_c_says_loudly_when_the_telescope_did_not_park(device, tmp_path, capsys):
+    from robofast.testing.fakes import FakeDeviceError
+
+    def refuses() -> None:
+        raise FakeDeviceError("Park: mount refused (limit switch)")
+
+    device.mount.Park = refuses
+    _ctrl_c_after_the_first_exposure(device)
+    with pytest.raises(SystemExit) as exc:
+        main(_args(device, tmp_path, "--no-enclosure", "--yes"))
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and "first light: stopped; the telescope DID NOT PARK" in err, err
+    assert "the telescope parked" not in err and not device.mount.AtPark
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the stand-in imports unix_events")
+def test_ctrl_c_where_the_loop_has_no_signal_handlers(device, tmp_path, capsys, monkeypatch):
+    from asyncio import unix_events
+
+    def unavailable(self, *args, **kwargs):
+        raise NotImplementedError
+
+    monkeypatch.setattr(unix_events._UnixSelectorEventLoop, "add_signal_handler", unavailable)
+    _ctrl_c_after_the_first_exposure(device)
+    with pytest.raises(SystemExit) as exc:  # not a KeyboardInterrupt
+        main(_args(device, tmp_path, "--no-enclosure", "--yes"))
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and "first light: stopped; the telescope parked" in err, err

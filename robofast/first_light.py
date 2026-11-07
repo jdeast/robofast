@@ -62,6 +62,23 @@ class FirstLightError(RuntimeError):
     """What stopped first light (printed; exit status 1)."""
 
 
+class FirstLightStopped(FirstLightError):
+    """Stopped by the operator (Ctrl-C): ``parked`` says whether every
+    telescope reported parked after the sequencer's cleanup."""
+
+    def __init__(self, parked: bool, why: str = "") -> None:
+        self.parked = parked
+        if parked:
+            text = "stopped; the telescope parked"
+        else:
+            text = (
+                "stopped; the telescope DID NOT PARK"
+                + (f" ({why})" if why else "")
+                + ": park it by hand now"
+            )
+        super().__init__(text)
+
+
 def first_light_config(
     devices: list[discover.Device],
     *,
@@ -181,11 +198,19 @@ async def _enclosure_closed(sup: Any) -> bool:
 
 
 async def run(
-    config: dict[str, Any], workdir: Path, operator: str, *, timeout: float = 1800.0
+    config: dict[str, Any],
+    workdir: Path,
+    operator: str,
+    *,
+    timeout: float = 1800.0,
+    stop: asyncio.Event | None = None,
 ) -> dict[str, Any]:
     """Run first light on ``config`` (already written in ``workdir``);
     return the first-light frame's index entry, with its solve. Raises
-    :class:`FirstLightError` saying what stopped it."""
+    :class:`FirstLightError` saying what stopped it; ``stop`` set (Ctrl-C),
+    or this task cancelled (Ctrl-C where the loop has no signal handlers),
+    stops the sequencer, whose cleanup parks, and raises
+    :class:`FirstLightStopped` saying whether every telescope parked."""
     from robofast import sequencer_service, supervisor_service
 
     tl = Timeline(maxlen=20000)
@@ -205,16 +230,31 @@ async def run(
     if sup._attended_only():
         sup.duty_on(operator, "first light (python -m robofast)")
         duty = asyncio.create_task(keep_duty(), name="duty")
-    seq_task = asyncio.create_task(sequencer_service.run(seq, remote), name="sequencer")
+    seq_task = asyncio.create_task(
+        sequencer_service.run(seq, remote, handle_signals=False), name="sequencer"
+    )
+    stop = stop or asyncio.Event()
+    stopped, parked = False, False
     try:
-        await asyncio.wait_for(asyncio.shield(seq_task), timeout)
-    except TimeoutError as exc:
-        raise FirstLightError(f"not done after {timeout:g} s; {_waiting(sup)}") from exc
+        stop_wait = asyncio.create_task(stop.wait(), name="stop")
+        done, _ = await asyncio.wait({seq_task, stop_wait}, timeout=timeout,
+                                     return_when=asyncio.FIRST_COMPLETED)  # fmt: skip
+        stop_wait.cancel()
+        stopped = stop.is_set()
+        if not done:
+            raise FirstLightError(f"not done after {timeout:g} s; {_waiting(sup)}")
+    except asyncio.CancelledError:
+        stopped = True  # Ctrl-C where the loop has no signal handlers (Windows)
     finally:
         if not seq_task.done():
-            seq_task.cancel()
+            seq_task.cancel()  # its cleanup aborts and parks
             with contextlib.suppress(BaseException):
                 await seq_task
+        if stopped:
+            try:
+                parked = await sup._telescopes_parked()
+            except Exception:  # an unreadable mount: not known to be parked
+                parked = False
         if duty is not None:
             duty.cancel()
             sup.duty_off(operator, "first light over")
@@ -225,6 +265,8 @@ async def run(
         with contextlib.suppress(BaseException):
             await sup_task
         await server.stop()
+    if stopped:
+        raise FirstLightStopped(parked, "; ".join(list(sup.alarms)[-2:]))
     if closed is False:
         raise FirstLightError(
             f"the enclosure did not read closed within {_close_bound(sup):g} s"
@@ -343,22 +385,26 @@ def main(argv: list[str] | None = None) -> None:
     print("first light: a pointing calibration (3 plate solves), then one frame at the zenith")
 
     async def go() -> dict[str, Any]:
-        task = asyncio.current_task()
-        assert task is not None
+        stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
-            # Windows' loops have none: Ctrl-C reaches asyncio.run, which cancels.
+            # Windows' loops have none: Ctrl-C reaches asyncio.run, which
+            # cancels this task, and run() treats that as the same stop.
             with contextlib.suppress(NotImplementedError):
-                loop.add_signal_handler(sig, task.cancel)
-        return await run(config, workdir, args.operator, timeout=args.timeout)
+                loop.add_signal_handler(sig, stop.set)
+        return await run(config, workdir, args.operator, timeout=args.timeout, stop=stop)
 
     try:
         entry = asyncio.run(go())
     except FirstLightError as exc:
         print(f"first light: {exc}", file=sys.stderr)
         sys.exit(1)
-    except asyncio.CancelledError:
-        print("first light: stopped; the telescope parked", file=sys.stderr)
+    except KeyboardInterrupt:  # a second Ctrl-C, before the cleanup finished
+        print(
+            "first light: stopped before the cleanup finished; the telescope may NOT be"
+            " parked: check it now",
+            file=sys.stderr,
+        )
         sys.exit(1)
     solve = entry["solve"]
     target_ra, target_dec = config["plan"]["targets"][1]["ra_hours"] * 15.0, site[0]

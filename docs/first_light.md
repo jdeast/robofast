@@ -71,3 +71,13 @@ the real one. Its mount points with an injected TPOINT error
 (`--pointing-error`, default `IH=150,ID=-40,NP=20` arcsec), which the
 calibration measures. `tests/core/test_first_light.py` runs the command on
 it.
+
+On the real sky the simulated camera needs its catalog tiles before it
+renders: a tile downloaded inside an exposure can time the camera out.
+Hold the sky at one instant with `--time` (its mount's sidereal time and
+its stars), so every run points at the same four fields; fill the cache
+for them once (`catalog_from_config(...).cone(ra, dec, 0.55)` around each:
+the zenith at that instant's sidereal time, and the calibration's three
+points, `pointmodel.sky_grid`), and every run after renders from it.
+A real camera needs none of this: only the solver reads the catalog, and
+it downloads what it lacks as it solves.

@@ -163,6 +163,23 @@ def _waiting(sup: Any) -> str:
     return out
 
 
+def _close_bound(sup: Any) -> float:
+    return sup.config.shutter_timeout + 3 * sup.config.poll_interval
+
+
+async def _enclosure_closed(sup: Any) -> bool:
+    """Wait (bounded) for the supervisor to read the shutter closed."""
+    from robofast.safety import Shutter
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _close_bound(sup)
+    while loop.time() < deadline:
+        if sup.shutter == Shutter.CLOSED and sup.outstanding() is None:
+            return True
+        await asyncio.sleep(min(0.5, sup.config.poll_interval))
+    return False
+
+
 async def run(
     config: dict[str, Any], workdir: Path, operator: str, *, timeout: float = 1800.0
 ) -> dict[str, Any]:
@@ -201,10 +218,18 @@ async def run(
         if duty is not None:
             duty.cancel()
             sup.duty_off(operator, "first light over")
+        # The enclosure closes through the supervisor's own enclosure loop
+        # (the lease is gone); first light returns once it reads closed.
+        closed = await _enclosure_closed(sup) if sup.enclosure else None
         sup_task.cancel()
         with contextlib.suppress(BaseException):
             await sup_task
         await server.stop()
+    if closed is False:
+        raise FirstLightError(
+            f"the enclosure did not read closed within {_close_bound(sup):g} s"
+            f" (shutter {sup.status()['shutter']}): check it now"
+        )
     errors = [e.detail.get("error") for e in tl.events("telescope_error")]
     if not seq.pointing_models:
         unsolved = [e.detail.get("error") for e in tl.events("pointing_point_unsolved")]
@@ -225,6 +250,7 @@ async def run(
     if not solve.get("ra") and solve.get("ra") != 0:
         raise FirstLightError(f"the first-light frame {entry.get('file')} did not solve: {solve}")
     entry["model"] = seq.pointing_models[-1].model.terms
+    entry["enclosure"] = None if closed is None else "closed"
     return entry
 
 
@@ -339,6 +365,8 @@ def main(argv: list[str] | None = None) -> None:
     off = separation(float(solve["ra"]), float(solve["dec"]), target_ra, target_dec) * 3600.0
     terms = ", ".join(f'{k} {v:+.1f}"' for k, v in entry["model"].items())
     root = Path(config["images"]["data_root"])
+    if entry.get("enclosure"):
+        print(f"first light: enclosure {entry['enclosure']}")
     print(f"first light frame: {(root if root.is_absolute() else workdir / root) / entry['file']}")
     print(
         f"  solved: RA {float(solve['ra']):.5f} Dec {float(solve['dec']):+.5f} deg,"

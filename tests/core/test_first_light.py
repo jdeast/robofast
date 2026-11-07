@@ -173,3 +173,33 @@ def test_an_enclosure_with_unsafe_weather_stays_closed_and_says_why(device, tmp_
     assert "not done after 15 s" in err and "SafetyMonitor.IsSafe=False" in err
     assert device.camera.exposures_started == 0  # nothing exposed
     assert dome.state() == 1  # closed
+
+
+def test_an_enclosure_is_closed_when_it_returns(device, tmp_path, capsys, monkeypatch):
+    """With safe weather the enclosure opens (after the reopen hold, shortened
+    here by the test alone), first light solves, and the command returns only
+    once the enclosure reads closed, saying so."""
+    from robofast import first_light
+    from robofast.testing.fakes import FakeDome, FakeSafetyMonitor, FakeWeather
+
+    config = first_light.first_light_config
+
+    def short_hold(*args, **kwargs):
+        c = config(*args, **kwargs)
+        c["safety"] = {"reopen_hold": 1.0, "poll_interval": 0.5}  # the test's, not robofast's
+        return c
+
+    monkeypatch.setattr(first_light, "first_light_config", short_hold)
+    dome = FakeDome(travel=2.0)
+    safe = FakeSafetyMonitor(FakeWeather(safe=True))
+    enclosure = FakeAlpacaServer({"dome": dome, "safetymonitor": safe}).start()
+    a = enclosure.address
+    try:
+        main(_args(device, tmp_path, "--dome", f"{a}/0", "--safety-monitor", f"{a}/0", "--yes"))
+        state = dome.state()
+    finally:
+        enclosure.stop()
+    out = capsys.readouterr().out
+    assert json.loads(out.strip().splitlines()[-1])["first_light"]["solve"]["solved"]
+    assert state == 1, state  # closed, not closing
+    assert "enclosure closed" in out

@@ -87,6 +87,22 @@ Run settings (`pointing.run` in the config, overridable per observation):
 `min_alt` 25, `max_alt` 85, `moon_distance` 15, `max_hour_angle`,
 `min_dec`, `max_dec` (none), `settle` 2 s, `min_points` 12, `significance` 4.
 
+### A first calibration
+
+On a new telescope, two or three solved points are enough to measure the
+zero points: a run with `count` 3 and `min_points` 3 (the model is built
+from at least `min_points` solved points) keeps only the index terms
+(`IH`, `ID`; alt-az `IA`, `IE`), since `select_terms` adds no term that so
+few points cannot carry. For example, as the first observation of a plan:
+
+```json
+{"name": "first-pointing", "kind": "pointing_model", "count": 3, "exptime": 5,
+ "pointing": {"min_points": 3}}
+```
+
+Its cross-validated rms is not defined (fewer points than folds). A full
+run (`min_points` 12) replaces it once the sky is clear for long enough.
+
 ## 4. Using it
 
 With a model for the port, every slew is commanded through it: the target

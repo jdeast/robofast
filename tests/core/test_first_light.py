@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -46,7 +47,33 @@ def _args(device, tmp_path, *extra):
     ]  # fmt: skip
 
 
-def test_one_command_to_a_solved_first_light_frame(device, tmp_path, capsys):
+#: One instant for the sky (the device's clock and first light's): the
+#: synthetic field at the zenith then, the same in every run.
+HELD = datetime(2026, 11, 7, 3, 0, 0, tzinfo=UTC)
+
+
+class _HeldClock(datetime):
+    @classmethod
+    def now(cls, tz=None):  # type: ignore[override]
+        return HELD if tz is None or tz is UTC else HELD.astimezone(tz)
+
+
+@pytest.fixture
+def held_device(tmp_path, monkeypatch):
+    import robofast.first_light
+
+    monkeypatch.setattr(robofast.first_light, "datetime", _HeldClock)
+    d = SkyDevice(
+        catalog={"cache_dir": str(tmp_path / "sky")},
+        pointing_error={"IH": 150.0, "ID": -40.0, "NP": 20.0},
+        clock=lambda: HELD,
+    ).start()
+    yield d
+    d.stop()
+
+
+def test_one_command_to_a_solved_first_light_frame(held_device, tmp_path, capsys):
+    device = held_device
     main(_args(device, tmp_path, "--no-enclosure", "--yes"))
     out = capsys.readouterr().out
     entry = json.loads(out.strip().splitlines()[-1])["first_light"]
@@ -391,7 +418,7 @@ def _counted_source(name, calls, device, delay=0.0):
 
 
 def test_the_catalog_is_fetched_before_the_telescope_moves(device, tmp_path, capsys):
-    """F13: a tile downloaded inside a solve held the process past its
+    """A tile downloaded inside a solve held the process past its
     timeout (asyncio.run waits for the solve's thread). First light fetches
     the four fields' tiles first, saying so."""
     from robofast.catalog import CATALOG_SOURCES

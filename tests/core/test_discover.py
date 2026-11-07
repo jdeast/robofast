@@ -39,10 +39,12 @@ def plugged_in():
     """A mount, a camera, a focuser, a dome and a safety monitor on one
     server that answers discovery on loopback."""
     weather = FakeWeather()
+    telescope = FakeTelescope()
+    telescope.FocalLength = 0.5  # m, as an Alpaca Telescope reports it
     server = FakeAlpacaServer(
         {
-            "telescope": FakeTelescope(),
-            "camera": FakeCamera(),
+            "telescope": telescope,
+            "camera": FakeCamera(),  # PixelSizeX = PixelSizeY = 9.0 um
             "focuser": FakeFocuser(),
             "dome": FakeDome(),
             "safetymonitor": FakeSafetyMonitor(weather),

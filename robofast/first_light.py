@@ -60,6 +60,13 @@ log = logging.getLogger(__name__)
 #: Exposure (s) of the calibration's frames and of the first light frame.
 EXPTIME = 5.0
 
+#: Fewest matched stars for a solve, the calibration's and the frame's.
+MIN_MATCHES = 8
+
+#: Give up once this many calibration points went unsolved with none solved
+#: (two pointing runs of three): the frames will not solve.
+UNSOLVED_LIMIT = 6
+
 
 class FirstLightError(RuntimeError):
     """What stopped first light (printed; exit status 1)."""
@@ -120,12 +127,17 @@ def first_light_config(
     config["site"] = {"latitude": lat, "longitude": lon, "elevation": elev}
     if plugins:
         config["plugins"] = list(plugins)
-    config["images"]["solve"] = {"catalog": dict(catalog)}
+    # Jason's solver accepts 4 matched stars by default; a sparse field can
+    # solve falsely with so few (room 118, F12): first light asks 8.
+    config["images"]["solve"] = {
+        "catalog": dict(catalog),
+        "telescopes": {tel: {"min_matches": MIN_MATCHES}},
+    }
     scopes[tel]["pointing"] = {
         "latitude": lat,
         "longitude": lon,
         "store": "pointing",
-        "solver": {"plate_scale": optics["plate_scale"]},
+        "solver": {"plate_scale": optics["plate_scale"], "min_matches": MIN_MATCHES},
         "catalog": dict(catalog),
         "run": {"settle": 1.0},
     }
@@ -179,6 +191,23 @@ def _first_light_frame(data_root: Path, tel: str) -> dict[str, Any] | None:
             if entry.get("object") == "first-light":
                 return entry
     return None
+
+
+def _frames(tl: Timeline) -> str:
+    """The calibration's frames so far: how many solved, the last errors."""
+    solved = len(tl.events("pointing_point"))
+    errors = [str(e.detail.get("error")) for e in tl.events("pointing_point_unsolved")]
+    out = f"{solved} calibration frame(s) solved, {len(errors)} did not solve"
+    return out + (f" (last: {'; '.join(errors[-2:])})" if errors else "")
+
+
+async def _unsolvable(tl: Timeline) -> None:
+    """Return once the calibration's frames are found not to solve."""
+    while not (
+        len(tl.events("pointing_point_unsolved")) >= UNSOLVED_LIMIT
+        and not tl.events("pointing_point")
+    ):
+        await asyncio.sleep(0.5)
 
 
 def _waiting(sup: Any) -> str:
@@ -250,12 +279,20 @@ async def run(
     stopped, parked = False, False
     try:
         stop_wait = asyncio.create_task(stop.wait(), name="stop")
-        done, _ = await asyncio.wait({seq_task, stop_wait}, timeout=timeout,
+        unsolvable = asyncio.create_task(_unsolvable(tl), name="unsolvable")
+        done, _ = await asyncio.wait({seq_task, stop_wait, unsolvable}, timeout=timeout,
                                      return_when=asyncio.FIRST_COMPLETED)  # fmt: skip
         stop_wait.cancel()
+        unsolvable.cancel()
         stopped = stop.is_set()
+        if unsolvable in done and not stopped:
+            raise FirstLightError(
+                f"the frames did not solve: {_frames(tl)}; check the plate scale"
+                " (the telescope's FocalLength and the camera's pixel size), the focus,"
+                " and that the sky is clear"
+            )
         if not done:
-            raise FirstLightError(f"not done after {timeout:g} s; {_waiting(sup)}")
+            raise FirstLightError(f"not done after {timeout:g} s; {_frames(tl)}; {_waiting(sup)}")
     except asyncio.CancelledError:
         stopped = True  # Ctrl-C where the loop has no signal handlers (Windows)
     finally:

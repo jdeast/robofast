@@ -7,6 +7,7 @@ loopback."""
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -132,6 +133,10 @@ def test_two_telescopes_are_not_chosen_between(tmp_path, capsys):
     assert exc.value.code == 1 and "first light runs one telescope; 2" in capsys.readouterr().err
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="on Windows the real loop runs: test_one_command_to_a_solved_first_light_frame",
+)
 def test_runs_where_the_event_loop_has_no_signal_handlers(device, tmp_path, capsys, monkeypatch):
     """Windows' asyncio loops have no ``add_signal_handler`` (they raise
     NotImplementedError; Ctrl-C arrives as KeyboardInterrupt instead):

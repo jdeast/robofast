@@ -358,3 +358,34 @@ def test_first_light_asks_eight_matched_stars_of_a_solve(device, tmp_path):
     )
     assert config["telescopes"]["t1"]["pointing"]["solver"]["min_matches"] == 8
     assert config["images"]["solve"]["telescopes"]["t1"]["min_matches"] == 8
+
+
+class _NeverParks(FakeTelescope):
+    @property
+    def AtPark(self) -> bool:  # type: ignore[override]
+        return False
+
+    def Park(self) -> None:
+        from robofast.testing.fakes import FakeDeviceError
+
+        raise FakeDeviceError("MethodNotImplemented: Park")
+
+
+def test_a_mount_that_never_parks_is_named_in_the_last_line(tmp_path, capsys):
+    """Room 118, S1: no lease is granted until every telescope is parked;
+    the last line says so, in the supervisor's words."""
+    tel, cam = _NeverParks(), FakeCamera()
+    tel.FocalLength = 0.5
+    cam.PixelSizeX = cam.PixelSizeY = 9.0
+    server = FakeAlpacaServer({"telescope": tel, "camera": cam}).start()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main(["--site", SITE, "--no-enclosure", "--yes", "--server", server.address,
+                  "--dir", str(tmp_path / "run"), "--catalog-dir", str(tmp_path / "cat"),
+                  "--plugin", "robofast.testing.sky_device:register", "--catalog", "synthetic",
+                  "--timeout", "6"])  # fmt: skip
+    finally:
+        server.stop()
+    last = [ln for ln in capsys.readouterr().err.splitlines() if ln.startswith("first light")]
+    assert exc.value.code == 1 and cam.exposures_started == 0
+    assert "telescope not parked" in last[-1], last

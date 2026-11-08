@@ -40,6 +40,7 @@ import os
 import signal
 import threading
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -127,12 +128,18 @@ class SkyDevice:
         port: int = 0,
         discovery_port: int | None = 0,
         clock: Callable[[], datetime] = now,
+        focus_error: float = 0.0,
+        bright: bool = False,
     ) -> None:
         self.clock = clock
         self.mount = SkyMount(clock, latitude, longitude, slew_time=0.5)
         #: What the mount reports (m): the focal length that, with the
         #: camera's pixels, gives the sky's plate scale.
         self.mount.FocalLength = ARCSEC_PER_UM_PER_MM * pixel_size / plate_scale / 1000.0
+        # Its aperture (m, m^2), as an ASCOM telescope reports it: the
+        # simulated optics' f/6.5 with a 47 % central obstruction.
+        self.mount.ApertureDiameter = self.mount.FocalLength / 6.5
+        self.mount.ApertureArea = math.pi * (self.mount.ApertureDiameter / 2) ** 2 * (1 - 0.47**2)
         camera = SkyCamera(
             shape=shape, plate_scale=plate_scale, pixel_size=pixel_size, detector=Detector(shape)
         )
@@ -144,8 +151,11 @@ class SkyDevice:
             sky_mag=21.0,
             seeing=2.5,
         )
-        scene = SkyFocusScene(self.sky, self.mount, clock, effective_exposure=10.0)
-        self.focuser = SimFocuser(position=20000)
+        scene = (_BrightFocusScene if bright else SkyFocusScene)(
+            self.sky, self.mount, clock, effective_exposure=10.0
+        )
+        #: The focuser starts ``focus_error`` steps from the true focus (20000).
+        self.focuser = SimFocuser(position=round(20000 + focus_error), max_step=120000)
         self.camera = StarfieldCamera(self.focuser, scene)
         self.camera.PixelSizeX = self.camera.PixelSizeY = pixel_size
         self.server = FakeAlpacaServer(
@@ -172,6 +182,45 @@ class SkyDevice:
         self.server.stop()
 
 
+class _BrightFocusScene(SkyFocusScene):
+    """The sky's stars, and the bright object first light focuses on
+    (:func:`robofast.first_focus.bright_target`: a planet or a bright star),
+    drawn with its whole defocused disk wherever it falls on the chip, and
+    at the exposure asked for (it would saturate at the faint stars' 10 s)."""
+
+    def render(self, optical: float, duration: float, roi, binning: int) -> np.ndarray:
+        from robofast.first_focus import bright_target
+        from robofast.testing.starfield import Star, render
+
+        img = super().render(optical, duration, roi, binning).astype(float)
+        when = self.clock()
+        sky = self.sky
+        target = bright_target((sky.site[0], sky.site[1], 0.0), when)
+        if target is None:
+            return img.astype(np.int32)
+        ra = float(self.mount.RightAscension) * 15.0
+        dec = float(self.mount.Declination)
+        tra, tdec = sky.true_pointing(ra, dec, when)
+        x, y = sky.camera.project(tra, tdec, np.array([target.ra]), np.array([target.dec]))
+        rate = 10.0 ** (-0.4 * (target.mag - sky.photometry.zp))
+        det = replace(self.detector, sky=0.0, dark=0.0)
+        blur = abs(self.defocus(optical)) / (self.optics.f_ratio * self.optics.pixel_size)
+        frame = render(
+            [Star(float(x[0]), float(y[0]), rate)],
+            self.optics,
+            det,
+            seeing=sky.seeing,
+            defocus=self.defocus(optical),
+            exposure=max(duration, 1e-6),
+            roi=roi,
+            binning=binning,
+            noise=False,
+            oversample=1 if blur > 300 else 2,
+        )
+        img += frame.image - det.bias
+        return np.clip(np.rint(img), 0, self.detector.saturation).astype(np.int32)
+
+
 def _held(text: str) -> Callable[[], datetime]:
     t = datetime.fromisoformat(text)
     t = t.replace(tzinfo=UTC) if t.tzinfo is None else t.astimezone(UTC)
@@ -193,6 +242,12 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--site", default="42.38,-71.13", help="LAT,LON (deg north, deg east)")
     ap.add_argument("--pointing-error", default="IH=150,ID=-40,NP=20", help="TPOINT terms, arcsec")
     ap.add_argument("--time", help="hold the sky at this UTC instant (ISO 8601)")
+    ap.add_argument("--focus-error", type=float, default=0.0, help="focuser steps from focus")
+    ap.add_argument(
+        "--bright",
+        action="store_true",
+        help="draw the planet or bright star first light focuses on",
+    )
     ap.add_argument("--listen", default="127.0.0.1:0", help="HOST:PORT for Alpaca")
     ap.add_argument("--discovery-port", type=int, default=32227, help="UDP port (0: any)")
     args = ap.parse_args(argv)
@@ -210,6 +265,8 @@ def main(argv: list[str] | None = None) -> None:
         port=int(port),
         discovery_port=args.discovery_port,
         clock=_held(args.time) if args.time else now,
+        focus_error=args.focus_error,
+        bright=args.bright,
     ).start()
     print(
         json.dumps(

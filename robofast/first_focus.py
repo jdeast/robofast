@@ -104,6 +104,18 @@ class FocusError(RuntimeError):
     """Why the focus could not be found (one line, what to do)."""
 
 
+class TooBright(FocusError):
+    """The target needs a shorter exposure (``need``, s) than the camera's
+    ``shortest``."""
+
+    def __init__(self, need: float, shortest: float) -> None:
+        self.need, self.shortest = need, shortest
+        super().__init__(
+            f"the target is too bright for this camera's shortest exposure ({shortest:g} s;"
+            f" focus needs about {need:.2g} s)"
+        )
+
+
 @dataclass
 class Level:
     """The reference's level: its mean at the first exposure (ADU), the
@@ -520,10 +532,13 @@ class Target:
     alt: float
 
 
-def bright_target(site: tuple[float, float, float], when) -> Target | None:
-    """What to focus on now from ``site``: the brightest planet above
-    :data:`MIN_ALT`, else the brightest star above it (the Moon is not used:
-    on a small chip it is a disk with no edge in the frame). None: nothing."""
+def targets_up(site: tuple[float, float, float], when) -> list[Target]:
+    """Every listed planet and star above :data:`MIN_ALT` from ``site`` at
+    ``when``, the planets first, each list brightest first."""
+    return [t for t in _targets(site, when) if t.alt >= MIN_ALT]
+
+
+def _targets(site: tuple[float, float, float], when) -> list[Target]:
     import astropy.units as u
     from astropy.coordinates import AltAz, EarthLocation, SkyCoord, get_body, solar_system_ephemeris
     from astropy.time import Time
@@ -534,17 +549,51 @@ def bright_target(site: tuple[float, float, float], when) -> Target | None:
     t = Time(when)
     loc = EarthLocation(lat=site[0] * u.deg, lon=site[1] * u.deg, height=site[2] * u.m)
     frame = AltAz(obstime=t, location=loc)
+    out: list[Target] = []
     with solar_system_ephemeris.set("builtin"):
         for name, mag in PLANETS:
             c = get_body(name.lower(), t, loc)
             alt = float(c.transform_to(frame).alt.deg)
-            if alt >= MIN_ALT:
-                return Target(name, float(c.ra.deg), float(c.dec.deg), mag, alt)
+            out.append(Target(name, float(c.ra.deg), float(c.dec.deg), mag, alt))
     for name, ra, dec, mag in BRIGHT_STARS:
         alt = float(SkyCoord(ra * u.deg, dec * u.deg).transform_to(frame).alt.deg)
-        if alt >= MIN_ALT:
-            return Target(name, ra, dec, mag, alt)
-    return None
+        out.append(Target(name, ra, dec, mag, alt))
+    return out
+
+
+def bright_target(site: tuple[float, float, float], when, name: str | None = None) -> Target | None:
+    """What to focus on now from ``site``: the brightest planet above
+    :data:`MIN_ALT`, else the brightest star above it (the Moon is not used:
+    on a small chip it is a disk with no edge in the frame); None: nothing.
+    With ``name`` (--focus-on), that planet or star, or :class:`FocusError`
+    if it is not listed or is below :data:`MIN_ALT`."""
+    if name is None:
+        up = targets_up(site, when)
+        return up[0] if up else None
+    every = {t.name.lower(): t for t in _targets(site, when)}
+    t = every.get(name.strip().lower())
+    if t is None:
+        raise FocusError(
+            f"--focus-on {name}: not one first light knows; these are:"
+            f" {', '.join(n for n, _ in PLANETS)}, {', '.join(s[0] for s in BRIGHT_STARS)}"
+        )
+    if t.alt < MIN_ALT:
+        raise FocusError(
+            f"--focus-on {t.name}: at {t.alt:.0f} deg it is below {MIN_ALT:.0f} deg now;"
+            " choose one higher"
+        )
+    return t
+
+
+def fainter_star(
+    up: list[tuple[str, float]], mag: float, *, need: float, shortest: float
+) -> tuple[str, float] | None:
+    """For a target of ``mag`` that needs ``need`` s, shorter than the
+    camera's ``shortest``: the brightest of ``up`` (name, V mag) at least
+    2.5 log10(shortest / need) magnitudes fainter; None if none is."""
+    fainter = mag + 2.5 * math.log10(shortest / need)
+    ok = sorted((s for s in up if s[1] >= fainter), key=lambda s: s[1])
+    return ok[0] if ok else None
 
 
 # -- the observation kind: first light's focus step, in the sequencer --------------
@@ -554,6 +603,18 @@ async def _ask(prompt: str) -> str:
     import asyncio
 
     return await asyncio.to_thread(input, prompt)
+
+
+def too_bright_line(exc: TooBright, opts: dict) -> str:
+    """The stop for a target too bright for the camera: what to run next,
+    with a fainter star up now by :func:`fainter_star`'s rule, if one is."""
+    star = fainter_star(
+        [(str(n), float(m)) for n, m in opts.get("stars_up", [])], float(opts.get("mag", 0.0)),
+        need=exc.need, shortest=exc.shortest,
+    )  # fmt: skip
+    if star is None:
+        return f"{exc}: run again with --focus-on NAME, a fainter star up now (docs/first_light.md)"
+    return f"{exc}: run again with --focus-on {star[0]} (V {star[1]:g}, up now)"
 
 
 def sweep_settings(
@@ -577,11 +638,7 @@ def sweep_settings(
     size = max(a.donut or fwhm_px, fwhm_px)
     t = min(exptime, a.exptime * (fwhm_px / size) ** 2)
     if t < exposure_min:
-        raise FocusError(
-            f"the target is too bright for this camera's shortest exposure ({exposure_min:g} s;"
-            f" focus needs about {t:.2g} s): focus by hand on a fainter star (first light"
-            " cannot yet be given another target)"
-        )
+        raise TooBright(t, exposure_min)
     return {"exptime": t, "min_stars": 1}
 
 
@@ -729,6 +786,10 @@ async def run_first_focus(r) -> None:
             raise FocusError(f"the sweep did not find focus: {res.message}")
         say(f"focus: done at position {res.focus:.0f} (+-{res.focus_err or 0:.0f} steps)")
         seq._event("first_focus_done", telescope=unit.name, focus=res.focus, method="sweep")
+    except TooBright as exc:
+        why = too_bright_line(exc, opts)
+        seq._event("first_focus_failed", telescope=unit.name, error=why)
+        raise ObservationFailed(f"focus: {why}") from exc
     except FocusError as exc:
         seq._event("first_focus_failed", telescope=unit.name, error=str(exc))
         raise ObservationFailed(f"focus: {exc}") from exc

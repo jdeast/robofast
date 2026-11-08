@@ -77,6 +77,19 @@ MIN_MATCHES = 8
 #: slewed to a minute or two after they are laid out, and the sky turns.
 FIELD_MARGIN = 0.25
 
+#: The calibration's points are fixed in altitude and azimuth, so their
+#: fields move with the sky: its tiles are fetched for where they will be
+#: over the calibration, every SKY_STEP s (the sky turns 0.25 deg a
+#: minute, within :data:`FIELD_MARGIN`), allowing PER_POINT s a point
+#: (slew, settle, readout, solve) besides its exposure.
+SKY_STEP = 60.0
+PER_POINT = 60.0
+
+#: At most this many download passes: on a network slower than the sky
+#: turns (about six tiles a minute for three points), fetching after the
+#: fields cannot catch them, and the rest download during the calibration.
+FETCH_PASSES = 5
+
 #: Give up once this many calibration points went unsolved with none solved
 #: (two pointing runs of three): the frames will not solve.
 UNSOLVED_LIMIT = 6
@@ -222,16 +235,19 @@ def _lst_hours(site: tuple[float, float, float], when: datetime) -> float:
     return sky_now(Site(site[0], site[1], site[2]), when).lst_hours
 
 
-def _fields(config: dict[str, Any], site: tuple[float, float, float], when: datetime):
-    """(ra, dec) deg of the frames first light takes, as the pointing run
-    lays out its points (:func:`robofast.pointmodel.sky_grid`, from the site
-    given and this computer's clock), and the zenith frame."""
+def _fields(
+    config: dict[str, Any], site: tuple[float, float, float], when: datetime, span: float = 0.0
+):
+    """(ra, dec) deg of the frames first light takes: the calibration's
+    points as the pointing run lays them out (:func:`robofast.pointmodel.sky_grid`,
+    from the site and this computer's clock) at ``when`` and every
+    :data:`SKY_STEP` s for ``span`` s after it, and the zenith at ``when``."""
     from robofast import pointmodel
     from robofast.sequencer import POINTING_RUN_DEFAULTS
 
     (tel,) = config["telescopes"]
     pc = config["telescopes"][tel]["pointing"]
-    cal, zenith = config["plan"]["targets"]
+    cal = config["plan"]["targets"][0]
     run = {**POINTING_RUN_DEFAULTS, **pc.get("run", {}), **cal.get("pointing", {})}
     lst = _lst_hours(site, when) * 15.0
     avoid = []
@@ -251,8 +267,20 @@ def _fields(config: dict[str, Any], site: tuple[float, float, float], when: date
         min_dec=run["min_dec"],
         max_dec=run["max_dec"],
     )
-    fields = [pointmodel.grid_radec(az, alt, site[0], lst) for az, alt in grid]
-    return [*fields, (zenith["ra_hours"] * 15.0, zenith["dec_deg"])]
+    steps = int(span // SKY_STEP) + 1
+    fields = [
+        pointmodel.grid_radec(az, alt, site[0], lst + k * SKY_STEP * pointmodel.SIDEREAL_DEG_PER_S)
+        for k in range(steps)
+        for az, alt in grid
+    ]
+    return [*fields, (lst % 360.0, site[0])]
+
+
+def _calibration_span(config: dict[str, Any]) -> float:
+    """Seconds the calibration takes, at most (its points, :data:`PER_POINT`
+    each besides the exposure)."""
+    cal = config["plan"]["targets"][0]
+    return cal["count"] * (float(cal["exptime"]) + PER_POINT)
 
 
 def _field_radius(plate_scale: float, size: tuple[int, int]) -> float:
@@ -265,8 +293,22 @@ def _field_radius(plate_scale: float, size: tuple[int, int]) -> float:
     return half_diag * (1 + c.scale_tolerance) + c.search_radius + FIELD_MARGIN
 
 
+def _missing(catalog: dict[str, Any], fields, radius: float) -> int:
+    from robofast.catalog import catalog_from_config
+
+    store = catalog_from_config(catalog).tiles
+    if store is None or store.fetch is None:
+        return 0
+    return len({p for ra, dec in fields for p in store.missing(ra, dec, radius)})
+
+
 def _fetch_catalog(
-    catalog: dict[str, Any], fields, radius: float, timeout: float, said: float | None = None
+    catalog: dict[str, Any],
+    fields,
+    radius: float,
+    timeout: float,
+    said: float | None = None,
+    frames: int | None = None,
 ) -> int:
     """Download the catalog tiles the solver will read for ``fields``
     before the telescope moves (a tile downloaded inside a solve holds the
@@ -283,7 +325,8 @@ def _fetch_catalog(
     if not tiles:
         return 0
     print(
-        f"first light: fetching the catalog for its {len(fields)} fields: {len(tiles)} tiles"
+        f"first light: fetching the catalog for its {frames or len(fields)} frames:"
+        f" {len(tiles)} tiles"
         f" ({store.source.title}; cached in {store.directory})",
         flush=True,
     )
@@ -616,22 +659,35 @@ def main(argv: list[str] | None = None) -> None:
             print("first light: not started", file=sys.stderr)
             sys.exit(1)
         started = time.monotonic()  # the time taken to answer is not counted
-    # The zenith now, from the site and this computer's clock (the mount's
-    # clock is not read: docs/first_light.md).
-    planned = datetime.now(UTC)
-    _zenith(config, _lst_hours(site, planned))
-    workdir.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(config, indent=2) + "\n")
-    print(f"wrote {path}")
     camera = next(
         d for d in devices if d.type == "Camera" and d.spec == config["telescopes"][tel]["camera"]
     )
     try:
         size = discover.read_members(camera, ["CameraXSize", "CameraYSize"])
         radius = _field_radius(config["images"]["telescopes"][tel]["plate_scale"], size)
-        left = args.timeout - (time.monotonic() - started)
-        fields = _fields(config, site, planned)
-        _fetch_catalog(config["images"]["solve"]["catalog"], fields, radius, left, args.timeout)
+        catalog = config["images"]["solve"]["catalog"]
+        frames = config["plan"]["targets"][0]["count"] + 1
+        # The sky turns while it downloads: fetch again for where the fields
+        # are then, over the calibration and the last download's length,
+        # until nothing is missing, or a pass no longer gains on the sky.
+        took, fetched = 0.0, None
+        for _ in range(FETCH_PASSES):
+            begun = datetime.now(UTC)
+            fields = _fields(config, site, begun, _calibration_span(config) + took)
+            left = args.timeout - (time.monotonic() - started)
+            n = _fetch_catalog(catalog, fields, radius, left, args.timeout, frames)
+            if not n or (fetched is not None and n >= fetched):
+                break
+            fetched, took = n, (datetime.now(UTC) - begun).total_seconds()
+        now = datetime.now(UTC)
+        behind = _missing(catalog, _fields(config, site, now, _calibration_span(config)), radius)
+        if behind:
+            print(
+                f"first light: the sky turns faster than the catalog downloads here: {behind}"
+                " tiles download during the calibration (a stop then waits for the one"
+                " downloading)",
+                flush=True,
+            )
     except (FirstLightError, discover.OpticsUnavailable) as exc:
         print(f"first light: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -639,6 +695,13 @@ def main(argv: list[str] | None = None) -> None:
         print("first light: stopped while fetching the catalog; the telescope did not move",
               file=sys.stderr)  # fmt: skip
         sys.exit(1)
+    # The zenith now, from the site and this computer's clock (the mount's
+    # clock is not read: docs/first_light.md), after the download.
+    planned = datetime.now(UTC)
+    _zenith(config, _lst_hours(site, planned))
+    workdir.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=2) + "\n")
+    print(f"wrote {path}")
     print("first light: a pointing calibration (3 plate solves), then one frame at the zenith")
 
     async def go() -> dict[str, Any]:

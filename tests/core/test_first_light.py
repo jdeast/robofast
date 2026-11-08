@@ -388,7 +388,7 @@ def test_first_light_asks_eight_matched_stars_of_a_solve(device, tmp_path):
     assert config["images"]["solve"]["telescopes"]["t1"]["min_matches"] == 8
 
 
-def _counted_source(name, calls, device, delay=0.0):
+def _counted_source(name, calls, device, delay=0.0, after=None):
     """A catalog source with the synthetic sky's stars that records, for
     each tile fetched, how many exposures the camera had started."""
     import dataclasses
@@ -406,6 +406,8 @@ def _counted_source(name, calls, device, delay=0.0):
         def counted(level, pix, mag_limit):
             time.sleep(delay)
             calls.append(device.camera.exposures_started)
+            if after is not None:
+                after()
             return fetch(level, pix, mag_limit)
 
         return counted
@@ -576,3 +578,63 @@ def test_the_telescopes_site_is_asked_and_a_no_moves_nothing(tmp_path, capsys, m
     assert len(asked) == 1 and "34.10000 N, 118.30000 W, 0 m" in asked[0], asked
     assert "the telescope's" in asked[0] and "where the telescope stands" in asked[0], asked
     assert far.camera.exposures_started == 0 and not far.mount.slews
+
+
+def _turning_run(tmp_path, capsys, monkeypatch, seconds):
+    """First light on a sky that turns ``seconds`` for every tile fetched
+    (one clock for the simulated telescope and first light): its stdout,
+    and the exposures the camera had started at each fetch."""
+    from datetime import timedelta
+
+    import robofast.first_light
+    from robofast.catalog import CATALOG_SOURCES
+
+    t = [HELD]
+
+    class Turning(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            return t[0]
+
+    monkeypatch.setattr(robofast.first_light, "datetime", Turning)
+    device = SkyDevice(
+        catalog={"cache_dir": str(tmp_path / "sky")},
+        pointing_error={"IH": 150.0, "ID": -40.0, "NP": 20.0},
+        clock=lambda: t[0],
+    ).start()
+    calls: list[int] = []
+
+    def tick():
+        t[0] += timedelta(seconds=seconds)
+
+    _counted_source("counted-turning", calls, device, after=tick)
+    try:
+        args = _args(device, tmp_path, "--no-enclosure", "--yes")
+        args[args.index("--catalog") + 1] = "counted-turning"
+        args[args.index("--catalog-dir") + 1] = str(tmp_path / "first-light-catalog")
+        main(args)
+    finally:
+        CATALOG_SOURCES.unregister("counted-turning")
+        device.stop()
+    out = capsys.readouterr().out
+    assert '"first_light"' in out
+    return out, calls
+
+
+def test_a_slow_download_fetches_the_fields_the_run_will_reach(tmp_path, capsys, monkeypatch):
+    """The sky turns while the catalog downloads: the tiles fetched are for
+    where the calibration's points will be when it slews, not where they
+    were when the download began (2 s of sky a tile)."""
+    out, calls = _turning_run(tmp_path, capsys, monkeypatch, 2.0)
+    assert calls and set(calls) == {0}, calls  # nothing fetched once exposing began
+    assert "faster than the catalog" not in out
+
+
+def test_a_download_slower_than_the_sky_is_bounded_and_said(tmp_path, capsys, monkeypatch):
+    """At 10 s of sky a tile the fetches cannot catch the turning fields:
+    first light stops after a few passes, says the rest download during
+    the calibration, and the calibration still runs."""
+    out, _calls = _turning_run(tmp_path, capsys, monkeypatch, 10.0)
+    passes = out.count("first light: fetching the catalog")
+    assert 1 <= passes <= 5, out
+    assert "the sky turns faster than the catalog downloads here" in out, out

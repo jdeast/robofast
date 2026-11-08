@@ -39,7 +39,12 @@ The model, from the legacy driver's use of PWI (``docs/pwi.md``):
   below it is accepted, the mount stops at the limit and then reports
   slewing *and* tracking until stopped -- what PWI4 4.1.6 does on a CDK700.
 * :meth:`CDK700Model.power_cycle`: the controller loses power (disconnected,
-  disabled, not homed, both axes reading 0 deg, as a CDK700's encoders do).
+  disabled, not homed, both axes reading 0 deg, as a CDK700's encoders do);
+  :meth:`CDK700Model.pwi_restart`: PWI itself restarts (disconnected,
+  disabled, not homed, ``Default_Mount_Model.PXP`` loaded; ``--restarted``
+  starts a simulator in that state).
+* PWI2 ``device=mount&cmd=setmodel&filename=F`` loads pointing model ``F``
+  (reported as ``mount.pointing_model``; PWI4's ``mount.model.filename``).
 * the M3 takes ``m3_time`` s between ports (PWI4 ``m3.port`` -1, PWI2 0
   meanwhile); ``m3_drops`` gotos are answered but ignored, as PWI4
   sometimes does; one
@@ -49,7 +54,8 @@ The model, from the legacy driver's use of PWI (``docs/pwi.md``):
 
 Fault injection (methods, or ``GET /robofast-sim/mode?mode=...``): ``ok``,
 ``hang`` (never answer), ``slow`` (answer after ``slow_delay``), ``garble``
-(a non-status reply), ``http500``. ``GET /robofast-sim/state`` is the
+(a non-status reply), ``http500``. ``GET /robofast-sim/restart`` is a PWI restart
+(:meth:`CDK700Model.pwi_restart`, mode back to ``ok``). ``GET /robofast-sim/state`` is the
 model as JSON (tests only; robofast's client never sends either).
 
 It binds loopback only and registers itself with :mod:`robofast.hwgate`
@@ -128,6 +134,7 @@ class CDK700Model:
         pwi_min_alt: float | None = None,
         wrap_min: float = 0.0,
         az_mech_min: float | None = None,
+        model_file: str = "",
     ) -> None:
         self.lat, self.lon = latitude, longitude
         self.slew_rate = slew_rate
@@ -163,7 +170,8 @@ class CDK700Model:
         self.m3_until = 0.0
         self.focusers = {1: _Axis(25000.0, focus_rate), 2: _Axis(25000.0, focus_rate)}
         self.rotators = {1: _Axis(0.0, rotator_rate), 2: _Axis(0.0, rotator_rate)}
-        self.model_file = ""
+        #: The loaded pointing-model file (PWI2 ``setmodel``; PWI4 reports it).
+        self.model_file = model_file
         self.ignored: list[str] = []
         self.commands: list[str] = []
         self._t = time.monotonic()
@@ -331,6 +339,16 @@ class CDK700Model:
         self.axes_homed = [False, False]
         self.alt = self.az = 0.0
 
+    def pwi_restart(self, model_file: str = "Default_Mount_Model.PXP") -> None:
+        """PWI (the program) is restarted while the controller keeps power:
+        not connected, motors disabled, not homed, and the default pointing
+        model loaded (as PWI2 did on MINERVA T1, 2026-11-06)."""
+        self.stop()
+        self.connected = False
+        self.enabled = [False, False]
+        self.axes_homed = [False, False]
+        self.model_file = model_file
+
     def m3_goto(self, port: int) -> None:
         if self.m3_drops > 0:
             self.m3_drops -= 1
@@ -371,6 +389,7 @@ class CDK700Model:
                 "rotators": {p: a.pos for p, a in self.rotators.items()},
                 "ignored": list(self.ignored),
                 "commands": list(self.commands),
+                "model_file": self.model_file,
             }
 
 
@@ -650,6 +669,11 @@ def pwi2_handle(m: CDK700Model, path: str, q: dict[str, list[str]]) -> str:
             m.disable()
         elif device == "mount" and cmd == "findhome":
             m.find_home()
+        elif device == "mount" and cmd == "setmodel":
+            name = q.get("filename", [""])[0]
+            if not name:
+                raise _HTTPError(400, "setmodel: no filename")
+            m.model_file = name
         elif device == "mount" and cmd == "stop":
             m.stop()
         elif device == "mount" and cmd in ("trackingon", "trackingoff"):
@@ -708,6 +732,13 @@ class _Handler(BaseHTTPRequestHandler):
         if url.path == "/robofast-sim/mode":
             sim.set_mode(q.get("mode", ["ok"])[0])
             self._reply(200, sim.mode, "text/plain")
+            return
+        if url.path == "/robofast-sim/restart":
+            # PWI restarted (tests only): answering again, in a fresh PWI's state.
+            with sim.model.lock:
+                sim.model.pwi_restart(q.get("model", ["Default_Mount_Model.PXP"])[0])
+            sim.set_mode("ok")
+            self._reply(200, "restarted", "text/plain")
             return
         if url.path == "/robofast-sim/state":
             self._reply(200, json.dumps(sim.model.state()), "application/json")
@@ -819,6 +850,12 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--version", default="4.1.8.0", help="PWI4 version to report")
     ap.add_argument("--pwi-min-alt", type=float, help="PWI's own altitude limit (deg)")
     ap.add_argument("--wrap-min", type=float, default=0.0, help="PWI4 axis-0 wrap range min")
+    ap.add_argument("--model-file", default="", help="the pointing-model file loaded at start")
+    ap.add_argument(
+        "--restarted",
+        action="store_true",
+        help="start as PWI does after a restart: not connected, not homed, default model",
+    )
     args = ap.parse_args(argv)
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -838,7 +875,11 @@ def main(argv: list[str] | None = None) -> None:
         version=args.version,
         pwi_min_alt=args.pwi_min_alt,
         wrap_min=args.wrap_min,
-    ).start()
+        model_file=args.model_file,
+    )
+    if args.restarted:
+        sim.model.pwi_restart(args.model_file or "Default_Mount_Model.PXP")
+    sim.start()
     print(f"{args.api} simulator on {sim.address}", flush=True)
     try:
         threading.Event().wait()

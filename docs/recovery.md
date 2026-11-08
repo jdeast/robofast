@@ -16,13 +16,34 @@ rungs listed in `steps`, in order:
 2. `restart` -- restart the vendor software with a hook: `{"command": [...]}`
    (must exit 0 within `step_timeout`; e.g. a service restart on the
    telescope's Windows PC over ssh) or `{"url": ..., "method": "POST"}`;
-   then `settle` s and reconnect.
-3. `powercycle` -- `Action("PowerCycle", "<switch>")` on the PDU's Alpaca
+   then `settle` s and reconnect (see "The restart hook").
+3. `home` (telescope only) -- if robofast's PWI server (docs/pwi.md) reports
+   the mount not homed (`Action("Status")`: `homed`), its Alpaca `FindHome`
+   (unparking first and parking again after, if it was parked), then wait
+   until `Slewing` reads false; bounded by `home_timeout` (300 s) instead
+   of `step_timeout`. The server homes only with `allow_find_home: true`
+   in its config: otherwise (`CanFindHome` false, or `FindHome` answering
+   NotImplemented) the rung is **skipped** -- logged and alarmed as
+   unavailable, never counted as a recovery -- and so is it on a telescope
+   that is not a PWI server or that reports itself homed.
+4. `powercycle` -- `Action("PowerCycle", "<switch>")` on the PDU's Alpaca
    Switch server (below), `boot_time` s, reconnect. A PDU server whose
    action is named differently: `powercycle.action`.
 
+On a telescope served by robofast's PWI server, `reconnect` and `restart`
+also reconnect PWI to the mount: `Action("MountConnect")` if `Status` says
+PWI is not connected, then `Action("MotorsEnable")` if both axes are
+disabled -- the state of a PWI that was just started. An axis PWI disabled
+while connected (a drive fault, e.g. PWI4's I2t) is left disabled: the
+telescope is not usable and the ladder climbs on.
+
 After each rung the device must answer (`AtPark`, `CameraState`, `Position`
-read within `verify_timeout`), else the next rung is tried. Every rung is
+read within `verify_timeout`), else the next rung is tried. A PWI telescope
+must also be usable: `Status` shows it connected with both axes enabled
+and, when its steps include `home`, homed. A mount that answers but is not
+usable fails the rung at once (no waiting out `verify_timeout`): after a
+PWI restart the `restart` rung fails with "the mount is not homed" and
+`home` comes next. Every rung is
 bounded (`step_timeout` + `verify_timeout`) and raises an alarm (status
 snapshot, console, notifier) saying what was tried and how it went. A
 device that fails again within `escalate_window` (1 h) starts one rung above
@@ -38,6 +59,13 @@ and one per `min_interval` (1800 s); only with the telescope parked
 being cycled itself are skipped when it cannot answer. The PDU server adds
 its own guards (below).
 
+A PWI that died or was restarted (MINERVA T1, 2026-11-06: Windows Task
+Scheduler closed PWI2) is the ladder `["reconnect", "restart", "home"]`:
+reconnect fails (PWI does not answer), the restart hook starts PWI again
+and the rung reconnects PWI to the mount, the mount answers but is not
+homed, `home` homes it, and the PWI server loads the M3 port's pointing
+model again (`pointing_models`, docs/pwi.md).
+
 ```json
 "recovery": {
   "camera": {
@@ -46,10 +74,47 @@ its own guards (below).
     "powercycle": {"pdu": "127.0.0.1:11120", "switch": 0, "boot_time": 60},
     "camera_warm_above": -5, "max_powercycles": 1, "min_interval": 1800
   },
-  "telescope": {"steps": ["reconnect", "restart"], "restart": {"command": ["..."]},
-                "requires_parked": false}
+  "telescope": {"steps": ["reconnect", "restart", "home"],
+                "restart": {"command": ["..."], "settle": 5},
+                "home_timeout": 300, "requires_parked": false}
 }
 ```
+
+## The restart hook
+
+`restart.command` is run as given (no shell), with `step_timeout` as its
+bound. The contract:
+
+- it restarts the vendor software (for a PWI telescope: PWI on the
+  telescope's PC) and **exits 0 only once that software answers again**
+  (for PWI2: `GET /?cmd=getsystem` on its port returns a status); any
+  other exit, or no exit within `step_timeout`, fails the rung;
+- it does nothing else: connecting PWI to the mount, enabling, homing and
+  the pointing model are robofast's (the rungs above and the PWI server);
+- its output (the last 300 characters) goes into the rung's
+  `recovery_restart` event; it must not print secrets.
+
+Site hooks (MINERVA's goes through the site gateway to the telescope's
+Windows PC: `taskkill` of `PWI.exe` and `ComACRServer.exe`, then
+`schtasks /Run` of the PWI task, then poll the HTTP API) live in the
+site's deployment, outside this repository, with their host names and
+credentials. `tests/e2e/pwi2_restart.py` is the hook the tests use: it
+restarts a PWI2 simulator process.
+
+## In the rehearsal
+
+`python -m robofast.testing.rehearsal --recovery t1=t1-recovery.json`
+(one per real telescope; the JSON is a `recovery` entry as above, without
+`powercycle`: the rehearsal never switches a PDU) gives the night's
+sequencer that ladder, exactly as in production; the rehearsal's mount
+guard forwards to that telescope what the ladder sends (`Action("Status")`,
+`MountConnect`, `MotorsEnable`, `FindHome`) and still never a real `Park`
+or `Unpark`. At the preflight a real telescope whose endpoints fail gets
+its ladder once (through a guard of its own) and is read again: still
+failing, it is **dropped** (a WARNING; a problem in the evaluation and the
+summary) and the night goes on with the other telescopes. The rehearsal
+refuses when a telescope without a recovery policy fails, or when no real
+telescope is left.
 
 ## The PDU server
 
@@ -101,6 +166,12 @@ The outlet map of MINERVA's PDUs is to be taken from the legacy
 
 ## Tests
 
+`tests/core/test_pwi_recovery.py` (the `home` rung and the PWI reconnect
+on a PWI2 simulator, a skipped `home`, `pointing_models`, the guard and
+the rehearsal's preflight: recovered, dropped, refused);
+`tests/e2e/test_rehearsal_recovery.py` (a PWI2 simulator killed mid-night
+and brought back by the restart hook, reconnect, home and its model; a
+telescope dropped at the preflight while the other observes the night);
 `tests/core/test_pdu.py` (BER round trip, client vs simulator incl. wrong
 and read-only communities, credentials file mode, the hardware gate, the
 Alpaca server incl. protected outlets and the cycle rate limit, a silent

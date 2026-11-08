@@ -21,7 +21,9 @@ This client
 -----------
 * One method per operation; nothing else can be sent (:data:`PWI4_PATHS`,
   :data:`PWI2_COMMANDS` are the allowlists, checked on every request). No
-  sync, no pointing-model writes, no PWI process control, no jog.
+  sync, no pointing-model writes (the one model request is PWI2's
+  ``setmodel``, which loads an existing model file: the PWI server's
+  ``pointing_models``), no PWI process control, no jog.
 * Every request has a hard timeout (connect + reply). A timeout or an
   unreachable PWI is :class:`PWITimeout`; an HTTP error
   :class:`PWICommandError`; a reply that is not a status
@@ -360,6 +362,8 @@ PWI2_COMMANDS: dict[tuple[str, str], bool] = {
     ("mount", "enable"): False,
     ("mount", "disable"): True,
     ("mount", "findhome"): True,
+    # Loads an existing pointing-model file (legacy cdk700.startPWI); moves nothing.
+    ("mount", "setmodel"): False,
     ("mount", "move"): True,
     ("mount", "stop"): True,
     ("mount", "trackingon"): True,
@@ -476,6 +480,10 @@ class PWIClient:
     async def set_az_wrap_min(self, degs: float) -> PWIStatus:
         """PWI4: gotos put azimuth at the mechanical angle in [degs, degs + 360)."""
         raise PWIError(f"{self.backend} has no azimuth wrap range setting")
+
+    async def set_model(self, filename: str) -> PWIStatus:
+        """PWI2: load the pointing-model file ``filename`` (``setmodel``)."""
+        raise PWIError(f"{self.backend}: robofast does not load pointing models through it")
 
     async def m3_select(self, port: int) -> PWIStatus:
         raise NotImplementedError
@@ -620,6 +628,11 @@ class PWI2Client(PWIClient):
 
     async def tracking(self, on: bool) -> PWIStatus:
         return await self._cmd("mount", "trackingon" if on else "trackingoff")
+
+    async def set_model(self, filename: str) -> PWIStatus:
+        if not filename or any(c in filename for c in "\r\n"):
+            raise ValueError(f"setmodel: bad file name {filename!r}")
+        return await self._cmd("mount", "setmodel", filename=filename)
 
     async def m3_select(self, port: int) -> PWIStatus:
         return await self._cmd("m3", "select", port=int(port))

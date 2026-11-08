@@ -181,7 +181,9 @@ python -m robofast.testing.rehearsal --out /tmp/rehearsal \
   (`--rotator t1=none`: no rotator). It refuses to start without
   `--i-know-the-enclosure-is-closed`, with a parked mount (it never sends
   a real mount `Park` or `Unpark`), a busy camera or an endpoint that does
-  not answer. It logs, for each endpoint, whether it is a verified robofast
+  not answer -- unless that telescope has a recovery policy (`--recovery`,
+  below): then it gets its ladder once and, still failing, is dropped while
+  the others observe on (it refuses when no real telescope is left). It logs, for each endpoint, whether it is a verified robofast
   simulator (`robofast/hwgate.py`) or real.
 * **What it starts** is only the simulated night's services, each on a
   verified simulator and none with `--hardware`: nothing it starts can
@@ -195,7 +197,21 @@ python -m robofast.testing.rehearsal --out /tmp/rehearsal \
   `AbortSlew`, `Tracking` and `Connected`; robofast's `Park` becomes
   "abort the slew, tracking off, stay where you are" (`AtPark` then reads
   true until robofast's next `Unpark`); every other command is refused and
-  reported. The camera is used directly.
+  reported, except `Action("Status")` and, for a telescope with
+  `--recovery`, what its recovery ladder sends (`MountConnect`,
+  `MotorsEnable`, `FindHome`; listed in the summary). `AtPark` reads the
+  guard's flag only once the real mount has answered its own. The camera
+  is used directly.
+* **`--recovery NAME=FILE`** (opt-in, per real telescope): the JSON is a
+  sequencer `recovery` entry (docs/recovery.md; no `powercycle`), e.g.
+  `{"telescope": {"steps": ["reconnect", "restart", "home"], "restart":
+  {"command": [...]}}}` with the site's PWI restart hook. In the night it
+  is that telescope's recovery ladder in the sequencer, as in production
+  (a PWI that dies is restarted, PWI reconnected to the mount, the mount
+  homed if PWI says it is not; the PWI server reloads the port's pointing
+  model with `pointing_models`). At the preflight a failing telescope gets
+  the ladder once, then is read again, and is dropped (a WARNING, a
+  problem in the checks) if it still fails.
 * **Real time.** The clock runs at real speed from now (the real mounts
   point by the real sidereal time). The plan is made at start: `SPECTRUM`
   requests (a B star through iodine, RV standards with iodine, a template
@@ -245,16 +261,20 @@ python -m robofast.testing.rehearsal --out /tmp/rehearsal \
 It prints the night as it goes (slews with the pointing error, frames,
 spectra), then a summary: the spectra, the request statuses at the end,
 every slew of a real mount (commanded position, the mount's position after
-it, the pointing error and how long it took), every frame (exposure time,
+it, the pointing error and how long it took), any telescope dropped at the
+preflight and every recovery (preflight and night: what each rung did), every frame (exposure time,
 download time and rate, the header's pointing), anything the guard refused,
-the simulated roof and the end action. The checks: spectra fed by every
+the simulated roof and the end action. The checks: no telescope dropped, spectra fed by every
 real telescope, no autofocus on a real one, the night ended by itself,
-nothing refused by the guard, every slew within the limits, the safety
+nothing refused by the guard, every slew within the limits and ended
+(one cut short by a telescope error is that error's), the safety
 invariants above (never a spectrum unguided, every abort before a park,
 every park before the roof closes), a sidecar with the barycentric
 correction for every spectrum, every real frame on disk with the mount's
 pointing within a degree of its target, one night name, and every real
 mount not tracking after the end action. The tests
-(`tests/e2e/test_rehearsal.py`, `tests/core/test_rehearsal_guard.py`) run it
+(`tests/e2e/test_rehearsal.py`, `tests/core/test_rehearsal_guard.py`;
+recovery: `tests/e2e/test_rehearsal_recovery.py`,
+`tests/core/test_pwi_recovery.py`, with PWI2 simulators) run it
 against fake mounts and cameras served over Alpaca on loopback as if they
 were real, with a faster clock (test only).

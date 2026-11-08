@@ -638,41 +638,54 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
     for d in devices:
         print(f"found {d.type:<20} {d.spec:<24} {d.name}")
-    try:
-        if site is None:
-            site = telescope_site(_one_telescope(devices))
-            whose = (
-                "the telescope's (--site to change it); the elevation is not read from"
-                " it: 0 m unless --site gives one"
+    # One connected session for the reads before anything moves: each device
+    # is connected once (a connect can take seconds; some mounts home on it).
+    with discover.session():
+        try:
+            if site is None:
+                site = telescope_site(_one_telescope(devices))
+                whose = (
+                    "the telescope's (--site to change it); the elevation is not read from"
+                    " it: 0 m unless --site gives one"
+                )
+            else:
+                whose = "--site"
+        except (FirstLightError, discover.OpticsUnavailable) as exc:
+            print(f"first light: {exc}; give the site with --site LAT,LON", file=sys.stderr)
+            sys.exit(1)
+        print(f"site {site[0]:.5f}, {site[1]:.5f}, {site[2]:g} m: {whose}")
+        try:
+            _check_clock(_one_telescope(devices), site)
+        except (FirstLightError, discover.OpticsUnavailable) as exc:
+            print(f"first light: {exc}", file=sys.stderr)
+            sys.exit(1)
+        catalog: dict[str, Any] = {"source": args.catalog}
+        if args.catalog_dir:
+            catalog["cache_dir"] = str(Path(args.catalog_dir).resolve())
+        try:
+            config = first_light_config(
+                devices,
+                site=site,
+                enclosure=enclosure,
+                catalog=catalog,
+                plugins=args.plugin,
+                exptime=args.exptime,
             )
-        else:
-            whose = "--site"
-    except (FirstLightError, discover.OpticsUnavailable) as exc:
-        print(f"first light: {exc}; give the site with --site LAT,LON", file=sys.stderr)
-        sys.exit(1)
-    print(f"site {site[0]:.5f}, {site[1]:.5f}, {site[2]:g} m: {whose}")
-    try:
-        _check_clock(_one_telescope(devices), site)
-    except (FirstLightError, discover.OpticsUnavailable) as exc:
-        print(f"first light: {exc}", file=sys.stderr)
-        sys.exit(1)
-    catalog: dict[str, Any] = {"source": args.catalog}
-    if args.catalog_dir:
-        catalog["cache_dir"] = str(Path(args.catalog_dir).resolve())
-    try:
-        config = first_light_config(
-            devices,
-            site=site,
-            enclosure=enclosure,
-            catalog=catalog,
-            plugins=args.plugin,
-            exptime=args.exptime,
+        except (FirstLightError, discover.OpticsUnavailable) as exc:
+            print(f"first light: {exc}", file=sys.stderr)
+            sys.exit(1)
+        (tel,) = config["telescopes"]
+        print(f"plate scale {config['images']['telescopes'][tel]['plate_scale']} arcsec/pixel")
+        camera = next(
+            d
+            for d in devices
+            if d.type == "Camera" and d.spec == config["telescopes"][tel]["camera"]
         )
-    except (FirstLightError, discover.OpticsUnavailable) as exc:
-        print(f"first light: {exc}", file=sys.stderr)
-        sys.exit(1)
-    (tel,) = config["telescopes"]
-    print(f"plate scale {config['images']['telescopes'][tel]['plate_scale']} arcsec/pixel")
+        try:
+            size = discover.read_members(camera, ["CameraXSize", "CameraYSize"])
+        except discover.OpticsUnavailable as exc:
+            print(f"first light: {exc}", file=sys.stderr)
+            sys.exit(1)
     # One question: what robofast cannot see, and what the operator must
     # confirm. A mount with no GPS reports its factory site, which may be
     # another continent: points laid for it can be below the real horizon.
@@ -692,11 +705,7 @@ def main(argv: list[str] | None = None) -> None:
             print("first light: not started", file=sys.stderr)
             sys.exit(1)
         started = time.monotonic()  # the time taken to answer is not counted
-    camera = next(
-        d for d in devices if d.type == "Camera" and d.spec == config["telescopes"][tel]["camera"]
-    )
     try:
-        size = discover.read_members(camera, ["CameraXSize", "CameraYSize"])
         radius = _field_radius(config["images"]["telescopes"][tel]["plate_scale"], size)
         catalog = config["images"]["solve"]["catalog"]
         frames = config["plan"]["targets"][0]["count"] + 1

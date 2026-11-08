@@ -152,7 +152,11 @@ is a disk with no edge in the frame, which needs its own measure).
   from a start already near focus on a planet it still takes the donut's
   two frames (a few frames more, the same focus).
 * **Then the autofocus's sweep** (docs/autofocus.md) from there, which
-  fits the curve and so does not need that slope to be exact.
+  fits the curve and so does not need that slope to be exact. One frame
+  at the sweep's exposure first: if the only stars in it clip (a planet
+  alone), the sweep is taken at the approach's last unclipped exposure
+  times (seeing / star size)^2, on that one star, or every point of it
+  would clip.
 * **The end of the travel.** If the disk still shrinks at an end of the
   focuser's travel, the focus is beyond it: first light says which end,
   and to add (or remove) a spacer or extension.

@@ -5,16 +5,17 @@ light frame (`robofast/first_light.py`):
 
 ```sh
 pip install .        # this repository, or a wheel built from it (robofast is not on PyPI yet)
-python -m robofast --site 42.38,-71.13 --no-enclosure
+python -m robofast --no-enclosure
 ```
 
-(`robofast --site ...` is the same command.) It:
+(`robofast ...` is the same command.) It:
 
 1. finds the telescope and camera by Alpaca discovery (docs/discover.md;
    `--address 127.0.0.1` for devices served on this machine, `--server
    HOST:PORT` for one discovery does not reach);
 2. reads the plate scale from them (the telescope's `FocalLength`, the
-   camera's `PixelSizeX`/`PixelSizeY`);
+   camera's `PixelSizeX`/`PixelSizeY`) and the telescope's site ("The
+   site", below; `--site` to give another);
 3. writes the enclosure config itself, `first-light/observatory.json`
    (`--dir`; it never overwrites one);
 4. asks you, with no enclosure, whether the sky is clear and whether you
@@ -44,16 +45,43 @@ or what it must never guess:
 
 | | |
 |---|---|
-| `--site LAT,LON[,ELEV]` | deg north, deg east, m. The calibration lays its points in altitude from it; a mount's own site setting is often wrong, so it is not read. |
 | `--no-enclosure` | a telescope with no dome or roof: the operator on duty judges the weather. |
 | `--dome HOST:PORT/N --safety-monitor HOST:PORT/N` | an enclosure, and the device whose verdict decides whether it may open. robofast lists the Dome and SafetyMonitor it finds but never chooses one. The enclosure opens only after the weather has been safe for the reopen hold (`safety.reopen_hold`, 20 min by default). |
 
 It stops, naming what, when a device cannot report what it needs (a mount
-that does not know its focal length, a camera with no pixel size), when
+that does not know its focal length or its site, a camera with no pixel
+size), when
 more than one telescope answers, and when the operator does not say yes.
 A mount that cannot park gets no lease (the supervisor grants none until
 every telescope reports parked): first light gives up after `--timeout`,
 saying so in the supervisor's words.
+
+## The site
+
+The site is the telescope's own: its `SiteLatitude` and `SiteLongitude`
+(and `SiteElevation`, 0 m if it has none), which a GPS mount fills in;
+first light prints it. `--site LAT,LON[,ELEV]` (deg north, deg east, m)
+is used instead when given. A telescope that cannot report its site,
+with no `--site`, stops first light before anything moves, saying so.
+
+The calibration lays its points in altitude from the site, and the first
+light frame goes to the zenith of the site; the pointing model itself
+does not use it. Measured on the simulated telescope (an injected IH of
+150", ID -40", NP 20"), the site off by a distance north or east:
+
+| site off by | calibration | IH, ID | frame from its target | frame from the zenith |
+|---|---|---|---|---|
+| 0 | solved | +159.5", -40.0" | 6.4" | 0.0 deg |
+| 100 km | solved | +159.9", -40.0" (north) | 6.5" | 0.9 deg |
+| 300 km | solved | +160.8", -40.0" (north) | 6.5" | 2.7 deg |
+| 1000 km | solved | +163.6", -40.0" (north) | 7.1" | 9.0 deg |
+| 3000 km | solved | +169.1", -40.0" (north) | 12.0" | 27 deg |
+
+(east: IH and ID unchanged, the frame 6.3-6.6" from its target.) A site
+off by hundreds of km still calibrates; the "zenith" frame is then about
+0.9 deg from the true zenith per 100 km. Not measured: a real mount's
+altitude limits (the simulated one has none): with the site 1000 km off,
+a point laid at the calibration's lowest altitude (25 deg) is near 16 deg.
 
 ## The catalog
 
@@ -63,7 +91,7 @@ where"); `--catalog-dir` its cache.
 
 Before the telescope moves, first light downloads the tiles its four
 frames' solves will read (the calibration's three points, laid out as the
-pointing run lays them from `--site` and this computer's clock, and the
+pointing run lays them from the site and this computer's clock, and the
 zenith), and says how many: a tile downloaded inside a solve would hold
 the command until it arrived, past `--timeout` and Ctrl-C. `--timeout`
 counts from the start (after the duty question), the download included.
@@ -76,7 +104,7 @@ sky, served on loopback as plugged-in Alpaca devices (with discovery):
 
 ```sh
 python -m robofast.testing.sky_device --discovery-port 32227 &
-python -m robofast --site 42.38,-71.13 --no-enclosure --address 127.0.0.1 \
+python -m robofast --no-enclosure --address 127.0.0.1 \
     --plugin robofast.testing.sky_device:register --catalog synthetic
 ```
 

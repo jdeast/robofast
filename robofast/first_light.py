@@ -9,8 +9,9 @@ One command, for a classroom or a first night: it finds the telescope and
 camera (Alpaca discovery, :mod:`robofast.discover`), reads their plate
 scale from them, writes the enclosure config itself (``--dir``, default
 ``first-light/``; it never overwrites one), and runs robofast's own safety
-supervisor and sequencer on it, in this process: a first pointing
-calibration from three plate solves (docs/pointing_model.md, "A first
+supervisor and sequencer on it, in this process: a focus, from however
+far out, on the brightest planet or star up (robofast.first_focus), a
+first pointing calibration from three plate solves (docs/pointing_model.md, "A first
 calibration"), then one light frame near the zenith, plate-solved
 (docs/sky.md). It prints where the frame points and exits 0 once it is
 solved; 1 if robofast could not get there, saying why.
@@ -51,6 +52,7 @@ import contextlib
 import getpass
 import json
 import logging
+import math
 import signal
 import sys
 import threading
@@ -224,6 +226,98 @@ def _where(site: tuple[float, float, float]) -> str:
     )
 
 
+def _focus_reads(config: dict[str, Any], devices: list[discover.Device]) -> dict[str, Any]:
+    """What the focus step reads from the devices (in the setup's session)."""
+    (tel,) = config["telescopes"]
+    scope = config["telescopes"][tel]
+    by = {(d.type, d.spec): d for d in devices}
+    focal, aperture, area = discover.read_members(
+        by["Telescope", scope["telescope"]], ["FocalLength", "ApertureDiameter", "ApertureArea"]
+    )
+    (full,) = discover.read_members(by["Camera", scope["camera"]], ["MaxADU"])
+    reads = {"focal": focal, "aperture": aperture, "area": area, "full": full}
+    if "focuser" in scope:
+        (reads["step"],) = discover.read_members(by["Focuser", scope["focuser"]], ["StepSize"])
+    return reads
+
+
+def _target(config: dict[str, Any], name: str) -> dict[str, Any]:
+    return next(t for t in config["plan"]["targets"] if t["name"] == name)
+
+
+def _focus_step(
+    config: dict[str, Any],
+    devices: list[discover.Device],
+    site: tuple[float, float, float],
+    when: datetime,
+    *,
+    attended: bool,
+    reads: dict[str, Any],
+) -> str:
+    """Put the focus step first in the plan (robofast.first_focus): on the
+    brightest planet or star up, from the devices' optics. Returns what it
+    says about it (one line)."""
+    from robofast import first_focus
+
+    (tel,) = config["telescopes"]
+    scope = config["telescopes"][tel]
+    if "focuser" not in scope and not attended:
+        return (
+            "no focuser: no focus step (--yes answers no walk-through: run without --yes"
+            " to focus by hand, the program saying which way to turn)"
+        )
+    target = first_focus.bright_target(site, when)
+    if target is None:
+        return "no planet or bright star is up to focus on: no focus step"
+    focal, aperture, area, full = (reads[k] for k in ("focal", "aperture", "area", "full"))
+    optics = config["images"]["telescopes"][tel]
+    pixel = optics["plate_scale"] * float(focal) * 1000.0 / discover.ARCSEC_PER_UM_PER_MM
+    obstruction = math.sqrt(max(0.0, 1.0 - float(area) / (math.pi * (float(aperture) / 2) ** 2)))
+    settings: dict[str, Any] = {
+        "f_ratio": float(focal) / float(aperture),
+        "pixel_size": pixel,
+        "plate_scale": optics["plate_scale"],
+        "obstruction": round(obstruction, 3),
+        "fwhm_px": 2.5 / optics["plate_scale"],
+        "saturation": float(full),
+        "exptime": 0.01,
+        "sweep_exptime": 1.0,
+    }
+    if "focuser" in scope:
+        settings["um_per_step"] = reads["step"]
+        # The telescope's autofocus entry (docs/autofocus.md): what gives the
+        # sequencer its focuser; its sweep finishes the focus step.
+        scope["autofocus"] = {
+            "optics": {
+                k: settings[k] for k in ("f_ratio", "pixel_size", "obstruction", "um_per_step")
+            }
+            | {"pixel_scale": settings["plate_scale"]},
+            "method": "sweep",
+            "exptime": settings["sweep_exptime"],
+            "measure": {"saturation": 0.9 * settings["saturation"]},
+        }
+    else:
+        settings["walk_through"] = True  # a person is there (no --yes)
+    config["plan"]["targets"].insert(
+        0,
+        {
+            "name": "first-focus",
+            "kind": "first_focus",
+            "ra_hours": round(target.ra / 15.0, 6),
+            "dec_deg": round(target.dec, 5),
+            "exptime": settings["exptime"],
+            "object": target.name,
+            "autofocus": settings,
+        },
+    )
+    config.setdefault("plugins", [])
+    if "robofast.first_focus:register" not in config["plugins"]:
+        config["plugins"].append("robofast.first_focus:register")
+    first_focus.register()
+    how = "with the focuser" if "focuser" in scope else "by hand: you turn the knob"
+    return f"focus first, {how}, on {target.name} (altitude {target.alt:.0f} deg)"
+
+
 def _zenith(config: dict[str, Any], lst_hours: float) -> None:
     for t in config["plan"]["targets"]:
         if t["name"] == "first-light":
@@ -250,7 +344,7 @@ def _fields(
 
     (tel,) = config["telescopes"]
     pc = config["telescopes"][tel]["pointing"]
-    cal = config["plan"]["targets"][0]
+    cal = _target(config, "first-pointing")
     run = {**POINTING_RUN_DEFAULTS, **pc.get("run", {}), **cal.get("pointing", {})}
     lst = _lst_hours(site, when) * 15.0
     avoid = []
@@ -282,7 +376,7 @@ def _fields(
 def _calibration_span(config: dict[str, Any]) -> float:
     """Seconds the calibration takes, at most (its points, :data:`PER_POINT`
     each besides the exposure)."""
-    cal = config["plan"]["targets"][0]
+    cal = _target(config, "first-pointing")
     return cal["count"] * (float(cal["exptime"]) + PER_POINT)
 
 
@@ -418,6 +512,13 @@ def _frames(tl: Timeline) -> str:
     return out + (f" (last: {'; '.join(errors[-2:])})" if errors else "")
 
 
+async def _focus_failed(tl: Timeline) -> str:
+    """The focus step's failure (robofast.first_focus), once it is reported."""
+    while not tl.events("first_focus_failed"):
+        await asyncio.sleep(0.5)
+    return str(tl.events("first_focus_failed")[-1].detail.get("error"))
+
+
 async def _unsolvable(tl: Timeline) -> None:
     """Return once the calibration's frames are found not to solve."""
     while not (
@@ -502,12 +603,17 @@ async def run(
     try:
         stop_wait = asyncio.create_task(stop.wait(), name="stop")
         unsolvable = asyncio.create_task(_unsolvable(tl), name="unsolvable")
+        unfocused = asyncio.create_task(_focus_failed(tl), name="unfocused")
         left = timeout - (time.monotonic() - started) if started is not None else timeout
-        done, _ = await asyncio.wait({seq_task, stop_wait, unsolvable}, timeout=max(1.0, left),
+        done, _ = await asyncio.wait({seq_task, stop_wait, unsolvable, unfocused},
+                                     timeout=max(1.0, left),
                                      return_when=asyncio.FIRST_COMPLETED)  # fmt: skip
         stop_wait.cancel()
         unsolvable.cancel()
+        unfocused.cancel()
         stopped = stop.is_set()
+        if unfocused in done and not stopped:
+            raise FirstLightError(f"focus: {unfocused.result()}")
         if unsolvable in done and not stopped:
             raise FirstLightError(
                 f"the frames did not solve: {_frames(tl)}; check the plate scale"
@@ -683,6 +789,9 @@ def main(argv: list[str] | None = None) -> None:
         )
         try:
             size = discover.read_members(camera, ["CameraXSize", "CameraYSize"])
+            # A focus step can happen with a focuser, or a person (no --yes).
+            focusable = "focuser" in config["telescopes"][tel] or not args.yes
+            reads = _focus_reads(config, devices) if focusable else {}
         except discover.OpticsUnavailable as exc:
             print(f"first light: {exc}", file=sys.stderr)
             sys.exit(1)
@@ -708,7 +817,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         radius = _field_radius(config["images"]["telescopes"][tel]["plate_scale"], size)
         catalog = config["images"]["solve"]["catalog"]
-        frames = config["plan"]["targets"][0]["count"] + 1
+        frames = _target(config, "first-pointing")["count"] + 1
         # The sky turns while it downloads: fetch again for where the fields
         # are then, over the calibration and the last download's length,
         # until nothing is missing, or a pass no longer gains on the sky.
@@ -741,6 +850,14 @@ def main(argv: list[str] | None = None) -> None:
     # clock is not read: docs/first_light.md), after the download.
     planned = datetime.now(UTC)
     _zenith(config, _lst_hours(site, planned))
+    try:
+        print(
+            "first light: "
+            + _focus_step(config, devices, site, planned, attended=not args.yes, reads=reads)
+        )
+    except discover.OpticsUnavailable as exc:
+        print(f"first light: {exc}", file=sys.stderr)
+        sys.exit(1)
     workdir.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(config, indent=2) + "\n")
     print(f"wrote {path}")
@@ -771,7 +888,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         sys.exit(1)
     solve = entry["solve"]
-    target_ra, target_dec = config["plan"]["targets"][1]["ra_hours"] * 15.0, site[0]
+    target_ra, target_dec = _target(config, "first-light")["ra_hours"] * 15.0, site[0]
     ra, dec = float(solve["ra"]), float(solve["dec"])
     off = separation(ra, dec, target_ra, target_dec) * 3600.0
     taken = datetime.fromisoformat(str(solve["date_obs"])).replace(tzinfo=UTC)

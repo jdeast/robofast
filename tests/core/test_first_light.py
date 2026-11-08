@@ -28,6 +28,7 @@ def device(tmp_path):
     d = SkyDevice(
         catalog={"cache_dir": str(tmp_path / "sky")},
         pointing_error={"IH": 150.0, "ID": -40.0, "NP": 20.0},
+        focuser=False,  # in focus, fixed: these tests are not about focus
     ).start()
     yield d
     d.stop()
@@ -59,7 +60,7 @@ class _HeldClock(datetime):
 
 
 @pytest.fixture
-def held_device(tmp_path, monkeypatch):
+def held_device(tmp_path, monkeypatch, request):
     import robofast.first_light
 
     monkeypatch.setattr(robofast.first_light, "datetime", _HeldClock)
@@ -67,19 +68,25 @@ def held_device(tmp_path, monkeypatch):
         catalog={"cache_dir": str(tmp_path / "sky")},
         pointing_error={"IH": 150.0, "ID": -40.0, "NP": 20.0},
         clock=lambda: HELD,
+        # In focus and fixed unless a test asks for a focuser: the others
+        # are not about focus, and the focus step's sweep costs ~20 s a run.
+        focuser=getattr(request, "param", False),
     ).start()
     yield d
     d.stop()
 
 
+@pytest.mark.parametrize("held_device", [True], indirect=True)  # with a focuser, in focus
 def test_one_command_to_a_solved_first_light_frame(held_device, tmp_path, capsys):
     device = held_device
     main(_args(device, tmp_path, "--no-enclosure", "--yes"))
     out = capsys.readouterr().out
+    assert any(ln.startswith("focus: done") for ln in out.splitlines()), out[-2000:]
     entry = json.loads(out.strip().splitlines()[-1])["first_light"]
     solve = entry["solve"]
     assert solve["solved"] and solve["n_matched"] >= 10 and solve["rms"] < 1.0
-    target = json.loads((tmp_path / "run" / "observatory.json").read_text())["plan"]["targets"][1]
+    plan = json.loads((tmp_path / "run" / "observatory.json").read_text())["plan"]
+    target = next(t for t in plan["targets"] if t["name"] == "first-light")
     off = separation(solve["ra"], solve["dec"], target["ra_hours"] * 15, target["dec_deg"]) * 3600
     # The calibration fits the zero points only (IH, ID): the injected NP
     # (20") stays uncorrected, so the frame lands within that, not on the axis.
@@ -616,6 +623,7 @@ def _turning_run(tmp_path, capsys, monkeypatch, seconds):
         catalog={"cache_dir": str(tmp_path / "sky")},
         pointing_error={"IH": 150.0, "ID": -40.0, "NP": 20.0},
         clock=lambda: t[0],
+        focuser=False,  # in focus, fixed: this test is about the download
     ).start()
     calls: list[int] = []
 
@@ -717,6 +725,7 @@ def _wrong_clock_device(tmp_path, hours: float) -> SkyDevice:
     d = SkyDevice(
         catalog={"cache_dir": str(tmp_path / "sky")},
         pointing_error={"IH": 150.0, "ID": -40.0, "NP": 20.0},
+        focuser=False,  # in focus, fixed: these tests are about the clock
     )
     d.mount.__class__ = WrongClockMount
     scenes = [

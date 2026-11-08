@@ -605,6 +605,19 @@ async def _ask(prompt: str) -> str:
     return await asyncio.to_thread(input, prompt)
 
 
+#: A device's role in the owner's name (``t1.focuser``), in plain words.
+_ROLES = {"focuser": "the focuser", "telescope": "the mount", "camera": "the camera"}
+
+
+def _in_words(exc: Exception) -> str:
+    """A device's error, its device first in plain words ("the focuser: ...")."""
+    import re
+
+    text = str(exc)
+    m = re.search(r"\b(focuser|telescope|camera)\b", text.split(": ", 1)[0])
+    return f"{_ROLES[m.group(1)]}: {text}" if m else text
+
+
 def too_bright_line(exc: TooBright, opts: dict) -> str:
     """The stop for a target too bright for the camera: what to run next,
     with a fainter star up now by :func:`fainter_star`'s rule, if one is."""
@@ -710,13 +723,7 @@ async def run_first_focus(r) -> None:
     fwhm_px = float(opts["fwhm_px"])
     saturation = float(opts["saturation"])
     exposure_min = float(opts.get("exposure_min") or 0.0)
-    camera = camera_exposer(cam, readout_margin=30.0, poll=0.05)
-
-    async def expose(t: float) -> np.ndarray:
-        try:
-            return await camera(t)
-        except DeviceError as exc:  # stop now, in the camera's words
-            raise FocusError(f"the camera, asked for a {t:g} s exposure: {exc}") from exc
+    expose = camera_exposer(cam, readout_margin=30.0, poll=0.05)
 
     def say(line: str) -> None:
         print(line, flush=True)
@@ -786,6 +793,10 @@ async def run_first_focus(r) -> None:
             raise FocusError(f"the sweep did not find focus: {res.message}")
         say(f"focus: done at position {res.focus:.0f} (+-{res.focus_err or 0:.0f} steps)")
         seq._event("first_focus_done", telescope=unit.name, focus=res.focus, method="sweep")
+    except DeviceError as exc:  # any device inside the step: stop now, in its words
+        why = _in_words(exc)
+        seq._event("first_focus_failed", telescope=unit.name, error=why)
+        raise ObservationFailed(f"focus: {why}") from exc
     except TooBright as exc:
         why = too_bright_line(exc, opts)
         seq._event("first_focus_failed", telescope=unit.name, error=why)

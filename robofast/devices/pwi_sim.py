@@ -9,7 +9,8 @@ One mount model (:class:`CDK700Model`) behind either front end:
 * ``api="pwi2"``: ``GET /?device=mount&cmd=move&alt=..&azm=..`` and
   ``/?cmd=getsystem``, answering the ``<system>`` XML status PWI2 sends
   (fields as in the legacy ``telstateunknown.xml``). PWI2's quirk is kept:
-  ``mount.moving`` is ``True`` whenever tracking is off.
+  ``mount.moving`` is ``True`` whenever tracking is off; ``stuck_moving``
+  makes it ``True`` always (as MINERVA T1's PWI2 after a restart).
 
 The model, from the legacy driver's use of PWI (``docs/pwi.md``):
 
@@ -135,8 +136,12 @@ class CDK700Model:
         wrap_min: float = 0.0,
         az_mech_min: float | None = None,
         model_file: str = "",
+        stuck_moving: bool = False,
     ) -> None:
         self.lat, self.lon = latitude, longitude
+        #: PWI2: ``mount.moving`` stuck True (MINERVA T1 after a PWI2
+        #: restart, 2026-11-07), whatever the mount does.
+        self.stuck_moving = stuck_moving
         self.slew_rate = slew_rate
         self.home_time = home_time
         self.m3_time = m3_time
@@ -569,7 +574,7 @@ def pwi2_status(m: CDK700Model) -> str:
     ra, dec = m.radec_now()
     t_ra, t_dec = m.radec if m.radec is not None else (ra, dec)
     port = m.current_port
-    moving = m.slewing or m.homing or not m.tracking  # PWI2's quirk
+    moving = m.slewing or m.homing or not m.tracking or m.stuck_moving  # PWI2's quirks
 
     def el(tag: str, value: Any) -> str:
         return f"<{tag}>{escape(str(value))}</{tag}>"
@@ -849,6 +854,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--report-homed", action="store_true", help="PWI4: report mount.axisN.is_homed")
     ap.add_argument("--version", default="4.1.8.0", help="PWI4 version to report")
     ap.add_argument("--pwi-min-alt", type=float, help="PWI's own altitude limit (deg)")
+    ap.add_argument("--stuck-moving", action="store_true", help="PWI2: mount.moving always True")
     ap.add_argument("--wrap-min", type=float, default=0.0, help="PWI4 axis-0 wrap range min")
     ap.add_argument("--model-file", default="", help="the pointing-model file loaded at start")
     ap.add_argument(
@@ -876,6 +882,7 @@ def main(argv: list[str] | None = None) -> None:
         pwi_min_alt=args.pwi_min_alt,
         wrap_min=args.wrap_min,
         model_file=args.model_file,
+        stuck_moving=args.stuck_moving,
     )
     if args.restarted:
         sim.model.pwi_restart(args.model_file or "Default_Mount_Model.PXP")

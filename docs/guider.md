@@ -362,7 +362,18 @@ acquire, or fails mid-observation, is that telescope's ordinary error
 (back off, give up after `max_consecutive_errors`). A telescope without a
 guider fails an observation that asks to guide. Config: per telescope,
 `"guider": "http://host:port"` or `{"url", "acquire_timeout", "timeout",
-"poll_interval"}`.
+"poll_interval", "status_failures"}`.
+
+A status read that times out (`timeout`, default 5 s) is transient, not a
+failed guider: the service may be busy, or the computer loaded. While
+acquiring, `start()` asks again until `acquire_timeout`; while guiding,
+`check()` passes until `status_failures` (default 3) reads in a row have
+timed out. A refusal, a refused connection, or a `failed`/`stopped` state
+still fails at once. (Night 1107: the service did not answer `/status` for
+3.5-5 s while it acquired, the simulated camera rendering full frames on
+its event loop; one timeout failed each observation and three gave up a
+telescope. Full acquisition frames are now rendered, and searched for
+stars, in a worker thread, so the HTTP API keeps answering.)
 
 ## Safety
 

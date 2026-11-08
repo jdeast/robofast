@@ -74,13 +74,18 @@ Safety
   ``max_alt`` + ``limit_margin``] (a tracked target setting, a slew the
   limits did not foresee), or is heading out fast enough that it would
   coast past them after a stop (``stop_distance``: 6-8 deg from full slew
-  speed on a CDK700). It only ever stops.
+  speed on a CDK700). It only ever stops. Speeds span two read intervals;
+  with nothing of ours moving the mount, a fast read is read again before
+  it counts (``track_speed_max``); a slew of ours moving toward a target
+  inside the limits is predicted to stop within ``goto_margin`` of it.
 * A slew this server sent that PWI reports slewing but that does not move
   (``stall_time``, ``stall_move``) has failed -- PWI4 accepts a goto beyond
   its own axis limits, stops at the limit and reports slewing forever: the
   server stops the mount and ``Slewing`` raises the reason until the next
   slew or ``AbortSlew``. So does an axis PWI disables during a slew (a
-  drive fault), and a park not done within ``park_timeout``.
+  drive fault), and a park not done within ``park_timeout``. A mount on its
+  target (``slew_tolerance``) and still has finished its slew whatever PWI
+  says (PWI2's ``moving`` can stick True).
 * With ``az_wrap_min``/``az_wrap_max`` (mechanical azimuth, PWI4), every
   goto picks the mechanical angle of its azimuth inside that range nearest
   the current one and sets PWI4's axis-0 wrap range so PWI goes there; it
@@ -100,6 +105,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import concurrent.futures
 import contextlib
 import dataclasses
@@ -256,6 +262,20 @@ class PWIConfig:
     #: 2026-11-05: PWI2 reported 61.4 deg altitude mid-slew from near 40, a
     #: "32 deg/s" climb, and the watch stopped a good slew 7 arcmin short).
     glitch_speed: float | None = None
+    #: With no slew in progress (tracking, or still) a read implying more
+    #: than this (deg/s, either axis) is suspect: the watch reads PWI again
+    #: at once and acts only if that read confirms the motion (MINERVA T1,
+    #: 2026-11-07: PWI2 read 77.9 deg altitude for one sample while the
+    #: mount tracked at 63.7, "22 deg/s", and the watch stopped it).
+    track_speed_max: float = 1.0
+    #: A slew of ours to a target inside the limits, moving toward it, is
+    #: predicted to stop no further than this past the target (deg): the
+    #: watch is for runaways, not for a goto decelerating onto its target.
+    goto_margin: float = 1.0
+    #: A slew of ours is complete once the mount is this close to its target
+    #: (deg; RA/Dec, or alt/az and mechanical azimuth) and not moving, what
+    #: ever PWI's own flag says (PWI2's ``moving`` can stick True).
+    slew_tolerance: float = 0.1
     #: A slew robofast sent that PWI reports slewing but that has moved less
     #: than ``stall_move`` deg in ``stall_time`` s has failed (PWI4 stops at
     #: its own axis limits and reports slewing forever): stop, report.
@@ -357,6 +377,8 @@ class PWIConfig:
             raise ValueError("glitch_speed must be above slew_speed")
         if cfg.stall_time <= 0 or cfg.stall_move <= 0:
             raise ValueError("need stall_time > 0 and stall_move > 0")
+        if cfg.track_speed_max <= 0 or cfg.goto_margin < 0 or cfg.slew_tolerance <= 0:
+            raise ValueError("need track_speed_max > 0, goto_margin >= 0, slew_tolerance > 0")
         if cfg.m3_retries < 0 or cfg.m3_resend_after <= 0:
             raise ValueError("need m3_retries >= 0 and m3_resend_after > 0")
         if cfg.home_tolerance <= 0:
@@ -409,8 +431,11 @@ def same_model(a: str | None, b: str | None) -> bool:
 def coast_deg(config: PWIConfig, speed: float) -> float:
     """How far (deg) a mount moving at ``speed`` (deg/s) goes before a stop
     sent now takes hold: ``stop_distance`` scaled as the square of the
-    speed (constant deceleration), plus one ``watch_interval`` of travel."""
-    s = abs(speed)
+    speed (constant deceleration), plus one ``watch_interval`` of travel.
+    The mount cannot go faster than ``slew_speed``: a measured speed above
+    it (and below ``glitch_speed``, which is a bad read) is poll-timing
+    jitter, and counts as ``slew_speed``."""
+    s = min(abs(speed), config.slew_speed)
     return config.stop_distance * (s / config.slew_speed) ** 2 + s * config.watch_interval
 
 
@@ -420,6 +445,10 @@ def _sep_deg(alt1: float, az1: float, alt2: float, az2: float) -> float:
         math.radians(az1 - az2)
     )
     return math.degrees(math.acos(max(-1.0, min(1.0, c))))
+
+
+def _truthy(v: Any) -> bool:
+    return str(v).strip().lower() in ("true", "1", "yes")
 
 
 def j2000_to_date(ra_h: float, dec: float) -> tuple[float, float]:
@@ -485,6 +514,12 @@ class PWIMount:
         self._goto_altaz: tuple[float, float] | None = None
         self._goto_mech: float | None = None
         self._stall_ref: tuple[float, float, float] | None = None  # (t, alt, az)
+        #: An RA/Dec slew's target, apparent (precessed once, at the slew).
+        self._goto_app: tuple[float, float] | None = None
+        #: The last slew that ended (not failed): (when, alt, mech az target).
+        self._done_goto: tuple[float, float | None, float | None] | None = None
+        #: A stalled slew is being stopped (Slewing stays true meanwhile).
+        self._failing = False
         #: Why the last slew failed (Slewing raises it until the next command).
         self.slew_error: str | None = None
         self.m3_resends = 0
@@ -510,7 +545,10 @@ class PWIMount:
                 except PWIError:
                     self._pwi_up = False
                     raise
-                self._take(st, time.monotonic())
+                # The read's time: halfway between asking and the answer
+                # (through an SSH tunnel the answer can take 0.3-0.7 s, and
+                # its arrival time alone made speeds jitter by ~40%).
+                self._take(st, 0.5 * (now + time.monotonic()))
             assert self._st is not None
             return self._st
 
@@ -600,18 +638,27 @@ class PWIMount:
         self._goto_alt = target_alt
         self._goto_altaz = altaz
         self._goto_mech = mech
+        self._goto_app = None
+        self._done_goto = None
+        self._failing = False
         self._stall_ref = None
         self.slew_error = None
 
-    def _disarm_slew(self) -> None:
+    def _disarm_slew(self, completed: bool = False) -> None:
+        if completed and self._slew_active:
+            # The limit watch's speeds still hold this slew's last reads for
+            # a moment: they stay bounded by its target (watch()).
+            self._done_goto = (time.monotonic(), self._goto_alt, self._goto_mech)
         self._slew_active = False
         self._goto_alt = None
         self._goto_altaz = None
         self._goto_mech = None
+        self._goto_app = None
         self._stall_ref = None
 
     def _fail_slew(self, why: str) -> None:
         self._disarm_slew()
+        self._failing = False
         if self.park_state == "parking":
             self.park_state = "unknown"
         self.slew_error = why
@@ -676,6 +723,30 @@ class PWIMount:
         }
         return "; ".join(f"{k}={v}" for k, v in sorted(errs.items()))
 
+    def _at_target(self, st: PWIStatus) -> bool:
+        """The mount is within ``slew_tolerance`` of the target of the slew
+        in progress (its alt/az and mechanical azimuth, or its RA/Dec)."""
+        tol = self.config.slew_tolerance
+        if self._goto_altaz is not None:
+            alt, az = self._goto_altaz
+            if _sep_deg(st.alt_deg, st.az_deg, alt, az) > tol:
+                return False
+            mech = self._goto_mech
+            return mech is None or st.az_mech_deg is None or abs(st.az_mech_deg - mech) <= tol
+        if self.target_ra is None or self.target_dec is None:
+            return False
+        if st.ra2000_hours is not None and st.dec2000_deg is not None:
+            here, there = (st.ra2000_hours, st.dec2000_deg), (self.target_ra, self.target_dec)
+        elif self._goto_app is not None:
+            here, there = (st.ra_hours, st.dec_deg), self._goto_app
+        else:
+            return False
+        return _sep_deg(here[1], here[0] * 15.0, there[1], there[0] * 15.0) <= tol
+
+    def _arrived(self, st: PWIStatus) -> bool:
+        """A slew of ours has ended on its target: there, and not moving."""
+        return self._at_target(st) and self.speed < self.config.moving_speed
+
     async def _check_stall(self, st: PWIStatus) -> None:
         """PWI4 accepts a goto beyond its own axis limits, stops at the limit
         and reports slewing (and tracking) forever. A slew of ours that PWI
@@ -698,9 +769,28 @@ class PWIMount:
             with contextlib.suppress(PWIError):
                 await self._send(self.pwi.stop, "stop (axis disabled)")
             return
+        settled = now - self._moving_since > cfg.slew_report_min
+        if settled and self._arrived(st):
+            # On the target and still: done, whatever PWI's own flag says
+            # (PWI2's ``moving`` stuck True after a PWI2 restart, night 1107).
+            if st.slewing is True:
+                log.info(
+                    "slew complete: on the target (alt %.3f, az %.3f) although PWI reports slewing",
+                    st.alt_deg,
+                    st.az_deg,
+                )
+            self._disarm_slew(completed=True)
+            return
         if st.slewing is not True:
-            if now - self._moving_since > cfg.slew_report_min and self.speed < cfg.moving_speed:
-                self._disarm_slew()
+            # Not on the target: PWI's word that it is done counts only once
+            # the mount had time to start (PWI2 can report a tracked mount
+            # not moving for a second or two after a goto; disarming then
+            # left the limit watch without the target, night 1107).
+            if (
+                now - self._moving_since > max(cfg.slew_report_min, cfg.stall_time)
+                and self.speed < cfg.moving_speed
+            ):
+                self._disarm_slew(completed=True)
             self._stall_ref = None
             return
         # Progress: toward an alt/az target whose mechanical azimuth is known
@@ -729,6 +819,16 @@ class PWIMount:
         assert ref is not None
         if now - ref[0] < cfg.stall_time:
             return
+        if st.backend == "pwi2" and st.tracking and _truthy(st.raw.get("mount.on_target")):
+            # PWI2 says it is on the target (what the legacy code waited
+            # for) and the mount has stopped: a finished slew, not a stall.
+            log.info(
+                "slew complete: PWI2 on_target (alt %.3f, az %.3f) although it reports moving",
+                st.alt_deg,
+                st.az_deg,
+            )
+            self._disarm_slew(completed=True)
+            return
         why = (
             f"slew failed: PWI reports slewing but the mount has made no progress for"
             f" {now - ref[0]:.1f} s (alt {st.alt_deg:.3f}, az {st.az_deg:.3f}"
@@ -739,7 +839,8 @@ class PWIMount:
         # Stop first, then publish the error: a client polling Slewing (the
         # watcher task also runs this check) must not see the failure while the
         # mount is still being driven. Disarming first keeps a concurrent check
-        # from stopping twice.
+        # from stopping twice; ``_failing`` keeps Slewing true meanwhile.
+        self._failing = True
         self._disarm_slew()
         with contextlib.suppress(PWIError):
             await self._send(self.pwi.stop, "stop (slew stalled)")
@@ -754,10 +855,20 @@ class PWIMount:
         await self._check_stall(st)
         if self.slew_error is not None:
             raise AlpacaException(DRIVER_ERROR, self.slew_error)
+        if self._slew_active or self._failing:
+            # Ours, not yet on its target (_check_stall ends it there, or
+            # when PWI says done and nothing has moved for stall_time): a
+            # PWI2 that has not started moving yet is not done (night 1107).
+            return True
         if await self.homing(st):
             return True
         if st.slewing:
-            return True
+            if st.backend != "pwi2" or self._slew_active or self.speed >= self.config.moving_speed:
+                return True
+            # PWI2's ``moving`` can stick True (night 1107, after a PWI2
+            # restart): with no slew of ours under way (one that ended on its
+            # target, see _check_stall) and the mount not moving, it is not
+            # slewing.
         if self.park_state == "parking":
             return True
         if self.speed > self.config.moving_speed and not st.tracking:
@@ -901,13 +1012,15 @@ class PWIMount:
             raise AlpacaException(INVALID_OPERATION, "slew: tracking is off")
         if st.lst_hours is None:
             raise AlpacaException(DRIVER_ERROR, "slew: PWI reports no sidereal time")
-        alt, az = target_altaz(ra, dec, st.lst_hours, self.config.latitude)
+        app = j2000_to_date(ra, dec)
+        alt, az = hadec_to_altaz(st.lst_hours - app[0], app[1], self.config.latitude)
         self._check_alt(alt, "slew")
         mech = await self._place_azimuth(st, az % 360.0, "slew")
         self.target_ra, self.target_dec = ra, dec
         self.park_state = "unparked"
         self._watch_latched = False
         self._arm_slew(alt, None, mech)
+        self._goto_app = app
         self._moving_since = time.monotonic()
         await self._send(
             lambda: self.pwi.goto_radec_j2000(ra, dec), f"goto J2000 {ra:.5f} h {dec:.4f}"
@@ -1173,22 +1286,51 @@ class PWIMount:
     ) -> tuple[bool, bool, float]:
         """One axis against [lo, hi]: (outside it, should stop, rest point).
         Stop if outside and moving further out, or heading out fast enough
-        that a stop now would coast past (a slew of ours to a target inside
-        is left to PWI's deceleration until it passes that target)."""
-        margin = self.config.limit_margin
-        rest = pos + math.copysign(coast_deg(self.config, v), v)
+        that a stop now would coast past. A slew of ours to a target inside
+        moving toward it (not yet ``goto_margin`` past it) comes to rest
+        no further than ``goto_margin`` past that target: PWI decelerates
+        onto it. Past the target, or moving away, the full coast counts."""
+        cfg = self.config
+        rest = pos + math.copysign(coast_deg(cfg, v), v)
+        if goto is not None and lo <= goto <= hi:
+            gm = cfg.goto_margin
+            if v > 1e-4 and pos <= goto + gm:
+                rest = min(rest, goto + gm)
+            elif v < -1e-4 and pos >= goto - gm:
+                rest = max(rest, goto - gm)
         outside = not lo <= pos <= hi
         out_now = (pos < lo and v < -1e-4) or (pos > hi and v > 1e-4)
         heading = (v < -1e-4 and rest < lo) or (v > 1e-4 and rest > hi)
-        if heading and goto is not None and lo <= goto <= hi:
-            heading = (v < 0 and pos < goto - margin) or (v > 0 and pos > goto + margin)
         if self._homing_since is not None:
             heading = False  # homing may cross the limits
         return outside or heading, out_now or heading, rest
 
+    def _commanded_motion(self) -> bool:
+        """Motion of ours is under way (a slew, a park, a home)."""
+        return (
+            self._slew_active
+            or self._homing_since is not None
+            or self.park_state == "parking"
+            or time.monotonic() - self._moving_since < self.config.slew_report_min
+        )
+
     async def watch(self) -> None:
         cfg = self.config
-        last: tuple[float, float, float | None] | None = None  # (t, alt, mech az)
+        glitch = cfg.glitch_speed or 2.0 * cfg.slew_speed
+        # The last good reads (t, alt, mech az), newest last: speeds come
+        # from the newest read and the oldest kept (two intervals), so one
+        # read's timing jitter does not make a speed (night 1107: a
+        # 16 deg/s slew measured at 21.6 deg/s, "would coast to 95").
+        hist: collections.deque[tuple[float, float, float | None]] = collections.deque(maxlen=3)
+        confirmed = False  # fast motion of no slew of ours, confirmed by a re-read
+
+        def rates(t: float, alt: float, mech: float | None, ref) -> tuple[float, float]:
+            dt = t - ref[0]
+            if dt <= 1e-3:
+                return 0.0, 0.0
+            vm = (mech - ref[2]) / dt if mech is not None and ref[2] is not None else 0.0
+            return (alt - ref[1]) / dt, vm
+
         while True:
             await asyncio.sleep(cfg.watch_interval)
             if self._model_due and self.models:
@@ -1197,39 +1339,88 @@ class PWIMount:
             try:
                 st = await self.status(cfg.watch_interval / 2)
             except PWIError:
-                last = None
+                hist.clear()
+                confirmed = False
                 continue
             await self._check_stall(st)
             t, alt, mech = self._st_at, st.alt_deg, st.az_mech_deg
-            dt = t - last[0] if last is not None else 0.0
-            v = (alt - last[1]) / dt if last is not None and dt > 1e-3 else 0.0
-            # Where the mount would come to rest if stopped now: a stop
-            # coasts up to stop_distance (6-8 deg from full speed).
-            glitch = cfg.glitch_speed or 2.0 * cfg.slew_speed
-            vm = 0.0
-            if last is not None and last[2] is not None and mech is not None and dt > 1e-3:
-                vm = (mech - last[2]) / dt
-            if abs(v) > glitch or abs(vm) > glitch:
+            if hist and t - hist[-1][0] <= 1e-3:
+                continue  # the same read again
+            v1, vm1 = rates(t, alt, mech, hist[-1]) if hist else (0.0, 0.0)
+            if abs(v1) > glitch or abs(vm1) > glitch:
                 # Measure the next read from scratch: this one is not motion.
                 log.warning(
                     "limit watch: skipped a bad PWI read (altitude %.2f deg at %.1f deg/s,"
                     " mechanical azimuth at %.1f deg/s)",
                     alt,
-                    v,
-                    vm,
+                    v1,
+                    vm1,
                 )
                 self.watch_glitches += 1
-                last = None
+                hist.clear()
+                confirmed = False
                 continue
+            fast = max(abs(v1), abs(vm1)) > cfg.track_speed_max
+            confirmed = confirmed and fast
+            if hist and fast and not confirmed and not self._commanded_motion():
+                # Nothing of ours is moving it, yet it reads fast: read again
+                # now, and believe it only if that read agrees.
+                try:
+                    st2 = await self.status(0)
+                except PWIError:
+                    hist.clear()
+                    continue
+                if self._st_at - t <= 1e-3:
+                    continue  # no fresh read to be had
+                t2, alt2, mech2 = self._st_at, st2.alt_deg, st2.az_mech_deg
+                v2, vm2 = rates(t2, alt2, mech2, hist[-1])
+                if max(abs(v2), abs(vm2)) <= cfg.track_speed_max:
+                    log.warning(
+                        "limit watch: skipped a bad PWI read (altitude %.2f deg, %.2f deg/s;"
+                        " read again: %.2f deg, %.3f deg/s)",
+                        alt,
+                        v1,
+                        alt2,
+                        v2,
+                    )
+                    self.watch_glitches += 1
+                    hist.append((t2, alt2, mech2))
+                    continue
+                if abs(v2) > glitch or abs(vm2) > glitch:
+                    self.watch_glitches += 1
+                    hist.clear()
+                    continue
+                # Confirmed: the re-read is this sample (the first stays
+                # out of the speeds; it may be the one that was wrong), and
+                # this motion is not read twice again while it lasts.
+                confirmed = True
+                st, t, alt, mech = st2, t2, alt2, mech2
+            ref = hist[0] if hist else None
+            hist.append((t, alt, mech))
+            if ref is None:
+                continue  # one read is no speed
+            v, vm = rates(t, alt, mech, ref)
+            # A mount that has stopped (the last interval) coasts nowhere,
+            # whatever the interval before it saw (a slew just ended on its
+            # target, and no longer bounds the coast).
+            v1, vm1 = rates(t, alt, mech, hist[-2])
+            if abs(v1) < cfg.moving_speed:
+                v = v1
+            if abs(vm1) < cfg.moving_speed:
+                vm = vm1
+            goto_alt, goto_mech = self._goto_alt, self._goto_mech
+            done = self._done_goto
+            if not self._slew_active and done is not None and done[0] >= ref[0]:
+                # A slew just ended on its target: these speeds still hold
+                # its last reads (moving toward that target).
+                goto_alt, goto_mech = done[1], done[2]
             m = cfg.limit_margin
-            near, stop, rest = self._limit_check(
-                alt, v, cfg.min_alt - m, cfg.max_alt + m, self._goto_alt
-            )
+            near, stop, rest = self._limit_check(alt, v, cfg.min_alt - m, cfg.max_alt + m, goto_alt)
             what = f"altitude {alt:.2f} deg at {v:.2f} deg/s (would coast to {rest:.2f})"
             what += f" against [{cfg.min_alt}, {cfg.max_alt}]"
             if cfg.az_wrap_min is not None and cfg.az_wrap_max is not None and mech is not None:
                 near_m, stop_m, rest_m = self._limit_check(
-                    mech, vm, cfg.az_wrap_min - m, cfg.az_wrap_max + m, self._goto_mech
+                    mech, vm, cfg.az_wrap_min - m, cfg.az_wrap_max + m, goto_mech
                 )
                 if stop_m and not stop:
                     what = (
@@ -1239,7 +1430,7 @@ class PWIMount:
                 near, stop = near or near_m, stop or stop_m
             if not near:
                 self._watch_latched = False
-            elif stop and not self._watch_latched and last is not None:
+            elif stop and not self._watch_latched:
                 self._watch_latched = True
                 self.watch_stops += 1
                 if self._slew_active:
@@ -1250,7 +1441,6 @@ class PWIMount:
                     log.error("LIMIT: %s: stop", what)
                 with contextlib.suppress(PWIError):
                     await self._send(self.pwi.stop, "stop (limit watch)")
-            last = (t, alt, mech)
 
     # -- focuser ----------------------------------------------------------------------
 

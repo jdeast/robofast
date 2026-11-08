@@ -425,6 +425,134 @@ async def test_a_slew_the_limit_watch_stops_fails(make, backend):
     await tel.aclose()
 
 
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_limit_watch_reads_again_before_stopping_a_tracking_mount(make, backend):
+    """MINERVA T1, 2026-11-07 23:28: tracking steadily at 63.7 deg, PWI2
+    read 77.9 for one sample, "22 deg/s" (under glitch_speed), and the
+    watch stopped the mount. With nothing of ours moving it, a fast read is
+    read again, and here the second read says it was not motion."""
+    sim, server = make(backend, sim_kw={"alt": 80.0})
+    mount = server.mount
+    real = mount.pwi.status
+    bad = {"n": 0}
+
+    async def status():
+        st = await real()
+        if bad["n"] < 1:
+            bad["n"] += 1
+            # ~20 deg/s at watch_interval 0.1: under glitch_speed (30), and
+            # a stop from there would coast past max_alt (85 + 1).
+            return dataclasses.replace(st, alt_deg=st.alt_deg + 2.0)
+        return st
+
+    await asyncio.sleep(0.5)  # the watch has its reads
+    mount.pwi.status = status
+    await until(lambda: _async(bad["n"] >= 1), timeout=3, what="bad read served")
+    await until(lambda: _async(mount.watch_glitches >= 1), timeout=3, what="glitch seen")
+    await asyncio.sleep(0.5)
+    assert mount.watch_stops == 0
+    assert not any("stop" in c for c in sim.model.commands)
+
+
+def test_limit_check_bounds_a_slew_toward_its_target():
+    """The coast model for one axis: a slew of ours decelerating onto a
+    target inside the limits is not stopped however fast it reads; past the
+    target, away from it, or with no target, the full coast counts. A speed
+    above slew_speed (poll jitter) coasts as slew_speed."""
+    from robofast.devices.pwi_server import PWIMount, coast_deg
+
+    cfg = config(1, "pwi2", min_alt=21.0, max_alt=83.0, watch_interval=0.5)
+    m = PWIMount(None, cfg)  # type: ignore[arg-type]
+    lo, hi = 20.0, 84.0
+    assert coast_deg(cfg, 21.56) == coast_deg(cfg, 15.0) == 8.0 + 7.5
+    # Night 1107 23:34:58: a real slew to 79.5, read at 68.11 and 21.56 deg/s.
+    _near, stop, rest = m._limit_check(68.11, 21.56, lo, hi, 79.5)
+    assert not stop and rest == pytest.approx(80.5)
+    # With no target of ours, a runaway: stopped where the coast (clamped to
+    # slew_speed: 8 + 7.5 deg) would reach past max_alt + 1.
+    assert not m._limit_check(68.11, 21.56, lo, hi, None)[1]
+    assert m._limit_check(70.0, 21.56, lo, hi, None)[1]
+    # Past the target (plus goto_margin) and still going up: stopped.
+    assert m._limit_check(81.0, 10.0, lo, hi, 79.5)[1]
+    # Heading away from the target, down toward min_alt: stopped.
+    assert m._limit_check(30.0, -15.0, lo, hi, 79.5)[1]
+    # Down onto a target near min_alt: left alone.
+    assert not m._limit_check(30.0, -15.0, lo, hi, 22.0)[1]
+    # A target outside the limits bounds nothing.
+    assert m._limit_check(76.0, 15.0, lo, hi, 88.0)[1]
+
+
+async def test_limit_watch_keeps_a_pwi2_slew_that_starts_late(make):
+    """MINERVA T1, 2026-11-07 23:34:58: PWI2 reported the tracked mount not
+    moving for a moment after a goto; the server took the slew as done,
+    forgot its target, and the limit watch then stopped the real slew to
+    alt 79.5 (inside [21, 83]) as a runaway. The slew stays ours until the
+    mount gets there (or stall_time passes without motion)."""
+    import threading
+
+    sim, server = make(
+        "pwi2", sim_kw={"slew_rate": 20.0, "alt": 40.0, "az": 180.0}, max_alt=83.0, min_alt=21.0
+    )
+    tel = await device(server)
+    await tel.set("Tracking", True, timeout=T)
+    lst = await tel.get("SiderealTime", timeout=T)
+    ra, dec = lst % 24, SIM_LATITUDE - 10.5  # on the meridian, alt ~79.5
+    alt, _ = target_altaz(ra, dec, lst, SIM_LATITUDE)
+    assert 78 < alt < 81
+    goto = sim.model.goto_radec
+
+    def late(r, d):  # PWI2 starts moving 1 s after the goto
+        threading.Timer(1.0, goto, (r, d)).start()
+
+    sim.model.goto_radec = late  # type: ignore[method-assign]
+    await tel.call("SlewToCoordinatesAsync", ra, dec, timeout=T)
+    await until(lambda: _not(tel.get("Slewing", timeout=T)), timeout=20, what="slew end")
+    assert server.mount.watch_stops == 0
+    assert abs(sim.model.state()["alt"] - alt) < 0.5
+    await tel.aclose()
+
+
+async def test_pwi2_slew_ends_on_target_although_moving_sticks(make):
+    """MINERVA T1, 2026-11-07 23:16:52: after a PWI2 restart its mount
+    ``moving`` stuck True; a slew that had arrived (tracking on the target)
+    was taken for a stall and the mount stopped. A slew that is on its
+    target and not moving is done, whatever ``moving`` says, and Slewing
+    stays False after."""
+    sim, server = make("pwi2", sim_kw={"stuck_moving": True}, stall_time=0.5)
+    tel = await device(server)
+    await tel.set("Tracking", True, timeout=T)
+    lst = await tel.get("SiderealTime", timeout=T)
+    ra, dec = (lst - 1.0) % 24, 20.0
+    await tel.call("SlewToCoordinatesAsync", ra, dec, timeout=T)
+    await until(lambda: _not(tel.get("Slewing", timeout=T)), timeout=30, what="slew end")
+    assert abs(await tel.get("Declination", timeout=T) - dec) < 0.5
+    await asyncio.sleep(1.0)
+    assert not await tel.get("Slewing", timeout=T)
+    assert server.mount.slew_error is None
+    assert not any("stop" in c for c in sim.model.commands)
+    assert sim.model.state()["tracking"]
+    await tel.aclose()
+
+
+async def test_pwi2_stuck_moving_still_catches_a_stalled_slew(make):
+    """moving stuck True, and the mount really stuck short of its target (an
+    obstruction): still a stall, stopped and reported."""
+    sim, server = make(
+        "pwi2",
+        sim_kw={"stuck_moving": True, "az": 200.0, "alt": 40.0, "az_mech_min": 170.0},
+        stall_time=0.5,
+        stall_move=0.05,
+    )
+    tel = await device(server)
+    await tel.set("Tracking", True, timeout=T)
+    lst = await tel.get("SiderealTime", timeout=T)
+    await tel.call("SlewToCoordinatesAsync", (lst + 2.0) % 24, 20.0, timeout=T)  # east
+    with pytest.raises(Exception, match="no progress"):
+        await until(lambda: _not(tel.get("Slewing", timeout=T)), timeout=20, what="slew")
+    assert any("stop" in c for c in sim.model.commands)
+    await tel.aclose()
+
+
 async def _async(v):
     return v
 

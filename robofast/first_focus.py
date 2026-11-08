@@ -630,6 +630,11 @@ async def run_first_focus(r) -> None:
             )  # fmt: skip
             seq._event("first_focus_done", telescope=unit.name, method="walk_through")
             return
+        if await fg.get("Absolute") is not True:
+            raise FocusError(
+                "the focuser moves by steps, not to positions (Absolute false): not supported"
+                " yet; focus by hand"
+            )
         lo, hi = 0.0, float(await fg.get("MaxStep"))
 
         async def move(x: float) -> None:

@@ -135,6 +135,11 @@ so first light focuses first (`robofast/first_focus.py`), on the
 brightest planet up, else the brightest star (above 30 deg, from the site
 and this computer's clock; the Moon is not used yet: on a small chip it
 is a disk with no edge in the frame, which needs its own measure).
+`--focus-on NAME` chooses it instead, from these: Venus, Jupiter, Mars,
+Saturn; Sirius, Canopus, Arcturus, Vega, Capella, Rigel, Procyon,
+Betelgeuse, Altair, Aldebaran, Antares, Spica, Pollux, Fomalhaut, Deneb,
+Regulus. A name not on the list, or one below 30 deg now, is refused
+before anything moves.
 
 * **Light, then a donut.** Far from focus a star is the image of the
   telescope's opening, a disk of diameter D = |dz| / N (docs/autofocus.md):
@@ -161,7 +166,10 @@ is a disk with no edge in the frame, which needs its own measure).
   camera's `ExposureMin` and `ExposureMax` (where it reports them): the
   bright frames start at 0.01 s or its minimum, and are never shortened
   below it. A target too bright for the shortest exposure stops first
-  light, saying so (focus by hand on a fainter star); a camera that
+  light, saying so and what to run next: `--focus-on` with the brightest
+  listed star up then that is fainter by the magnitudes the exposure is
+  short (2.5 log10 of the camera's shortest over what focus needs); a
+  camera that
   refuses an exposure stops it at once, in the camera's words.
 * **The end of the travel.** If the disk still shrinks at an end of the
   focuser's travel, the focus is beyond it: first light says which end,

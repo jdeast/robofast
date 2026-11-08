@@ -306,6 +306,7 @@ def _focus_step(
     *,
     attended: bool,
     reads: dict[str, Any],
+    focus_on: str | None = None,
 ) -> str:
     """Put the focus step first in the plan (robofast.first_focus): on the
     brightest planet or star up, from the devices' optics. Returns what it
@@ -319,7 +320,7 @@ def _focus_step(
             "no focuser: no focus step (--yes answers no walk-through: run without --yes"
             " to focus by hand, the program saying which way to turn)"
         )
-    target = first_focus.bright_target(site, when)
+    target = first_focus.bright_target(site, when, focus_on)
     if target is None:
         return "no planet or bright star is up to focus on: no focus step"
     focal, aperture, area, full = (reads[k] for k in ("focal", "aperture", "area", "full"))
@@ -340,6 +341,14 @@ def _focus_step(
         "exptime": _within(0.01, reads),
         "sweep_exptime": _within(1.0, reads),
         "exposure_min": float(reads.get("emin") or 0.0),
+        "mag": target.mag,
+        # The listed stars up now (name, V mag): a too-bright target's stop
+        # names one of them for --focus-on.
+        "stars_up": [
+            [t.name, t.mag]
+            for t in first_focus.targets_up(site, when)
+            if t.name != target.name and t.name not in dict(first_focus.PLANETS)
+        ],
     }
     if "focuser" in scope:
         settings["um_per_step"] = reads.get("step") or 1.0
@@ -765,6 +774,12 @@ def main(argv: list[str] | None = None) -> None:
         " (no enclosure), and the telescope's site, as printed, is where it stands",
     )
     ap.add_argument(
+        "--focus-on",
+        metavar="NAME",
+        help="focus on this planet or bright star (docs/first_light.md) instead of the"
+        " brightest up",
+    )
+    ap.add_argument(
         "--f-ratio",
         type=float,
         help="the telescope's focal ratio, for a mount that does not report its aperture",
@@ -860,6 +875,14 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(1)
     for line in reads.get("said", []):
         print(f"first light: {line}", flush=True)
+    if args.focus_on:  # a name first light cannot use is refused before the question
+        from robofast import first_focus
+
+        try:
+            first_focus.bright_target(site, datetime.now(UTC), args.focus_on)
+        except first_focus.FocusError as exc:
+            print(f"first light: {exc}", file=sys.stderr)
+            sys.exit(1)
     # One question: what robofast cannot see, and what the operator must
     # confirm. A mount with no GPS reports its factory site, which may be
     # another continent: points laid for it can be below the real horizon.
@@ -915,12 +938,22 @@ def main(argv: list[str] | None = None) -> None:
     # clock is not read: docs/first_light.md), after the download.
     planned = datetime.now(UTC)
     _zenith(config, _lst_hours(site, planned))
+    from robofast import first_focus
+
     try:
         print(
             "first light: "
-            + _focus_step(config, devices, site, planned, attended=not args.yes, reads=reads)
+            + _focus_step(
+                config,
+                devices,
+                site,
+                planned,
+                attended=not args.yes,
+                reads=reads,
+                focus_on=args.focus_on,
+            )
         )
-    except discover.OpticsUnavailable as exc:
+    except (discover.OpticsUnavailable, first_focus.FocusError) as exc:
         print(f"first light: {exc}", file=sys.stderr)
         sys.exit(1)
     workdir.mkdir(parents=True, exist_ok=True)

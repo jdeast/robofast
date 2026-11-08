@@ -14,7 +14,7 @@ import time
 import numpy as np
 import pytest
 
-from robofast.guider.base import ROI, HardwareNotAllowed, RealClock, VirtualClock
+from robofast.guider.base import ROI, GuiderError, HardwareNotAllowed, RealClock, VirtualClock
 from robofast.guider.calibration import Calibration
 from robofast.guider.loop import Backlight, GuideConfig, Guider
 from robofast.guider.offload import OffloadConfig, Offloader
@@ -554,6 +554,142 @@ async def test_remote_stop_ends_a_poll_whose_cancel_was_lost():
     caller.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(caller, 2)
+
+
+class _StallingGuider:
+    """A guider service stand-in whose ``GET /status`` stalls (longer than
+    the client's timeout) for the calls ``stall`` says, as the real one did
+    while rendering acquisition frames on its event loop (night 1107)."""
+
+    def __init__(self, states, stall) -> None:
+        self.states = list(states)  # what each answered status says (last repeats)
+        self.stall = stall  # (n) -> bool: does the n-th status call stall
+        self.calls = 0
+        self.answered = 0
+        self.posts: list[str] = []
+        self.server = None
+
+    async def start(self) -> str:
+        self.server = await asyncio.start_server(self._conn, "127.0.0.1", 0)
+        return f"http://127.0.0.1:{self.server.sockets[0].getsockname()[1]}"
+
+    async def stop(self) -> None:
+        self.server.close()
+
+    async def _conn(self, reader, writer):
+        try:
+            while line := await reader.readline():
+                method, path, _ = line.decode().split(" ", 2)
+                n = 0
+                while (h := await reader.readline()) not in (b"\r\n", b""):
+                    k, _, v = h.decode().partition(":")
+                    if k.strip().lower() == "content-length":
+                        n = int(v)
+                if n:
+                    await reader.readexactly(n)
+                if method == "GET":
+                    self.calls += 1
+                    if self.stall(self.calls):
+                        await asyncio.sleep(1.0)
+                    state = self.states[min(self.answered, len(self.states) - 1)]
+                    self.answered += 1
+                    body = {"state": state, "reason": "", "telemetry": {}}
+                else:
+                    self.posts.append(path)
+                    body = {"stopped": True, "state": "stopped"}
+                data = json.dumps(body).encode()
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(data)}\r\n\r\n".encode()
+                    + data
+                )
+                await writer.drain()
+        except (ConnectionError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            writer.close()
+
+
+async def test_remote_rides_out_status_timeouts_while_acquiring_and_guiding():
+    """Night 1107: the guider did not answer ``/status`` for ~5 s while
+    acquiring; one ReadTimeout failed the observation, three a telescope.
+    A status timeout is transient: acquiring, the client asks again until
+    ``acquire_timeout``; guiding, ``check`` passes until ``status_failures``
+    timeouts in a row."""
+    fake = _StallingGuider(["acquiring", "acquiring", "guiding"], stall=lambda n: n <= 3)
+    url = await fake.start()
+    try:
+        remote = GuiderRemote(url, scope="t1", timeout=0.2, acquire_timeout=10, status_failures=3)
+        st = await remote.start(dec=10.0)
+        assert st["state"] == "guiding" and fake.calls > 3
+        assert remote.started and "/stop" not in fake.posts
+
+        # Guiding: two stalls in a row pass, an answer resets the count...
+        stall = {fake.calls + 1, fake.calls + 2, fake.calls + 4, fake.calls + 5}
+        fake.stall = lambda n: n in stall
+        await remote.check()
+        await remote.check()
+        await remote.check()  # answered
+        await remote.check()
+        await remote.check()
+        # ...and a third in a row fails the guider.
+        fake.stall = lambda n: True
+        with pytest.raises(GuiderError, match="status unanswered 3 times"):
+            await remote.check()
+    finally:
+        await fake.stop()
+
+
+async def test_remote_status_that_never_answers_fails_at_acquire_timeout():
+    fake = _StallingGuider(["acquiring"], stall=lambda n: True)
+    url = await fake.start()
+    try:
+        remote = GuiderRemote(url, scope="t1", timeout=0.2, acquire_timeout=1.0)
+        t0 = time.monotonic()
+        with pytest.raises(GuiderError, match=r"not guiding after 1.0 s \(status unanswered"):
+            await remote.start()
+        assert 1.0 <= time.monotonic() - t0 < 5.0
+        assert "/stop" in fake.posts  # stopped, as any failed acquisition
+    finally:
+        await fake.stop()
+
+
+async def test_acquisition_frames_render_and_are_searched_off_the_event_loop():
+    """The service answers its HTTP API from the event loop the guide loop
+    runs on: a full acquisition frame (~1 s to render on a busy computer)
+    and the star search over it run in a worker thread (real time), small
+    guide windows inline (latency)."""
+    import threading
+
+    clock = RealClock()
+    g, world = _rig(clock, config={"exposure": 0.005, "roi_size": 32, "acq_exposure": 0.01})
+    loop_thread = threading.get_ident()
+    renders: list[tuple[int, int]] = []
+    selects: list[int] = []
+    render, select = world.render, g._select
+
+    def spy_render(roi, t0, t1):
+        renders.append((roi.width * roi.height, threading.get_ident()))
+        return render(roi, t0, t1)
+
+    def spy_select(frame, hint=None):
+        selects.append(threading.get_ident())
+        return select(frame, hint)
+
+    world.render = spy_render
+    g._select = spy_select
+    g.start()
+    try:
+        await g.wait_state(("guiding", "failed"), 10)
+        assert g.state == "guiding", g.reason
+        await asyncio.sleep(0.1)
+    finally:
+        await g.stop()
+    big = [t for n, t in renders if n > 256 * 256]
+    small = [t for n, t in renders if n <= 256 * 256]
+    assert big and loop_thread not in big
+    assert small and set(small) == {loop_thread}
+    assert selects and loop_thread not in selects
 
 
 def test_service_hardware_gate(tmp_path):

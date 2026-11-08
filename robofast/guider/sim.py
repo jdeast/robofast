@@ -31,6 +31,7 @@ millisecond.
 
 from __future__ import annotations
 
+import asyncio
 import bisect
 import json
 import math
@@ -521,6 +522,10 @@ class SimWorld:
         )
 
 
+# Frames larger than this many pixels render in a worker thread (real time).
+OFFLOAD_PIXELS = 256 * 256
+
+
 class SimCamera:
     """A guide camera looking at a :class:`SimWorld` (module doc).
     ``readout`` seconds pass (on the clock) after each exposure;
@@ -554,7 +559,14 @@ class SimCamera:
         t0 = clock.now()
         await clock.sleep(exposure)
         t1 = clock.now()
-        data = self.world.render(roi, t0, t1)
+        if isinstance(clock, RealClock) and roi.width * roi.height > OFFLOAD_PIXELS:
+            # A full acquisition frame takes ~1 s to render (more on a busy
+            # machine): off the event loop, so the service still answers
+            # ``GET /status`` meanwhile (night 1107's ReadTimeouts). Guide
+            # windows stay inline (latency); simulated time needs none.
+            data = await asyncio.to_thread(self.world.render, roi, t0, t1)
+        else:
+            data = self.world.render(roi, t0, t1)
         if self.readout:
             await clock.sleep(self.readout)
         self.frames += 1

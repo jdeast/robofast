@@ -626,7 +626,12 @@ class Guider:
                     hint = self.identify(frame)
                 self.identified = hint
             self._why = "no star found"
-            m = self._select(frame, hint)
+            if isinstance(self.clock, RealClock):
+                # Star finding on a full acquisition frame: off the event
+                # loop, which must keep answering the service's HTTP API.
+                m = await asyncio.to_thread(self._select, frame, hint)
+            else:
+                m = self._select(frame, hint)
             if m is None:
                 self.reason = self._why
                 await self.clock.sleep(0)

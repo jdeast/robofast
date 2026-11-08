@@ -94,6 +94,21 @@ Quirks handled:
   `cdk700.isMoving`), so it means "slewing" only while tracking. For an
   untracked move the server also counts the mount as slewing while its
   position changes faster than `moving_speed` (deg/s) between reads.
+* **PWI2 `mount.moving` can stick `True`** (MINERVA T1 after a PWI2
+  restart, 2026-11-07: `True` while idle, and after a slew had arrived).
+  So `moving` alone never decides a slew: a slew the server sent is
+  complete once the mount is within `slew_tolerance` (default 0.1 deg) of
+  its target (RA/Dec, or alt/az and mechanical azimuth) and not moving
+  faster than `moving_speed`, whatever PWI reports; and when the stall
+  timer runs out with PWI2 reporting `on_target` (what the legacy driver
+  waited for), that too is a finished slew, not a stall. With no slew of
+  ours under way, PWI2's `moving` without any change of position is not
+  slewing. The simulator's `stuck_moving` (`--stuck-moving`) reproduces it.
+* **PWI2 can report a tracked mount not moving for a moment after a
+  goto** (night 1107). A slew the server sent stays its slew (`Slewing`
+  true, its target known to the limit watch) until the mount is on the
+  target, or PWI says it is not slewing and nothing has moved for
+  `stall_time` s.
 * **PWI4 reports only the GUI-selected focuser and rotator** ("Select from
   M3" must be ticked in PWI4; nothing in the API can check it), and
   `rotator.mech_position_degs` is always Rotator index 0's.
@@ -248,7 +263,22 @@ pipeline writes `DriverInfo` into each light frame's header as `MNTSWVER`
   A read implying more than `glitch_speed` (default twice `slew_speed`) is
   a bad sample, not motion: it is skipped and logged, and the next read is
   measured from scratch (MINERVA T1 under PWI2 once reported 61.4 deg
-  altitude mid-slew from near 40, and the watch stopped a good slew). When
+  altitude mid-slew from near 40, and the watch stopped a good slew).
+  Speeds come from the newest read and the read two before it (two
+  intervals), each timed halfway between asking PWI and its answer, so the
+  timing jitter of one read through an SSH tunnel does not make a speed;
+  a speed between `slew_speed` and `glitch_speed` (no mount goes faster
+  than `slew_speed`) coasts as `slew_speed`. With nothing of ours moving
+  the mount (no slew, park or home), a read implying more than
+  `track_speed_max` (default 1 deg/s; tracking is ~0.004) is suspect: the
+  watch reads PWI again at once and acts only if that read confirms the
+  motion (night 1107: PWI2 read 77.9 deg for one sample of a mount
+  tracking at 63.7, "22 deg/s", and the watch stopped it). A slew the
+  server sent toward a target inside the limits is predicted to come to
+  rest no further than `goto_margin` (default 1 deg) past that target
+  while it moves toward it: PWI decelerates onto it. Past the target, or
+  moving away from it, or with no target of ours, the full coast counts,
+  and a runaway is stopped as before. When
   the watch stops a slew the server sent, `Slewing` raises: the slew failed,
   and nobody mistakes where it stopped for the target.
   The jog tool applies the same coast to its own limit check.
@@ -256,7 +286,9 @@ pipeline writes `DriverInfo` into each light frame's header as `MNTSWVER`
   to an alt/az target (and a park) must make progress toward it: at least
   `stall_move` deg in `stall_time` s on the axis furthest from its target,
   so a mount pushing against an obstruction and only creeping is stopped
-  too. A park also fails after `park_timeout` s.
+  too. A park also fails after `park_timeout` s. A mount on its target
+  (`slew_tolerance`) and still is a finished slew, never a stall (PWI2's
+  stuck `moving`, above).
 * **Azimuth wrap**: see below.
 * **Stop** is always reachable: Alpaca `AbortSlew`, Action `Stop` (no
   connection needed), `robofast-pwi-jog stop`, and PWI's own GUI.
@@ -305,7 +337,8 @@ way. Without `az_wrap_min`/`az_wrap_max` PWI chooses, as before.
 `focuser`, `rotator`, `rotator_status_port`, `ports`, `m3_timeout`,
 `m3_resend_after`, `m3_retries`, `max_offset`, `guide_rate`,
 `max_pulse_ms`, `limit_margin`, `watch_interval`, `stop_distance`,
-`slew_speed`, `glitch_speed`, `stall_time`, `stall_move`, `moving_speed`,
+`slew_speed`, `glitch_speed`, `track_speed_max`, `goto_margin`,
+`slew_tolerance`, `stall_time`, `stall_move`, `moving_speed`,
 `slew_report_min`, `park_tolerance`, `park_timeout`, `az_wrap_min`,
 `az_wrap_max`, `status_max_age`, `request_timeout`,
 `aperture_diameter`, `focal_length`, `max_jog_deg` (at most 10),
@@ -473,6 +506,10 @@ Two CDK700s under PWI4 4.1.6 (2026-11):
 * What PWI2 does with an alt/az goto while tracking (legacy turned tracking
   on before an alt/az park, then off): robofast turns tracking off first.
 * PWI2 `moving` after an untracked alt/az goto (we rely on position change).
+* When PWI2's `moving` sticks `True` (seen after a restart), whether
+  `on_target` still tells the truth, and whether PWI2's reported position
+  keeps updating (night 1107's stall verdict saw it unchanged for 3.5 s
+  while the controller's own read showed the mount tracking).
 * Offset sign conventions (`incrementra` / `ra_add_arcsec` positive = RA
   increases) and the PulseGuide directions, with a star on a camera.
 * Whether PWI4's `/mount/find_home` reports `is_slewing` while homing.

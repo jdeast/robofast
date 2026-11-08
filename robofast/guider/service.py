@@ -929,6 +929,12 @@ def _json_default(o: Any) -> Any:
 # -- the client the sequencer uses ------------------------------------------------------
 
 
+class GuiderTimeout(GuiderError):
+    """The guider service did not answer in time (a transport timeout,
+    not a refusal): transient while it is busy, so :class:`GuiderRemote`
+    retries status reads before giving up."""
+
+
 class GuiderRemote:
     """The service's API, for the sequencer (its ``guider`` hook).
 
@@ -937,6 +943,11 @@ class GuiderRemote:
       it), which is that telescope's ordinary error.
     * :meth:`check` -- raises if the guider has failed or stopped on its
       own since :meth:`start`.
+    * a status read that times out is transient (a busy service, a loaded
+      computer; night 1107): while acquiring, :meth:`start` keeps asking
+      until ``acquire_timeout``; while guiding, :meth:`check` passes until
+      ``status_failures`` reads in a row have timed out. A refusal, a
+      connection refused or a ``failed`` state still fails at once.
     * :meth:`stop` -- bounded and never raises (cleanup must go on to park).
     * with a ``registry``, a background task copies the guider's state into
       it every ``poll_interval`` while guiding (the FITS headers).
@@ -951,6 +962,7 @@ class GuiderRemote:
         timeout: float = 5.0,
         acquire_timeout: float = 120.0,
         poll_interval: float = 2.0,
+        status_failures: int = 3,
     ) -> None:
         self.url = url.rstrip("/")
         self.scope = scope
@@ -958,6 +970,8 @@ class GuiderRemote:
         self.timeout = timeout
         self.acquire_timeout = acquire_timeout
         self.poll_interval = poll_interval
+        self.status_failures = max(1, int(status_failures))
+        self._status_misses = 0
         self._poll: asyncio.Task | None = None
         self.started = False
 
@@ -971,6 +985,8 @@ class GuiderRemote:
                 timeout=timeout or self.timeout, trust_env=False
             ) as client:
                 r = await isolated(client.request(method, self.url + path, json=body))
+        except httpx.TimeoutException as exc:
+            raise GuiderTimeout(f"guider {method} {path}: {type(exc).__name__}: {exc}") from exc
         except httpx.HTTPError as exc:
             raise GuiderError(f"guider {method} {path}: {type(exc).__name__}: {exc}") from exc
         data = r.json()
@@ -984,9 +1000,25 @@ class GuiderRemote:
     async def start(self, **params: Any) -> dict[str, Any]:
         await self._call("POST", "/start", params)
         self.started = True
+        self._status_misses = 0
         deadline = asyncio.get_running_loop().time() + self.acquire_timeout
+        misses = 0
         while True:
-            st = await self.status()
+            try:
+                st = await self.status()
+            except GuiderTimeout as exc:
+                # Busy acquiring (or a loaded computer): ask again, until
+                # acquire_timeout says it is not coming.
+                misses += 1
+                log.warning("guider %s status (acquiring, %d): %s", self.scope, misses, exc)
+                if asyncio.get_running_loop().time() > deadline:
+                    await self.stop("acquisition timed out")
+                    raise GuiderError(
+                        f"guider {self.scope}: not guiding after {self.acquire_timeout} s"
+                        f" (status unanswered: {exc})"
+                    ) from exc
+                await asyncio.sleep(0.2)
+                continue
             if st["state"] == "guiding":
                 break
             if st["state"] in ("failed", "stopped", "idle"):
@@ -1022,7 +1054,24 @@ class GuiderRemote:
         are its own re-acquisition and pass."""
         if not self.started:
             return
-        st = await self.status()
+        try:
+            st = await self.status()
+        except GuiderTimeout as exc:
+            self._status_misses += 1
+            if self._status_misses >= self.status_failures:
+                raise GuiderError(
+                    f"guider {self.scope}: status unanswered"
+                    f" {self._status_misses} times in a row ({exc})"
+                ) from exc
+            log.warning(
+                "guider %s status (%d of %d): %s",
+                self.scope,
+                self._status_misses,
+                self.status_failures,
+                exc,
+            )
+            return
+        self._status_misses = 0
         self._publish(st)
         if st["state"] in ("failed", "stopped", "idle"):
             raise GuiderError(f"guider {self.scope}: {st['state']}: {st.get('reason')}")

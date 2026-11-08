@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -950,4 +951,21 @@ def test_a_slew_that_fails_in_the_focus_step_stops_first_light_in_its_words(
         main(_args(d, tmp_path, "--no-enclosure", "--yes", "--timeout", "60"))
     err = capsys.readouterr().err
     assert exc.value.code == 1 and "the mount" in err and "axis fault" in err, err
+    assert d.mount.AtPark
+
+
+@pytest.mark.parametrize("held_device", [True], indirect=True)
+def test_a_telescope_error_stops_first_light_at_once_in_its_words(held_device, tmp_path, capsys):
+    """The sequencer's own slew to the target fails: it parks the telescope
+    and backs off (minutes); first light stops at once, saying why."""
+    d = held_device
+    _failing(d.mount, "Failing", "SlewToCoordinatesAsync", 0, "InvalidOperation: axis fault")
+    t0 = time.monotonic()
+    with pytest.raises(SystemExit) as exc:
+        main(_args(d, tmp_path, "--no-enclosure", "--yes", "--timeout", "60"))
+    took = time.monotonic() - t0
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and "the mount" in err and "axis fault" in err, err
+    assert "parked" in err and "not done after" not in err, err
+    assert took < 30, took
     assert d.mount.AtPark

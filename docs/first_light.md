@@ -62,7 +62,10 @@ What ASCOM lets a device leave out does not stop it: a focuser's
 a mount's `ApertureArea` (no central obstruction is assumed, and said).
 A mount that cannot park gets no lease (the supervisor grants none until
 every telescope reports parked): first light gives up after `--timeout`,
-saying so in the supervisor's words.
+saying so in the supervisor's words. A telescope that fails while first light runs
+(a slew refused, a device not answering) stops it at once, in the
+device's words, and says whether the sequencer parked it; first light
+does not wait out the sequencer's back-off.
 
 ## The site
 

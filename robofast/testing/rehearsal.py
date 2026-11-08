@@ -60,6 +60,13 @@ at the real FAU's geometry (docs/demo.md).
   without a recovery policy fails, or when no real telescope is left. A
   policy may not power-cycle (``powercycle``): the rehearsal never
   switches a PDU.
+* **Cooling** (``--cooling NAME=C`` or ``NAME=FILE``, per real telescope;
+  FILE is a sequencer ``cooling`` entry, docs/cooling.md, e.g.
+  ``{"setpoint": -50, "tolerance": 1, "settle_timeout": 900}``): robofast
+  keeps that real camera cooled, exactly as in production -- the cooler is
+  set when the sequencer starts and whenever it (re)connects the camera
+  (every recovery rung), and turned back on if found off. Without it the
+  rehearsal leaves the real camera's cooler alone.
 
 ``python -m robofast.testing.rehearsal --help``; the tests
 (``tests/e2e/test_rehearsal.py``) run it on fake mounts and cameras served
@@ -89,6 +96,7 @@ import numpy as np
 from robofast import hwgate, sky
 from robofast.autofocus import AutofocusSetup, FocusModel, FocusStore
 from robofast.autofocus_plan import AutofocusTriggers, TriggerConfig
+from robofast.cooling import CoolingConfig
 from robofast.dispatch import dispatch_from_config
 from robofast.owner import DeviceOwner
 from robofast.plan import Idle, Observation
@@ -238,6 +246,9 @@ class RehearsalSettings:
     #: ``--recovery NAME=FILE``: a real telescope's recovery policy (the
     #: sequencer's ``recovery`` entry; module doc).
     recovery: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: ``--cooling NAME=C|FILE``: a real camera's cooling (the sequencer's
+    #: ``cooling`` entry; module doc).
+    cooling: dict[str, dict[str, Any]] = field(default_factory=dict)
     #: Real telescopes the preflight dropped: name -> why (set by the
     #: rehearsal; they take no part in the night).
     dropped: dict[str, str] = field(default_factory=dict)
@@ -258,6 +269,10 @@ class RehearsalSettings:
                         f"--recovery {name}: {kind} lists powercycle; the rehearsal never"
                         " switches a PDU"
                     )
+        for name, entry in self.cooling.items():
+            if name not in self.real and name not in self.dropped:
+                raise ValueError(f"--cooling {name}: not a real telescope (--telescope)")
+            CoolingConfig.from_dict(entry)
         seen: dict[tuple[str, int, int, str], str] = {}
         for name, r in self.real.items():
             for kind, ep in (("telescope", r.telescope), ("camera", r.camera)):
@@ -1098,6 +1113,10 @@ class Rehearsal(SimulatedNight):
         for name, policy in self.r.recovery.items():
             if name in self.r.real:
                 cfg["telescopes"][name]["recovery"] = policy
+        # Each real camera's cooling, as in production (docs/cooling.md).
+        for name, entry in self.r.cooling.items():
+            if name in self.r.real:
+                cfg["telescopes"][name]["cooling"] = entry
         # Dark frames: nothing measures them (no FWHM, no plate solving).
         cfg["images"].update(
             imagebytes=True,
@@ -1255,6 +1274,9 @@ class Rehearsal(SimulatedNight):
                     "recovery_start",
                     "recovery_step",
                     "recovery_done",
+                    "cooling_set",
+                    "cooling_unsupported",
+                    "cooling_not_settled",
                     "giving_up",
                     "plan_exhausted",
                     "observe_start",
@@ -1527,6 +1549,13 @@ def summary(o: RehearsalOutcome) -> str:
                 f"recovery {d['telescope']} {d['device']}:"
                 f" {'recovered' if d['recovered'] else 'NOT recovered'} ({'; '.join(d['tried'])})"
             )
+        for what in ("cooling_set", "cooling_unsupported", "cooling_not_settled"):
+            for e in night.events(what, SEQUENCER):
+                d = e.detail
+                lines.append(
+                    f"{what} {d.get('telescope')}: "
+                    + ", ".join(f"{k} {v}" for k, v in d.items() if k not in ("telescope", "level"))
+                )
     lines.append(
         "requests at the end: " + ", ".join(f"{k} {v}" for k, v in sorted(o.statuses.items()))
     )
@@ -1644,6 +1673,28 @@ def _recovery(specs: list[str], real: dict[str, Any]) -> dict[str, dict[str, Any
     return out
 
 
+def _cooling(specs: list[str], real: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """``--cooling NAME=C`` (a setpoint, the rest default) or ``NAME=FILE``
+    (a sequencer ``cooling`` entry, JSON): each real camera's cooling."""
+    out: dict[str, dict[str, Any]] = {}
+    for name, spec in _named(specs, "cooling", "NAME=C|FILE").items():
+        if name not in real:
+            raise RehearsalRefused(f"--cooling {name}: not a real telescope (--telescope)")
+        try:
+            entry: Any = {"setpoint": float(spec)}
+        except ValueError:
+            try:
+                entry = json.loads(Path(spec).read_text())
+            except (OSError, ValueError) as exc:
+                raise RehearsalRefused(f"--cooling {name}={spec}: {exc}") from exc
+        try:
+            CoolingConfig.from_dict(entry)
+        except (TypeError, ValueError) as exc:
+            raise RehearsalRefused(f"--cooling {name}={spec}: {exc}") from exc
+        out[name] = entry
+    return out
+
+
 def _catalog_config(args: argparse.Namespace) -> dict[str, Any] | None:
     source = getattr(args, "catalog_source", None)
     cache = getattr(args, "catalog_dir", None)
@@ -1700,6 +1751,7 @@ def settings_from_args(args: argparse.Namespace) -> RehearsalSettings:
             kiwispec_url=getattr(args, "kiwispec", None),
             catalog_guide=_catalog_config(args),
             recovery=_recovery(getattr(args, "recovery", None) or [], real),
+            cooling=_cooling(getattr(args, "cooling", None) or [], real),
         )
     except ValueError as exc:
         raise RehearsalRefused(str(exc)) from exc
@@ -1797,6 +1849,15 @@ def main(argv: list[str] | None = None) -> int:
         help="a real telescope's recovery policy: a JSON file in the sequencer's 'recovery'"
         " schema (docs/recovery.md); at the preflight a failing telescope gets it once and is"
         " dropped if it still fails, and in the night it is the sequencer's ladder",
+    )
+    ap.add_argument(
+        "--cooling",
+        action="append",
+        metavar="NAME=C|FILE",
+        default=[],
+        help="keep a real telescope's camera cooled: its setpoint in C (e.g. t1=-50), or a JSON"
+        " file in the sequencer's 'cooling' schema (docs/cooling.md); robofast sets the cooler"
+        " at the start and whenever it (re)connects the camera",
     )
     ap.add_argument("--log-level", default="WARNING")
     args = ap.parse_args(argv)

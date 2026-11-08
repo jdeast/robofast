@@ -23,6 +23,10 @@ climb, in order:
    Alpaca Switch server (:mod:`robofast.devices.pdu_server`,
    ``Action("PowerCycle")``), wait for it to boot, reconnect.
 
+Every reconnection runs the device owner's ``on_connect`` hook: a cooled
+camera's cooler is set again there (robofast/cooling.py; MINERVA T1's
+Andor driver switches it off on a reconnect).
+
 On a telescope served by robofast's PWI server (it answers
 ``Action("Status")``), ``reconnect`` and ``restart`` also reconnect PWI to
 the mount: ``Action("MountConnect")`` if PWI says it is not connected, then

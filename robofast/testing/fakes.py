@@ -313,7 +313,15 @@ class FakeCamera(FakeDevice):
     exposure number), with the state members the frame pipeline reads.
     ``image_error`` makes ``ImageArray`` raise; ``download_time`` delays it.
     ``stale_ready`` acts like Andor's ASCOM driver: ``ImageReady`` stays true
-    (the previous image) while the next exposure runs."""
+    (the previous image) while the next exposure runs.
+
+    Cooling: ``CCDTemperature`` heads for ``SetCCDTemperature`` while
+    ``CoolerOn`` (no colder than ``coldest``, the most the cooler can do),
+    else for ``ambient``, at ``cooling_rate`` C/s (None: at once); setting
+    ``CCDTemperature`` puts the CCD there now (a test's hook).
+    ``cooler_off_on_connect`` acts like MINERVA T1's Andor ASCOM driver:
+    connecting it (``Connected`` false -> true) switches the cooler off.
+    ``can_cool`` False: ``CanSetCCDTemperature`` reads false."""
 
     def __init__(self, numx: int = 32, numy: int = 24) -> None:
         super().__init__()
@@ -335,9 +343,18 @@ class FakeCamera(FakeDevice):
         self.MaxADU = 65535
         self.ReadoutModes = ["Normal", "Fast"]
         self.ReadoutMode = 0
-        self.CCDTemperature = -20.0
+        self.cooling_rate: float | None = None
+        self.coldest: float | None = None
+        self.ambient = 15.0
+        self.cooler_off_on_connect = False
+        self.can_cool = True
+        self._connected = True
+        self._ccd = -20.0
+        self._ccd_t = self._now()
         self.SetCCDTemperature = -20.0
         self.CoolerOn = True
+        #: Times the cooler was switched on (``CoolerOn = True``) from off.
+        self.cooler_switched_on = 0
         self.CoolerPower = 40.0
         self.Gain = 1
         self.Offset = 10
@@ -349,6 +366,73 @@ class FakeCamera(FakeDevice):
         self.image_error: str | None = None
         self.download_time = 0.0
         self.downloads = 0
+
+    # -- connection and cooling ------------------------------------------------------
+
+    async def connect(self, *, timeout: float | None = None) -> None:
+        """As :meth:`robofast.alpaca_client.AlpacaDevice.connect`."""
+        await self._gate()
+        if not self.Connected:
+            self.Connected = True
+
+    @property
+    def Connected(self) -> bool:
+        return self._connected
+
+    @Connected.setter
+    def Connected(self, value: bool) -> None:
+        value = bool(value)
+        was = getattr(self, "_connected", True)
+        if value and not was and getattr(self, "cooler_off_on_connect", False):
+            self._settle()
+            self._cooler = False
+        self._connected = value
+
+    @property
+    def CanSetCCDTemperature(self) -> bool:
+        return self.can_cool
+
+    @property
+    def CoolerOn(self) -> bool:
+        return self._cooler
+
+    @CoolerOn.setter
+    def CoolerOn(self, value: bool) -> None:
+        if hasattr(self, "_cooler"):
+            self._settle()
+            if value and not self._cooler:
+                self.cooler_switched_on += 1
+        self._cooler = bool(value)
+
+    def _target(self) -> float:
+        if not self._cooler:
+            return self.ambient
+        sp = float(self.SetCCDTemperature)
+        return sp if self.coldest is None else max(sp, self.coldest)
+
+    def _settle(self) -> None:
+        """Bring ``_ccd`` up to now."""
+        now = self._now()
+        target = self._target()
+        if self.cooling_rate is None:
+            self._ccd = target
+        else:
+            step = self.cooling_rate * (now - self._ccd_t)
+            self._ccd = (
+                target
+                if abs(target - self._ccd) <= step
+                else (self._ccd + step * (1 if target > self._ccd else -1))
+            )
+        self._ccd_t = now
+
+    @property
+    def CCDTemperature(self) -> float:
+        self._settle()
+        return self._ccd
+
+    @CCDTemperature.setter
+    def CCDTemperature(self, value: float) -> None:
+        self._ccd, self._ccd_t = float(value), self._now()
 
     @property
     def ImageArray(self) -> ImageArray:

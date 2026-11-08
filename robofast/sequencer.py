@@ -137,6 +137,17 @@ reported ``complete`` only once its frames are on disk, with their paths
 telescope gives up for the night (an alarm); the others observe on. See
 :mod:`robofast.imaging`.
 
+Camera cooling
+--------------
+A telescope with a ``cooling`` entry (:class:`~robofast.cooling.CameraCooling`;
+docs/cooling.md) has its camera kept at its setpoint: the cooler is set
+whenever the camera's owner connects it afresh (its ``on_connect`` hook:
+startup, which touches each cooled camera once the mode lets the sequencer
+command, a timeout, every recovery rung) and, found off before an exposure,
+turned back on (rate-limited, an alarm). Light frames wait for the CCD to
+settle, but never past ``settle_timeout`` after the cooler was set; then
+they go ahead with a warning and ``COOLOK = F`` in the header.
+
 Spectra (fiber-fed, several telescopes)
 ---------------------------------------
 With a ``spectrograph`` (the enclosure's spectrograph service, a
@@ -286,6 +297,7 @@ from robofast.autofocus import (
 from robofast.camera_state import CAMERA_IDLE, image_ready
 from robofast.cancel import stop_task
 from robofast.clock import Clock, real_clock
+from robofast.cooling import CameraCooling, CoolingStatus
 from robofast.imagebytes import ImageArray, fits_order
 from robofast.imaging import FrameWriteFailed, Imaging, PendingFrame
 from robofast.instruments import SpectrographBusy, SpectrographError, SpectrographFault
@@ -293,7 +305,7 @@ from robofast.kinds import OBSERVATION_KINDS, KindRun
 from robofast.lamps import LampSetup, lamps_off, switch_status
 from robofast.modes import ModeGate
 from robofast.orbit import Orbit
-from robofast.owner import DeviceError, DeviceOwner, Grant, GrantRevoked
+from robofast.owner import DeviceError, DeviceOwner, Grant, GrantRevoked, Unsupported
 from robofast.plan import Idle, Observation, PlanProvider, as_plan
 from robofast.pointmodel import PointingCorrector
 from robofast.recovery import RecoveryLadder, RecoveryResult
@@ -393,10 +405,6 @@ class _PreemptAbortFailed(DeviceError):
 class ObservationFailed(Exception):
     """The observation failed but the telescope is fine (an autofocus that
     found no focus): reported ``failed``, with no error backoff."""
-
-
-class Unsupported(DeviceError):
-    """An observation needs a filter or M3 port this telescope cannot select."""
 
 
 class LampOff(DeviceError):
@@ -603,6 +611,9 @@ class TelescopeUnit:
     adc_switches: ADCSwitches = field(default_factory=ADCSwitches)
     #: How the guider identified the last target (docs/acquisition.md).
     acquisition: dict[str, Any] | None = field(default=None, init=False)
+    #: Keeps the camera cooled (docs/cooling.md); None: robofast leaves
+    #: its cooler alone.
+    cooling: CameraCooling | None = None
 
     @property
     def active(self) -> bool:
@@ -1145,6 +1156,9 @@ class Sequencer:
             if u.recovery is not None:
                 u.recovery.alarm = lambda text, u=u: self.alarm(u.name, text)
                 u.recovery.event = lambda what, u=u, **kw: self._event(what, telescope=u.name, **kw)
+            if u.cooling is not None:
+                u.cooling.alarm = lambda text, u=u: self.alarm(u.name, text)
+                u.cooling.event = lambda what, u=u, **kw: self._event(what, telescope=u.name, **kw)
 
     async def run(self) -> None:
         self._wire_pointing()
@@ -1156,7 +1170,9 @@ class Sequencer:
 
     async def _run(self) -> None:
         await self._shadow_start()
+        self._hook_cooling()
         await self._recover()
+        await self._start_cooling()
         while await self._wait_for_a_telescope():
             if not await self._closed_phase():
                 if self.quarantined:
@@ -1193,6 +1209,66 @@ class Sequencer:
             for u in self.units.values():
                 await self.modes.shadow(u.name)
             await asyncio.sleep(self.config.mode_idle)
+
+    def _hook_cooling(self) -> None:
+        """Each cooled camera's owner sets its cooler on every fresh
+        connection (its ``on_connect``; docs/cooling.md). Once the mode lets
+        the sequencer command (not in shadow), before the startup cleanup."""
+        for u in self.units.values():
+            if u.cooling is not None:
+                u.camera.on_connect = u.cooling.on_connect
+
+    async def _start_cooling(self) -> None:
+        """Touch each cooled camera the startup has not connected yet, so
+        it starts cooling now rather than at its first frame
+        (docs/cooling.md). A camera that does not answer is logged; its
+        first command tries again."""
+        units = [u for u in self.units.values() if u.cooling is not None]
+
+        async def touch(u: TelescopeUnit) -> None:
+            assert u.cooling is not None
+            if u.cooling.applied_at is not None or u.cooling.unsupported is not None:
+                return  # the startup cleanup connected it: the hook ran
+            grant = u.camera.grant(f"{self.name}/cooling")
+            try:
+                if u.camera.connected:
+                    await u.cooling.apply(grant, "startup")
+                else:
+                    await grant.get("CoolerOn")  # connects: the hook sets the cooler
+            except (DeviceError, TimeoutError) as exc:
+                log.warning("%s: %s: camera cooling at startup: %r", self.name, u.name, exc)
+                self._event("cooling_start_failed", telescope=u.name, error=repr(exc)[:200])
+            finally:
+                grant.revoke("cooling started")
+
+        if units:
+            await asyncio.gather(*(touch(u) for u in units))
+
+    async def _cooling_check(
+        self, state: _Generation, unit: TelescopeUnit, cam: Grant, *, light: bool
+    ) -> CoolingStatus | None:
+        """Before an exposure: :meth:`CameraCooling.check` (a cooler found off
+        back on; a light frame waits, bounded, for the CCD to settle); the
+        result goes in the frame's header (``COOLOK``). Never fails the
+        exposure: a camera that cannot answer fails at ``StartExposure``."""
+        assert unit.cooling is not None
+        try:
+            status = await unit.cooling.check(cam, wait=light)
+        except DeviceError as exc:
+            log.warning("%s: %s: cooling check: %s", self.name, unit.name, exc)
+            self._event(
+                "cooling_check_failed", gen=state.gen, telescope=unit.name, error=str(exc)[:200]
+            )
+            return None
+        if status is not None and self.imaging is not None:
+            self.imaging.registry.publish(
+                f"{unit.name}.camera.cool_ok",
+                status.settled,
+                max_age=1800.0,
+                keyword="COOLOK",
+                comment="CCD within tolerance of its setpoint",
+            )
+        return status
 
     async def _wait_for_a_telescope(self) -> bool:
         """Wait until some telescope may observe; False when none ever will."""
@@ -2157,6 +2233,9 @@ class Sequencer:
                 await unit.guider.check()  # a failed guider is this telescope's error
             if obs.follow is not None and obs.light:
                 await self._follow(state, unit, tel, obs, i)
+            cooled = None
+            if unit.cooling is not None:
+                cooled = await self._cooling_check(state, unit, cam, light=obs.light)
             # From here until it is read out (downloaded, with imaging), a
             # "now-after-readout" preemption waits for this exposure.
             unit.exposing = True
@@ -2196,6 +2275,7 @@ class Sequencer:
                     "target": obs.name,
                     "t": time.monotonic(),
                     **({"image": frame} if isinstance(frame, PendingFrame) else {}),
+                    **({"ccd_settled": cooled.settled} if cooled is not None else {}),
                 }
             )
             self._event("exposure_complete", gen=gen, telescope=unit.name, index=i)

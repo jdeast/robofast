@@ -13,6 +13,7 @@
     "site: Mt. Hopkins (minerva-control site_mtHopkins.ini), for python -m robofast.when (start the night at a Sun altitude; deploy/robofast-sequencer@.service).",
     "A telescope may also name a filterwheel (an Alpaca FilterWheel) and a port_action (its Alpaca Action that selects an M3 port), and a focuser and rotator (read only, for the FITS headers).",
     "images: every frame is saved under data_root (docs/data.md); the optics give an approximate WCS. plate_scale (arcsec per unbinned imager pixel) from minerva-control imager_t1.ini/imager_t2.ini PLATESCALE; aperture and focal length from the legacy FITS headers (control.py APTDIA, FOCALLEN). position_angle 0 (north up, east left) assumes PWI4 derotates the imager port to PA 0 as legacy did (sites/minerva/README.md: rotator offsets).",
+    "cooling: robofast keeps each imaging camera at its setpoint (docs/cooling.md): legacy imager_t1.ini / imager_t2.ini SETTEMP (T1 Andor -50 C; T2 Apogee +5 C, odd but legacy's), tolerance = legacy max_temp_error (instruments.json). Set whenever robofast connects or reconnects the camera (T1's Andor driver turns its cooler off on every reconnect).",
     "limits: the observer console's manual-slew altitude limits (deg): legacy telescope_N.ini HORIZON (21) and scheduler.ini MAXALT (83).",
     "T3 and T4 are in Aqawan 2 (down) and are not listed here; their values are in instruments.json, disabled.",
     "status_file: the sequencer's status snapshot (request API and observer console read it); operator_control: the console's pause/resume/stop directory (docs/console.md). Relative to this file here; use /var/lib/robofast in production.",
@@ -31,9 +32,11 @@
   },
   "telescopes": {
     "t1": {"telescope": "127.0.0.1:11121/0", "camera": "127.0.0.1:11121/0",
-           "limits": {"min_alt": 21.0, "max_alt": 83.0}},
+           "limits": {"min_alt": 21.0, "max_alt": 83.0},
+           "cooling": {"setpoint": -50.0, "tolerance": 0.75, "settle_timeout": 900}},
     "t2": {"telescope": "127.0.0.1:11122/0", "camera": "127.0.0.1:11122/0",
-           "limits": {"min_alt": 21.0, "max_alt": 83.0}}
+           "limits": {"min_alt": 21.0, "max_alt": 83.0},
+           "cooling": {"setpoint": 5.0, "tolerance": 0.75, "settle_timeout": 900}}
   },
   "mode": "robotic",
   "safety": {

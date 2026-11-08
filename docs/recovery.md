@@ -37,6 +37,11 @@ disabled -- the state of a PWI that was just started. An axis PWI disabled
 while connected (a drive fault, e.g. PWI4's I2t) is left disabled: the
 telescope is not usable and the ladder climbs on.
 
+A camera with a `cooling` entry (docs/cooling.md) has its cooler set again
+by every rung that reconnects it -- the camera owner's `on_connect` hook
+runs on each fresh connection -- because MINERVA T1's Andor ASCOM driver
+switches its cooler off whenever it is connected again.
+
 After each rung the device must answer (`AtPark`, `CameraState`, `Position`
 read within `verify_timeout`), else the next rung is tried. A PWI telescope
 must also be usable: `Status` shows it connected with both axes enabled

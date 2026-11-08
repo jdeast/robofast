@@ -68,6 +68,7 @@ def serve_real(name: str) -> tuple[Mount, FakeCamera, list[FakeAlpacaServer]]:
         {"telescope": mount, "focuser": FakeFocuser(), "rotator": Rotator()}
     ).start()
     cam = FakeCamera(256, 256)
+    cam.cooler_off_on_connect = True  # as MINERVA T1's Andor driver
     cam_srv = FakeAlpacaServer({"camera": cam}).start()
     return mount, cam, [mount_srv, cam_srv]
 
@@ -95,7 +96,12 @@ async def test_a_rehearsal_on_fake_real_hardware(tmp_path):
         # Test only: a dark night, ten times faster than real time.
         start=datetime(2026, 11, 10, 4, 0, tzinfo=UTC),
         scale=10.0,
+        # robofast keeps T1's camera cooled (docs/cooling.md); T2's is left alone.
+        cooling={"t1": {"setpoint": -50.0}},
     )
+    for cam in cams.values():
+        cam.CoolerOn = False
+        cam.Connected = False  # the first connection is robofast's
     try:
         outcome = await rehearse(out, settings)
     finally:
@@ -110,6 +116,8 @@ async def test_a_rehearsal_on_fake_real_hardware(tmp_path):
         assert not mount.Tracking
         assert (mount.Altitude, mount.Azimuth) == (60.0, 180.0)
         assert cams[name].exposures_started >= 2, name
+    assert cams["t1"].CoolerOn and cams["t1"].SetCCDTemperature == -50.0
+    assert not cams["t2"].CoolerOn and cams["t2"].SetCCDTemperature == -20.0
     assert all(c == "COMPLETED" for c in outcome.statuses.values()), outcome.statuses
     assert len(outcome.slews) >= 4 and all(r["error_arcsec"] < 1 for r in outcome.slews)
     assert outcome.why_end == "every request done"

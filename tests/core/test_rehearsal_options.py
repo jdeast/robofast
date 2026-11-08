@@ -232,3 +232,25 @@ async def test_the_guider_service_points_its_sky_at_each_target(tmp_path):
             await http.post("/stop", json={})
     finally:
         await svc.stop()
+
+
+def test_cooling_from_the_command_line(tmp_path):
+    """``--cooling NAME=C`` or ``NAME=FILE`` (docs/cooling.md)."""
+    assert reh.settings_from_args(_args()).cooling == {}
+    ns = _args()
+    entry = {"setpoint": 5, "tolerance": 0.75, "settle_timeout": 600}
+    (tmp_path / "t1.json").write_text(json.dumps(entry))
+    ns.cooling = ["t1=-50"]
+    assert reh.settings_from_args(ns).cooling == {"t1": {"setpoint": -50.0}}
+    ns.cooling = [f"t1={tmp_path / 't1.json'}"]
+    assert reh.settings_from_args(ns).cooling == {"t1": entry}
+    for bad, why in (
+        (["t2=-50"], "not a real telescope"),
+        (["t1=-50", "t1=-40"], "given twice"),
+        (["t1=-500"], "outside"),
+        ([f"t1={tmp_path / 'missing.json'}"], "No such file"),
+        (["t1"], "expected NAME=C"),
+    ):
+        ns.cooling = bad
+        with pytest.raises(reh.RehearsalRefused, match=why):
+            reh.settings_from_args(ns)

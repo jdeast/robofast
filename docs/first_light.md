@@ -39,6 +39,8 @@ the pointing model under `first-light/pointing/`. The config it wrote is
 an ordinary enclosure config: `robofast-supervisor` and
 `robofast-sequencer` run it as they run any other.
 
+What each line means and what to do after it: docs/first_light_lines.md.
+
 ## What you say, and why
 
 robofast reads what the devices can report and asks for what they cannot,
@@ -120,6 +122,53 @@ from the target); 2.5, 3 and 4 min, only some frames solved; 5 min, 47 of
 error moves its sky and its slews together): a wrong clock does not send
 the calibration below the horizon, it only stops the frames solving.
 
+## Focus
+
+A telescope plugged in for the first time can be so far from focus that
+its stars are disks larger than the chip, and nothing can be measured:
+so first light focuses first (`robofast/first_focus.py`), on the
+brightest planet up, else the brightest star (above 30 deg, from the site
+and this computer's clock; the Moon is not used yet: on a small chip it
+is a disk with no edge in the frame, which needs its own measure).
+
+* **Light, then a donut.** Far from focus a star is the image of the
+  telescope's opening, a disk of diameter D = |dz| / N (docs/autofocus.md):
+  its light is spread, so the signal is the frame's level over the sky
+  beside the target (one frame there first, at the same exposure: many
+  cameras have no shutter for a dark). The focuser steps the way the level
+  rises (the exposure shortened if the frame saturates) until the disk is
+  whole on the chip; two frames a known step apart then give the disk's
+  size per step, measured (the focuser's units and how far it moves the
+  focal plane are not assumed), and where it reaches zero.
+* **Then the autofocus's sweep** (docs/autofocus.md) from there, which
+  fits the curve and so does not need that slope to be exact.
+* **The end of the travel.** If the disk still shrinks at an end of the
+  focuser's travel, the focus is beyond it: first light says which end,
+  and to add (or remove) a spacer or extension.
+* **No focuser.** Without `--yes`, first light walks you through it: a
+  frame, a line saying what the star did and how to turn the knob (as a
+  multiple of your last turn), until it is in focus; `--yes` answers no
+  walk-through (it needs a person), so with `--yes` and no focuser there is
+  no focus step.
+
+Measured on the simulated focuser and sky (a 512-pixel chip, f/6.5, a
+47 % obstruction, 2" seeing; the tolerance is docs/autofocus.md's, a
+quarter of the seeing: 43.9 steps):
+
+| start (steps from focus) | frames | end (steps from focus) |
+|---|---|---|
+| 5000 to 40000, either side | 3 + 9 | -8.5 to +10.4 |
+| 60000 (the disk 1.3 times the chip), the star centred | 12-13 + 9 | +7.8, -8.5 |
+| 60000, the star 150 px from the centre | 25-26 + 9 | +7.8 |
+| the star 230 px from the centre (26 px from the edge) | - | stops: point at it again |
+| the walk-through, a hand exact / 5 % / 15 % off | 7-9 | within 11 / 24 (one 44) / 41 (two 55, 143) |
+
+A disk of an obstructed telescope has a dark centre: one more than about
+three chips across (the chip's diagonal over the obstruction) leaves a
+chip at its centre unlit, and first light says it sees no light. A
+person's hand is the floor of the walk-through: the more exact the turns,
+the closer the focus.
+
 ## The catalog
 
 `--catalog` names the catalog source (default `gaia`: Gaia DR3 tiles,
@@ -162,7 +211,8 @@ source the plug-in registers; offline) or, with `--catalog gaia` on both,
 the real one. Its mount points with an injected TPOINT error
 (`--pointing-error`, default `IH=150,ID=-40,NP=20` arcsec), which the
 calibration measures. `tests/core/test_first_light.py` runs the command on
-it.
+it; `tests/e2e/test_first_light_focus.py` (`-m e2e`) runs it from 30000
+focuser steps out of focus (`--focus-error`).
 
 On the real sky the simulated camera needs its catalog tiles before it
 renders: a tile downloaded inside an exposure can time the camera out.

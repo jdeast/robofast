@@ -1,0 +1,49 @@
+# What first light says, and what to do next
+
+`python -m robofast` prints one line a step. This page says what each
+line means and what to do after it, for someone who has never used a
+telescope (or a program reading the lines for them). The numbers in the
+lines are named; nothing here needs astronomy.
+
+## Before anything moves
+
+| The line starts | It means | Do |
+|---|---|---|
+| `found Telescope ...`, `found Camera ...` | the devices it found on the network | nothing; if one is missing, check it is on and plugged in |
+| `plate scale ... arcsec/pixel` | how much sky one pixel sees, from the telescope and camera | nothing |
+| `site LAT, LON, ELEV m: the telescope's` | where the telescope thinks it stands | check it is right; if not, run again with `--site LAT,LON` |
+| `first light: the telescope's clock disagrees ... by N min` | the mount's clock, date, time zone or longitude is wrong | set them on the mount (or give `--site`), then run again |
+| `first light: ... reports its site as 0, 0` | the mount was never told where it is | run again with `--site LAT,LON` |
+| `No enclosure: ... Is the sky clear ... Is this where the telescope stands? [y/N]` | the one question | answer `y` only if the sky is clear, you will stay, and the site is right |
+| `first light: fetching the catalog ...: N tiles` | downloading star maps for the frames it will take | wait (once; later runs reuse them) |
+| `first light: the sky turns faster than the catalog downloads here` | a slow network: some maps download later | nothing |
+| `first light: focus first, with the focuser, on <name>` | it will focus on that planet or star | nothing |
+| `first light: no focuser: no focus step` | `--yes` was given and there is no focuser | focus by hand first, or run without `--yes` |
+
+## Focus
+
+| The line starts | It means | Do |
+|---|---|---|
+| `focus: light ...`, `focus: climb ...`, `focus: donut ...` | it is moving the focuser and measuring the light (`level`) and the star's size (`donut`, pixels) | nothing |
+| `focus: done at position N` | in focus | nothing |
+| `focus: knob ... turn ...` | the walk-through: turn the focus knob as it says, then press Enter | turn the knob that way and that much (a multiple of your last turn) |
+| `... in focus: ...; stop here` | the walk-through is done | press Enter; leave the knob alone |
+| `first light: focus: no light at any focus position` | nothing bright reached the camera | check the cover is off and the telescope points at the sky; focus by day on something far away first |
+| `first light: focus: the focus is beyond the focuser's upper end` | the focuser cannot reach focus | add a spacer or extension between the telescope and the camera |
+| `... lower end` | the same, the other way | remove a spacer or extension |
+| `first light: focus: the star's light peaks with no whole donut` | the bright star is at the edge of the picture | run again: the telescope points at it again from the start |
+
+## The calibration and the frame
+
+| The line starts | It means | Do |
+|---|---|---|
+| `first light: a pointing calibration (3 plate solves), then one frame` | it is learning where the telescope really points | nothing |
+| `first light frame: <path>` | the picture it took | open it |
+| `solved: RA ... Dec ... from its target` | where the picture is in the sky, and how close to the aim | nothing: it worked |
+| `first light: the frames did not solve` | no picture could be matched to the sky | check the sky is clear and the focus; the line says what it saw |
+| `first light: not done after N s` | it ran out of time | the line says what it was waiting for |
+| `first light: stopped; the telescope parked` | you pressed Ctrl-C and it parked | nothing |
+| `first light: stopped; the telescope DID NOT PARK` | it could not park | park the telescope by hand now |
+
+Every line that stops first light starts with `first light:` and says
+what to do; the exit status is 0 when a frame was solved, 1 otherwise.

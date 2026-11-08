@@ -1895,6 +1895,7 @@ class Sequencer:
                 reconnect=lambda: owner.reconnect("recovery"),
                 probe=lambda member: grant.get(member),
                 others=others,
+                call=lambda member, *args: grant.call(member, *args),
             )
         except GrantRevoked:
             return None  # fenced: the generation's cleanup takes over

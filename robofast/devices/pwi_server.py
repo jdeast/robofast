@@ -56,6 +56,14 @@ Actions (telescope)
 * ``Stop``: mount stop, accepted even while not connected.
 * ``Status``: JSON of PWI's status (typed) and the server's state.
 
+Pointing models (PWI2)
+----------------------
+``pointing_models`` (``{"<m3 port>": "<file>"}``, PWI2 only; a PWI4 config
+with it is refused): whenever PWI comes back (the first read, a read after
+PWI did not answer, the mount connecting) or the M3 port changes, and PWI
+reports another ``pointing_model`` than the current port's, the server sends
+``setmodel`` for it (legacy ``cdk700.startPWI``). It moves nothing.
+
 Safety
 ------
 * The hardware gate (:mod:`robofast.hwgate`): PWI must be a verified
@@ -98,6 +106,7 @@ import dataclasses
 import json
 import logging
 import math
+import ntpath
 import signal
 import sys
 import threading
@@ -293,6 +302,13 @@ class PWIConfig:
     allow_unhomed_moves: bool = False
     #: robofast-pwi-jog home: give up (stop) after this long (s).
     home_timeout: float = 300.0
+    #: PWI2 only: the pointing-model file for each M3 port (``{"1": "a.PXP",
+    #: "2": "b.PXP"}``; a ``ports`` name works too). Whenever PWI comes back
+    #: (the server's first read, a read after PWI did not answer, the mount
+    #: connecting) or the M3 port changes, and PWI reports another model,
+    #: the server sends ``setmodel`` for the current port (legacy
+    #: ``cdk700.startPWI``: a restarted PWI2 loads ``Default_Mount_Model.PXP``).
+    pointing_models: dict[str, str] = field(default_factory=dict)
     #: robofast-pwi-jog: largest relative move per axis (deg) and its timeout.
     max_jog_deg: float = 1.0
     jog_timeout: float = 60.0
@@ -355,10 +371,39 @@ class PWIConfig:
                 raise ValueError("az_wrap_max - az_wrap_min must be at least 360")
         if cfg.park_timeout <= 0:
             raise ValueError("park_timeout must be > 0")
+        if cfg.pointing_models:
+            if cfg.backend != "pwi2":
+                raise ValueError(
+                    "pointing_models is PWI2 only: robofast sends PWI4 no model request (PWI4"
+                    " keeps its own model; docs/pwi.md)"
+                )
+            cfg.model_files()  # validates
         return cfg
+
+    def model_files(self) -> dict[int, str]:
+        """``pointing_models`` by M3 port number (1, 2)."""
+        out: dict[int, str] = {}
+        for key, name in self.pointing_models.items():
+            port = self.ports.get(key) or (int(key) if str(key) in ("1", "2") else None)
+            if port is None:
+                raise ValueError(f"pointing_models: {key!r} is not port 1, 2 or a ports name")
+            if not isinstance(name, str) or not name.strip() or any(c in name for c in "\r\n"):
+                raise ValueError(f"pointing_models.{key}: a file name, not {name!r}")
+            if port in out and out[port] != name:
+                raise ValueError(f"pointing_models: two models for port {port}")
+            out[port] = name
+        return out
 
     def home_record_path(self) -> Path:
         return Path(self.home_record) if self.home_record else default_home_path(self.name)
+
+
+def same_model(a: str | None, b: str | None) -> bool:
+    """Whether two pointing-model file names name the same file (PWI may
+    report a full Windows path; names compare without case, as on Windows)."""
+    if not a or not b:
+        return False
+    return ntpath.basename(a.strip()).lower() == ntpath.basename(b.strip()).lower()
 
 
 def coast_deg(config: PWIConfig, speed: float) -> float:
@@ -443,6 +488,15 @@ class PWIMount:
         #: Why the last slew failed (Slewing raises it until the next command).
         self.slew_error: str | None = None
         self.m3_resends = 0
+        #: ``pointing_models`` (PWI2): a model check is due (PWI came back,
+        #: the mount connected or the port changed); what was seen last.
+        self.models = config.model_files()
+        self._model_due = True
+        self._pwi_up = False
+        self._was_connected: bool | None = None
+        self._was_port: int | None = None
+        #: Every setmodel sent: (port, file, error or None).
+        self.model_loads: list[tuple[int, str, str | None]] = []
 
     # -- reads ----------------------------------------------------------------------
 
@@ -451,7 +505,11 @@ class PWIMount:
         async with self._lock:
             now = time.monotonic()
             if self._st is None or now - self._st_at > max_age:
-                st = await self.pwi.status()
+                try:
+                    st = await self.pwi.status()
+                except PWIError:
+                    self._pwi_up = False
+                    raise
                 self._take(st, time.monotonic())
             assert self._st is not None
             return self._st
@@ -464,6 +522,18 @@ class PWIMount:
         elif self._prev is None:
             self._prev = (t, st.alt_deg, st.az_deg)
         self._st, self._st_at = st, t
+        if self.models:
+            port = st.m3_port if st.m3_port in (1, 2) else None
+            if (
+                not self._pwi_up
+                or (st.connected and self._was_connected is False)
+                or (port is not None and port != self._was_port)
+            ):
+                self._model_due = True
+            self._was_connected = st.connected
+            if port is not None:
+                self._was_port = port
+        self._pwi_up = True
         if st.version != self.version:
             if self.version is not None and self.homed_here:
                 self.homed_here.clear()
@@ -483,9 +553,44 @@ class PWIMount:
         log.info("PWI %s", what)
         try:
             st = await fn()
+        except PWITimeout:
+            self._pwi_up = False
+            raise
         finally:
             self._invalidate()
         return st
+
+    async def check_model(self) -> None:
+        """``pointing_models``: if a check is due (:meth:`_take`), the mount
+        is connected and on a port with a model, and PWI reports another
+        model, send ``setmodel`` for that port (once per check: a failure is
+        logged, and the next reconnect or port change tries again)."""
+        if not self.models or not self._model_due:
+            return
+        st = await self.status()
+        if not st.connected or st.m3_port not in (1, 2):
+            return  # still due: once the mount is connected and on a port
+        self._model_due = False
+        want = self.models.get(st.m3_port)
+        if want is None or same_model(st.pointing_model, want):
+            return
+        log.warning(
+            "PWI reports pointing model %r, not %r for port %d: setmodel",
+            st.pointing_model,
+            want,
+            st.m3_port,
+        )
+        try:
+            after = await self._send(lambda: self.pwi.set_model(want), f"setmodel {want}")
+        except PWIError as exc:
+            log.error("setmodel %s failed: %s", want, exc)
+            self.model_loads.append((st.m3_port, want, str(exc)))
+            return
+        err = None
+        if after.pointing_model is not None and not same_model(after.pointing_model, want):
+            err = f"PWI still reports {after.pointing_model!r}"
+            log.error("setmodel %s: %s", want, err)
+        self.model_loads.append((st.m3_port, want, err))
 
     def _arm_slew(
         self, target_alt: float, altaz: tuple[float, float] | None, mech: float | None
@@ -921,6 +1026,8 @@ class PWIMount:
 
     async def mount_connect(self) -> None:
         await self._send(self.pwi.mount_connect, "mount connect")
+        with contextlib.suppress(PWIError):
+            await self.check_model()
 
     async def motors(self, on: bool) -> None:
         if on:
@@ -941,6 +1048,12 @@ class PWIMount:
         raise AlpacaException(INVALID_VALUE, f"{PORT_ACTION}: no port {p!r} (one of {names})")
 
     async def select_port(self, parameters: str) -> str:
+        out = await self._select_port(parameters)
+        with contextlib.suppress(PWIError):
+            await self.check_model()
+        return out
+
+    async def _select_port(self, parameters: str) -> str:
         port = self._port(parameters)
         st = await self.status(0)
         if st.m3_port == port:
@@ -1048,6 +1161,9 @@ class PWIMount:
             "unhomed_override": self.unhomed_ok,
             "slew_error": self.slew_error,
             "m3_resends": self.m3_resends,
+            "pointing_model": st.pointing_model,
+            "pointing_model_wanted": self.models.get(st.m3_port),
+            "model_loads": [list(x) for x in self.model_loads],
         }
 
     # -- the limit watch -----------------------------------------------------------------
@@ -1075,6 +1191,9 @@ class PWIMount:
         last: tuple[float, float, float | None] | None = None  # (t, alt, mech az)
         while True:
             await asyncio.sleep(cfg.watch_interval)
+            if self._model_due and self.models:
+                with contextlib.suppress(PWIError):
+                    await self.check_model()
             try:
                 st = await self.status(cfg.watch_interval / 2)
             except PWIError:

@@ -62,13 +62,15 @@ Actions on the telescope:
 | RA/Dec offset | `/mount/offset?ra_add_arcsec=&dec_add_arcsec=` | `device=mount&cmd=move&incrementra=&incrementdec=` | legacy; **sign conventions not confirmed on the sky** |
 | stop | `/mount/stop` | `device=mount&cmd=stop` | both: legacy |
 | azimuth wrap range | `/mount/set_axis0_wrap_range_min?degs=` (status `mount.axis0_wrap_range_min_degs`, `mount.axis0.position_degs`) | (none) | PWI4 changelog; **path, parameter and status keys unconfirmed** (see "Azimuth wrap") |
+| load pointing model | (none: robofast sends PWI4 no model request) | `device=mount&cmd=setmodel&filename=` | PWI2: legacy (`cdk700.startPWI`) |
 | tracking on/off | `/mount/tracking_on`, `/tracking_off` | `cmd=trackingon` / `trackingoff` | both: legacy |
 | M3 port | `/m3/goto?port=1\|2`, `/m3/stop` | `device=m3&cmd=select&port=`, `cmd=stop` | both: legacy |
 | focuser goto/stop | `/focuser/goto?target=`, `/focuser/stop` (GUI-selected focuser) | `device=focuserN&cmd=move&position=`, `cmd=stop` | legacy |
 | rotator goto/stop | `/rotator/goto_mech?degs=`, `/rotator/stop` (GUI-selected rotator) | `device=rotatorN&cmd=move&position=`, `cmd=stop` | legacy |
 
 Nothing else can be sent (`PWI4_PATHS`, `PWI2_COMMANDS` in
-`pwi_client.py`): no sync, no pointing-model load/save/add, no jog, no
+`pwi_client.py`): no sync, no pointing-model save/add (and no load but
+PWI2's `setmodel`, below), no jog, no
 disconnect, no PWI process control, no focuser/rotator homing, no
 derotation (`goto_field` / `derotatestart`; a later step).
 
@@ -116,6 +118,29 @@ Quirks handled:
 * **PWI4 configuration keys are dotted** (`Axis0.HomePositionDegs`,
   `Axis1.NegativeSoftwareLimitDegs`); an undotted name is silently ignored.
 
+## Pointing models (PWI2)
+
+A restarted PWI2 loads `Default_Mount_Model.PXP`, not the model of the M3
+port in use; legacy `cdk700.startPWI` sent
+`device=mount&cmd=setmodel&filename=<the current port's model>` after
+starting PWI. The server's optional `pointing_models` does the same:
+
+```json
+"pointing_models": {"1": "<port 1 model>.PXP", "2": "<port 2 model>.PXP"}
+```
+
+(keys: M3 port `1`/`2` or a `ports` name). Whenever PWI comes back (the
+server's first read, a read after PWI did not answer, PWI reconnecting to
+the mount) or the M3 port changes, and PWI reports another
+`mount.pointing_model` than the current port's (file names compare
+without directory or case), the server sends `setmodel` for it, once per
+such event; a failure is logged and the next reconnect or port change
+tries again. It moves nothing. The `Status` action reports
+`pointing_model`, `pointing_model_wanted` and every `model_loads` entry
+(port, file, error). PWI2 only: a PWI4 config with `pointing_models` is
+refused (robofast sends PWI4 no model request; PWI4 keeps the model loaded
+in its GUI).
+
 ## Homing
 
 `/mount/find_home` under PWI4 4.1.6 homed both CDK700s from every start
@@ -137,6 +162,8 @@ What robofast does:
   not before a slew. The server's `FindHome` (Alpaca, and the `FindHome`
   Action) is refused (NotImplemented, `CanFindHome` false) unless the config
   says `"allow_find_home": true`; the MINERVA configs say false.
+  The recovery ladder's `home` rung (docs/recovery.md) is a client of that
+  `FindHome`: with `allow_find_home` false it is skipped as unavailable.
 * The engineering path is `robofast-pwi-jog home --axis 0|1|both`: it asks
   first, prints the position while it runs, and sends stop on Ctrl-C, after
   `home_timeout` s, or (for one axis) if the other axis moves more than
@@ -196,7 +223,8 @@ pipeline writes `DriverInfo` into each light frame's header as `MNTSWVER`
   and the jog tool talk only to a verified simulator on loopback. A tunnel
   (`ssh -L 7101:...`) on 127.0.0.1 is refused before a byte is sent.
 * **Nothing implicit**: starting, Alpaca `Connected` and every read only
-  read PWI. Connecting PWI to the mount, enabling the motors and homing
+  read PWI (and, with `pointing_models`, load the port's model: it moves
+  nothing). Connecting PWI to the mount, enabling the motors and homing
   are explicit (`MountConnect`, `MotorsEnable`, `FindHome`).
 * **Altitude limits** (`min_alt`, `max_alt`) are checked here before any
   goto (RA/Dec targets via PWI's sidereal time and the configured
@@ -283,7 +311,7 @@ way. Without `az_wrap_min`/`az_wrap_max` PWI chooses, as before.
 `aperture_diameter`, `focal_length`, `max_jog_deg` (at most 10),
 `jog_timeout`, `home_timeout`, `home_alt`, `home_az`, `home_tolerance`,
 `home_record`, `allow_find_home`, `allow_unhomed_moves`,
-`discovery_port`.
+`pointing_models` (PWI2), `discovery_port`.
 
     robofast-pwi-server --config sites/minerva/remote/t1_pwi4.json --hardware [--allow-unhomed]
 
@@ -301,8 +329,12 @@ modelled too: `--pwi-min-alt` (a goto below PWI's own limit stops there and
 reports slewing forever), the axis-0 wrap range (`--wrap-min`; mechanical
 azimuth is continuous and a goto ends inside the wrap range),
 `CDK700Model.az_mech_min` (an azimuth obstruction), `m3.port` -1 while the
-M3 moves, dropped M3 gotos (`CDK700Model.m3_drops`), and a controller power cycle
-(`CDK700Model.power_cycle`: disconnected, not homed, both axes at 0).
+M3 moves, dropped M3 gotos (`CDK700Model.m3_drops`), a controller power cycle
+(`CDK700Model.power_cycle`: disconnected, not homed, both axes at 0), and a
+PWI restart (`CDK700Model.pwi_restart`, `GET /robofast-sim/restart`, or a
+new simulator started with `--restarted`: disconnected, motors disabled,
+not homed, `Default_Mount_Model.PXP` loaded). PWI2 `setmodel` replaces the
+loaded model (`--model-file` at start; reported as `mount.pointing_model`).
 Loopback only, registered with `hwgate` while serving.
 
 ## The jog tool

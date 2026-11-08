@@ -246,6 +246,10 @@ class DeviceOwner:
                 generation=self._generation,
             )
             if isinstance(exc, DeviceError):
+                if exc.args and isinstance(exc.args[0], str) and self.name not in exc.args[0]:
+                    # Name the device (the recovery ladder finds the failed
+                    # device by it: RecoveryLadder.device_for).
+                    exc.args = (f"{self.name}.{member}: {exc.args[0]}", *exc.args[1:])
                 raise
             raise DeviceError(f"{self.name}.{member}: {type(exc).__name__}: {exc}") from exc
         self.timeline.command(

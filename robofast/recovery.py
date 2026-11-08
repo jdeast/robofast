@@ -10,14 +10,33 @@ climb, in order:
 1. ``reconnect`` -- drop the device's Alpaca client and connect afresh;
 2. ``restart`` -- restart the vendor software through a configured hook
    (a command, e.g. a service restart on the telescope's Windows PC over
-   ssh, or an HTTP request), then reconnect;
-3. ``powercycle`` -- power-cycle the device's PDU outlet through the PDU's
+   ssh, or an HTTP request; it must exit 0 once the software answers
+   again), then reconnect;
+3. ``home`` (telescope only) -- if robofast's PWI server
+   (:mod:`robofast.devices.pwi_server`) reports the mount not homed: its
+   Alpaca ``FindHome`` (unparking first and parking again after if it was
+   parked), wait until it stops, bounded by ``home_timeout``. A server
+   that does not allow homing (``allow_find_home`` false: NotImplemented),
+   or a telescope that is not a PWI server, **skips** the rung (logged as
+   unavailable, never counted as a recovery);
+4. ``powercycle`` -- power-cycle the device's PDU outlet through the PDU's
    Alpaca Switch server (:mod:`robofast.devices.pdu_server`,
    ``Action("PowerCycle")``), wait for it to boot, reconnect.
 
+On a telescope served by robofast's PWI server (it answers
+``Action("Status")``), ``reconnect`` and ``restart`` also reconnect PWI to
+the mount: ``Action("MountConnect")`` if PWI says it is not connected, then
+``Action("MotorsEnable")`` if both axes are disabled (a freshly started
+PWI's state, not a drive fault: an axis PWI disabled while connected is left
+alone).
+
 After each rung the device must answer (``verify``: a read of a member,
-within ``verify_timeout``) or the next rung is tried. Every rung is bounded
-(``step_timeout``) and alarmed (the sequencer's :meth:`alarm`). A rung that
+within ``verify_timeout``) or the next rung is tried. A PWI telescope must
+also be usable: ``Status`` shows it connected with both axes enabled and,
+if its steps include ``home``, homed (a mount that answers but is not homed
+fails the rung at once, so ``home`` comes next). Every rung is bounded
+(``step_timeout``; ``home``: ``home_timeout``) and alarmed (the sequencer's
+:meth:`alarm`). A rung that
 worked is remembered: if the same device fails again within
 ``escalate_window`` the ladder starts one rung higher, and once every rung
 has been tried and it still fails, the telescope **gives up for the night**.
@@ -36,6 +55,7 @@ itself when it cannot answer.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -48,7 +68,11 @@ log = logging.getLogger(__name__)
 
 __all__ = ["RUNGS", "DevicePolicy", "PDUSwitch", "RecoveryLadder", "RecoveryResult"]
 
-RUNGS = ("reconnect", "restart", "powercycle")
+RUNGS = ("reconnect", "restart", "home", "powercycle")
+#: Rungs only a telescope has.
+TELESCOPE_RUNGS = ("home",)
+#: ASCOM NotImplemented and ActionNotImplemented: the device cannot do it.
+NOT_IMPLEMENTED = (0x400, 0x40C)
 #: robofast's PDU server's power-cycle action (``powercycle.action``).
 POWERCYCLE_ACTION = "PowerCycle"
 DEVICES = ("telescope", "camera", "focuser", "rotator", "filterwheel")
@@ -83,6 +107,9 @@ class DevicePolicy:
     camera_warm_above: float | None = None
     min_interval: float = 1800.0
     max_powercycles: int = 1
+    #: The ``home`` rung's bound (s): a CDK700 homes in 33-58 s, but azimuth
+    #: may first travel ~100 deg to its NoWrap sensor (docs/pwi.md).
+    home_timeout: float = 300.0
 
     def __post_init__(self) -> None:
         bad = [s for s in self.steps if s not in RUNGS]
@@ -108,6 +135,19 @@ class DevicePolicy:
         if set(d) - known:
             raise ValueError(f"recovery: unknown keys {sorted(set(d) - known)}")
         return cls(**d)
+
+
+class Skipped(Exception):
+    """A rung that cannot be done here (logged; not a recovery)."""
+
+
+class NotUsable(Exception):
+    """The device answers but cannot observe (not connected, an axis
+    disabled, not homed): no point waiting for it."""
+
+
+def _not_implemented(exc: BaseException) -> bool:
+    return getattr(exc, "number", None) in NOT_IMPLEMENTED
 
 
 @dataclass
@@ -185,6 +225,10 @@ class RecoveryLadder:
         bad = set(policies) - set(DEVICES)
         if bad:
             raise ValueError(f"recovery: unknown devices {sorted(bad)}")
+        for kind, pol in policies.items():
+            only = [s for s in pol.steps if s in TELESCOPE_RUNGS]
+            if only and kind != "telescope":
+                raise ValueError(f"recovery.{kind}: {only} is a telescope step")
         self.telescope = telescope
         self.policies = policies
         self.alarm = alarm or (lambda text: None)
@@ -219,11 +263,13 @@ class RecoveryLadder:
         reconnect: Callable[[], None],
         probe: Callable[[str], Awaitable[Any]],
         others: Callable[[str, str], Awaitable[Any]] | None = None,
+        call: Callable[..., Awaitable[Any]] | None = None,
     ) -> RecoveryResult:
         """Climb ``kind``'s ladder (module doc). ``reconnect()`` drops its
         client; ``probe(member)`` reads one of its members; ``others(device,
         member)`` reads another device of the telescope (for the power-cycle
-        preconditions)."""
+        preconditions); ``call(member, *args)`` calls one of its methods
+        (a telescope's PWI actions and ``FindHome``; None: none)."""
         pol = self.policies[kind]
         now = self.clock()
         if now - self.last_failure.get(kind, -1e18) > pol.escalate_window:
@@ -235,10 +281,18 @@ class RecoveryLadder:
         for i in range(start, len(pol.steps)):
             rung = pol.steps[i]
             self.level[kind] = i + 1
+            bound = pol.home_timeout if rung == "home" else pol.step_timeout
             try:
-                async with asyncio.timeout(pol.step_timeout + pol.verify_timeout):
-                    await self._rung(rung, kind, pol, reconnect, probe, others)
-                    await self._verify(kind, pol, reconnect, probe)
+                async with asyncio.timeout(bound + pol.verify_timeout):
+                    await self._rung(rung, kind, pol, reconnect, probe, others, call)
+                    await self._verify(kind, pol, reconnect, probe, call)
+            except Skipped as exc:
+                why = str(exc)
+                tried.append((rung, f"skipped: {why}"))
+                log.warning("%s: recovery %s skipped: %s", who, rung, why)
+                self.event("recovery_step", device=kind, step=rung, ok=False, skipped=why[:200])
+                self.alarm(f"{who}: recovery {rung} unavailable: {why[:120]}")
+                continue
             except Exception as exc:
                 why = str(exc) or type(exc).__name__
                 tried.append((rung, f"failed: {why}"))
@@ -256,13 +310,17 @@ class RecoveryLadder:
         self.alarm(f"{who}: recovery ladder exhausted ({', '.join(pol.steps)}): giving up tonight")
         return res
 
-    async def _verify(self, kind: str, pol: DevicePolicy, reconnect, probe) -> None:
+    async def _verify(self, kind: str, pol: DevicePolicy, reconnect, probe, call=None) -> None:
         deadline = self.clock() + pol.verify_timeout
         last: Exception | None = None
         while True:
             try:
                 await probe(VERIFY[kind])
+                if kind == "telescope":
+                    await self._usable(probe, call, need_homed="home" in pol.steps)
                 return
+            except NotUsable:
+                raise
             except Exception as exc:
                 last = exc
                 reconnect()
@@ -270,9 +328,106 @@ class RecoveryLadder:
                 raise RuntimeError(f"still not answering: {last}")
             await self.sleep(min(2.0, pol.verify_timeout / 10))
 
-    async def _rung(self, rung, kind, pol: DevicePolicy, reconnect, probe, others) -> None:
+    # -- robofast's PWI server (a telescope) ---------------------------------------------
+
+    @staticmethod
+    async def _status(probe, call) -> dict[str, Any] | None:
+        """The PWI server's ``Action("Status")``; None if the telescope has
+        none (not robofast's PWI server: ``SupportedActions`` does not list
+        it, or cannot be read). Other errors propagate."""
+        if call is None:
+            return None
+        try:
+            actions = await probe("SupportedActions")
+        except Exception:
+            return None
+        if "status" not in {str(a).lower() for a in actions or ()}:
+            return None
+        try:
+            text = await call("Action", "Status", "")
+        except Exception as exc:
+            if _not_implemented(exc):
+                return None
+            raise
+        try:
+            st = json.loads(text)
+        except (TypeError, ValueError):
+            return None
+        return st if isinstance(st, dict) else None
+
+    async def _usable(self, probe, call, *, need_homed: bool) -> None:
+        """Raise :class:`NotUsable` unless the PWI server's ``Status`` shows
+        the mount connected, both axes enabled and (``need_homed``) homed."""
+        st = await self._status(probe, call)
+        if st is None:
+            return
+        pwi = st.get("pwi") or {}
+        if pwi.get("connected") is False:
+            raise NotUsable("PWI is not connected to the mount")
+        off = [a for a in ("az", "alt") if pwi.get(f"{a}_enabled") is False]
+        if off:
+            raise NotUsable(f"the {' and '.join(off)} axis is disabled")
+        if need_homed and st.get("homed") is not True:
+            raise NotUsable("the mount is not homed")
+
+    async def _mount_up(self, kind: str, probe, call) -> None:
+        """A PWI telescope: MountConnect if PWI is not connected, then
+        MotorsEnable if both axes are disabled (module doc)."""
+        st = await self._status(probe, call)
+        if st is None:
+            return
+        assert call is not None
+        pwi = st.get("pwi") or {}
+        if pwi.get("connected") is not False:
+            return
+        await call("Action", "MountConnect", "")
+        self.event("recovery_mount_connect", device=kind)
+        pwi = (await self._status(probe, call) or {}).get("pwi") or {}
+        if pwi.get("az_enabled") is False and pwi.get("alt_enabled") is False:
+            await call("Action", "MotorsEnable", "")
+            self.event("recovery_motors_enable", device=kind)
+
+    async def _until_still(self, probe, poll: float = 1.0) -> None:
+        """Until the mount stops (homing reads as Slewing)."""
+        await self.sleep(poll)
+        while await probe("Slewing"):
+            await self.sleep(poll)
+
+    async def _home(self, kind: str, probe, call) -> None:
+        st = await self._status(probe, call)
+        if st is None:
+            raise Skipped("no Status action (not robofast's PWI server, or it does not answer)")
+        assert call is not None
+        if st.get("homed") is True:
+            raise Skipped("the mount reports itself homed")
+        if await probe("CanFindHome") is False:
+            raise Skipped("FindHome is not allowed by the server (CanFindHome false)")
+        await self._mount_up(kind, probe, call)
+        parked = bool(await probe("AtPark"))
+        if parked:
+            await call("Unpark")
+        try:
+            await call("FindHome")
+        except Exception as exc:
+            if _not_implemented(exc):
+                if parked:
+                    await call("Park")
+                raise Skipped(f"FindHome not allowed by the server ({exc})") from None
+            raise
+        self.event("recovery_home", device=kind)
+        await self._until_still(probe)
+        if parked:
+            await call("Park")
+            await self._until_still(probe)
+
+    async def _rung(self, rung, kind, pol: DevicePolicy, reconnect, probe, others, call) -> None:
         if rung == "reconnect":
             reconnect()
+            if kind == "telescope":
+                await self._mount_up(kind, probe, call)
+            return
+        if rung == "home":
+            await self._home(kind, probe, call)
             return
         if rung == "restart":
             assert pol.restart is not None
@@ -281,6 +436,8 @@ class RecoveryLadder:
             if pol.restart.get("settle"):
                 await self.sleep(float(pol.restart["settle"]))
             reconnect()
+            if kind == "telescope":
+                await self._mount_up(kind, probe, call)
             return
         assert rung == "powercycle" and pol.powercycle is not None
         await self._may_cycle(kind, pol, probe, others)

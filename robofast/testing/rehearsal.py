@@ -43,6 +43,23 @@ at the real FAU's geometry (docs/demo.md).
   locked and each real mount gets the ``--end-action``: ``leave`` (tracking
   off, where it is; the default) or ``altaz:ALT,AZ`` (tracking off, then a
   slew to that altitude and azimuth).
+* **Recovery** (``--recovery NAME=FILE``, per real telescope; the JSON is a
+  sequencer ``recovery`` entry, docs/recovery.md, e.g. ``{"telescope":
+  {"steps": ["reconnect", "restart", "home"], "restart": {"command":
+  [...]}}}``). During the night it is that telescope's ladder in the
+  sequencer, exactly as in production: on a device failure the sequencer
+  makes the telescope safe and climbs it (the guard forwards what the
+  ladder sends a mount: ``Action("Status")``, ``MountConnect``,
+  ``MotorsEnable``, ``FindHome``; robofast's PWI server allows
+  ``FindHome`` only with ``allow_find_home``). At the preflight, a real
+  telescope whose endpoints fail gets its ladder once (bounded by the
+  policy's step timeouts; the mount through a guard, so never a real
+  ``Park``/``Unpark``) and is read again; if it still fails it is
+  **dropped** (a WARNING, and a problem in the evaluation) and the night
+  goes on with the others. The rehearsal refuses only when a telescope
+  without a recovery policy fails, or when no real telescope is left. A
+  policy may not power-cycle (``powercycle``): the rehearsal never
+  switches a PDU.
 
 ``python -m robofast.testing.rehearsal --help``; the tests
 (``tests/e2e/test_rehearsal.py``) run it on fake mounts and cameras served
@@ -54,6 +71,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import math
@@ -75,6 +93,7 @@ from robofast.dispatch import dispatch_from_config
 from robofast.owner import DeviceOwner
 from robofast.plan import Idle, Observation
 from robofast.plan_record import read_record
+from robofast.recovery import RecoveryLadder
 from robofast.request_model import Status
 from robofast.sequencer import Sequencer
 from robofast.testing.alpaca_server import FakeAlpacaServer
@@ -216,6 +235,12 @@ class RehearsalSettings:
     #: catalog's config (robofast.catalog.catalog_from_config). None: one
     #: synthetic star (the default).
     catalog_guide: dict[str, Any] | None = None
+    #: ``--recovery NAME=FILE``: a real telescope's recovery policy (the
+    #: sequencer's ``recovery`` entry; module doc).
+    recovery: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Real telescopes the preflight dropped: name -> why (set by the
+    #: rehearsal; they take no part in the night).
+    dropped: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         unknown = set(self.real) - set(NAMES)
@@ -223,6 +248,16 @@ class RehearsalSettings:
             raise ValueError(f"unknown telescopes {sorted(unknown)} (MINERVA's are {NAMES})")
         if not self.real:
             raise ValueError("no real telescope: use robofast.testing.rv_night instead")
+        for name, policy in self.recovery.items():
+            if name not in self.real and name not in self.dropped:
+                raise ValueError(f"--recovery {name}: not a real telescope (--telescope)")
+            ladder = RecoveryLadder.from_config(name, policy)
+            for kind, pol in ladder.policies.items():
+                if "powercycle" in pol.steps:
+                    raise ValueError(
+                        f"--recovery {name}: {kind} lists powercycle; the rehearsal never"
+                        " switches a PDU"
+                    )
         seen: dict[tuple[str, int, int, str], str] = {}
         for name, r in self.real.items():
             for kind, ep in (("telescope", r.telescope), ("camera", r.camera)):
@@ -230,6 +265,11 @@ class RehearsalSettings:
                 if key in seen:
                     raise ValueError(f"{name} {kind} {ep} is also {seen[key]}'s")
                 seen[key] = name
+
+    @property
+    def active(self) -> list[str]:
+        """The telescopes of the night: MINERVA's, less those dropped."""
+        return [n for n in NAMES if n not in self.dropped]
 
 
 class RehearsalRefused(Exception):
@@ -319,6 +359,10 @@ class RehearsalOutcome(Outcome):
     end: dict[str, dict[str, Any]] = field(default_factory=dict)
     #: name -> what the preflight read.
     preflight: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: The preflight's recovery ladders: one record per telescope tried.
+    preflight_recovery: list[dict[str, Any]] = field(default_factory=list)
+    #: Recovery commands the guards forwarded to real mounts.
+    recovery_commands: list[dict[str, Any]] = field(default_factory=list)
 
 
 # -- the plan ------------------------------------------------------------------------------
@@ -513,7 +557,7 @@ def make_requests(
                 "requests": [
                     {
                         "id": f"{gid}-r",
-                        "extra_params": {"telescopes": list(NAMES)},
+                        "extra_params": {"telescopes": s.active},
                         "windows": windows(t),
                         "configurations": [
                             {
@@ -531,7 +575,7 @@ def make_requests(
     # Imaging: spread over the rehearsal, per telescope, on the highest
     # target up in the middle of each window.
     span = end - start
-    for name in NAMES:
+    for name in s.active:
         for i in range(s.images):
             w0, w1 = start + span * i / s.images, start + span * (i + 1) / s.images
             mid = w0 + (w1 - w0) / 2
@@ -663,10 +707,25 @@ def preflight(s: RehearsalSettings, timeout: float = 10.0) -> dict[str, dict[str
     a device not yet connected (as robofast's device owners do anyway). A
     focuser or rotator that does not answer is only noted (they are read for
     the FITS headers)."""
-    bad: list[str] = []
+    seen, problems = preflight_problems(s, timeout=timeout)
+    if problems:
+        raise RehearsalRefused("; ".join(t for p in problems.values() for _, t in p))
+    return seen
+
+
+def preflight_problems(
+    s: RehearsalSettings, names: list[str] | None = None, timeout: float = 10.0
+) -> tuple[dict[str, dict[str, Any]], dict[str, list[tuple[str, str]]]]:
+    """:func:`preflight` without refusing: what it read, and per telescope
+    its problems as ``(device kind, text)`` (only telescopes with problems).
+    ``names``: only these real telescopes."""
+    problems: dict[str, list[tuple[str, str]]] = {}
     seen: dict[str, dict[str, Any]] = {}
     with httpx.Client(trust_env=False, timeout=timeout) as c:
         for name, r in s.real.items():
+            if names is not None and name not in names:
+                continue
+            bad: list[tuple[str, str]] = []
             info: dict[str, Any] = {}
             seen[name] = info
             for kind, ep in (
@@ -691,11 +750,15 @@ def preflight(s: RehearsalSettings, timeout: float = 10.0) -> dict[str, dict[str
                         _alpaca_put(c, url + "/connected", Connected=True)
                     if kind == "telescope":
                         if not _alpaca_get(c, url + "/connected"):
-                            bad.append(f"{name} telescope at {ep}: not connected")
+                            bad.append((kind, f"{name} telescope at {ep}: not connected"))
                         if _alpaca_get(c, url + "/atpark"):
                             bad.append(
-                                f"{name} telescope at {ep} is parked: unpark it yourself first"
-                                " (the rehearsal never sends a real mount Park or Unpark)"
+                                (
+                                    kind,
+                                    f"{name} telescope at {ep} is parked: unpark it yourself"
+                                    " first (the rehearsal never sends a real mount Park or"
+                                    " Unpark)",
+                                )
                             )
                         for m in ("rightascension", "declination", "altitude", "azimuth"):
                             info[m] = _alpaca_get(c, f"{url}/{m}")
@@ -703,7 +766,7 @@ def preflight(s: RehearsalSettings, timeout: float = 10.0) -> dict[str, dict[str
                         if s.end_action.kind == "altaz" and not _alpaca_get(
                             c, url + "/canslewaltazasync"
                         ):
-                            bad.append(f"{name} telescope at {ep} cannot SlewToAltAzAsync")
+                            bad.append((kind, f"{name} telescope at {ep} cannot SlewToAltAzAsync"))
                     elif kind == "camera":
                         if not _alpaca_get(c, url + "/connected"):
                             log.warning("%s camera at %s: connecting it", name, ep)
@@ -711,7 +774,8 @@ def preflight(s: RehearsalSettings, timeout: float = 10.0) -> dict[str, dict[str
                         state = _alpaca_get(c, url + "/camerastate")
                         info["camera_state"] = state
                         if state != 0:
-                            bad.append(f"{name} camera at {ep}: CameraState {state}, not idle")
+                            why = f"{name} camera at {ep}: CameraState {state}, not idle"
+                            bad.append((kind, why))
                         for m in ("cameraxsize", "cameraysize"):
                             info[m] = _alpaca_get(c, f"{url}/{m}")
                     else:
@@ -721,10 +785,10 @@ def preflight(s: RehearsalSettings, timeout: float = 10.0) -> dict[str, dict[str
                         info[f"{kind}_error"] = repr(exc)
                         log.warning("%s %s at %s: %r (headers will lack it)", name, kind, ep, exc)
                     else:
-                        bad.append(f"{name} {kind} at {ep}: {exc!r}")
-    if bad:
-        raise RehearsalRefused("; ".join(bad))
-    return seen
+                        bad.append((kind, f"{name} {kind} at {ep}: {exc!r}"))
+            if bad:
+                problems[name] = bad
+    return seen, problems
 
 
 def _loopback(host: str) -> bool:
@@ -738,6 +802,13 @@ class Rehearsal(SimulatedNight):
     """The rehearsal's services and night (module doc)."""
 
     def __init__(self, out: Path, settings: RehearsalSettings) -> None:
+        # Its own copy: the preflight may drop real telescopes.
+        settings = dataclasses.replace(
+            settings,
+            real=dict(settings.real),
+            az_windows=dict(settings.az_windows),
+            dropped=dict(settings.dropped),
+        )
         self.r = settings
         start = settings.start or datetime.now(UTC)
         base = NightSettings(
@@ -756,7 +827,7 @@ class Rehearsal(SimulatedNight):
 
     @property
     def sim_names(self) -> list[str]:
-        return [n for n in NAMES if n not in self.r.real]
+        return [n for n in self.r.active if n not in self.r.real]
 
     # -- the services ----------------------------------------------------------------
 
@@ -782,8 +853,114 @@ class Rehearsal(SimulatedNight):
                 f"--catalog-guide: catalog {r.catalog_guide}; checking {len(targets)} fields"
             )
             await asyncio.to_thread(warm_catalog, r.catalog_guide, targets, self._note)
-        self.outcome.preflight = await asyncio.to_thread(preflight, r)
+        self.outcome.preflight = await self._preflight()
         await super().start()
+
+    async def _preflight(self) -> dict[str, dict[str, Any]]:
+        """:func:`preflight`, with each failing telescope's recovery ladder
+        once (module doc): refuses if a telescope without one fails or no
+        real telescope is left; drops a telescope that still fails."""
+        r = self.r
+        seen, problems = await asyncio.to_thread(preflight_problems, r)
+        if any(name not in r.recovery for name in problems):
+            raise RehearsalRefused("; ".join(t for p in problems.values() for _, t in p))
+        for name in sorted(problems):
+            texts = "; ".join(t for _, t in problems[name])
+            log.warning("%s: preflight failed (%s): its recovery ladder, once", name, texts)
+            self._note(f"WARNING: {name}: preflight failed ({texts}); trying its recovery ladder")
+            await self._recover_preflight(name, sorted({k for k, _ in problems[name]}))
+            again, still = await asyncio.to_thread(preflight_problems, r, [name])
+            seen.update(again)
+            if not still.get(name):
+                self._note(f"{name}: recovered at the preflight; it takes part in the night")
+                continue
+            why = "; ".join(t for _, t in still[name])
+            r.dropped[name] = why
+            del r.real[name]
+            r.az_windows.pop(name, None)
+            seen[name]["dropped"] = why
+            log.warning("%s DROPPED from the rehearsal: %s", name, why)
+            self._note(
+                f"WARNING: {name} DROPPED: still failing after its recovery ladder ({why});"
+                f" the night goes on with {', '.join(r.active) or 'nothing'}"
+            )
+        if not r.real:
+            raise RehearsalRefused(
+                "no real telescope left: "
+                + "; ".join(f"{n} dropped ({w})" for n, w in sorted(r.dropped.items()))
+            )
+        return seen
+
+    async def _recover_preflight(self, name: str, kinds: list[str]) -> None:
+        """``name``'s recovery ladder for each failing device it has a policy
+        for (the mount through a guard of its own: never a real Park)."""
+        from robofast.alpaca_client import AlpacaDevice
+
+        o = self.outcome
+        assert isinstance(o, RehearsalOutcome)
+        real = self.r.real[name]
+        events: list[dict[str, Any]] = []
+        ladder = RecoveryLadder.from_config(
+            name,
+            self.r.recovery[name],
+            alarm=lambda text: self._note(f"WARNING: {text}"),
+            event=lambda what, **kw: events.append({"what": what, **kw}),
+        )
+        tl = Timeline(maxlen=10000)
+        for kind in kinds:
+            if kind not in ladder.policies:
+                o.preflight_recovery.append(
+                    {
+                        "telescope": name,
+                        "device": kind,
+                        "tried": [],
+                        "recovered": False,
+                        "why": "no recovery policy for it",
+                    }
+                )
+                continue
+            guard: MountGuard | None = None
+            if kind == "telescope":
+                guard = MountGuard(
+                    {name: {"telescope": real.telescope}},
+                    limits=(MIN_ALT, MAX_ALT),
+                    site=(MINERVA.latitude, MINERVA.longitude),
+                    clock=self.clock,
+                    recovery={name},
+                ).start()
+                address, number = guard.address, 0
+            else:
+                ep = getattr(real, kind)
+                address, number = ep.address, ep.number
+            owner = DeviceOwner(
+                f"{name}.{kind}",
+                lambda a=address, k=kind, n=number: AlpacaDevice(a, k, n),
+                tl,
+                default_timeout=30.0,
+            )
+            grant = owner.grant(f"{name}-preflight-recovery")
+            try:
+                res = await ladder.recover(
+                    kind,
+                    reconnect=lambda o_=owner: o_.reconnect("recovery"),
+                    probe=lambda m, g=grant: g.get(m),
+                    call=lambda m, *a, g=grant: g.call(m, *a),
+                )
+            finally:
+                owner.reconnect("preflight recovery done")
+                if guard is not None:
+                    guard.stop()
+                    o.recovery_commands += [dict(x) for x in guard.recovery_commands]
+                    o.refused += [dict(x) for x in guard.refused]
+            o.preflight_recovery.append(
+                {
+                    "telescope": name,
+                    "device": kind,
+                    "tried": [f"{rung}: {how}" for rung, how in res.tried],
+                    "recovered": res.recovered,
+                    "events": events[:],
+                }
+            )
 
     async def _start_spectrograph(self) -> None:
         if not self.r.kiwispec_url:
@@ -821,7 +998,7 @@ class Rehearsal(SimulatedNight):
     def _start_telescopes(self) -> None:
         devices: dict[str, Any] = {}
         for i, name in enumerate(NAMES):
-            if name in self.r.real:
+            if name in self.r.real or name in self.r.dropped:
                 continue
             mount = _recording_telescope(name, self.outcome.mount_events)
             foc = SimFocuser(position=round(TRUE_FOCUS + 250 * (1 if i == 0 else -1)))
@@ -843,6 +1020,7 @@ class Rehearsal(SimulatedNight):
             clock=self.clock,
             events=self.outcome.mount_events,
             az_windows=self.r.az_windows,
+            recovery=set(self.r.recovery) & set(self.r.real),
         ).start()
         self._stack.callback(self.guard.stop)
         for name in self.r.real:
@@ -861,6 +1039,8 @@ class Rehearsal(SimulatedNight):
         limits = {"min_alt": MIN_ALT, "max_alt": MAX_ALT}
         tels: dict[str, Any] = {}
         for i, name in enumerate(NAMES):
+            if name in self.r.dropped:
+                continue
             if name in self.r.real:
                 r = self.r.real[name]
                 g = self.guard.spec(name)
@@ -914,6 +1094,10 @@ class Rehearsal(SimulatedNight):
             locate_timeout=30.0,
             spectrograph_abort_wait=10.0,
         )
+        # Each real telescope's recovery ladder, as in production.
+        for name, policy in self.r.recovery.items():
+            if name in self.r.real:
+                cfg["telescopes"][name]["recovery"] = policy
         # Dark frames: nothing measures them (no FWHM, no plate solving).
         cfg["images"].update(
             imagebytes=True,
@@ -980,6 +1164,8 @@ class Rehearsal(SimulatedNight):
         )
         if r.ignore_twilight:
             entry["max_sun_alt"] = 90.0
+        for name in self.r.dropped:
+            entry["telescopes"].pop(name, None)
         for lim in entry["telescopes"].values():
             lim.pop("filters", None)  # no filter wheel in the rehearsal
             lim.update(min_alt=MIN_ALT + ALT_MARGIN / 2, max_alt=MAX_ALT - ALT_MARGIN / 2)
@@ -1003,7 +1189,7 @@ class Rehearsal(SimulatedNight):
             )
         dispatch = dispatch_from_config(
             {k: v for k, v in entry.items() if k != "type"},
-            list(NAMES),
+            self.r.active,
             base=self.out,
             clock=self.clock,
         )
@@ -1066,6 +1252,10 @@ class Rehearsal(SimulatedNight):
                     self._note(f"{d['telescope']}: frame {d['file']}")
                 elif e.what in (
                     "telescope_error",
+                    "recovery_start",
+                    "recovery_step",
+                    "recovery_done",
+                    "giving_up",
                     "plan_exhausted",
                     "observe_start",
                     "lease_released",
@@ -1096,7 +1286,8 @@ class Rehearsal(SimulatedNight):
         if self.guard is not None:
             self.guard.lock()
             o.slews = [dict(x) for x in self.guard.slews]
-            o.refused = [dict(x) for x in self.guard.refused]
+            o.refused += [dict(x) for x in self.guard.refused]
+            o.recovery_commands += [dict(x) for x in self.guard.recovery_commands]
         act = self.r.end_action
         with httpx.Client(trust_env=False, timeout=30.0) as c:
             for name, r in self.r.real.items():
@@ -1140,6 +1331,8 @@ def check(o: RehearsalOutcome) -> list[str]:
     bad: list[str] = list(o.errors)
     s = o.rehearsal
     assert s is not None
+    for name, why in sorted(s.dropped.items()):
+        bad.append(f"{name} dropped at the preflight (its recovery ladder did not help): {why}")
     tl = o.timelines.get("night")
     if tl is None:
         return [*bad, "no night run"]
@@ -1172,10 +1365,20 @@ def check(o: RehearsalOutcome) -> list[str]:
     # The guard: nothing refused, every slew within the limits and ended.
     for r in o.refused:
         bad.append(f"{r['telescope']} {r['device']}: {r['member']} refused ({r['why']})")
+    errors = tl.events("telescope_error", SEQUENCER)
     for r in o.slews:
         if not MIN_ALT <= r["alt"] <= MAX_ALT:
             bad.append(f"{r['telescope']}: slew to altitude {r['alt']:.1f}")
-        if "seconds" not in r:
+        # A slew cut short by a device failure (the sequencer's error, then
+        # its recovery) is that failure's, not a slew that hung.
+        nxt = min(
+            (x["t"] for x in o.slews if x["telescope"] == r["telescope"] and x["t"] > r["t"]),
+            default=math.inf,
+        )
+        cut = any(
+            e.detail.get("telescope") == r["telescope"] and r["t"] <= e.t <= nxt for e in errors
+        )
+        if "seconds" not in r and not cut:
             bad.append(f"{r['telescope']}: a slew never reported its end ({r['utc']})")
     # Safety: never a spectrum unguided, every abort before a park, every
     # park before the (simulated) roof closes. The guard parks at once
@@ -1287,6 +1490,14 @@ def summary(o: RehearsalOutcome) -> str:
         f" {o.runtime:.0f} s (clock x{s.scale:g}); real: {', '.join(sorted(s.real))};"
         f" ended: {o.why_end}"
     ]
+    for name, why in sorted(s.dropped.items()):
+        lines.append(f"DROPPED at the preflight: {name}: {why}")
+    for rec in o.preflight_recovery:
+        lines.append(
+            f"preflight recovery {rec['telescope']} {rec['device']}:"
+            f" {'recovered' if rec['recovered'] else 'NOT recovered'}"
+            f" ({'; '.join(rec['tried']) or rec.get('why', '')})"
+        )
     night = o.timelines.get("night")
     if night is not None:
         done = night.events("spectrum_done", SEQUENCER)
@@ -1296,6 +1507,12 @@ def summary(o: RehearsalOutcome) -> str:
             lines.append(
                 f"  {d['spectrum']:<40} {','.join(d['telescopes']):<6} -> "
                 f"{','.join(d['telescopes_end']):<6} {d['ended_by']:<6} {d['file']}"
+            )
+        for e in night.events("recovery_done", SEQUENCER):
+            d = e.detail
+            lines.append(
+                f"recovery {d['telescope']} {d['device']}:"
+                f" {'recovered' if d['recovered'] else 'NOT recovered'} ({'; '.join(d['tried'])})"
             )
     lines.append(
         "requests at the end: " + ", ".join(f"{k} {v}" for k, v in sorted(o.statuses.items()))
@@ -1328,6 +1545,11 @@ def summary(o: RehearsalOutcome) -> str:
                 f"  {f['telescope']} {f['file']}  exptime {f.get('EXPTIME')}  download"
                 f" {f.get('download_s')} s ({rate}, {f.get('transfer')})  {pointing}"
             )
+    if o.recovery_commands:
+        lines.append(
+            "recovery commands to real mounts: "
+            + ", ".join(f"{r['telescope']} {r['what']}" for r in o.recovery_commands)
+        )
     if o.refused:
         lines.append(f"refused by the guard: {len(o.refused)}")
         for r in o.refused:
@@ -1364,12 +1586,12 @@ def parse_duration(text: str) -> float:
     return h * 3600 + mi * 60 + sec
 
 
-def _named(values: list[str], what: str) -> dict[str, str]:
+def _named(values: list[str], what: str, form: str = "NAME=HOST:PORT/N") -> dict[str, str]:
     out = {}
     for v in values or []:
         name, eq, spec = v.partition("=")
         if not eq or not name or not spec:
-            raise RehearsalRefused(f"--{what} {v!r}: expected NAME=HOST:PORT/N")
+            raise RehearsalRefused(f"--{what} {v!r}: expected {form}")
         if name in out:
             raise RehearsalRefused(f"--{what} {name} given twice")
         out[name] = spec
@@ -1390,6 +1612,22 @@ def _az_windows(specs: list[str], real: dict[str, Any]) -> dict[str, tuple[float
         if not 0 <= lo < hi <= 360:
             raise RehearsalRefused(f"--az-window {spec!r}: need 0 <= LO < HI <= 360")
         out[name] = (lo, hi)
+    return out
+
+
+def _recovery(specs: list[str], real: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """``--recovery NAME=FILE``: each real telescope's recovery policy (JSON)."""
+    out: dict[str, dict[str, Any]] = {}
+    for name, path in _named(specs, "recovery", "NAME=FILE").items():
+        if name not in real:
+            raise RehearsalRefused(f"--recovery {name}: not a real telescope (--telescope)")
+        try:
+            policy = json.loads(Path(path).read_text())
+        except (OSError, ValueError) as exc:
+            raise RehearsalRefused(f"--recovery {name}={path}: {exc}") from exc
+        if not isinstance(policy, dict):
+            raise RehearsalRefused(f"--recovery {name}={path}: not a JSON object")
+        out[name] = policy
     return out
 
 
@@ -1448,6 +1686,7 @@ def settings_from_args(args: argparse.Namespace) -> RehearsalSettings:
             console_port=None if args.console_port < 0 else args.console_port,
             kiwispec_url=getattr(args, "kiwispec", None),
             catalog_guide=_catalog_config(args),
+            recovery=_recovery(getattr(args, "recovery", None) or [], real),
         )
     except ValueError as exc:
         raise RehearsalRefused(str(exc)) from exc
@@ -1536,6 +1775,15 @@ def main(argv: list[str] | None = None) -> int:
         "--catalog-dir",
         help="--catalog-guide's catalog cache directory (default $ROBOFAST_CATALOG_DIR, else"
         " ~/.cache/robofast/catalog)",
+    )
+    ap.add_argument(
+        "--recovery",
+        action="append",
+        metavar="NAME=FILE",
+        default=[],
+        help="a real telescope's recovery policy: a JSON file in the sequencer's 'recovery'"
+        " schema (docs/recovery.md); at the preflight a failing telescope gets it once and is"
+        " dropped if it still fails, and in the night it is the sequencer's ladder",
     )
     ap.add_argument("--log-level", default="WARNING")
     args = ap.parse_args(argv)

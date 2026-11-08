@@ -191,6 +191,7 @@ METHODS: dict[str, tuple[str, tuple[str, ...]]] = {
     "MoveAxis": ("PUT", ("Axis", "Rate")),  # TelescopeAxes, deg/s
     "Park": ("PUT", ()),
     "Unpark": ("PUT", ()),
+    "FindHome": ("PUT", ()),
     # dome
     "OpenShutter": ("PUT", ()),
     "CloseShutter": ("PUT", ()),

@@ -468,7 +468,7 @@ class SimulatedNight:
         # Each guider reports its fiber flux to the KiwiSpec service: the
         # spectra's flux record (docs/kiwispec.md, "Flux from the FAU guide frames").
         self.kiwispec_url = self._spectrograph_url()
-        for name in NAMES:
+        for name in list(self.telescopes):
             cfg = {
                 "name": f"{name}-guider",
                 "scope": name,
@@ -614,7 +614,7 @@ class SimulatedNight:
         cfg["spectrograph"] = {
             "type": "kiwispec",
             "url": self.kiwispec_url,
-            "telescopes": {"t1": "T1", "t2": "T2"},
+            "telescopes": {name: name.upper() for name in self.telescopes},
             "instrument": "kiwispec",
             "timeout": 5.0,
             "abort_timeout": 8.0,

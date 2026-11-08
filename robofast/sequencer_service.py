@@ -76,8 +76,8 @@ and optionally:
   frame's WCS from it.
 * per telescope, ``recovery``: the recovery ladder per device
   (:class:`~robofast.recovery.RecoveryLadder`; docs/recovery.md):
-  reconnect, restart the vendor software, power-cycle its PDU outlet, then
-  give up for the night.
+  reconnect, restart the vendor software, home a PWI mount (telescope),
+  power-cycle its PDU outlet, then give up for the night.
 * ``images`` -- save every frame (:mod:`robofast.imaging`;
   ``docs/data.md``): ``{"data_root": "/data", "site": "minerva", ...}``
   with :class:`~robofast.imaging.ImagingConfig` fields; a relative

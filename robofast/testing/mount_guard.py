@@ -5,13 +5,20 @@ docs/demo.md) points the supervisor and the sequencer at real mounts while
 the enclosure is closed. They reach each real Telescope (and its Focuser
 and Rotator, read for the FITS headers) only through this guard, which:
 
-* forwards every read (``GET``) unchanged;
+* forwards every read (``GET``) unchanged (``AtPark`` answers the guard's
+  own flag, below, but only once the real mount has answered its own
+  ``AtPark``: a dead mount does not look parked and alive);
 * forwards only the commands a rehearsal needs: ``SlewToCoordinatesAsync``
   (refused unless the target is within the altitude limits at that moment
   and the guard is not "parked"), ``AbortSlew``, ``Tracking`` and
   ``Connected``. Every other command (``Action``, ``SlewToAltAz*``,
   ``MoveAxis``, ``PulseGuide``, ``FindHome``, a focuser ``Move``, a
-  rotator move, ...) is refused with an Alpaca error and recorded;
+  rotator move, ...) is refused with an Alpaca error and recorded, except
+  ``Action("Status")`` (a read of robofast's PWI server) and, for a
+  telescope with a recovery policy (``recovery``), what its recovery
+  ladder sends (robofast/recovery.py): ``Action("MountConnect")``,
+  ``Action("MotorsEnable")`` and ``FindHome`` (each recorded in
+  :attr:`MountGuard.recovery_commands`);
 * turns ``Park`` into "stop where you are": ``AbortSlew`` and
   ``Tracking=False`` on the real mount, and ``AtPark`` reads True (from the
   guard) until the next ``Unpark``, which only clears that flag. The real
@@ -59,6 +66,12 @@ FORWARDED = {
     "focuser": {"connected"},
     "rotator": {"connected"},
 }
+#: Telescope actions (lower case) forwarded for every telescope (reads).
+READ_ACTIONS = {"status"}
+#: What a recovery ladder sends a telescope (``recovery`` telescopes only):
+#: actions, and Alpaca methods.
+RECOVERY_ACTIONS = {"mountconnect", "motorsenable"}
+RECOVERY_METHODS = {"findhome"}
 
 
 @dataclass(frozen=True)
@@ -129,6 +142,13 @@ class _Route:
     upstream: str  # http://host:port/api/v1/kind/N
 
 
+def _alpaca_error(data: bytes) -> bool:
+    try:
+        return bool(json.loads(data).get("ErrorNumber"))
+    except (ValueError, AttributeError):
+        return True
+
+
 def _alpaca(value: Any = None, *, ctid: int = 0, err: int = 0, msg: str = "") -> dict[str, Any]:
     body: dict[str, Any] = {
         "ClientTransactionID": ctid,
@@ -182,6 +202,10 @@ class _Handler(BaseHTTPRequestHandler):
         ctid = int((form or params).get("clienttransactionid", 0) or 0)
         if self.command == "GET":
             if route.kind == "telescope" and member == "atpark":
+                code, ctype, data = g.forward("GET", route, member, url.query, b"", None)
+                if code != 200 or _alpaca_error(data):
+                    self._send(code, data, ctype)  # the real mount does not answer
+                    return
                 self._answer(g.parked(route.name), ctid=ctid)
                 return
             code, ctype, data = g.forward("GET", route, member, url.query, b"", None)
@@ -201,7 +225,17 @@ class _Handler(BaseHTTPRequestHandler):
             g.unpark(route)
             self._answer(ctid=ctid)
             return
-        if member not in FORWARDED.get(route.kind, set()):
+        allowed = member in FORWARDED.get(route.kind, set())
+        recovery = route.kind == "telescope" and route.name in g.recovery
+        if route.kind == "telescope" and member == "action":
+            name = form.get("action", "").lower()
+            allowed = name in READ_ACTIONS or (recovery and name in RECOVERY_ACTIONS)
+            if allowed and name not in READ_ACTIONS:
+                g.record_recovery(route, f"Action {form.get('action')}")
+        elif recovery and member in RECOVERY_METHODS:
+            allowed = True
+            g.record_recovery(route, member)
+        if not allowed:
             self._refuse(route, member, form, ctid, "not allowed in a hardware rehearsal")
             return
         if route.kind == "telescope" and member == "slewtocoordinatesasync":
@@ -240,6 +274,8 @@ class MountGuard(ThreadingHTTPServer):
     refused (a mount whose mechanical azimuth is kept in 0..360, as PWI4's is
     with wrap minimum 0, then never leaves the window). ``events`` (if given)
     receives ``(time.monotonic(), name, "park" | "unpark" | "slew")``.
+    ``recovery``: the telescopes whose recovery ladder's commands are
+    forwarded (module doc).
     """
 
     daemon_threads = True
@@ -254,6 +290,7 @@ class MountGuard(ThreadingHTTPServer):
         clock: Callable[[], datetime],
         events: list[tuple[float, str, str]] | None = None,
         az_windows: dict[str, tuple[float, float]] | None = None,
+        recovery: set[str] | frozenset[str] = frozenset(),
         timeout: float = 30.0,
         host: str = "127.0.0.1",
     ) -> None:
@@ -268,6 +305,9 @@ class MountGuard(ThreadingHTTPServer):
                     self.routes[f"{kind}/{i}"] = _Route(name, kind, ep.url(kind))
         self.limits = limits
         self.az_windows = dict(az_windows or {})
+        self.recovery = frozenset(recovery)
+        #: Every recovery command forwarded: telescope, what, t (monotonic).
+        self.recovery_commands: list[dict[str, Any]] = []
         self.site = site
         self.clock = clock
         self.timeout = timeout
@@ -462,6 +502,13 @@ class MountGuard(ThreadingHTTPServer):
             mount_dec=dec,
             error_arcsec=round(separation(rec["ra"], rec["dec"], ra, dec), 1),
         )
+
+    def record_recovery(self, route: _Route, what: str) -> None:
+        rec = {"telescope": route.name, "what": what, "t": time.monotonic()}
+        with self._lock:
+            self.recovery_commands.append(rec)
+        self.events.append((rec["t"], route.name, "recovery"))
+        log.warning("%s: recovery: %s forwarded to the real mount", route.name, what)
 
     def record_refusal(self, route: _Route, member: str, form: dict[str, str], why: str) -> None:
         rec = {

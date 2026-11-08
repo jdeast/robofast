@@ -86,7 +86,7 @@ async def test_reporter_posts_unix_times_and_keeps_frames_on_failure():
     from robofast.devices.kiwispec_sim import KiwiSpecSim, SimConfig
 
     g = _FakeGuider()
-    now = g.clock.now()
+    now, unix_now = g.clock.now(), time.time()  # the same moment on both clocks
     g.flux_frames.extend([(now - 1.0, now - 0.5, 100.0), (now - 0.5, now, 120.0)])
     # nobody listening: the frames are kept for the next report
     down = FluxReporter(
@@ -108,7 +108,9 @@ async def test_reporter_posts_unix_times_and_keeps_frames_on_failure():
         assert rep.pending == [] and rep.sent == 3
         frames = server.kiwispec.flux.window(["T2"], time.time() - 10, time.time() + 10)["T2"]
         assert [c for *_, c in frames] == [100.0, 120.0, 130.0]
-        assert frames[-1][1] == pytest.approx(time.time() + 0.5, abs=0.5)  # Unix time
+        # Unix time: the frame's end on the guider's clock, mapped (not the
+        # time now: starting the KiwiSpec service can take seconds when loaded).
+        assert frames[-1][1] == pytest.approx(unix_now + 0.5, abs=0.2)
         assert server.kiwispec.status()["flux_reports"]["T2"]["frames"] == 3
         # an unknown telescope is refused, and the frames are kept
         bad = FluxReporter(g, FluxReportConfig(server.url, "T9", timeout=2.0))

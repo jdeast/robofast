@@ -32,7 +32,9 @@ lines are named; nothing here needs astronomy.
 | `focus: done at position N` | in focus | nothing |
 | `focus: knob ... turn ...` | the walk-through: turn the focus knob as it says, then press Enter | turn the knob that way and that much (a multiple of your last turn) |
 | `... in focus: ...; stop here` | the walk-through is done | press Enter; leave the knob alone |
-| `first light: focus: the target is too bright for this camera's shortest exposure ...` | even the camera's shortest exposure saturates on the planet | focus by hand on a fainter star; first light cannot yet be given another target, so it stops here again while that planet is the brightest up |
+| `first light: focus: the target is too bright for this camera's shortest exposure ...: run again with --focus-on NAME ...` | even the camera's shortest exposure saturates on the planet | run again as it says, with the star it names (or another fainter star up now, from docs/first_light.md's list) |
+| `first light: --focus-on NAME: not one first light knows; ...` | the name is not on the list | run again with a name from the list it prints |
+| `first light: --focus-on NAME: at N deg it is below 30 deg now; ...` | that target is too low now | choose one higher, or wait for it to rise |
 | `first light: focus: the camera, asked for a N s exposure: ...` | the camera refused an exposure; its own words follow | check the camera (its driver, its connection); the words say why |
 | `first light: focus: no light at any focus position` | nothing bright reached the camera | check the cover is off and the telescope points at the sky; focus by day on something far away first |
 | `first light: focus: the focus is beyond the focuser's upper end` | the focuser cannot reach focus | add a spacer or extension between the telescope and the camera |

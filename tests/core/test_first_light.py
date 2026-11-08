@@ -887,3 +887,24 @@ def test_a_camera_with_a_minimum_exposure_is_never_asked_below_it(held_device, t
     out = capsys.readouterr().out
     assert asked and min(asked) >= emin, sorted(asked)[:5]
     assert json.loads(out.strip().splitlines()[-1])["first_light"]["solve"]["solved"]
+
+
+def test_an_unknown_focus_target_is_refused_before_anything_moves(held_device, tmp_path, capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(_args(held_device, tmp_path, "--no-enclosure", "--focus-on", "Nostar"))
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and "Nostar" in err, err
+    assert not held_device.mount.slews and held_device.camera.exposures_started == 0
+
+
+@pytest.mark.parametrize("held_device", [True], indirect=True)
+def test_focus_on_a_named_star(held_device, tmp_path, capsys):
+    from robofast.first_focus import PLANETS, targets_up
+
+    up = [t.name for t in targets_up((42.38, -71.13, 0.0), HELD) if t.name not in dict(PLANETS)]
+    name = up[-1]  # not the brightest: the one asked for
+    main(_args(held_device, tmp_path, "--no-enclosure", "--yes", "--focus-on", name))
+    out = capsys.readouterr().out
+    plan = json.loads((tmp_path / "run" / "observatory.json").read_text())["plan"]
+    assert next(t for t in plan["targets"] if t["name"] == "first-focus")["object"] == name
+    assert json.loads(out.strip().splitlines()[-1])["first_light"]["solve"]["solved"]

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+from datetime import UTC, datetime
 
 import pytest
 
@@ -22,7 +23,13 @@ from robofast.plan import StaticPlan
 from robofast.testing.alpaca_server import FakeAlpacaServer
 from robofast.testing.fakes import FakeCamera, FakeTelescope
 
+from . import test_pointmodel_sequencer
 from .test_pointmodel_sequencer import field_now, run, sky_rig
+
+#: One instant for the simulated sky in the calibration test: its fields
+#: are then the same in every run (on the wall clock they differ, and a
+#: chance alignment can solve one even at a wrong plate scale).
+HELD = datetime(2026, 11, 7, 3, 0, 0, tzinfo=UTC)
 
 
 def _served(telescope, camera):
@@ -90,11 +97,14 @@ def test_write_puts_the_plate_scale_in_images(scope, tmp_path):
 
 
 @pytest.mark.parametrize("focal_error", [1.0, 1.1])
-async def test_first_pointing_calibration_from_the_devices(make_rig, tmp_path, focal_error):
+async def test_first_pointing_calibration_from_the_devices(
+    make_rig, tmp_path, monkeypatch, focal_error
+):
     """The plate scale read from the simulated mount and camera over Alpaca
     solves the simulated sky: three solves calibrate the pointing. A focal
     length reported 10 % off (beyond the solver's 3 % scale tolerance)
     solves nothing, and the run fails saying so."""
+    monkeypatch.setattr(test_pointmodel_sequencer, "now", lambda: HELD)
     ra_h, dec = field_now()
     plan = StaticPlan(
         [

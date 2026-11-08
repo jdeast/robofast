@@ -520,6 +520,9 @@ class PWIMount:
         self._done_goto: tuple[float, float | None, float | None] | None = None
         #: A stalled slew is being stopped (Slewing stays true meanwhile).
         self._failing = False
+        #: Tracking off was asked during an alt/az slew of ours: sent once
+        #: the mount is on the target (on PWI2 it halts a slew midway).
+        self._untrack_on_arrival = False
         #: Why the last slew failed (Slewing raises it until the next command).
         self.slew_error: str | None = None
         self.m3_resends = 0
@@ -641,6 +644,7 @@ class PWIMount:
         self._goto_app = None
         self._done_goto = None
         self._failing = False
+        self._untrack_on_arrival = False
         self._stall_ref = None
         self.slew_error = None
 
@@ -747,6 +751,15 @@ class PWIMount:
         """A slew of ours has ended on its target: there, and not moving."""
         return self._at_target(st) and self.speed < self.config.moving_speed
 
+    async def _slew_done(self, st: PWIStatus) -> None:
+        """A slew of ours has ended: disarm it, and send a tracking off
+        asked for while it moved (:meth:`set_tracking`)."""
+        untrack, self._untrack_on_arrival = self._untrack_on_arrival, False
+        self._disarm_slew(completed=True)
+        if untrack and st.tracking:
+            with contextlib.suppress(PWIError):
+                await self._send(lambda: self.pwi.tracking(False), "tracking off (slew done)")
+
     async def _check_stall(self, st: PWIStatus) -> None:
         """PWI4 accepts a goto beyond its own axis limits, stops at the limit
         and reports slewing (and tracking) forever. A slew of ours that PWI
@@ -779,7 +792,7 @@ class PWIMount:
                     st.alt_deg,
                     st.az_deg,
                 )
-            self._disarm_slew(completed=True)
+            await self._slew_done(st)
             return
         if st.slewing is not True:
             # Not on the target: PWI's word that it is done counts only once
@@ -790,7 +803,7 @@ class PWIMount:
                 now - self._moving_since > max(cfg.slew_report_min, cfg.stall_time)
                 and self.speed < cfg.moving_speed
             ):
-                self._disarm_slew(completed=True)
+                await self._slew_done(st)
             self._stall_ref = None
             return
         # Progress: toward an alt/az target whose mechanical azimuth is known
@@ -827,7 +840,7 @@ class PWIMount:
                 st.alt_deg,
                 st.az_deg,
             )
-            self._disarm_slew(completed=True)
+            await self._slew_done(st)
             return
         why = (
             f"slew failed: PWI reports slewing but the mount has made no progress for"
@@ -1041,6 +1054,7 @@ class PWIMount:
         await self._send(lambda: self.pwi.goto_altaz(alt, az), f"goto alt {alt:.4f} az {az:.4f}")
 
     async def abort(self) -> None:
+        self._untrack_on_arrival = False
         self._moving_since = -1e9
         self._disarm_slew()
         self.slew_error = None
@@ -1062,8 +1076,17 @@ class PWIMount:
                 return
             self.park_state = "unparked"
             self._watch_latched = False
-        elif not (await self.status(0)).tracking:
-            return
+        else:
+            if self._slew_active and self._goto_altaz is not None:
+                # An alt/az slew of ours (sent with tracking off) is under
+                # way: PWI2 can report tracking during it, and tracking off
+                # then halts the slew midway (night 1107, the rehearsal's
+                # end action). Sent once the mount is on the target.
+                self._untrack_on_arrival = True
+                log.info("tracking off: once the alt/az slew is on its target")
+                return
+            if not (await self.status(0)).tracking:
+                return
         await self._send(lambda: self.pwi.tracking(on), f"tracking {'on' if on else 'off'}")
 
     async def park(self) -> None:

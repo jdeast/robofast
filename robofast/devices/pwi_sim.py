@@ -10,7 +10,9 @@ One mount model (:class:`CDK700Model`) behind either front end:
   ``/?cmd=getsystem``, answering the ``<system>`` XML status PWI2 sends
   (fields as in the legacy ``telstateunknown.xml``). PWI2's quirk is kept:
   ``mount.moving`` is ``True`` whenever tracking is off; ``stuck_moving``
-  makes it ``True`` always (as MINERVA T1's PWI2 after a restart).
+  makes it ``True`` always (as MINERVA T1's PWI2 after a restart);
+  ``altaz_tracks`` reports tracking on during an alt/az move, and tracking
+  off halts that move (as MINERVA T1's PWI2, 2026-11-08).
 
 The model, from the legacy driver's use of PWI (``docs/pwi.md``):
 
@@ -137,11 +139,16 @@ class CDK700Model:
         az_mech_min: float | None = None,
         model_file: str = "",
         stuck_moving: bool = False,
+        altaz_tracks: bool = False,
     ) -> None:
         self.lat, self.lon = latitude, longitude
         #: PWI2: ``mount.moving`` stuck True (MINERVA T1 after a PWI2
         #: restart, 2026-11-07), whatever the mount does.
         self.stuck_moving = stuck_moving
+        #: PWI2: report tracking on during an alt/az move, and halt the move
+        #: on tracking off (MINERVA T1, 2026-11-08: the rehearsal's end
+        #: action sent tracking off mid-slew and the mount stopped short).
+        self.altaz_tracks = altaz_tracks
         self.slew_rate = slew_rate
         self.home_time = home_time
         self.m3_time = m3_time
@@ -333,7 +340,7 @@ class CDK700Model:
             self.altaz = None
         else:
             self.radec = None
-            if self.slewing and self.altaz is None:
+            if self.slewing and (self.altaz is None or self.altaz_tracks):
                 self.slewing = False
 
     def power_cycle(self) -> None:
@@ -688,6 +695,8 @@ def pwi2_handle(m: CDK700Model, path: str, q: dict[str, list[str]]) -> str:
                 m.goto_radec(_param(q, "ra2000"), _param(q, "dec2000"))
             elif "alt" in q:
                 m.goto_altaz(_param(q, "alt"), _param(q, "azm"), keep_tracking=True)
+                if m.altaz_tracks and m.altaz is not None:
+                    m.tracking = True
             elif "incrementra" in q:
                 m.offset_radec(_param(q, "incrementra"), _param(q, "incrementdec"))
             else:

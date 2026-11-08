@@ -232,8 +232,11 @@ python -m robofast.testing.rehearsal --out /tmp/rehearsal \
 * **The end** (also on Ctrl-C or an error): the guard is locked, then each
   real mount gets `--end-action`: `leave` (abort any slew, tracking off,
   where it is; the default) or `altaz:ALT,AZ` (tracking off, then a slew
-  there, within the limits). A `kill -9` skips it: stop the mounts
-  yourself then.
+  there, within the limits; it waits, up to `end_slew_timeout`, until the
+  mount reads within 0.5 deg of ALT,AZ, not just `Slewing` false, and only
+  then sends tracking off again: on PWI2 a tracking off mid-slew halts the
+  slew. Not there in time is reported, tracking left as is). A `kill -9`
+  skips it: stop the mounts yourself then.
 * **`--kiwispec URL`** (opt-in): use an already-running KiwiSpec service
   (`robofast.devices.kiwispec_service`) -- the **real spectrograph** --
   instead of starting the simulated one. The guiders' flux reports and the

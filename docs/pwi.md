@@ -104,6 +104,11 @@ Quirks handled:
   waited for), that too is a finished slew, not a stall. With no slew of
   ours under way, PWI2's `moving` without any change of position is not
   slewing. The simulator's `stuck_moving` (`--stuck-moving`) reproduces it.
+* **PWI2 can report tracking on during an alt/az move, and tracking off
+  then halts the move midway** (MINERVA T1, 2026-11-08: the rehearsal's
+  end action stopped 15 deg short). A tracking off asked during an alt/az
+  slew of ours is sent once the mount is on the target. The simulator's
+  `altaz_tracks` reproduces it.
 * **PWI2 can report a tracked mount not moving for a moment after a
   goto** (night 1107). A slew the server sent stays its slew (`Slewing`
   true, its target known to the limit watch) until the mount is on the

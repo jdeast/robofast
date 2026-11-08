@@ -130,6 +130,7 @@ class SkyDevice:
         clock: Callable[[], datetime] = now,
         focus_error: float = 0.0,
         bright: bool = False,
+        focuser: bool = True,
     ) -> None:
         self.clock = clock
         self.mount = SkyMount(clock, latitude, longitude, slew_time=0.5)
@@ -159,7 +160,10 @@ class SkyDevice:
         self.camera = StarfieldCamera(self.focuser, scene)
         self.camera.PixelSizeX = self.camera.PixelSizeY = pixel_size
         self.server = FakeAlpacaServer(
-            {"telescope": self.mount, "camera": self.camera, "focuser": self.focuser},
+            # Without ``focuser`` the camera keeps it (it sets the sharpness)
+            # but the server does not offer it: a telescope with fixed focus.
+            {"telescope": self.mount, "camera": self.camera}
+            | ({"focuser": self.focuser} if focuser else {}),
             host=host,
             port=port,
             discovery_port=discovery_port,

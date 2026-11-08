@@ -553,6 +553,27 @@ async def test_pwi2_stuck_moving_still_catches_a_stalled_slew(make):
     await tel.aclose()
 
 
+async def test_pwi2_tracking_off_waits_for_an_alt_az_slew_to_arrive(make):
+    """MINERVA T1, 2026-11-08: the rehearsal's end action slewed to alt 25
+    az 0 and sent tracking off ~2 s later; PWI2 (reporting tracking on during
+    the move) halted the slew midway. Tracking off during an alt/az slew of
+    ours is sent once the mount is on the target."""
+    sim, server = make(
+        "pwi2", sim_kw={"altaz_tracks": True, "slew_rate": 10.0, "alt": 40.0, "az": 120.0}
+    )
+    tel = await device(server)
+    await tel.put("SlewToAltAzAsync", Altitude=25.0, Azimuth=10.0, timeout=T)
+    await asyncio.sleep(0.5)
+    assert sim.model.state()["tracking"]  # as PWI2 reports it mid-move
+    await tel.set("Tracking", False, timeout=T)  # mid-slew
+    await until(lambda: _not(tel.get("Slewing", timeout=T)), timeout=30, what="slew end")
+    st = sim.model.state()
+    assert abs(st["alt"] - 25.0) < 0.1 and abs((st["az"] - 10.0 + 180) % 360 - 180) < 0.1
+    await until(lambda: _not(tel.get("Tracking", timeout=T)), timeout=5, what="tracking off")
+    assert server.mount.slew_error is None
+    await tel.aclose()
+
+
 async def _async(v):
     return v
 

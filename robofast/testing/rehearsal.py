@@ -1301,10 +1301,17 @@ class Rehearsal(SimulatedNight):
                     if act.kind == "altaz":
                         _alpaca_put(c, url + "/slewtoaltazasync", Azimuth=act.az, Altitude=act.alt)
                         deadline = time.monotonic() + self.r.end_slew_timeout
-                        while _alpaca_get(c, url + "/slewing"):
+                        # Arrived means there (by position), not just Slewing
+                        # false: night 1107's PWI2 said done mid-slew, and the
+                        # tracking off sent then halted it short. Tracking off
+                        # goes only to a mount verified on the target.
+                        while _alpaca_get(c, url + "/slewing") or not _at_altaz(c, url, act):
                             if time.monotonic() > deadline:
+                                here = [_alpaca_get(c, url + m) for m in ("/altitude", "/azimuth")]
                                 raise TimeoutError(
-                                    f"still slewing after {self.r.end_slew_timeout} s"
+                                    f"not at alt {act.alt:g} az {act.az:g} after"
+                                    f" {self.r.end_slew_timeout} s (at alt, az {here});"
+                                    " tracking left as is"
                                 )
                             time.sleep(0.5)
                         with contextlib.suppress(Exception):  # some mounts track after a slew
@@ -1321,6 +1328,12 @@ class Rehearsal(SimulatedNight):
             await asyncio.to_thread(self.end_action)
         finally:
             await super().close()
+
+
+def _at_altaz(c: httpx.Client, url: str, act: Any, tol: float = 0.5) -> bool:
+    """The mount reads within ``tol`` deg of the end action's alt/az."""
+    alt, az = _alpaca_get(c, url + "/altitude"), _alpaca_get(c, url + "/azimuth")
+    return abs(alt - act.alt) <= tol and abs((az - act.az + 180.0) % 360.0 - 180.0) <= tol
 
 
 # -- checks and the report ------------------------------------------------------------------

@@ -586,6 +586,26 @@ async def _focus_failed(tl: Timeline) -> str:
     return str(tl.events("first_focus_failed")[-1].detail.get("error"))
 
 
+async def _telescope_failed(tl: Timeline) -> str:
+    """The sequencer's telescope error (a slew, a device), once it is
+    reported, in the device's words, and whether it parked the telescope
+    (it backs off for minutes then; first light does not wait for it)."""
+    from robofast.first_focus import device_words
+
+    while not tl.events("telescope_error"):
+        await asyncio.sleep(0.5)
+    error = tl.events("telescope_error")[-1]
+    why = device_words(str(error.detail.get("error")))
+    for _ in range(20):  # its cleanup follows within seconds
+        safed = [e for e in tl.events("telescope_safed") if e.t >= error.t]
+        if safed:
+            if safed[-1].detail.get("parked"):
+                return f"{why}; the telescope parked"
+            break
+        await asyncio.sleep(0.5)
+    return f"{why}; the telescope did not report parked: park it by hand now"
+
+
 async def _unsolvable(tl: Timeline) -> None:
     """Return once the calibration's frames are found not to solve."""
     while not (
@@ -671,16 +691,20 @@ async def run(
         stop_wait = asyncio.create_task(stop.wait(), name="stop")
         unsolvable = asyncio.create_task(_unsolvable(tl), name="unsolvable")
         unfocused = asyncio.create_task(_focus_failed(tl), name="unfocused")
+        failed = asyncio.create_task(_telescope_failed(tl), name="failed")
         left = timeout - (time.monotonic() - started) if started is not None else timeout
-        done, _ = await asyncio.wait({seq_task, stop_wait, unsolvable, unfocused},
+        done, _ = await asyncio.wait({seq_task, stop_wait, unsolvable, unfocused, failed},
                                      timeout=max(1.0, left),
                                      return_when=asyncio.FIRST_COMPLETED)  # fmt: skip
         stop_wait.cancel()
         unsolvable.cancel()
         unfocused.cancel()
+        failed.cancel()
         stopped = stop.is_set()
         if unfocused in done and not stopped:
             raise FirstLightError(f"focus: {unfocused.result()}")
+        if failed in done and not stopped:
+            raise FirstLightError(failed.result())
         if unsolvable in done and not stopped:
             raise FirstLightError(
                 f"the frames did not solve: {_frames(tl)}; check the plate scale"

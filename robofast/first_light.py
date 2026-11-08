@@ -90,6 +90,11 @@ PER_POINT = 60.0
 #: fields cannot catch them, and the rest download during the calibration.
 FETCH_PASSES = 5
 
+#: Minutes the telescope's sidereal time may differ from the site's (this
+#: computer's clock): the calibration still solved at 2 min off and not at
+#: 2.5 on the simulated telescope (docs/first_light.md, "The telescope's clock").
+CLOCK_LIMIT = 1.0
+
 #: Give up once this many calibration points went unsolved with none solved
 #: (two pointing runs of three): the frames will not solve.
 UNSOLVED_LIMIT = 6
@@ -355,6 +360,28 @@ def _fetch_catalog(
             " a longer --timeout"
         )
     return len(tiles)
+
+
+def _check_clock(telescope: discover.Device, site: tuple[float, float, float]) -> None:
+    """The telescope's sidereal time against the site's from this computer's
+    clock, before anything moves: a mount whose clock, date, time zone or
+    longitude is wrong points elsewhere than it reports, and nothing solves.
+    :class:`FirstLightError` past :data:`CLOCK_LIMIT` minutes."""
+    (theirs,) = discover.read_members(telescope, ["SiderealTime"])
+    ours = _lst_hours(site, datetime.now(UTC))
+    off = ((float(theirs) - ours + 12.0) % 24.0 - 12.0) * 60.0  # minutes
+    if abs(off) > CLOCK_LIMIT:
+        raise FirstLightError(
+            f"the telescope's clock disagrees with this computer's by {abs(off):.0f} min"
+            f" (its sidereal time {_hms(float(theirs))}, the site's {_hms(ours)}): set the"
+            " mount's date, time, time zone and longitude (or give --site with the"
+            " right longitude), then run again"
+        )
+
+
+def _hms(hours: float) -> str:
+    s = round((hours % 24.0) * 3600.0)
+    return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
 
 
 def _site(text: str) -> tuple[float, float, float]:
@@ -624,6 +651,11 @@ def main(argv: list[str] | None = None) -> None:
         print(f"first light: {exc}; give the site with --site LAT,LON", file=sys.stderr)
         sys.exit(1)
     print(f"site {site[0]:.5f}, {site[1]:.5f}, {site[2]:g} m: {whose}")
+    try:
+        _check_clock(_one_telescope(devices), site)
+    except (FirstLightError, discover.OpticsUnavailable) as exc:
+        print(f"first light: {exc}", file=sys.stderr)
+        sys.exit(1)
     catalog: dict[str, Any] = {"source": args.catalog}
     if args.catalog_dir:
         catalog["cache_dir"] = str(Path(args.catalog_dir).resolve())

@@ -132,8 +132,21 @@ def test_no_operator_no_start(device, tmp_path, capsys, monkeypatch):
     assert device.camera.exposures_started == 0 and device.mount.AtPark
 
 
+class _OnTime(FakeTelescope):
+    """A fake telescope whose clock agrees with SITE's sidereal time."""
+
+    @property
+    def SiderealTime(self) -> float:  # type: ignore[override]
+        from datetime import UTC, datetime
+
+        from robofast.first_light import _lst_hours
+
+        lat, lon = (float(v) for v in SITE.split(","))
+        return _lst_hours((lat, lon, 0.0), datetime.now(UTC))
+
+
 def test_a_camera_without_a_pixel_size_stops_naming_it(tmp_path, capsys):
-    tel, cam = FakeTelescope(), FakeCamera()
+    tel, cam = _OnTime(), FakeCamera()
     tel.FocalLength = 0.5
     del cam.PixelSizeX
     server = FakeAlpacaServer({"telescope": tel, "camera": cam}).start()
@@ -294,9 +307,9 @@ def test_ctrl_c_where_the_loop_has_no_signal_handlers(device, tmp_path, capsys, 
 
 
 def test_the_zenith_is_the_sites_not_the_mounts(device, tmp_path, capsys):
-    """The mount's sidereal time is not read (its clock or site may be off):
-    with the mount's clock 24 min fast, the frame is still at the zenith of
-    the site given, by this computer's clock."""
+    """The zenith is the site's by this computer's clock, not the mount's:
+    with the mount's clock half a minute fast (inside the clock check's
+    limit), the frame is at the zenith of the site given."""
     from datetime import UTC, datetime
 
     from robofast.catalog import separation
@@ -305,7 +318,9 @@ def test_the_zenith_is_the_sites_not_the_mounts(device, tmp_path, capsys):
     mount_cls = type(device.mount)
     true_lst = mount_cls.SiderealTime.fget
     device.mount.__class__ = type(
-        "FastClockMount", (mount_cls,), {"SiderealTime": property(lambda s: true_lst(s) + 0.4)}
+        "FastClockMount",
+        (mount_cls,),
+        {"SiderealTime": property(lambda s: true_lst(s) + 0.5 / 60.0)},
     )
     main(_args(device, tmp_path, "--no-enclosure", "--yes"))
     out = capsys.readouterr().out
@@ -465,7 +480,7 @@ def test_a_timeout_while_the_catalog_downloads_exits_on_time(device, tmp_path, c
     assert device.camera.exposures_started == 0
 
 
-class _NeverParks(FakeTelescope):
+class _NeverParks(_OnTime):
     @property
     def AtPark(self) -> bool:  # type: ignore[override]
         return False
@@ -531,10 +546,10 @@ def test_a_telescope_that_cannot_report_its_site_stops_naming_site(tmp_path, cap
 
 def test_the_site_given_is_used_over_the_telescopes(device, tmp_path, capsys):
     args = _args(device, tmp_path, "--no-enclosure", "--yes")
-    args[args.index("--site") + 1] = "40.0,-70.0,100"
+    args[args.index("--site") + 1] = "40.0,-71.13,100"  # the longitude: the clock check's
     main(args)
     site = json.loads((tmp_path / "run" / "observatory.json").read_text())["site"]
-    assert site == {"latitude": 40.0, "longitude": -70.0, "elevation": 100.0}
+    assert site == {"latitude": 40.0, "longitude": -71.13, "elevation": 100.0}
 
 
 def test_a_telescope_reporting_its_site_as_0_0_does_not_move(tmp_path, capsys):
@@ -661,3 +676,84 @@ def test_the_telescopes_elevation_is_not_read(tmp_path, capsys):
     line = next(ln for ln in out.splitlines() if ln.startswith("site "))
     assert line.startswith("site 31.68000, -110.88000, 0 m: the telescope's"), line
     assert "elevation is not read" in line, line
+
+
+from robofast.testing.pointing_sim import SkyMount  # noqa: E402
+
+
+def _wrong_clock_device(tmp_path, hours: float) -> SkyDevice:
+    """The sky device with its mount's clock fast by ``hours``: the mount
+    reports RA from its own sidereal time, so it reports RA + hours for where
+    it really points and lands ``hours`` west of what it is told; the camera
+    sees the physical sky."""
+
+    class WrongClockMount(SkyMount):
+        @property
+        def SiderealTime(self):  # type: ignore[override]
+            return (super().SiderealTime + hours) % 24.0
+
+        @property
+        def RightAscension(self):  # type: ignore[override]
+            return (self.ra + hours) % 24.0
+
+        def SlewToCoordinatesAsync(self, ra, dec):
+            super().SlewToCoordinatesAsync((ra - hours) % 24.0, dec)
+
+    class PhysicalView:
+        def __init__(self, mount):
+            self._m = mount
+
+        @property
+        def RightAscension(self):
+            return self._m.ra
+
+        @property
+        def Declination(self):
+            return self._m.dec
+
+        def __getattr__(self, name):
+            return getattr(self._m, name)
+
+    d = SkyDevice(
+        catalog={"cache_dir": str(tmp_path / "sky")},
+        pointing_error={"IH": 150.0, "ID": -40.0, "NP": 20.0},
+    )
+    d.mount.__class__ = WrongClockMount
+    scenes = [
+        v
+        for v in vars(d.camera).values()
+        if hasattr(v, "__dict__") and any(w is d.mount for w in vars(v).values())
+    ]
+    assert scenes
+    for scene in scenes:
+        for name, v in list(vars(scene).items()):
+            if v is d.mount:
+                setattr(scene, name, PhysicalView(d.mount))
+    return d
+
+
+def test_a_telescope_whose_clock_is_wrong_stops_before_it_moves(tmp_path, capsys):
+    """A handset clock an hour off (daylight saving) points the mount 15 deg
+    from where it reports, and no frame solves: first light compares the
+    telescope's sidereal time with the site's from this computer's clock,
+    before anything moves, and says which is wrong."""
+    d = _wrong_clock_device(tmp_path, 1.0).start()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main(_without_site(_args(d, tmp_path, "--no-enclosure", "--yes")))
+        slews, exposures = list(d.mount.slews), d.camera.exposures_started
+    finally:
+        d.stop()
+    lines = [ln for ln in capsys.readouterr().err.splitlines() if ln.startswith("first light")]
+    assert exc.value.code == 1 and len(lines) == 1, lines
+    assert "clock" in lines[0] and "60 min" in lines[0], lines
+    assert not slews and exposures == 0
+
+
+def test_a_telescope_clock_half_a_minute_off_runs(tmp_path, capsys):
+    d = _wrong_clock_device(tmp_path, 0.5 / 60.0).start()
+    try:
+        main(_without_site(_args(d, tmp_path, "--no-enclosure", "--yes")))
+    finally:
+        d.stop()
+    assert '"first_light"' in capsys.readouterr().out

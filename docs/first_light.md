@@ -93,11 +93,32 @@ does not use it. Measured on the simulated telescope (an injected IH of
 | 1000 km | solved | +163.6", -40.0" (north) | 7.1" | 9.0 deg |
 | 3000 km | solved | +169.1", -40.0" (north) | 12.0" | 27 deg |
 
-(east: IH and ID unchanged, the frame 6.3-6.6" from its target.) A site
+(east: IH and ID unchanged, the frame 6.3-6.6" from its target, measured
+before the clock check below: since it, a `--site` whose longitude differs
+from the telescope's own by more than about 15 arcmin, a minute of
+sidereal time, stops first light at the check, as a wrong mount clock does.) A site
 off by hundreds of km still calibrates; the "zenith" frame is then about
 0.9 deg from the true zenith per 100 km. Not measured: a real mount's
 altitude limits (the simulated one has none): with the site 1000 km off,
 a point laid at the calibration's lowest altitude (25 deg) is near 16 deg.
+
+A script that runs first light with `--yes` confirms the printed site
+unseen: it owns the site it runs at (give it `--site`).
+
+## The telescope's clock
+
+The calibration points where the telescope reports it points, and the
+telescope works that out from its own clock: a mount whose date, time,
+time zone (daylight saving) or longitude is wrong reports one place and
+looks at another, and no frame solves. So before anything moves, first
+light compares the telescope's `SiderealTime` with the site's, from this
+computer's clock, and stops if they differ by more than a minute, saying
+by how many minutes and what to set. Measured on the simulated telescope,
+its clock off by: 0 to 2 min, the calibration and frame solved (6.3-6.5"
+from the target); 2.5, 3 and 4 min, only some frames solved; 5 min, 47 of
+141 solved. The mount's own points stay where it meant them (its clock
+error moves its sky and its slews together): a wrong clock does not send
+the calibration below the horizon, it only stops the frames solving.
 
 ## The catalog
 

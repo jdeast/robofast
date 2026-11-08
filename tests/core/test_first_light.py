@@ -969,3 +969,18 @@ def test_a_telescope_error_stops_first_light_at_once_in_its_words(held_device, t
     assert "parked" in err and "not done after" not in err, err
     assert took < 30, took
     assert d.mount.AtPark
+
+
+@pytest.mark.parametrize("held_device", [True], indirect=True)
+def test_the_park_words_are_said_after_the_cleanup_has_parked(held_device, tmp_path, capsys):
+    """A mount that takes 20 s to park: the stop says it parked once the
+    sequencer's cleanup has waited for it, never "park it by hand" while it
+    is parking."""
+    d = held_device
+    d.mount._park_time = 20.0
+    _failing(d.mount, "Failing", "SlewToCoordinatesAsync", 0, "InvalidOperation: axis fault")
+    with pytest.raises(SystemExit):
+        main(_args(d, tmp_path, "--no-enclosure", "--yes", "--timeout", "90"))
+    err = capsys.readouterr().err
+    assert d.mount.AtPark
+    assert "the telescope parked" in err and "park it by hand" not in err, err

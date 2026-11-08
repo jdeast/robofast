@@ -152,9 +152,7 @@ class SkyDevice:
             sky_mag=21.0,
             seeing=2.5,
         )
-        scene = (_BrightFocusScene if bright else SkyFocusScene)(
-            self.sky, self.mount, clock, effective_exposure=10.0
-        )
+        scene = (_BrightFocusScene if bright else _Scene)(self.sky, self.mount, clock)
         #: The focuser starts ``focus_error`` steps from the true focus (20000).
         self.focuser = SimFocuser(position=round(20000 + focus_error), max_step=120000)
         self.camera = StarfieldCamera(self.focuser, scene)
@@ -186,11 +184,22 @@ class SkyDevice:
         self.server.stop()
 
 
-class _BrightFocusScene(SkyFocusScene):
+class _Scene(SkyFocusScene):
+    """The sky's stars and its background at ten times the exposure asked
+    (a camera ten times as sensitive: the faint field shows in a 1 s frame),
+    so the field follows the exposure, as a real sky does."""
+
+    GAIN = 10.0
+
+    def render(self, optical: float, duration: float, roi, binning: int) -> np.ndarray:
+        return super().render(optical, self.GAIN * duration, roi, binning)
+
+
+class _BrightFocusScene(_Scene):
     """The sky's stars, and the bright object first light focuses on
     (:func:`robofast.first_focus.bright_target`: a planet or a bright star),
     drawn with its whole defocused disk wherever it falls on the chip, and
-    at the exposure asked for (it would saturate at the faint stars' 10 s)."""
+    at the exposure asked for (it would saturate at the field's gain)."""
 
     def render(self, optical: float, duration: float, roi, binning: int) -> np.ndarray:
         from robofast.first_focus import bright_target

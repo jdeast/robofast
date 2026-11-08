@@ -9,7 +9,8 @@
     "max_jog_deg: robofast-pwi-jog's largest relative move per axis (first hardware session: keep it small).",
     "Only one of the PWI2 and PWI4 configs of a telescope runs at a time (same listen port); only one of PWI2 and PWI4 may own the mount.",
     "allow_find_home false: robofast never homes this mount through the Alpaca server. T1's home sensor was replaced and PWI2's home-direction setting changed then (PWI2 settingsMount.xml vs settingsMount.20161219.badhome.xml), so a home may drive the wrong way: home with robofast-pwi-jog home --axis 0|1, one axis at a time, after the checklist in docs/pwi.md.",
-    "allow_unhomed_moves true: the engineering override for the first session (small jogs before homing, to check axis directions). It does nothing without --allow-unhomed on the command line; set it false once the mount homes reliably."
+    "allow_unhomed_moves true: the engineering override for the first session (small jogs before homing, to check axis directions). It does nothing without --allow-unhomed on the command line; set it false once the mount homes reliably.",
+    "pointing_models: legacy telescope_2.ini [MODEL] per M3 port (files in PWI2's Mount folder on the telescope PC, confirmed 2026-11-08); the server reloads them after a PWI2 restart (docs/pwi.md)."
   ],
   "name": "t2",
   "backend": "pwi2",
@@ -42,5 +43,9 @@
   "home_timeout": 300.0,
   "allow_find_home": false,
   "allow_unhomed_moves": true,
-  "request_timeout": 20.0
+  "request_timeout": 20.0,
+  "pointing_models": {
+    "1": "T2.Port1.PXP",
+    "2": "T2.Port2.PXP"
+  }
 }

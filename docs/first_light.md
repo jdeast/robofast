@@ -112,6 +112,18 @@ the command until it arrived, past `--timeout` and Ctrl-C. `--timeout`
 counts from the start (after the duty question), the download included.
 Once cached, a run downloads nothing.
 
+The calibration's points are fixed in altitude and azimuth, so their
+fields move with the sky (0.25 deg a minute) while the catalog downloads.
+First light fetches the fields where the points will be over the
+calibration (allowing a minute a point besides its exposure, and the
+last download's length), then again for where they are once that is
+done, until nothing is missing; the zenith frame is placed after the
+download. On a network slower than the sky turns (about six tiles a
+minute for the three points: measured on the simulated sky, a download
+of 2 s a tile caught up in four passes, one of 10 s a tile did not), it
+stops after a pass that gains nothing, at most five, and says how many
+tiles will download during the calibration instead.
+
 ## On the simulated telescope
 
 `robofast.testing.sky_device` is a telescope and camera on a simulated

@@ -59,8 +59,9 @@ saying so in the supervisor's words.
 
 ## The site
 
-The site is the telescope's own: its `SiteLatitude` and `SiteLongitude`
-(and `SiteElevation`, 0 m if it has none), which a GPS mount fills in;
+The site is the telescope's own: its `SiteLatitude` and `SiteLongitude`,
+which a GPS mount fills in (its elevation is not read: 0 m unless
+`--site LAT,LON,ELEV` gives one);
 first light prints it, and asks, with the other question, whether that
 is where the telescope stands; a no stops it before anything moves.
 **`--yes` answers yes to that too: it confirms the printed site.**

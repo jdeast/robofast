@@ -15,8 +15,8 @@ calibration"), then one light frame near the zenith, plate-solved
 (docs/sky.md). It prints where the frame points and exits 0 once it is
 solved; 1 if robofast could not get there, saying why.
 
-The site is the telescope's own (``SiteLatitude``, ``SiteLongitude``,
-``SiteElevation``; a GPS mount fills them), or ``--site LAT,LON[,ELEV]``,
+The site is the telescope's own (``SiteLatitude``, ``SiteLongitude``; a GPS
+mount fills them; its elevation is not read: 0 m), or ``--site LAT,LON[,ELEV]``,
 which is used instead. The telescope's site is shown and asked about (a
 mount with no GPS may report its factory site, another continent: points
 laid for it can be below the real horizon); a telescope that cannot
@@ -192,16 +192,14 @@ def _one_telescope(devices: list[discover.Device]) -> discover.Device:
 
 
 def telescope_site(telescope: discover.Device) -> tuple[float, float, float]:
-    """(lat, lon, elev) as the telescope reports them (``SiteLatitude``,
-    ``SiteLongitude``; ``SiteElevation`` 0 m if it has none, as for
-    ``--site LAT,LON``). :class:`robofast.discover.OpticsUnavailable` naming
+    """(lat, lon, 0.0): the telescope's ``SiteLatitude`` and ``SiteLongitude``;
+    its elevation is not read (0 m, as for ``--site LAT,LON``: a site's
+    elevation barely changes the calibration, and a mount without it would
+    need a second way). :class:`robofast.discover.OpticsUnavailable` naming
     the member it cannot report; :class:`FirstLightError` for a site out of
-    range."""
+    range or never set."""
     lat, lon = discover.read_members(telescope, ["SiteLatitude", "SiteLongitude"])
-    try:
-        (elev,) = discover.read_members(telescope, ["SiteElevation"])
-    except discover.OpticsUnavailable:
-        elev = 0.0
+    elev = 0.0
     what = f"Telescope {telescope.spec} ({telescope.name})"
     try:
         site = _checked(float(lat), float(lon), float(elev))
@@ -616,7 +614,10 @@ def main(argv: list[str] | None = None) -> None:
     try:
         if site is None:
             site = telescope_site(_one_telescope(devices))
-            whose = "the telescope's (--site to change it)"
+            whose = (
+                "the telescope's (--site to change it); the elevation is not read from"
+                " it: 0 m unless --site gives one"
+            )
         else:
             whose = "--site"
     except (FirstLightError, discover.OpticsUnavailable) as exc:

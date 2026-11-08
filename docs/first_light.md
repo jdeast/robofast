@@ -170,7 +170,13 @@ before anything moves.
   listed star up then that is fainter by the magnitudes the exposure is
   short (2.5 log10 of the camera's shortest over what focus needs); a
   camera that
-  refuses an exposure stops it at once, in the camera's words.
+  refuses an exposure stops it at once, in the camera's words, as any
+  device that fails inside the focus step does (the focuser, the mount),
+  and the telescope is parked as at any other stop. A known cost: when
+  the exposure is held at the camera's minimum, a planet that clips there
+  stops shrinking above the size the autofocus takes over at, and the
+  approach spends its eight donut frames before handing over; the focus
+  is found all the same, a few frames later.
 * **The end of the travel.** If the disk still shrinks at an end of the
   focuser's travel, the focus is beyond it: first light says which end,
   and to add (or remove) a spacer or extension.

@@ -908,3 +908,46 @@ def test_focus_on_a_named_star(held_device, tmp_path, capsys):
     plan = json.loads((tmp_path / "run" / "observatory.json").read_text())["plan"]
     assert next(t for t in plan["targets"] if t["name"] == "first-focus")["object"] == name
     assert json.loads(out.strip().splitlines()[-1])["first_light"]["solve"]["solved"]
+
+
+# -- a device that fails inside the focus step -----------------------------------------
+
+
+def _failing(device, name, member, after, words):
+    from robofast.testing.fakes import FakeDeviceError
+
+    cls, calls = type(device), [0]
+
+    def failing(self, *args):
+        calls[0] += 1
+        if calls[0] > after:
+            raise FakeDeviceError(words)
+        return getattr(cls, member)(self, *args)
+
+    device.__class__ = type(name, (cls,), {member: failing})
+
+
+@pytest.mark.parametrize("held_device", [True], indirect=True)
+def test_a_focuser_that_fails_a_move_stops_first_light_in_its_words(held_device, tmp_path, capsys):
+    d = held_device
+    _failing(d.focuser, "Failing", "Move", 2, "InvalidOperation: focuser did not respond")
+    with pytest.raises(SystemExit) as exc:
+        main(_args(d, tmp_path, "--no-enclosure", "--yes", "--timeout", "60"))
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and "the focuser" in err and "did not respond" in err, err
+    assert "not done after" not in err, err
+    assert d.mount.AtPark  # left as every stop leaves it
+
+
+@pytest.mark.parametrize("held_device", [True], indirect=True)
+def test_a_slew_that_fails_in_the_focus_step_stops_first_light_in_its_words(
+    held_device, tmp_path, capsys
+):
+    d = held_device
+    # The sequencer's own slew to the target first; then the focus step's to the sky beside it.
+    _failing(d.mount, "Failing", "SlewToCoordinatesAsync", 1, "InvalidOperation: axis fault")
+    with pytest.raises(SystemExit) as exc:
+        main(_args(d, tmp_path, "--no-enclosure", "--yes", "--timeout", "60"))
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and "the mount" in err and "axis fault" in err, err
+    assert d.mount.AtPark

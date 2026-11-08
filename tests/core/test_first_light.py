@@ -757,3 +757,60 @@ def test_a_telescope_clock_half_a_minute_off_runs(tmp_path, capsys):
     finally:
         d.stop()
     assert '"first_light"' in capsys.readouterr().out
+
+
+def test_the_setup_reads_connect_each_device_once(tmp_path):
+    """Before anything moves, first light reads the site, the clock, the
+    optics and the chip in one connected session: each device is connected
+    once (and once more by the sequencer), not once a read."""
+    from datetime import UTC, datetime
+
+    from robofast.first_light import _lst_hours
+
+    lat, lon = (float(v) for v in SITE.split(","))
+
+    class Counting:
+        def _init_count(self):
+            self.sets: list[bool] = []
+            self._connected = False  # at power-on: not connected
+
+        @property
+        def Connected(self):  # type: ignore[override]
+            return self._connected
+
+        @Connected.setter
+        def Connected(self, v):
+            self.sets.append(bool(v))
+            self._connected = bool(v)
+
+    class Tel(Counting, FakeTelescope):
+        def __init__(self):
+            self._init_count()
+            FakeTelescope.__init__(self)
+            self._init_count()  # what the fake's own set-up did is not counted
+            self.FocalLength = 0.5
+            self.SiteLatitude, self.SiteLongitude = lat, lon
+
+        @property
+        def SiderealTime(self):  # type: ignore[override]
+            return _lst_hours((lat, lon, 0.0), datetime.now(UTC))
+
+    class Cam(Counting, FakeCamera):
+        def __init__(self):
+            self._init_count()
+            FakeCamera.__init__(self)
+            self._init_count()  # what the fake's own set-up did is not counted
+            self.PixelSizeX = self.PixelSizeY = 9.0
+
+    tel, cam = Tel(), Cam()
+    server = FakeAlpacaServer({"telescope": tel, "camera": cam}).start()
+    try:
+        with pytest.raises(SystemExit):
+            main(["--no-enclosure", "--yes", "--server", server.address,
+                  "--dir", str(tmp_path / "run"), "--timeout", "5",
+                  "--plugin", "robofast.testing.sky_device:register", "--catalog", "synthetic",
+                  "--catalog-dir", str(tmp_path / "sky")])  # fmt: skip
+    finally:
+        server.stop()
+    for d in (tel, cam):
+        assert d.sets.count(True) <= 2 and d.sets.count(False) <= 1, (type(d).__name__, d.sets)

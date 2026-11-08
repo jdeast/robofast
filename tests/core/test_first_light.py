@@ -106,12 +106,13 @@ def test_what_is_never_guessed_must_be_said(device, tmp_path, capsys, extra, mes
     assert exc.value.code == 2 and message in capsys.readouterr().err
 
 
-def test_the_site_is_required(device, tmp_path, capsys):
+def test_a_site_given_out_of_range_is_refused(device, tmp_path, capsys):
     args = _args(device, tmp_path, "--no-enclosure", "--yes")
-    i = args.index("--site")
+    args[args.index("--site") + 1] = "95,-71.13"
     with pytest.raises(SystemExit) as exc:
-        main(args[:i] + args[i + 2 :])
-    assert exc.value.code == 2 and "--site" in capsys.readouterr().err
+        main(args)
+    err = capsys.readouterr().err
+    assert exc.value.code == 2 and "--site: 95,-71.13: latitude -90..90" in err, err
 
 
 def test_an_existing_config_is_not_overwritten(device, tmp_path, capsys):
@@ -491,3 +492,44 @@ def test_a_mount_that_never_parks_is_named_in_the_last_line(tmp_path, capsys):
     last = [ln for ln in capsys.readouterr().err.splitlines() if ln.startswith("first light")]
     assert exc.value.code == 1 and cam.exposures_started == 0
     assert "telescope not parked" in last[-1], last
+
+
+def _without_site(args):
+    i = args.index("--site")
+    return args[:i] + args[i + 2 :]
+
+
+def test_the_site_comes_from_the_telescope(device, tmp_path, capsys):
+    main(_without_site(_args(device, tmp_path, "--no-enclosure", "--yes")))
+    out = capsys.readouterr().out
+    assert '"first_light"' in out
+    site = json.loads((tmp_path / "run" / "observatory.json").read_text())["site"]
+    assert site == {"latitude": 42.38, "longitude": -71.13, "elevation": 0.0}
+    assert "site 42.38000, -71.13000, 0 m: the telescope's (--site to change it)" in out, out
+
+
+def test_a_telescope_that_cannot_report_its_site_stops_naming_site(tmp_path, capsys):
+    tel, cam = FakeTelescope(), FakeCamera()  # SiteLatitude only: no SiteLongitude
+    tel.FocalLength = 0.5
+    cam.PixelSizeX = cam.PixelSizeY = 9.0
+    server = FakeAlpacaServer({"telescope": tel, "camera": cam}).start()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main(["--no-enclosure", "--yes", "--server", server.address,
+                  "--dir", str(tmp_path / "run")])  # fmt: skip
+    finally:
+        server.stop()
+    err = capsys.readouterr().err
+    lines = [ln for ln in err.splitlines() if ln.startswith("first light")]
+    assert exc.value.code == 1 and len(lines) == 1, err
+    assert "SiteLongitude" in lines[0] and "--site" in lines[0], lines
+    assert not (tmp_path / "run" / "observatory.json").exists()
+    assert cam.exposures_started == 0
+
+
+def test_the_site_given_is_used_over_the_telescopes(device, tmp_path, capsys):
+    args = _args(device, tmp_path, "--no-enclosure", "--yes")
+    args[args.index("--site") + 1] = "40.0,-70.0,100"
+    main(args)
+    site = json.loads((tmp_path / "run" / "observatory.json").read_text())["site"]
+    assert site == {"latitude": 40.0, "longitude": -70.0, "elevation": 100.0}

@@ -3,7 +3,7 @@
 ::
 
     pip install .          # the repository or a wheel built from it (not on PyPI yet)
-    python -m robofast --site 42.38,-71.13 --no-enclosure      # or: robofast ...
+    python -m robofast --no-enclosure      # or: robofast ...
 
 One command, for a classroom or a first night: it finds the telescope and
 camera (Alpaca discovery, :mod:`robofast.discover`), reads their plate
@@ -15,10 +15,15 @@ calibration"), then one light frame near the zenith, plate-solved
 (docs/sky.md). It prints where the frame points and exits 0 once it is
 solved; 1 if robofast could not get there, saying why.
 
+The site is the telescope's own (``SiteLatitude``, ``SiteLongitude``,
+``SiteElevation``; a GPS mount fills them), or ``--site LAT,LON[,ELEV]``,
+which is used instead; a telescope that cannot report its site and no
+``--site`` stops before anything moves. The pointing run lays its points
+in altitude from it; a site hundreds of km off still calibrates
+(docs/first_light.md, "The site").
+
 What it never reads or guesses, and so asks for in words:
 
-* ``--site LAT,LON[,ELEV]``: the pointing run lays its points in altitude
-  from it (a mount's own site setting is often wrong);
 * the enclosure: ``--no-enclosure`` (a telescope on a tripod: the operator
   on duty judges the weather; robofast.safety, "No enclosure"), or
   ``--dome HOST:PORT/N --safety-monitor HOST:PORT/N``.
@@ -109,12 +114,7 @@ def first_light_config(
     :func:`robofast.discover.starter_config` (with the optics read from the
     devices), and what the operator said (``site``; ``enclosure`` None: no
     enclosure, else ``{"dome": spec, "safetymonitor": spec}``)."""
-    found = [d for d in devices if d.type == "Telescope"]
-    if len(found) != 1:  # before anything is read from, or connected on, any of them
-        raise FirstLightError(
-            f"first light runs one telescope; {len(found)} answered"
-            f" ({', '.join(d.spec for d in found) or 'none'})"
-        )
+    _one_telescope(devices)  # before anything is read from, or connected on, any of them
     config = discover.starter_config(devices, name, optics=True)
     scopes = config["telescopes"]
     (tel,) = scopes
@@ -163,6 +163,34 @@ def first_light_config(
         ],
     }
     return config
+
+
+def _one_telescope(devices: list[discover.Device]) -> discover.Device:
+    found = [d for d in devices if d.type == "Telescope"]
+    if len(found) != 1:
+        raise FirstLightError(
+            f"first light runs one telescope; {len(found)} answered"
+            f" ({', '.join(d.spec for d in found) or 'none'})"
+        )
+    return found[0]
+
+
+def telescope_site(telescope: discover.Device) -> tuple[float, float, float]:
+    """(lat, lon, elev) as the telescope reports them (``SiteLatitude``,
+    ``SiteLongitude``; ``SiteElevation`` 0 m if it has none, as for
+    ``--site LAT,LON``). :class:`robofast.discover.OpticsUnavailable` naming
+    the member it cannot report; :class:`FirstLightError` for a site out of
+    range."""
+    lat, lon = discover.read_members(telescope, ["SiteLatitude", "SiteLongitude"])
+    try:
+        (elev,) = discover.read_members(telescope, ["SiteElevation"])
+    except discover.OpticsUnavailable:
+        elev = 0.0
+    what = f"Telescope {telescope.spec} ({telescope.name})"
+    try:
+        return _checked(float(lat), float(lon), float(elev))
+    except (TypeError, ValueError) as exc:
+        raise FirstLightError(f"{what} reports its site as {lat!r}, {lon!r}: {exc}") from exc
 
 
 def _zenith(config: dict[str, Any], lst_hours: float) -> None:
@@ -277,10 +305,16 @@ def _site(text: str) -> tuple[float, float, float]:
     parts = [float(v) for v in text.split(",")]
     if len(parts) not in (2, 3):
         raise ValueError("--site: LAT,LON or LAT,LON,ELEV (deg north, deg east, m)")
-    lat, lon = parts[0], parts[1]
+    try:
+        return _checked(parts[0], parts[1], parts[2] if len(parts) == 3 else 0.0)
+    except ValueError as exc:
+        raise ValueError(f"--site: {text}: {exc}") from None
+
+
+def _checked(lat: float, lon: float, elev: float) -> tuple[float, float, float]:
     if not (-90 <= lat <= 90 and -180 <= lon <= 360):
-        raise ValueError(f"--site: {text}: latitude -90..90, longitude -180..360")
-    return lat, lon, parts[2] if len(parts) == 3 else 0.0
+        raise ValueError("latitude -90..90, longitude -180..360")
+    return lat, lon, elev
 
 
 def _first_light_frame(data_root: Path, tel: str) -> dict[str, Any] | None:
@@ -456,7 +490,10 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(
         prog="robofast", description=__doc__.split("\n\n")[0], epilog="docs/first_light.md"
     )
-    ap.add_argument("--site", required=True, help="LAT,LON[,ELEV]: deg north, deg east, m")
+    ap.add_argument(
+        "--site",
+        help="LAT,LON[,ELEV]: deg north, deg east, m (default: the telescope's own site)",
+    )
     enc = ap.add_mutually_exclusive_group(required=True)
     enc.add_argument(
         "--no-enclosure",
@@ -480,10 +517,12 @@ def main(argv: list[str] | None = None) -> None:
     args = ap.parse_args(argv)
     started = time.monotonic()  # --timeout counts from here
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(message)s")
-    try:
-        site = _site(args.site)
-    except ValueError as exc:
-        ap.error(str(exc))
+    site = None
+    if args.site:
+        try:
+            site = _site(args.site)
+        except ValueError as exc:
+            ap.error(str(exc))
     if args.dome and not args.safety_monitor:
         ap.error("--dome needs --safety-monitor (the enclosure's weather verdict)")
     enclosure = (
@@ -511,6 +550,16 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
     for d in devices:
         print(f"found {d.type:<20} {d.spec:<24} {d.name}")
+    try:
+        if site is None:
+            site = telescope_site(_one_telescope(devices))
+            whose = "the telescope's (--site to change it)"
+        else:
+            whose = "--site"
+    except (FirstLightError, discover.OpticsUnavailable) as exc:
+        print(f"first light: {exc}; give the site with --site LAT,LON", file=sys.stderr)
+        sys.exit(1)
+    print(f"site {site[0]:.5f}, {site[1]:.5f}, {site[2]:g} m: {whose}")
     catalog: dict[str, Any] = {"source": args.catalog}
     if args.catalog_dir:
         catalog["cache_dir"] = str(Path(args.catalog_dir).resolve())
@@ -537,8 +586,8 @@ def main(argv: list[str] | None = None) -> None:
             print("first light: not started", file=sys.stderr)
             sys.exit(1)
         started = time.monotonic()  # the time taken to answer is not counted
-    # The zenith now, from the site given and this computer's clock (the
-    # mount's own site and clock are not read: docs/first_light.md).
+    # The zenith now, from the site and this computer's clock (the mount's
+    # clock is not read: docs/first_light.md).
     planned = datetime.now(UTC)
     _zenith(config, _lst_hours(site, planned))
     workdir.mkdir(parents=True, exist_ok=True)

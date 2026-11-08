@@ -298,9 +298,15 @@ def test_a_planet_too_bright_for_the_shortest_exposure_says_so():
     img = render([Star(128.0, 128.0, 3e9)], opt, Detector(shape=(256, 256)), seeing=2.0,
                  exposure=1.0).image  # fmt: skip
     a = Approach(0.0, 0.01, [], exptime=0.1, donut=8.0)
-    with pytest.raises(FocusError, match="shortest exposure") as exc:
+    from robofast.first_focus import TooBright, too_bright_line
+
+    with pytest.raises(TooBright, match="shortest exposure") as exc:
         sweep_settings(img, 1.0, a, fwhm_px=2.0, saturation=60000.0, exposure_min=0.1)
-    assert "by hand" in str(exc.value)
+    # The stop says what to run next, naming a fainter star up now.
+    line = too_bright_line(exc.value, {"mag": -2.5, "stars_up": [["Vega", 0.03], ["Mirfak", 1.79]]})
+    # 0.1 s / 0.0063 s is 3.0 mag: fainter than -2.5 + 3.0 = +0.5, so Mirfak, not Vega.
+    assert "--focus-on Mirfak" in line, line
+    assert "--focus-on NAME" in too_bright_line(exc.value, {"mag": -2.5, "stars_up": []})
 
 
 async def test_a_camera_error_in_the_focus_step_stops_it_in_the_cameras_words():
@@ -339,3 +345,30 @@ async def test_a_camera_error_in_the_focus_step_stops_it_in_the_cameras_words():
     with pytest.raises(ObservationFailed, match=r"ExposureMin 0\.1"):
         await run_first_focus(r)
     assert [k for k, _ in events] == ["first_focus_failed"], events
+
+
+def test_a_target_is_chosen_by_name_and_refused_if_unknown_or_low():
+    from datetime import UTC, datetime
+
+    from robofast.first_focus import bright_target, targets_up
+
+    site, when = (42.38, -71.13, 0.0), datetime(2026, 11, 7, 3, 0, 0, tzinfo=UTC)
+    up = targets_up(site, when)
+    assert up and bright_target(site, when).name == up[0].name
+    other = up[-1]
+    assert bright_target(site, when, other.name.lower()).name == other.name
+    with pytest.raises(FocusError, match=r"Nostar.*not one first light knows"):
+        bright_target(site, when, "Nostar")
+    with pytest.raises(FocusError, match=r"Canopus.*below"):
+        bright_target(site, when, "Canopus")
+
+
+def test_a_too_bright_target_names_a_fainter_star_by_its_rule():
+    """The brightest listed star up now at least as many magnitudes fainter
+    as the exposure is short: 2.5 log10(minimum / needed)."""
+    from robofast.first_focus import fainter_star
+
+    up = [("Vega", 0.03), ("Deneb", 1.25), ("Mirfak", 1.79)]
+    # Jupiter (-2.5) needs 0.01 s on a camera whose shortest is 0.1 s: 2.5 mag fainter.
+    assert fainter_star(up, -2.5, need=0.01, shortest=0.1) == ("Vega", 0.03)
+    assert fainter_star(up, -2.5, need=0.001, shortest=0.1) is None  # 5 mag: none listed

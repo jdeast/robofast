@@ -242,9 +242,13 @@ def _focus_reads(
     mount = by["Telescope", scope["telescope"]]
     (focal,) = discover.read_members(mount, ["FocalLength"])
     aperture, area = _optional(mount, "ApertureDiameter"), _optional(mount, "ApertureArea")
-    (full,) = discover.read_members(by["Camera", scope["camera"]], ["MaxADU"])
+    camera = by["Camera", scope["camera"]]
+    (full,) = discover.read_members(camera, ["MaxADU"])
     said: list[str] = []
     reads = {"focal": focal, "aperture": aperture, "area": area, "full": full}
+    # The camera's exposure limits (optional): never asked outside them.
+    reads["emin"] = _optional(camera, "ExposureMin")
+    reads["emax"] = _optional(camera, "ExposureMax")
     reads["f_ratio"], reads["said"] = f_ratio, said
     if "focuser" in scope:
         focuser = by["Focuser", scope["focuser"]]
@@ -272,6 +276,13 @@ def _focus_reads(
             " obstruction assumed"
         )
     return reads
+
+
+def _within(t: float, reads: dict[str, Any]) -> float:
+    """``t`` s within the camera's ExposureMin and ExposureMax, where reported."""
+    lo, hi = reads.get("emin"), reads.get("emax")
+    t = max(t, float(lo)) if isinstance(lo, (int, float)) and lo > 0 else t
+    return min(t, float(hi)) if isinstance(hi, (int, float)) and hi > 0 else t
 
 
 def _optional(d: discover.Device, member: str) -> Any:
@@ -326,8 +337,9 @@ def _focus_step(
         "obstruction": round(obstruction, 3),
         "fwhm_px": 2.5 / optics["plate_scale"],
         "saturation": float(full),
-        "exptime": 0.01,
-        "sweep_exptime": 1.0,
+        "exptime": _within(0.01, reads),
+        "sweep_exptime": _within(1.0, reads),
+        "exposure_min": float(reads.get("emin") or 0.0),
     }
     if "focuser" in scope:
         settings["um_per_step"] = reads.get("step") or 1.0

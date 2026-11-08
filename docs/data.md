@@ -166,6 +166,7 @@ name the snapshot that a value comes from.
 | `EGAIN`, `MAXADU` | camera | [e-/ADU], [ADU] |
 | `CCD-TEMP`, `SET-TEMP` | camera, end | [C] |
 | `COOLERON`, `COOLPOW` | camera, end | cooler state, [%] power |
+| `COOLOK` | sequencer, start | a cooled camera's CCD within tolerance of its setpoint before the exposure (docs/cooling.md) |
 | `GAIN`, `OFFSET` | camera, end | gain and offset settings (left out if the camera has none) |
 | `XBINNING`, `YBINNING` | camera, end | binning |
 | `XORGSUBF`, `YORGSUBF` | camera, end | [px] subframe origin |

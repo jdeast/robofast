@@ -11,7 +11,12 @@ A :class:`DeviceOwner` is the only path to one physical device. It:
 * refuses "privileged" members (e.g. ``CloseShutter``) to anyone but the one
   privileged grant (the safety supervisor); an entry ``"Action:Name"``
   makes the one Alpaca ``Action("Name", ...)`` privileged;
-* records every command and its outcome in the shared :class:`Timeline`.
+* records every command and its outcome in the shared :class:`Timeline`;
+* runs its ``on_connect`` hook, if it has one, every time it connects the
+  device afresh (the first command, after a timeout discarded the driver,
+  after :meth:`DeviceOwner.reconnect`): what a device must have set again
+  whenever it is (re)connected -- a camera's cooler (robofast/cooling.py)
+  -- is set there, and only there.
 
 Components never hold the device object itself, only a :class:`Grant`.
 Revoking a grant is how a cancelled task is fenced off: any command it still
@@ -36,7 +41,7 @@ import itertools
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from robofast.timeline import Timeline
@@ -50,6 +55,13 @@ class DeviceError(Exception):
 
 class DeviceTimeout(DeviceError):
     """A command did not complete within its timeout."""
+
+
+class Unsupported(DeviceError):
+    """The device (or the telescope) cannot do what was asked: an
+    observation's filter or M3 port, a camera that cannot set its CCD
+    temperature. The caller handles it (one path per feature: a device that
+    cannot do it says so, nothing works around it)."""
 
 
 class GrantRevoked(Exception):
@@ -154,8 +166,14 @@ class DeviceOwner:
         *,
         default_timeout: float = 5.0,
         privileged_members: frozenset[str] | set[str] = frozenset(),
+        on_connect: Callable[[Any, float], Awaitable[None]] | None = None,
     ) -> None:
         self.name = name
+        #: ``await on_connect(driver, timeout)`` after every fresh connection
+        #: (module doc), before the command that made it: bounded by
+        #: ``timeout`` on its own (it does not eat into the command's), and
+        #: its failure is logged and recorded, never the command's.
+        self.on_connect = on_connect
         self.timeline = timeline
         self.default_timeout = default_timeout
         self.privileged_members = frozenset(privileged_members)
@@ -167,6 +185,7 @@ class DeviceOwner:
         self._factory = factory
         self._lock = asyncio.Lock()
         self._driver: Any = None
+        self._fresh = False
         self._generation = 0
         self._inflight: asyncio.Task | None = None
         self._privileged_grant: Grant | None = None
@@ -193,6 +212,11 @@ class DeviceOwner:
 
     # -- execution --------------------------------------------------------
 
+    @property
+    def connected(self) -> bool:
+        """It holds a connected driver (the next command does not connect)."""
+        return self._driver is not None
+
     def reconnect(self, why: str) -> None:
         """Drop the device's client; the next command connects afresh (the
         recovery ladder's first rung, robofast/recovery.py)."""
@@ -216,14 +240,38 @@ class DeviceOwner:
                     _close_later(driver)
                     raise
             self._driver = driver
+            self._fresh = True
         return self._driver
+
+    async def _connected(self, driver: Any, timeout: float) -> None:
+        """Run ``on_connect`` on a freshly connected driver (bounded; never raises)."""
+        hook = self.on_connect
+        if hook is None:
+            return
+        try:
+            async with asyncio.timeout(timeout):
+                await hook(driver, timeout)
+        except Exception as exc:
+            why = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            log.warning("%s: on-connect hook failed: %s", self.name, why)
+            self.timeline.event(
+                self.name, "on_connect_failed", generation=self._generation, error=why[:300]
+            )
 
     async def _send(self, grant: Grant, op: str, member: str, args: tuple, timeout: float) -> Any:
         """Send one command and record its outcome (runs as its own task)."""
         t_sent = time.monotonic()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         try:
-            async with asyncio.timeout(timeout):
+            async with asyncio.timeout_at(deadline):
                 driver = await self._get_driver(timeout)
+            if self._fresh:
+                self._fresh = False
+                t0 = loop.time()
+                await self._connected(driver, timeout)
+                deadline += loop.time() - t0  # the hook's time is not the command's
+            async with asyncio.timeout_at(deadline):
                 if op == "get":
                     result = await driver.get(member, timeout=timeout)
                 elif op == "set":

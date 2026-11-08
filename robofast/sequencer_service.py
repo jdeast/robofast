@@ -78,6 +78,14 @@ and optionally:
   (:class:`~robofast.recovery.RecoveryLadder`; docs/recovery.md):
   reconnect, restart the vendor software, home a PWI mount (telescope),
   power-cycle its PDU outlet, then give up for the night.
+* per telescope, ``cooling``: keep its camera cooled
+  (:class:`~robofast.cooling.CoolingConfig`; docs/cooling.md):
+  ``{"setpoint": C, "tolerance": C, "settle_timeout": s}`` (``tolerance``
+  default 1, ``settle_timeout`` 900). robofast sets ``SetCCDTemperature``
+  and ``CoolerOn`` whenever it connects or reconnects the camera (startup,
+  every recovery rung), turns a cooler found off back on (an alarm), and
+  lets light frames wait, bounded, for the CCD to settle (``COOLOK`` in
+  the header). Without it robofast leaves the cooler alone.
 * ``images`` -- save every frame (:mod:`robofast.imaging`;
   ``docs/data.md``): ``{"data_root": "/data", "site": "minerva", ...}``
   with :class:`~robofast.imaging.ImagingConfig` fields; a relative
@@ -213,6 +221,7 @@ TELESCOPE_KEYS = {
     "lamps",
     "adc",
     "limits",
+    "cooling",
 }
 
 
@@ -318,6 +327,14 @@ def build_units(
                 recovery = RecoveryLadder.from_config(name, entry["recovery"])
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"telescope {name!r}: {exc}") from exc
+        cooling = None
+        if entry.get("cooling") is not None:
+            from robofast.cooling import CameraCooling, CoolingConfig
+
+            try:
+                cooling = CameraCooling(name, CoolingConfig.from_dict(entry["cooling"]))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"telescope {name!r}: {exc}") from exc
         guider = None
         if "guider" in entry:
             from robofast.guider.service import GuiderRemote
@@ -345,6 +362,7 @@ def build_units(
                 pa_calibration=pa_cal,
                 recovery=recovery,
                 flats=_flats(name, entry.get("sky_flats")),
+                cooling=cooling,
             )
         )
     if not units:

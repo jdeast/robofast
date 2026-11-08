@@ -586,24 +586,25 @@ async def _focus_failed(tl: Timeline) -> str:
     return str(tl.events("first_focus_failed")[-1].detail.get("error"))
 
 
+def _parked_words(parked: bool, waited: float) -> str:
+    """What the mount did, said once the sequencer's cleanup has returned."""
+    if parked:
+        return "the telescope parked"
+    return (
+        f"the telescope did not report parked after the sequencer's cleanup ({waited:.0f} s):"
+        " park it by hand now"
+    )
+
+
 async def _telescope_failed(tl: Timeline) -> str:
     """The sequencer's telescope error (a slew, a device), once it is
-    reported, in the device's words, and whether it parked the telescope
-    (it backs off for minutes then; first light does not wait for it)."""
+    reported, in the device's words (it then parks and backs off for
+    minutes; first light does not wait for the back-off)."""
     from robofast.first_focus import device_words
 
     while not tl.events("telescope_error"):
         await asyncio.sleep(0.5)
-    error = tl.events("telescope_error")[-1]
-    why = device_words(str(error.detail.get("error")))
-    for _ in range(20):  # its cleanup follows within seconds
-        safed = [e for e in tl.events("telescope_safed") if e.t >= error.t]
-        if safed:
-            if safed[-1].detail.get("parked"):
-                return f"{why}; the telescope parked"
-            break
-        await asyncio.sleep(0.5)
-    return f"{why}; the telescope did not report parked: park it by hand now"
+    return device_words(str(tl.events("telescope_error")[-1].detail.get("error")))
 
 
 async def _unsolvable(tl: Timeline) -> None:
@@ -687,6 +688,7 @@ async def run(
     )
     stop = stop or asyncio.Event()
     stopped, parked = False, False
+    failure: str | None = None  # why first light stops, said after the cleanup
     try:
         stop_wait = asyncio.create_task(stop.wait(), name="stop")
         unsolvable = asyncio.create_task(_unsolvable(tl), name="unsolvable")
@@ -701,26 +703,31 @@ async def run(
         unfocused.cancel()
         failed.cancel()
         stopped = stop.is_set()
-        if unfocused in done and not stopped:
-            raise FirstLightError(f"focus: {unfocused.result()}")
-        if failed in done and not stopped:
-            raise FirstLightError(failed.result())
-        if unsolvable in done and not stopped:
-            raise FirstLightError(
+        if stopped:
+            pass
+        elif unfocused in done:
+            failure = f"focus: {unfocused.result()}"
+        elif failed in done:
+            failure = failed.result()
+        elif unsolvable in done:
+            failure = (
                 f"the frames did not solve: {_frames(tl)}; check the plate scale"
                 " (the telescope's FocalLength and the camera's pixel size), the focus,"
                 " and that the sky is clear"
             )
-        if not done:
-            raise FirstLightError(f"not done after {timeout:g} s; {_frames(tl)}; {_waiting(sup)}")
+        elif not done:
+            failure = f"not done after {timeout:g} s; {_frames(tl)}; {_waiting(sup)}"
     except asyncio.CancelledError:
         stopped = True  # Ctrl-C where the loop has no signal handlers (Windows)
     finally:
+        cleanup = time.monotonic()
         if not seq_task.done():
-            seq_task.cancel()  # its cleanup aborts and parks
+            seq_task.cancel()  # its cleanup aborts and parks (it waits for AtPark)
             with contextlib.suppress(BaseException):
                 await seq_task
-        if stopped:
+        waited = time.monotonic() - cleanup
+        # Every stop says what the mount did, read once the cleanup is over.
+        if stopped or failure is not None:
             try:
                 parked = await sup._telescopes_parked()
             except Exception:  # an unreadable mount: not known to be parked
@@ -737,6 +744,8 @@ async def run(
         await server.stop()
     if stopped:
         raise FirstLightStopped(parked, "; ".join(list(sup.alarms)[-2:]))
+    if failure is not None:
+        raise FirstLightError(f"{failure}; {_parked_words(parked, waited)}")
     if closed is False:
         raise FirstLightError(
             f"the enclosure did not read closed within {_close_bound(sup):g} s"

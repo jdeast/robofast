@@ -36,8 +36,8 @@ lines are named; nothing here needs astronomy.
 | `first light: --focus-on NAME: not one first light knows; ...` | the name is not on the list | run again with a name from the list it prints |
 | `first light: --focus-on NAME: at N deg it is below 30 deg now; ...` | that target is too low now | choose one higher, or wait for it to rise |
 | `first light: focus: the camera, asked for a N s exposure: ...` | the camera refused an exposure; its own words follow | check the camera (its driver, its connection); the words say why |
-| `first light: the mount: ...; the telescope parked` (or `the focuser`, `the camera`) | that device failed while first light ran (its own words follow) | check that device (its power, cable, driver); the telescope is parked, run again |
-| `first light: ...; the telescope did not report parked: park it by hand now` | a device failed, and the telescope did not report parked | park it by hand now, then check the device |
+| `first light: the mount: ...; the telescope parked` (or `the focuser`, `the camera`) | that device failed while first light ran (its own words follow) | check that device (its power, cable, driver); the telescope is parked; run again (a new `--dir`, and the focus step again) |
+| `first light: ...; the telescope did not report parked after the sequencer's cleanup (N s): park it by hand now` | first light stopped, and the telescope was not parked when the sequencer's cleanup, which waits for the park, had ended | park it by hand now, then check the mount |
 | `first light: focus: no light at any focus position` | nothing bright reached the camera | check the cover is off and the telescope points at the sky; focus by day on something far away first |
 | `first light: focus: the focus is beyond the focuser's upper end` | the focuser cannot reach focus | add a spacer or extension between the telescope and the camera |
 | `... lower end` | the same, the other way | remove a spacer or extension |

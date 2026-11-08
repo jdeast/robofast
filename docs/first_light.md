@@ -64,8 +64,12 @@ A mount that cannot park gets no lease (the supervisor grants none until
 every telescope reports parked): first light gives up after `--timeout`,
 saying so in the supervisor's words. A telescope that fails while first light runs
 (a slew refused, a device not answering) stops it at once, in the
-device's words, and says whether the sequencer parked it; first light
-does not wait out the sequencer's back-off.
+device's words; first light does not wait out the sequencer's
+back-off. Every stop ends with what the mount did, read once the
+sequencer's cleanup (which waits for the park) is over: "the telescope
+parked", or, only if it had not parked by then, "park it by hand now"
+with the time waited. It is one run that stops: running it again takes a
+new `--dir` and focuses again.
 
 ## The site
 

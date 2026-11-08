@@ -609,7 +609,7 @@ async def _ask(prompt: str) -> str:
 _ROLES = {"focuser": "the focuser", "telescope": "the mount", "camera": "the camera"}
 
 
-def _in_words(exc: Exception) -> str:
+def device_words(exc: Exception | str) -> str:
     """A device's error, its device first in plain words ("the focuser: ...")."""
     import re
 
@@ -794,7 +794,7 @@ async def run_first_focus(r) -> None:
         say(f"focus: done at position {res.focus:.0f} (+-{res.focus_err or 0:.0f} steps)")
         seq._event("first_focus_done", telescope=unit.name, focus=res.focus, method="sweep")
     except DeviceError as exc:  # any device inside the step: stop now, in its words
-        why = _in_words(exc)
+        why = device_words(exc)
         seq._event("first_focus_failed", telescope=unit.name, error=why)
         raise ObservationFailed(f"focus: {why}") from exc
     except TooBright as exc:

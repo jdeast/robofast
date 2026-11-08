@@ -638,3 +638,26 @@ def test_a_download_slower_than_the_sky_is_bounded_and_said(tmp_path, capsys, mo
     passes = out.count("first light: fetching the catalog")
     assert 1 <= passes <= 5, out
     assert "the sky turns faster than the catalog downloads here" in out, out
+
+
+def test_the_telescopes_elevation_is_not_read(tmp_path, capsys):
+    """The site's latitude and longitude are the telescope's; its elevation
+    is not read (a mount without it would need a second way): 0 m unless
+    --site gives one."""
+    tel, cam = FakeTelescope(), FakeCamera()
+    tel.FocalLength = 0.5
+    tel.SiteLatitude, tel.SiteLongitude, tel.SiteElevation = 31.68, -110.88, 2345.0
+    cam.PixelSizeX = cam.PixelSizeY = 9.0
+    server = FakeAlpacaServer({"telescope": tel, "camera": cam}).start()
+    try:
+        with pytest.raises(SystemExit):
+            main(["--no-enclosure", "--yes", "--server", server.address,
+                  "--dir", str(tmp_path / "run"), "--timeout", "3",
+                  "--plugin", "robofast.testing.sky_device:register", "--catalog", "synthetic",
+                  "--catalog-dir", str(tmp_path / "sky")])  # fmt: skip
+    finally:
+        server.stop()
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if ln.startswith("site "))
+    assert line.startswith("site 31.68000, -110.88000, 0 m: the telescope's"), line
+    assert "elevation is not read" in line, line

@@ -157,6 +157,12 @@ is a disk with no edge in the frame, which needs its own measure).
   alone), the sweep is taken at the approach's last unclipped exposure
   times (seeing / star size)^2, on that one star, or every point of it
   would clip.
+* **The camera's exposure limits.** Every focus frame is within the
+  camera's `ExposureMin` and `ExposureMax` (where it reports them): the
+  bright frames start at 0.01 s or its minimum, and are never shortened
+  below it. A target too bright for the shortest exposure stops first
+  light, saying so (focus by hand on a fainter star); a camera that
+  refuses an exposure stops it at once, in the camera's words.
 * **The end of the travel.** If the disk still shrinks at an end of the
   focuser's travel, the focus is beyond it: first light says which end,
   and to add (or remove) a spacer or extension.

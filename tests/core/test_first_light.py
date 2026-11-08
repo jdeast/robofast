@@ -867,3 +867,23 @@ def test_a_focuser_that_moves_by_steps_is_left_alone(held_device, tmp_path, caps
     assert not d.focuser.moves, d.focuser.moves
     assert "moves by steps" in said, said
     assert json.loads(out.out.strip().splitlines()[-1])["first_light"]["solve"]["solved"]
+
+
+@pytest.mark.parametrize("held_device", [True], indirect=True)
+def test_a_camera_with_a_minimum_exposure_is_never_asked_below_it(held_device, tmp_path, capsys):
+    from robofast.testing.fakes import FakeDeviceError
+
+    d, emin, asked = held_device, 0.1, []
+    cls = type(d.camera)
+
+    def start(self, duration, light):
+        asked.append(float(duration))
+        if float(duration) < emin:
+            raise FakeDeviceError(f"InvalidValue: Duration {duration} below ExposureMin {emin}")
+        return cls.StartExposure(self, duration, light)
+
+    d.camera.__class__ = type("MinExposure", (cls,), {"StartExposure": start, "ExposureMin": emin})
+    main(_args(d, tmp_path, "--no-enclosure", "--yes"))
+    out = capsys.readouterr().out
+    assert asked and min(asked) >= emin, sorted(asked)[:5]
+    assert json.loads(out.strip().splitlines()[-1])["first_light"]["solve"]["solved"]

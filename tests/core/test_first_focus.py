@@ -31,7 +31,11 @@ def _scene(off_px: float = 0.0, true: float = TRUE, faint: bool = True) -> Focus
 
 def _dark(sc: FocusScene) -> Level:
     empty = dataclasses.replace(sc, stars=[])
-    return Level.of(empty.render(sc.true_focus, T, (0, 0, 512, 512), 1))
+
+    def frame(t: float) -> np.ndarray:
+        return empty.render(sc.true_focus, t, (0, 0, 512, 512), 1)
+
+    return Level.of(frame(T), frame(T / 4), T)
 
 
 async def _approach(sc: FocusScene, start: float, limits=(0.0, 120000.0)):
@@ -136,3 +140,59 @@ async def test_the_walk_through_brings_a_person_to_focus():
     )  # fmt: skip
     assert "stop here" in lines[-1], lines[-3:]
     assert abs(state["x"] - TRUE) < tolerance(2.0), state["x"] - TRUE
+
+
+def test_a_shortened_frame_is_compared_with_the_dark_at_its_own_exposure():
+    """The camera's bias does not shrink with the exposure; the sky does. A
+    frame shortened 16x (a bright star near focus) still reads its light, at
+    the first exposure's scale, not the bias it lost times 16."""
+    rng = np.random.default_rng(1)
+    t0, bias, sky, light = 1.0, 1000.0, 50.0, 500.0
+
+    def frame(t: float, lit: bool) -> np.ndarray:
+        mean = bias + (sky + (light if lit else 0.0)) * t / t0
+        return mean + rng.normal(0.0, 5.0, (256, 256))
+
+    dark = Level.of(frame(t0, False), frame(t0 / 4, False), t0)
+    full, short = dark.sigma(frame(t0, True), t0), dark.sigma(frame(t0 / 16, True), t0 / 16)
+    assert full > 0 and short > 0, (full, short)
+    assert abs(short - full) < 0.05 * full, (full, short)
+
+
+async def test_a_hot_pixel_does_not_shorten_the_exposure():
+    """A pixel at full scale that a shorter exposure does not change (a hot
+    pixel) is not the star's light: the exposure stays, and focus is found."""
+    sc = _scene(faint=False)
+    pos = [TRUE + 20000.0]
+
+    async def expose(t: float) -> np.ndarray:
+        img = sc.render(pos[0], t, (0, 0, 512, 512), 1)
+        img[10, 10] = 65535.0
+        return img
+
+    async def move(x: float) -> None:
+        pos[0] = x
+
+    lines: list[str] = []
+    a = await approach(
+        expose, move, start=pos[0], limits=(0.0, 120000.0), dark=_dark(sc), fwhm_px=2.0,
+        step=2000.0, exptime=T, saturation=65535.0, say=lines.append,
+    )  # fmt: skip
+    # Far out only the hot pixel clips: the exposure stays. (Near focus the
+    # star itself clips, and is rightly taken shorter.)
+    far = [ln for ln in lines if (m := re.search(r"donut ([-0-9.]+)", ln)) and
+           (m.group(1) == "-" or float(m.group(1)) > 50.0)]  # fmt: skip
+    assert far and all(f" in {T:g} s" in ln for ln in far), lines
+    assert abs(a.position - TRUE) < 2000, (a.position - TRUE, lines)
+
+
+async def test_every_focus_line_reads_in_plain_words():
+    """Each line says how bright, as a multiple of the sky (or of the noise,
+    where the sky does not show), never a standard error or a power of ten."""
+    _, lines = await _approach(_scene(faint=False), TRUE + 40000.0)
+    steps = [ln for ln in lines if ln.startswith("focus: ") and " position " in ln]
+    assert steps, lines
+    words = ("times the sky", "times the noise", "light on the chip", "no light above")
+    for ln in steps:
+        assert "sigma" not in ln and "e+" not in ln and " -" not in ln.split("donut")[0], ln
+        assert any(w in ln for w in words), ln

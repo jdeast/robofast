@@ -54,19 +54,40 @@ FULL = 0.9
 
 class _Exposure:
     """Frames that do not saturate: the exposure shortened as the light
-    gathers; levels scaled to the first exposure's, so steps compare."""
+    gathers (while that clips fewer pixels); levels at the first exposure's
+    scale, so steps compare."""
 
     def __init__(self, expose, exptime: float, saturation: float, dark: Level) -> None:
         self.expose, self.t0, self.t = expose, exptime, exptime
         self.saturation, self.dark = saturation, dark
 
     async def frame(self) -> tuple[np.ndarray, float]:
+        img = np.asarray(await self.expose(self.t))
+        clipped = int(np.count_nonzero(img >= FULL * self.saturation))
         for _ in range(8):
-            img = np.asarray(await self.expose(self.t))
-            if float(img.max()) < FULL * self.saturation:
+            if not clipped:
                 break
-            self.t /= 4.0
-        return img, self.dark.sigma(img) * (self.t0 / self.t)
+            short = np.asarray(await self.expose(self.t / 4.0))
+            n = int(np.count_nonzero(short >= FULL * self.saturation))
+            if n >= clipped:
+                # A shorter exposure clips as many pixels: they are not the
+                # light it gathers (a hot pixel); keep this exposure.
+                break
+            img, clipped, self.t = short, n, self.t / 4.0
+        return img, self.dark.sigma(img, self.t)
+
+    def shown(self, img: np.ndarray, star: _Sizes) -> tuple[float | None, float, str]:
+        """What a line shows: (how bright, as a multiple of what; the
+        exposure, s; of what: "the sky around it" or "the noise around it",
+        a measured star's brightest pixel in the same frame, over the sky
+        if the sky shows above the frame's noise; else "the sky beside it",
+        the frame's light over the sky beside the target)."""
+        if star.above is not None and star.sky is not None:
+            sky, noise = star.sky - self.dark.bias, star.noise or 0.0
+            if sky > noise:
+                return star.above / sky, self.t, "the sky around it"
+            return star.above / max(noise, 1e-9), self.t, "the noise around it"
+        return self.dark.times(img, self.t), self.t, "the sky beside it"
 
 
 def _rises(now: Step, before: Step) -> bool:
@@ -79,19 +100,40 @@ class FocusError(RuntimeError):
 
 @dataclass
 class Level:
-    """A dark frame's level: its mean (ADU) and the standard error of a
-    frame's mean (ADU)."""
+    """The reference's level: its mean at the first exposure (ADU), the
+    standard error of a frame's mean (ADU), and the part of the mean a
+    shorter exposure keeps (the camera's bias, ADU), from a second frame at
+    a quarter of the exposure."""
 
     mean: float
     err: float
+    bias: float
+    exptime: float
 
     @classmethod
-    def of(cls, dark: np.ndarray) -> Level:
+    def of(cls, dark: np.ndarray, quarter: np.ndarray, exptime: float) -> Level:
+        """From ``dark`` (``exptime`` s) and ``quarter`` (``exptime / 4`` s)."""
         d = np.asarray(dark, dtype=float)
-        return cls(float(d.mean()), max(float(d.std()) / math.sqrt(d.size), 1e-9))
+        m, mq = float(d.mean()), float(np.asarray(quarter, dtype=float).mean())
+        err = max(float(d.std()) / math.sqrt(d.size), 1e-9)
+        return cls(m, err, (4.0 * mq - m) / 3.0, exptime)
 
-    def sigma(self, image: np.ndarray) -> float:
-        return (float(np.asarray(image, dtype=float).mean()) - self.mean) / self.err
+    def times(self, image: np.ndarray, t: float) -> float | None:
+        """``image``'s (``t`` s) light above the bias and the sky, as a
+        multiple of the sky beside the target at ``t``; None if that sky
+        is within its own error (a multiple of it would be noise)."""
+        sky = (self.mean - self.bias) * t / self.exptime
+        if sky <= LIGHT_SIGMA * self.err:
+            return None
+        mean = float(np.asarray(image, dtype=float).mean())
+        return (mean - self.bias - sky) / sky
+
+    def sigma(self, image: np.ndarray, t: float) -> float:
+        """``image``'s (``t`` s) level over the reference at ``t``, in
+        standard errors at the first exposure's scale."""
+        at_t = self.bias + (self.mean - self.bias) * t / self.exptime
+        mean = float(np.asarray(image, dtype=float).mean())
+        return (mean - at_t) / self.err * (self.exptime / t)
 
 
 @dataclass
@@ -100,13 +142,36 @@ class Step:
 
     stage: str
     position: float
+    #: The frame's level over the reference (standard errors at the first
+    #: exposure's scale): compared between frames, never printed (its
+    #: reference is a field 2 deg away).
     level: float
     donut: float | None = None
     note: str = ""
+    #: What the line shows (:meth:`_Exposure.shown`): how bright, as a
+    #: multiple of the sky, the exposure (s), and whether of a measured star.
+    times: float | None = None
+    exptime: float = 0.0
+    of: str = "the sky beside it"
+
+    @property
+    def lit(self) -> bool:
+        """Light on the chip: the level above the reference's noise, or a
+        star measured."""
+        return self.level >= LIGHT_SIGMA or self.donut is not None
 
     def line(self) -> str:
         d = "-" if self.donut is None else f"{self.donut:.1f}"
-        out = f"focus: {self.stage:<6} position {self.position:.0f}  level {self.level:.1f} sigma"
+        out = f"focus: {self.stage:<6} position {self.position:.0f}"
+        t = self.times
+        n = "" if t is None else f"{t:,.0f}" if abs(t) >= 100 else f"{t:.2g}"
+        if self.of != "the sky beside it":
+            out += f"  star {n} times {self.of}"
+        elif self.lit:
+            out += f"  light {n} times {self.of}" if n else "  light on the chip"
+        else:
+            out += "  no light above the sky beside it"
+        out += f"  in {self.exptime:g} s"
         return out + f"  donut {d} px" + (f"  {self.note}" if self.note else "")
 
 
@@ -120,9 +185,21 @@ class Approach:
     steps: list[Step] = field(default_factory=list)
 
 
-def _sizes(image: np.ndarray, fwhm_px: float) -> tuple[float | None, float | None]:
-    """(donut diameter, HFD), px, of the brightest star whole on the chip
-    (fainter stars' rings in the same field are not it); None if none."""
+@dataclass
+class _Sizes:
+    """The brightest star whole on the chip (fainter stars' rings in the
+    same field are not it): its donut diameter and HFD (px), its brightest
+    pixel above the sky around it, that sky and the frame's noise (ADU);
+    None if none."""
+
+    donut: float | None = None
+    hfd: float | None = None
+    above: float | None = None
+    sky: float | None = None
+    noise: float | None = None
+
+
+def _sizes(image: np.ndarray, fwhm_px: float) -> _Sizes:
     smooth = max(1.0, fwhm_px / 2.0)
     try:
         m = measure(
@@ -130,17 +207,18 @@ def _sizes(image: np.ndarray, fwhm_px: float) -> tuple[float | None, float | Non
             MeasureConfig(smooth=smooth, min_snr=10.0, max_ellipticity=0.5, background_box=512),
         )
     except ValueError:
-        return None, None
+        return _Sizes()
     if not m.stars:
-        return None, None
+        return _Sizes()
     best = max(m.stars, key=lambda st: st.flux)
-    donut = float(best.donut) if np.isfinite(best.donut) else None
-    return donut, float(best.hfd) if np.isfinite(best.hfd) else None
+    return _Sizes(
+        _finite(best.donut), _finite(best.hfd), float(best.peak - m.sky), float(m.sky),
+        _finite(m.noise),
+    )  # fmt: skip
 
 
-def _donut(image: np.ndarray, fwhm_px: float) -> float | None:
-    """The diameter (px) of the brightest donut whole on the chip, if any."""
-    return _sizes(image, fwhm_px)[0]
+def _finite(v: float) -> float | None:
+    return float(v) if np.isfinite(v) else None
 
 
 async def approach(
@@ -157,8 +235,8 @@ async def approach(
     say: Callable[[str], None] = print,
 ) -> Approach:
     """Approach the focus from ``start`` (module doc). ``expose(t)`` takes a
-    ``t`` s frame of the bright object at the current position (``dark``: a
-    dark of ``exptime`` s; ``saturation``: the camera's full scale, ADU,
+    ``t`` s frame of the bright object at the current position (``dark``:
+    the reference, :meth:`Level.of`; ``saturation``: the camera's full scale, ADU,
     from which the exposure is shortened); ``move(x)`` moves
     the focuser; ``step`` the first step (focuser units); ``fwhm_px`` the
     seeing's FWHM (px), for when to hand over. :class:`FocusError` saying
@@ -173,9 +251,9 @@ async def approach(
         x = min(hi, max(lo, x))
         await move(x)
         img, level = await exposure.frame()
-        donut, hfd = _sizes(img, fwhm_px)
-        sizes.append(hfd)
-        s = Step(stage, x, level, donut, note)
+        z = _sizes(img, fwhm_px)
+        sizes.append(z.hfd)
+        s = Step(stage, x, level, z.donut, note, *exposure.shown(img, z))
         log.append(s)
         say(s.line())
         return s
@@ -188,11 +266,11 @@ async def approach(
         return Approach(here.position, None, log)
     # 1. Light: either way, the step doubled until one way is lit.
     s = step
-    while here.level < LIGHT_SIGMA and here.donut is None:
+    while not here.lit:
         up = await at(here.position + s, "light")
         down = await at(here.position - s, "light")
         best = max((up, down), key=lambda t: t.level)
-        if best.level >= LIGHT_SIGMA or best.donut is not None:
+        if best.lit:
             here = best
             break
         if up.position >= hi and down.position <= lo:
@@ -301,8 +379,9 @@ async def walk_through(
     final = False
     for _ in range(max_frames):
         img, level = await exposure.frame()
-        donut, hfd = _sizes(img, fwhm_px)
-        s = Step("knob", knob, level, donut)
+        z = _sizes(img, fwhm_px)
+        donut, hfd = z.donut, z.hfd
+        s = Step("knob", knob, level, donut, "", *exposure.shown(img, z))
         far = donut is not None and donut > LINEAR_FWHM * fwhm_px
         if far and prev is not None and prev.donut is not None and last:
             if prev.donut > LINEAR_FWHM * fwhm_px and prev.donut != donut:
@@ -372,7 +451,7 @@ def _relative(turn: float, last: float, what: str) -> str:
 
 def _start(prev: Step | None, now: Step, last: float) -> tuple[float, str]:
     """Before the donut's size per turn is known: find light, then a donut."""
-    if now.donut is None and now.level < LIGHT_SIGMA:
+    if not now.lit:
         way = 1.0 if last >= 0 else -1.0
         return 4.0 * way, (
             "no light yet: turn the knob one full turn, the same way as before"
@@ -533,10 +612,11 @@ async def run_first_focus(r) -> None:
 
     try:
         # The level's reference: the sky beside the target (a camera with no
-        # shutter cannot take a dark), at the same exposure.
+        # shutter cannot take a dark), at the exposure and at a quarter of it
+        # (what a shortened frame keeps: the bias).
         ra_h, dec = float(obs.ra_hours), float(obs.dec_deg)
         await seq._goto(state, unit, tel, ra_h, dec + (2.0 if dec < 80 else -2.0))
-        dark = Level.of(await expose(exptime))
+        dark = Level.of(await expose(exptime), await expose(exptime / 4.0), exptime)
         await seq._goto(state, unit, tel, ra_h, dec)
         fg = state.focusers.get(unit.name)
         if fg is None:

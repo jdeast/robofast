@@ -34,6 +34,7 @@ from __future__ import annotations
 import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -177,12 +178,16 @@ class Step:
 
 @dataclass
 class Approach:
-    """Where :func:`approach` ended: the position, and the donut's measured
-    diameter per focuser step (px per step), for the autofocus."""
+    """Where :func:`approach` ended: the position, the donut's measured
+    diameter per focuser step (px per step), for the autofocus; the last
+    exposure (s), at which the star did not clip, and the star's last size
+    (donut or HFD, px), for the sweep's settings (:func:`sweep_settings`)."""
 
     position: float
     slope: float | None
     steps: list[Step] = field(default_factory=list)
+    exptime: float = 0.0
+    donut: float | None = None
 
 
 @dataclass
@@ -263,7 +268,7 @@ async def approach(
     if here.donut is None and sizes[-1] is not None and sizes[-1] <= HANDOVER_FWHM * fwhm_px:
         here.note = "near focus already: the autofocus takes it from here"
         say(f"focus: near focus already (star {sizes[-1]:.1f} px across)")
-        return Approach(here.position, None, log)
+        return Approach(here.position, None, log, exposure.t, sizes[-1])
     # 1. Light: either way, the step doubled until one way is lit.
     s = step
     while not here.lit:
@@ -327,7 +332,7 @@ async def approach(
         # Stop short, on this side: the autofocus measures from there.
         go = max(0.0, (nxt.donut - target / 2.0) / slope)
         here = await at(nxt.position + way * go, "donut", f"slope {slope:.4f} px/step")
-    return Approach(here.position, slope, log)
+    return Approach(here.position, slope, log, exposure.t, log[-1].donut or sizes[-1])
 
 
 def _beyond(upper: bool, where: float) -> FocusError:
@@ -538,6 +543,21 @@ async def _ask(prompt: str) -> str:
     return await asyncio.to_thread(input, prompt)
 
 
+def sweep_settings(
+    frame: np.ndarray, exptime: float, a: Approach, *, fwhm_px: float, saturation: float
+) -> dict[str, Any]:
+    """The autofocus sweep's ``exptime`` and ``min_stars``, from one
+    ``frame`` at ``exptime`` s at the handover. A star measured in it
+    unclipped (a field): as they are. Only clipped stars (a planet alone):
+    the approach's last exposure times (FWHM / its last size)^2, the star
+    gathering into the seeing's disk at focus, and that one star is enough."""
+    m = measure(frame, MeasureConfig(saturation=saturation))
+    if m.n or not m.rejected.get("saturated"):
+        return {"exptime": exptime}
+    size = max(a.donut or fwhm_px, fwhm_px)
+    return {"exptime": min(exptime, a.exptime * (fwhm_px / size) ** 2), "min_stars": 1}
+
+
 def _optics(opts: dict, slope: float | None):
     """The autofocus's optics from what the devices reported (``opts``), its
     focal-plane factor from the donut's measured slope (px per step)."""
@@ -611,6 +631,14 @@ async def run_first_focus(r) -> None:
         seq._event("first_focus_step", telescope=unit.name, line=line)
 
     try:
+        fg = state.focusers.get(unit.name)
+        # Before anything moves: a focuser that moves by steps would take a
+        # position as that many steps.
+        if fg is not None and await fg.get("Absolute") is not True:
+            raise FocusError(
+                "the focuser moves by steps, not to positions (Absolute false): not supported"
+                " yet; focus by hand"
+            )
         # The level's reference: the sky beside the target (a camera with no
         # shutter cannot take a dark), at the exposure and at a quarter of it
         # (what a shortened frame keeps: the bias).
@@ -618,7 +646,6 @@ async def run_first_focus(r) -> None:
         await seq._goto(state, unit, tel, ra_h, dec + (2.0 if dec < 80 else -2.0))
         dark = Level.of(await expose(exptime), await expose(exptime / 4.0), exptime)
         await seq._goto(state, unit, tel, ra_h, dec)
-        fg = state.focusers.get(unit.name)
         if fg is None:
             if not opts.get("walk_through"):
                 raise FocusError(
@@ -630,11 +657,6 @@ async def run_first_focus(r) -> None:
             )  # fmt: skip
             seq._event("first_focus_done", telescope=unit.name, method="walk_through")
             return
-        if await fg.get("Absolute") is not True:
-            raise FocusError(
-                "the focuser moves by steps, not to positions (Absolute false): not supported"
-                " yet; focus by hand"
-            )
         lo, hi = 0.0, float(await fg.get("MaxStep"))
 
         async def move(x: float) -> None:
@@ -648,10 +670,16 @@ async def run_first_focus(r) -> None:
             expose, move, start=start, limits=(lo, hi), dark=dark, fwhm_px=fwhm_px,
             step=step, exptime=exptime, saturation=saturation, say=say,
         )  # fmt: skip
+        # One frame at the handover: the sweep's exposure (a planet alone
+        # clips at the field's exposure at every point).
+        sweep_t = float(opts.get("sweep_exptime", 1.0))
+        sweep = sweep_settings(
+            await expose(sweep_t), sweep_t, a, fwhm_px=fwhm_px, saturation=0.9 * saturation
+        )
         cfg = AutofocusConfig(
             optics=_optics(opts, a.slope),
             method="sweep",
-            exptime=float(opts.get("sweep_exptime", 1.0)),
+            **sweep,
             max_start_error=0.0,
             measure={"saturation": 0.9 * saturation},
             min_position=lo,

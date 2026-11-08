@@ -24,7 +24,8 @@ lines are named; nothing here needs astronomy.
 
 | The line starts | It means | Do |
 |---|---|---|
-| `focus: light ...`, `focus: climb ...`, `focus: donut ...` | it is moving the focuser and measuring the light (`level`) and the star's size (`donut`, pixels) | nothing |
+| `focus: light ...`, `focus: climb ...`, `focus: donut ...` | it is moving the focuser: how bright, and the star's size (`donut`, pixels). Far out, before a star is seen: the light on the chip as a multiple of the sky beside the target (`light 400 times the sky beside it`; it grows as the star comes in), or `light on the chip` when that sky is too faint to count. Once a star is seen: its brightest pixel as a multiple of the sky around it in the same frame (`star 900 times the sky around it`), or of the frame's noise when the sky there is fainter than the noise (`star 40 times the noise around it`, short exposures). Then the exposure it took | nothing |
+| `focus: ... no light above the sky beside it` | at that position nothing bright reached the chip | nothing: it steps on, both ways; if no position finds light it stops with `no light at any focus position` |
 | `focus: done at position N` | in focus | nothing |
 | `focus: knob ... turn ...` | the walk-through: turn the focus knob as it says, then press Enter | turn the knob that way and that much (a multiple of your last turn) |
 | `... in focus: ...; stop here` | the walk-through is done | press Enter; leave the knob alone |

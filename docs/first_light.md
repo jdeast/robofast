@@ -134,12 +134,18 @@ is a disk with no edge in the frame, which needs its own measure).
 * **Light, then a donut.** Far from focus a star is the image of the
   telescope's opening, a disk of diameter D = |dz| / N (docs/autofocus.md):
   its light is spread, so the signal is the frame's level over the sky
-  beside the target (one frame there first, at the same exposure: many
-  cameras have no shutter for a dark). The focuser steps the way the level
-  rises (the exposure shortened if the frame saturates) until the disk is
-  whole on the chip; two frames a known step apart then give the disk's
+  beside the target (two frames there first, at the exposure and at a
+  quarter of it: many cameras have no shutter for a dark, and the two give
+  the camera's bias, which a shorter exposure keeps). The focuser steps the
+  way the level rises until the disk is whole on the chip. A frame that
+  clips is taken again at a quarter of the exposure, as long as that clips
+  fewer pixels (a hot pixel stays clipped at any exposure, and is not the
+  star's light). Two frames a known step apart then give the disk's
   size per step, measured (the focuser's units and how far it moves the
-  focal plane are not assumed), and where it reaches zero.
+  focal plane are not assumed), and where it reaches zero. A planet in
+  focus is a small disk, which measures as a donut a few pixels across: so
+  from a start already near focus on a planet it still takes the donut's
+  two frames (a few frames more, the same focus).
 * **Then the autofocus's sweep** (docs/autofocus.md) from there, which
   fits the curve and so does not need that slope to be exact.
 * **The end of the travel.** If the disk still shrinks at an end of the

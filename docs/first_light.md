@@ -19,8 +19,9 @@ python -m robofast --no-enclosure
 3. writes the enclosure config itself, `first-light/observatory.json`
    (`--dir`; it never overwrites one);
 4. asks you, with no enclosure, whether the sky is clear and whether you
-   will stay with the telescope (`--yes` answers yes): you are then the
-   operator on duty (docs/no_enclosure.md) until it finishes;
+   will stay with the telescope, and, when the site is the telescope's,
+   whether that is where it stands (`--yes` answers yes to all of it): you
+   are then the operator on duty (docs/no_enclosure.md) until it finishes;
 5. runs robofast's safety supervisor and sequencer on that config, in this
    process: a first pointing calibration from three plate solves
    (docs/pointing_model.md, "A first calibration"), then one light frame
@@ -60,9 +61,23 @@ saying so in the supervisor's words.
 
 The site is the telescope's own: its `SiteLatitude` and `SiteLongitude`
 (and `SiteElevation`, 0 m if it has none), which a GPS mount fills in;
-first light prints it. `--site LAT,LON[,ELEV]` (deg north, deg east, m)
-is used instead when given. A telescope that cannot report its site,
-with no `--site`, stops first light before anything moves, saying so.
+first light prints it, and asks, with the other question, whether that
+is where the telescope stands; a no stops it before anything moves.
+**`--yes` answers yes to that too: it confirms the printed site.**
+`--site LAT,LON[,ELEV]` (deg north, deg east, m) is used instead when
+given, and not asked about. A telescope that cannot report its site, or
+reports 0, 0 (a site never set), with no `--site`, stops first light
+before anything moves, saying so.
+
+A mount with no GPS reports the site it was given, or its factory
+default, which may be another continent; robofast cannot tell that from
+the real one (the mount's own limits use the same site, so they do not
+catch it), which is why it asks. Measured on the simulated telescope
+standing at 41.0 N, 29.0 E with its mount reporting 34.1 N, 118.3 W,
+answered yes: two of the three calibration points were commanded at true
+altitudes of -22.7 and -16.6 deg, and the "zenith" frame at -9.1 deg,
+while first light reported it 4.1 arcmin from the zenith (of the site it
+was told).
 
 The calibration lays its points in altitude from the site, and the first
 light frame goes to the zenith of the site; the pointing model itself

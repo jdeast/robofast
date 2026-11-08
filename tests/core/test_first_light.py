@@ -823,3 +823,47 @@ def test_the_setup_reads_connect_each_device_once(tmp_path):
         server.stop()
     for d in (tel, cam):
         assert d.sets.count(True) <= 2 and d.sets.count(False) <= 1, (type(d).__name__, d.sets)
+
+
+# -- what a mount or a focuser may not report (ASCOM: PropertyNotImplemented) ----------
+
+
+@pytest.mark.parametrize("held_device", [True], indirect=True)
+def test_a_focuser_and_mount_that_report_less_still_focus(held_device, tmp_path, capsys):
+    """StepSize, ApertureArea and ApertureDiameter are optional in ASCOM:
+    the approach measures the donut's size per step itself, no area means
+    no obstruction, and the f-ratio the sweep needs is given (--f-ratio)."""
+    d = held_device
+    del d.focuser.StepSize, d.mount.ApertureArea, d.mount.ApertureDiameter
+    main(_args(d, tmp_path, "--no-enclosure", "--yes", "--f-ratio", "6.5"))
+    out = capsys.readouterr()
+    lines = (out.out + out.err).splitlines()
+    assert any(ln.startswith("focus: done") for ln in lines), lines[-20:]
+    said = "\n".join(ln for ln in lines if ln.startswith("first light"))
+    assert "ApertureArea" in said and "StepSize" not in said, said
+    assert json.loads(out.out.strip().splitlines()[-1])["first_light"]["solve"]["solved"]
+
+
+@pytest.mark.parametrize("held_device", [True], indirect=True)
+def test_a_mount_without_its_aperture_asks_for_the_f_ratio(held_device, tmp_path, capsys):
+    d = held_device
+    del d.mount.ApertureDiameter
+    with pytest.raises(SystemExit) as exc:
+        main(_args(d, tmp_path, "--no-enclosure", "--yes"))
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and "ApertureDiameter" in err and "--f-ratio" in err, err
+    assert not d.mount.slews and d.camera.exposures_started == 0
+
+
+@pytest.mark.parametrize("held_device", [True], indirect=True)
+def test_a_focuser_that_moves_by_steps_is_left_alone(held_device, tmp_path, capsys):
+    """A relative focuser (Absolute False) takes Move(n) as n steps, not a
+    position: first light does not drive it (not supported yet), and says so."""
+    d = held_device
+    d.focuser.Absolute = False
+    main(_args(d, tmp_path, "--no-enclosure", "--yes"))
+    out = capsys.readouterr()
+    said = "\n".join(ln for ln in (out.out + out.err).splitlines() if ln.startswith("first light"))
+    assert not d.focuser.moves, d.focuser.moves
+    assert "moves by steps" in said, said
+    assert json.loads(out.out.strip().splitlines()[-1])["first_light"]["solve"]["solved"]

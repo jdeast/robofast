@@ -18,6 +18,9 @@ lines are named; nothing here needs astronomy.
 | `first light: fetching the catalog ...: N tiles` | downloading star maps for the frames it will take | wait (once; later runs reuse them) |
 | `first light: the sky turns faster than the catalog downloads here` | a slow network: some maps download later | nothing |
 | `first light: focus first, with the focuser, on <name>` | it will focus on that planet or star | nothing |
+| `first light: Focuser ... moves by steps, not to positions ...` | the focuser is a relative one, which first light does not drive yet | focus by hand (run without `--yes` for the walk-through) |
+| `first light: Telescope ... ApertureArea: not reported; no central obstruction assumed` | the mount does not say how much of its opening is blocked | nothing (on the simulated telescope, 47 % blocked, the focus lands the same) |
+| `first light: Telescope ... ApertureDiameter: not reported; ... give it with --f-ratio` | the mount does not report its aperture, and the focuser's sweep needs the focal ratio | run again with `--f-ratio N` (the focal length over the aperture, from the telescope's label or manual) |
 | `first light: no focuser: no focus step` | `--yes` was given and there is no focuser | focus by hand first, or run without `--yes` |
 
 ## Focus

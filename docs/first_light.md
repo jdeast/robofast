@@ -53,8 +53,13 @@ or what it must never guess:
 
 It stops, naming what, when a device cannot report what it needs (a mount
 that does not know its focal length or its site, a camera with no pixel
-size), when
+size or full scale, `MaxADU`, and, with a focuser, a mount that does not
+report its aperture, `ApertureDiameter`: give the focal ratio with
+`--f-ratio`), when
 more than one telescope answers, and when the operator does not say yes.
+What ASCOM lets a device leave out does not stop it: a focuser's
+`StepSize` (the focus step measures the star's size per step itself) and
+a mount's `ApertureArea` (no central obstruction is assumed, and said).
 A mount that cannot park gets no lease (the supervisor grants none until
 every telescope reports parked): first light gives up after `--timeout`,
 saying so in the supervisor's words.
@@ -156,6 +161,10 @@ is a disk with no edge in the frame, which needs its own measure).
   multiple of your last turn), until it is in focus; `--yes` answers no
   walk-through (it needs a person), so with `--yes` and no focuser there is
   no focus step.
+* **A focuser that moves by steps.** A relative focuser (ASCOM `Absolute`
+  false) takes a move as a number of steps, not a position: first light
+  does not drive it (not supported yet), says so, and focus is by hand as
+  with no focuser.
 
 Measured on the simulated focuser and sky (a 512-pixel chip, f/6.5, a
 47 % obstruction, 2" seeing; the tolerance is docs/autofocus.md's, a

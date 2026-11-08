@@ -226,19 +226,61 @@ def _where(site: tuple[float, float, float]) -> str:
     )
 
 
-def _focus_reads(config: dict[str, Any], devices: list[discover.Device]) -> dict[str, Any]:
-    """What the focus step reads from the devices (in the setup's session)."""
+def _focus_reads(
+    config: dict[str, Any], devices: list[discover.Device], f_ratio: float | None = None
+) -> dict[str, Any]:
+    """What the focus step reads from the devices (in the setup's session).
+    ASCOM lets a mount leave out ApertureDiameter and ApertureArea, and a
+    focuser StepSize: those are optional (no obstruction is said, in
+    ``"said"``; the step size the focus step measures itself);
+    the f-ratio the sweep needs is ``f_ratio`` (--f-ratio) if the aperture
+    is not reported. A focuser that moves by steps (Absolute false) is not
+    driven: it is taken out of the telescope's entry, and said."""
     (tel,) = config["telescopes"]
     scope = config["telescopes"][tel]
     by = {(d.type, d.spec): d for d in devices}
-    focal, aperture, area = discover.read_members(
-        by["Telescope", scope["telescope"]], ["FocalLength", "ApertureDiameter", "ApertureArea"]
-    )
+    mount = by["Telescope", scope["telescope"]]
+    (focal,) = discover.read_members(mount, ["FocalLength"])
+    aperture, area = _optional(mount, "ApertureDiameter"), _optional(mount, "ApertureArea")
     (full,) = discover.read_members(by["Camera", scope["camera"]], ["MaxADU"])
+    said: list[str] = []
     reads = {"focal": focal, "aperture": aperture, "area": area, "full": full}
+    reads["f_ratio"], reads["said"] = f_ratio, said
     if "focuser" in scope:
-        (reads["step"],) = discover.read_members(by["Focuser", scope["focuser"]], ["StepSize"])
+        focuser = by["Focuser", scope["focuser"]]
+        what = f"{focuser.type} {focuser.spec} ({focuser.name})"
+        (absolute,) = discover.read_members(focuser, ["Absolute"])
+        if absolute is not True:
+            del scope["focuser"]
+            said.append(
+                f"{what} moves by steps, not to positions (Absolute {absolute}): not supported"
+                " yet, so it is not driven; focus is by hand"
+            )
+        else:
+            # Optional: the approach measures the star's size per step itself.
+            reads["step"] = _optional(focuser, "StepSize")
+            if aperture is None and f_ratio is None:
+                raise discover.OpticsUnavailable(
+                    f"Telescope {mount.spec} ({mount.name}) ApertureDiameter: not reported; the"
+                    " focuser's sweep needs the f-ratio: give it with --f-ratio (the focal"
+                    " length over the aperture)"
+                )
+    missing = "ApertureArea" if area is None else "ApertureDiameter" if aperture is None else ""
+    if missing:
+        said.append(
+            f"Telescope {mount.spec} ({mount.name}) {missing}: not reported; no central"
+            " obstruction assumed"
+        )
     return reads
+
+
+def _optional(d: discover.Device, member: str) -> Any:
+    """``member`` of ``d``, or None if it cannot report it."""
+    try:
+        (value,) = discover.read_members(d, [member])
+    except discover.OpticsUnavailable:
+        return None
+    return value
 
 
 def _target(config: dict[str, Any], name: str) -> dict[str, Any]:
@@ -272,9 +314,13 @@ def _focus_step(
     focal, aperture, area, full = (reads[k] for k in ("focal", "aperture", "area", "full"))
     optics = config["images"]["telescopes"][tel]
     pixel = optics["plate_scale"] * float(focal) * 1000.0 / discover.ARCSEC_PER_UM_PER_MM
-    obstruction = math.sqrt(max(0.0, 1.0 - float(area) / (math.pi * (float(aperture) / 2) ** 2)))
+    obstruction = 0.0
+    if area is not None and aperture is not None:
+        disk = math.pi * (float(aperture) / 2) ** 2
+        obstruction = math.sqrt(max(0.0, 1.0 - float(area) / disk))
+    f_ratio = reads.get("f_ratio") or (float(focal) / float(aperture) if aperture else None)
     settings: dict[str, Any] = {
-        "f_ratio": float(focal) / float(aperture),
+        "f_ratio": f_ratio,
         "pixel_size": pixel,
         "plate_scale": optics["plate_scale"],
         "obstruction": round(obstruction, 3),
@@ -284,7 +330,7 @@ def _focus_step(
         "sweep_exptime": 1.0,
     }
     if "focuser" in scope:
-        settings["um_per_step"] = reads["step"]
+        settings["um_per_step"] = reads.get("step") or 1.0
         # The telescope's autofocus entry (docs/autofocus.md): what gives the
         # sequencer its focuser; its sweep finishes the focus step.
         scope["autofocus"] = {
@@ -706,6 +752,11 @@ def main(argv: list[str] | None = None) -> None:
         help="answer yes to the question: the sky is clear and you stay with the telescope"
         " (no enclosure), and the telescope's site, as printed, is where it stands",
     )
+    ap.add_argument(
+        "--f-ratio",
+        type=float,
+        help="the telescope's focal ratio, for a mount that does not report its aperture",
+    )
     ap.add_argument("--timeout", type=float, default=1800.0, help="give up after (s)")
     ap.add_argument("--log-level", default="WARNING")
     args = ap.parse_args(argv)
@@ -791,10 +842,12 @@ def main(argv: list[str] | None = None) -> None:
             size = discover.read_members(camera, ["CameraXSize", "CameraYSize"])
             # A focus step can happen with a focuser, or a person (no --yes).
             focusable = "focuser" in config["telescopes"][tel] or not args.yes
-            reads = _focus_reads(config, devices) if focusable else {}
+            reads = _focus_reads(config, devices, args.f_ratio) if focusable else {}
         except discover.OpticsUnavailable as exc:
             print(f"first light: {exc}", file=sys.stderr)
             sys.exit(1)
+    for line in reads.get("said", []):
+        print(f"first light: {line}", flush=True)
     # One question: what robofast cannot see, and what the operator must
     # confirm. A mount with no GPS reports its factory site, which may be
     # another continent: points laid for it can be below the real horizon.

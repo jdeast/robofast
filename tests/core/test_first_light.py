@@ -533,3 +533,46 @@ def test_the_site_given_is_used_over_the_telescopes(device, tmp_path, capsys):
     main(args)
     site = json.loads((tmp_path / "run" / "observatory.json").read_text())["site"]
     assert site == {"latitude": 40.0, "longitude": -70.0, "elevation": 100.0}
+
+
+def test_a_telescope_reporting_its_site_as_0_0_does_not_move(tmp_path, capsys):
+    """0, 0 is a mount whose site was never set: first light stops before
+    anything moves, even with --yes."""
+    tel, cam = FakeTelescope(), FakeCamera()
+    tel.FocalLength = 0.5
+    tel.SiteLatitude, tel.SiteLongitude, tel.SiteElevation = 0.0, 0.0, 0.0
+    cam.PixelSizeX = cam.PixelSizeY = 9.0
+    server = FakeAlpacaServer({"telescope": tel, "camera": cam}).start()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main(["--no-enclosure", "--yes", "--server", server.address,
+                  "--dir", str(tmp_path / "run"), "--timeout", "10",
+                  "--plugin", "robofast.testing.sky_device:register", "--catalog", "synthetic",
+                  "--catalog-dir", str(tmp_path / "sky")])  # fmt: skip
+    finally:
+        server.stop()
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and cam.exposures_started == 0 and not tel.slews, err
+    lines = [ln for ln in err.splitlines() if ln.startswith("first light")]
+    assert len(lines) == 1 and "0, 0" in lines[0] and "--site" in lines[0], lines
+    assert not (tmp_path / "run" / "observatory.json").exists()
+
+
+def test_the_telescopes_site_is_asked_and_a_no_moves_nothing(tmp_path, capsys, monkeypatch):
+    """A mount with no GPS reports its factory site, which may be another
+    continent: the question shows it, and a no stops first light."""
+    far = SkyDevice(
+        catalog={"cache_dir": str(tmp_path / "sky")}, latitude=34.1, longitude=-118.3
+    ).start()
+    asked: list[str] = []
+    monkeypatch.setattr("builtins.input", lambda prompt: asked.append(prompt) or "n")
+    try:
+        args = _without_site(_args(far, tmp_path, "--no-enclosure"))
+        with pytest.raises(SystemExit) as exc:
+            main(args)
+    finally:
+        far.stop()
+    assert exc.value.code == 1 and "not started" in capsys.readouterr().err
+    assert len(asked) == 1 and "34.10000 N, 118.30000 W, 0 m" in asked[0], asked
+    assert "the telescope's" in asked[0] and "where the telescope stands" in asked[0], asked
+    assert far.camera.exposures_started == 0 and not far.mount.slews

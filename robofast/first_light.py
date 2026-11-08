@@ -17,10 +17,12 @@ solved; 1 if robofast could not get there, saying why.
 
 The site is the telescope's own (``SiteLatitude``, ``SiteLongitude``,
 ``SiteElevation``; a GPS mount fills them), or ``--site LAT,LON[,ELEV]``,
-which is used instead; a telescope that cannot report its site and no
-``--site`` stops before anything moves. The pointing run lays its points
-in altitude from it; a site hundreds of km off still calibrates
-(docs/first_light.md, "The site").
+which is used instead. The telescope's site is shown and asked about (a
+mount with no GPS may report its factory site, another continent: points
+laid for it can be below the real horizon); a telescope that cannot
+report its site, or reports 0, 0, with no ``--site``, stops before anything
+moves. The pointing run lays its points in altitude from it; a site
+hundreds of km off still calibrates (docs/first_light.md, "The site").
 
 What it never reads or guesses, and so asks for in words:
 
@@ -31,7 +33,8 @@ What it never reads or guesses, and so asks for in words:
 Light frames need the supervisor's lease. With ``--no-enclosure`` that is
 an operator on duty: the person running this command, who is asked first
 whether the sky is clear and whether they will stay with the telescope
-(``--yes`` answers yes). Their duty lasts while the command runs; Ctrl-C,
+(and whether the telescope's site is where it stands; ``--yes`` answers
+yes to all of it). Their duty lasts while the command runs; Ctrl-C,
 or the end, takes them off duty, and the telescope parks.
 
 The catalog is ``--catalog`` (default ``gaia``: Gaia DR3 tiles, docs/sky.md),
@@ -188,9 +191,21 @@ def telescope_site(telescope: discover.Device) -> tuple[float, float, float]:
         elev = 0.0
     what = f"Telescope {telescope.spec} ({telescope.name})"
     try:
-        return _checked(float(lat), float(lon), float(elev))
+        site = _checked(float(lat), float(lon), float(elev))
     except (TypeError, ValueError) as exc:
         raise FirstLightError(f"{what} reports its site as {lat!r}, {lon!r}: {exc}") from exc
+    if site[0] == 0.0 and site[1] == 0.0:
+        raise FirstLightError(f"{what} reports its site as 0, 0: its site is not set")
+    return site
+
+
+def _where(site: tuple[float, float, float]) -> str:
+    lat, lon, elev = site
+    lon = (lon + 180.0) % 360.0 - 180.0
+    return (
+        f"{abs(lat):.5f} {'N' if lat >= 0 else 'S'}, {abs(lon):.5f} {'E' if lon >= 0 else 'W'},"
+        f" {elev:g} m"
+    )
 
 
 def _zenith(config: dict[str, Any], lst_hours: float) -> None:
@@ -511,7 +526,12 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--plugin", action="append", default=[], help="a plug-in module to load")
     ap.add_argument("--exptime", type=float, default=EXPTIME, help="seconds per frame")
     ap.add_argument("--operator", default=getpass.getuser(), help="who is on duty")
-    ap.add_argument("--yes", action="store_true", help="answer yes to the duty question")
+    ap.add_argument(
+        "--yes",
+        action="store_true",
+        help="answer yes to the question: the sky is clear and you stay with the telescope"
+        " (no enclosure), and the telescope's site, as printed, is where it stands",
+    )
     ap.add_argument("--timeout", type=float, default=1800.0, help="give up after (s)")
     ap.add_argument("--log-level", default="WARNING")
     args = ap.parse_args(argv)
@@ -577,11 +597,21 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
     (tel,) = config["telescopes"]
     print(f"plate scale {config['images']['telescopes'][tel]['plate_scale']} arcsec/pixel")
-    if enclosure is None and not args.yes:
-        answer = input(
+    # One question: what robofast cannot see, and what the operator must
+    # confirm. A mount with no GPS reports its factory site, which may be
+    # another continent: points laid for it can be below the real horizon.
+    asks = []
+    if enclosure is None:
+        asks.append(
             "No enclosure: robofast cannot see the weather. Is the sky clear, and will you"
-            " stay with the telescope until this finishes? [y/N] "
+            " stay with the telescope until this finishes?"
         )
+    if args.site is None:
+        asks.append(
+            f"The site is the telescope's: {_where(site)}. Is this where the telescope stands?"
+        )
+    if asks and not args.yes:
+        answer = input("\n".join(asks) + " [y/N] ")
         if answer.strip().lower() not in ("y", "yes"):
             print("first light: not started", file=sys.stderr)
             sys.exit(1)

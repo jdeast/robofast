@@ -10,7 +10,7 @@ import re
 import numpy as np
 import pytest
 
-from robofast.first_focus import FocusError, Level, approach, walk_through
+from robofast.first_focus import FocusError, Level, approach, sweep_settings, walk_through
 from robofast.testing.focus_sim import FocusScene
 from robofast.testing.starfield import Star
 
@@ -55,9 +55,13 @@ async def _approach(sc: FocusScene, start: float, limits=(0.0, 120000.0)):
     return a, lines
 
 
-@pytest.mark.parametrize("offset", [40000.0, -20000.0])
-async def test_from_far_out_the_approach_and_the_sweep_reach_focus(offset):
-    sc = _scene()
+@pytest.mark.parametrize(
+    "offset, faint", [(40000.0, True), (-20000.0, True), (20000.0, False)]
+)  # fmt: skip
+async def test_from_far_out_the_approach_and_the_sweep_reach_focus(offset, faint):
+    """With a field of fainter stars, and with the bright star alone (a
+    planet: the sweep's exposure is chosen from a frame, sweep_settings)."""
+    sc = _scene(faint=faint)
     rig = Rig(sc, position=TRUE + offset, max_step=120000)
     pos = rig.focuser
 
@@ -75,7 +79,8 @@ async def test_from_far_out_the_approach_and_the_sweep_reach_focus(offset):
     )  # fmt: skip
     assert abs(a.position - TRUE) < 2000 and a.slope
     optics = dataclasses.replace(OPTICS, focal_plane_factor=a.slope / OPTICS.donut_slope)
-    cfg = config(optics=optics, exptime=1.0, measure={"saturation": 60000.0})
+    sweep = sweep_settings(await expose(1.0), 1.0, a, fwhm_px=2.0, saturation=60000.0)
+    cfg = config(optics=optics, measure={"saturation": 60000.0}, **sweep)
     res = await rig.autofocus(cfg).run("sweep", start=a.position)
     rig.close()
     assert res.success, res.message
@@ -196,3 +201,65 @@ async def test_every_focus_line_reads_in_plain_words():
     for ln in steps:
         assert "sigma" not in ln and "e+" not in ln and " -" not in ln.split("donut")[0], ln
         assert any(w in ln for w in words), ln
+
+
+def test_the_sweep_is_shortened_only_when_its_stars_all_clip():
+    """At the handover, one frame at the sweep's exposure: stars measured
+    unclipped keep it; only clipped ones, and it is the approach's last
+    exposure times (FWHM / donut)^2 (the star gathers into the seeing's disk)."""
+    from robofast.first_focus import Approach
+    from robofast.testing.starfield import Detector, SimOptics, render
+
+    opt = SimOptics(pixel_scale=1.0, pixel_size=13.5, f_ratio=6.5, obstruction=0.47)
+    det = Detector(shape=(256, 256))
+
+    def frame(rate: float) -> np.ndarray:
+        return render([Star(128.0, 128.0, rate)], opt, det, seeing=2.0, exposure=1.0).image
+
+    a = Approach(0.0, 0.01, [], exptime=0.000625, donut=8.0)
+    field = sweep_settings(frame(2e4), 1.0, a, fwhm_px=2.0, saturation=60000.0)
+    assert field == {"exptime": 1.0}
+    alone = sweep_settings(frame(3e9), 1.0, a, fwhm_px=2.0, saturation=60000.0)
+    assert alone["exptime"] == pytest.approx(0.000625 * (2.0 / 8.0) ** 2), alone
+    assert alone["min_stars"] == 1
+
+
+async def test_the_kind_refuses_a_focuser_that_moves_by_steps_before_anything_moves():
+    """first_focus in any plan: a relative focuser (Absolute false) is
+    refused before a slew, an exposure or a move."""
+    from types import SimpleNamespace
+
+    from robofast.first_focus import run_first_focus
+    from robofast.sequencer import ObservationFailed
+
+    done: list[str] = []
+
+    class Focuser:
+        async def get(self, name):
+            done.append(f"get {name}")
+            return {"Absolute": False}.get(name, 0)
+
+        async def call(self, name, *args):
+            done.append(f"call {name}")
+
+    class Camera:
+        async def call(self, name, *args):
+            done.append(f"camera {name}")
+            raise AssertionError("exposed")
+
+        get = call
+
+    async def goto(*args):
+        done.append("slew")
+
+    seq = SimpleNamespace(_goto=goto, _event=lambda *a, **k: None)
+    r = SimpleNamespace(
+        sequencer=seq, state=SimpleNamespace(focusers={"t1": Focuser()}),
+        unit=SimpleNamespace(name="t1"), tel=None, cam=Camera(),
+        obs=SimpleNamespace(
+            autofocus={"fwhm_px": 2.0, "saturation": 65535.0}, ra_hours=1.0, dec_deg=10.0
+        ),
+    )  # fmt: skip
+    with pytest.raises(ObservationFailed, match="moves by steps"):
+        await run_first_focus(r)
+    assert done == ["get Absolute"], done

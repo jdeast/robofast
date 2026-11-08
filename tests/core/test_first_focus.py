@@ -263,3 +263,79 @@ async def test_the_kind_refuses_a_focuser_that_moves_by_steps_before_anything_mo
     with pytest.raises(ObservationFailed, match="moves by steps"):
         await run_first_focus(r)
     assert done == ["get Absolute"], done
+
+
+async def test_a_camera_minimum_exposure_is_never_asked_below():
+    """A camera refuses an exposure under its ExposureMin (a CCD's is often
+    0.1 s): the approach starts there and never shortens below it."""
+    from robofast.owner import DeviceError
+
+    sc, emin, asked = _scene(faint=False), 0.1, []
+    pos = [TRUE + 20000.0]
+
+    async def expose(t: float) -> np.ndarray:
+        asked.append(t)
+        if t < emin:
+            raise DeviceError(f"InvalidValue: Duration {t} below ExposureMin {emin}")
+        return sc.render(pos[0], t, (0, 0, 512, 512), 1)
+
+    async def move(x: float) -> None:
+        pos[0] = x
+
+    a = await approach(
+        expose, move, start=pos[0], limits=(0.0, 120000.0), dark=_dark(sc), fwhm_px=2.0,
+        step=2000.0, exptime=emin, saturation=65535.0, say=lambda s: None, exposure_min=emin,
+    )  # fmt: skip
+    assert min(asked) >= emin, sorted(asked)[:5]
+    assert abs(a.position - TRUE) < 2000, a.position - TRUE
+
+
+def test_a_planet_too_bright_for_the_shortest_exposure_says_so():
+    from robofast.first_focus import Approach
+    from robofast.testing.starfield import Detector, SimOptics, render
+
+    opt = SimOptics(pixel_scale=1.0, pixel_size=13.5, f_ratio=6.5, obstruction=0.47)
+    img = render([Star(128.0, 128.0, 3e9)], opt, Detector(shape=(256, 256)), seeing=2.0,
+                 exposure=1.0).image  # fmt: skip
+    a = Approach(0.0, 0.01, [], exptime=0.1, donut=8.0)
+    with pytest.raises(FocusError, match="shortest exposure") as exc:
+        sweep_settings(img, 1.0, a, fwhm_px=2.0, saturation=60000.0, exposure_min=0.1)
+    assert "by hand" in str(exc.value)
+
+
+async def test_a_camera_error_in_the_focus_step_stops_it_in_the_cameras_words():
+    from types import SimpleNamespace
+
+    from robofast.first_focus import run_first_focus
+    from robofast.owner import DeviceError
+    from robofast.sequencer import ObservationFailed
+
+    events: list[tuple[str, dict]] = []
+
+    class Focuser:
+        async def get(self, name):
+            return {"Absolute": True}.get(name, 0)
+
+        async def call(self, name, *args):
+            pass
+
+    class Camera:
+        async def call(self, name, *args):
+            raise DeviceError("InvalidValue: Duration 0.01 below ExposureMin 0.1")
+
+        get = call
+
+    async def goto(*args):
+        pass
+
+    seq = SimpleNamespace(_goto=goto, _event=lambda kind, **k: events.append((kind, k)))
+    r = SimpleNamespace(
+        sequencer=seq, state=SimpleNamespace(focusers={"t1": Focuser()}),
+        unit=SimpleNamespace(name="t1"), tel=None, cam=Camera(),
+        obs=SimpleNamespace(
+            autofocus={"fwhm_px": 2.0, "saturation": 65535.0}, ra_hours=1.0, dec_deg=10.0
+        ),
+    )  # fmt: skip
+    with pytest.raises(ObservationFailed, match=r"ExposureMin 0\.1"):
+        await run_first_focus(r)
+    assert [k for k, _ in events] == ["first_focus_failed"], events

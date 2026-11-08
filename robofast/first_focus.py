@@ -58,23 +58,28 @@ class _Exposure:
     gathers (while that clips fewer pixels); levels at the first exposure's
     scale, so steps compare."""
 
-    def __init__(self, expose, exptime: float, saturation: float, dark: Level) -> None:
+    def __init__(
+        self, expose, exptime: float, saturation: float, dark: Level, floor: float = 0.0
+    ) -> None:
         self.expose, self.t0, self.t = expose, exptime, exptime
         self.saturation, self.dark = saturation, dark
+        #: The camera's shortest exposure (ExposureMin, s): never asked below.
+        self.floor = floor
 
     async def frame(self) -> tuple[np.ndarray, float]:
         img = np.asarray(await self.expose(self.t))
         clipped = int(np.count_nonzero(img >= FULL * self.saturation))
         for _ in range(8):
-            if not clipped:
+            shorter = max(self.t / 4.0, self.floor)
+            if not clipped or shorter >= self.t:
                 break
-            short = np.asarray(await self.expose(self.t / 4.0))
+            short = np.asarray(await self.expose(shorter))
             n = int(np.count_nonzero(short >= FULL * self.saturation))
             if n >= clipped:
                 # A shorter exposure clips as many pixels: they are not the
                 # light it gathers (a hot pixel); keep this exposure.
                 break
-            img, clipped, self.t = short, n, self.t / 4.0
+            img, clipped, self.t = short, n, shorter
         return img, self.dark.sigma(img, self.t)
 
     def shown(self, img: np.ndarray, star: _Sizes) -> tuple[float | None, float, str]:
@@ -112,12 +117,18 @@ class Level:
     exptime: float
 
     @classmethod
-    def of(cls, dark: np.ndarray, quarter: np.ndarray, exptime: float) -> Level:
-        """From ``dark`` (``exptime`` s) and ``quarter`` (``exptime / 4`` s)."""
+    def of(
+        cls, dark: np.ndarray, other: np.ndarray, exptime: float, other_t: float | None = None
+    ) -> Level:
+        """From ``dark`` (``exptime`` s) and ``other`` (``other_t`` s, by
+        default a quarter of it): the mean is the bias plus the sky's rate
+        times the exposure."""
+        t2 = exptime / 4.0 if other_t is None else other_t
         d = np.asarray(dark, dtype=float)
-        m, mq = float(d.mean()), float(np.asarray(quarter, dtype=float).mean())
+        m, m2 = float(d.mean()), float(np.asarray(other, dtype=float).mean())
         err = max(float(d.std()) / math.sqrt(d.size), 1e-9)
-        return cls(m, err, (4.0 * mq - m) / 3.0, exptime)
+        rate = (m - m2) / (exptime - t2)
+        return cls(m, err, m - rate * exptime, exptime)
 
     def times(self, image: np.ndarray, t: float) -> float | None:
         """``image``'s (``t`` s) light above the bias and the sky, as a
@@ -238,6 +249,7 @@ async def approach(
     exptime: float,
     saturation: float,
     say: Callable[[str], None] = print,
+    exposure_min: float = 0.0,
 ) -> Approach:
     """Approach the focus from ``start`` (module doc). ``expose(t)`` takes a
     ``t`` s frame of the bright object at the current position (``dark``:
@@ -248,7 +260,7 @@ async def approach(
     why it cannot."""
     lo, hi = limits
     log: list[Step] = []
-    exposure = _Exposure(expose, exptime, saturation, dark)
+    exposure = _Exposure(expose, exptime, saturation, dark, exposure_min)
 
     sizes: list[float | None] = []
 
@@ -363,6 +375,7 @@ async def walk_through(
     saturation: float,
     say: Callable[[str], None] = print,
     max_frames: int = 60,
+    exposure_min: float = 0.0,
 ) -> list[Step]:
     """The person turns the focus knob; each frame says what the star did
     and what to do next (module doc). ``ask(prompt)`` returns their answer:
@@ -375,7 +388,7 @@ async def walk_through(
     from robofast.focusfit import FitError, fit_hyperbola
 
     log: list[Step] = []
-    exposure = _Exposure(expose, exptime, saturation, dark)
+    exposure = _Exposure(expose, exptime, saturation, dark, exposure_min)
     knob, last = 0.0, 0.0  # in units of the first quarter turn
     per_unit: float | None = None
     prev: Step | None = None
@@ -544,18 +557,32 @@ async def _ask(prompt: str) -> str:
 
 
 def sweep_settings(
-    frame: np.ndarray, exptime: float, a: Approach, *, fwhm_px: float, saturation: float
+    frame: np.ndarray,
+    exptime: float,
+    a: Approach,
+    *,
+    fwhm_px: float,
+    saturation: float,
+    exposure_min: float = 0.0,
 ) -> dict[str, Any]:
     """The autofocus sweep's ``exptime`` and ``min_stars``, from one
     ``frame`` at ``exptime`` s at the handover. A star measured in it
     unclipped (a field): as they are. Only clipped stars (a planet alone):
     the approach's last exposure times (FWHM / its last size)^2, the star
-    gathering into the seeing's disk at focus, and that one star is enough."""
+    gathering into the seeing's disk at focus, and that one star is enough;
+    :class:`FocusError` if that is shorter than the camera's ``exposure_min``."""
     m = measure(frame, MeasureConfig(saturation=saturation))
     if m.n or not m.rejected.get("saturated"):
         return {"exptime": exptime}
     size = max(a.donut or fwhm_px, fwhm_px)
-    return {"exptime": min(exptime, a.exptime * (fwhm_px / size) ** 2), "min_stars": 1}
+    t = min(exptime, a.exptime * (fwhm_px / size) ** 2)
+    if t < exposure_min:
+        raise FocusError(
+            f"the target is too bright for this camera's shortest exposure ({exposure_min:g} s;"
+            f" focus needs about {t:.2g} s): focus by hand on a fainter star (first light"
+            " cannot yet be given another target)"
+        )
+    return {"exptime": t, "min_stars": 1}
 
 
 def _optics(opts: dict, slope: float | None):
@@ -617,6 +644,7 @@ async def run_first_focus(r) -> None:
     import asyncio
 
     from robofast.autofocus import Autofocus, AutofocusConfig, camera_exposer
+    from robofast.owner import DeviceError
     from robofast.sequencer import ObservationFailed
 
     seq, state, unit, tel, cam, obs = r.sequencer, r.state, r.unit, r.tel, r.cam, r.obs
@@ -624,7 +652,14 @@ async def run_first_focus(r) -> None:
     exptime = float(opts.get("exptime", 0.01))
     fwhm_px = float(opts["fwhm_px"])
     saturation = float(opts["saturation"])
-    expose = camera_exposer(cam, readout_margin=30.0, poll=0.05)
+    exposure_min = float(opts.get("exposure_min") or 0.0)
+    camera = camera_exposer(cam, readout_margin=30.0, poll=0.05)
+
+    async def expose(t: float) -> np.ndarray:
+        try:
+            return await camera(t)
+        except DeviceError as exc:  # stop now, in the camera's words
+            raise FocusError(f"the camera, asked for a {t:g} s exposure: {exc}") from exc
 
     def say(line: str) -> None:
         print(line, flush=True)
@@ -644,7 +679,9 @@ async def run_first_focus(r) -> None:
         # (what a shortened frame keeps: the bias).
         ra_h, dec = float(obs.ra_hours), float(obs.dec_deg)
         await seq._goto(state, unit, tel, ra_h, dec + (2.0 if dec < 80 else -2.0))
-        dark = Level.of(await expose(exptime), await expose(exptime / 4.0), exptime)
+        # (four times it, where a quarter is below the camera's shortest).
+        other_t = exptime / 4.0 if exptime / 4.0 >= exposure_min else 4.0 * exptime
+        dark = Level.of(await expose(exptime), await expose(other_t), exptime, other_t)
         await seq._goto(state, unit, tel, ra_h, dec)
         if fg is None:
             if not opts.get("walk_through"):
@@ -653,7 +690,7 @@ async def run_first_focus(r) -> None:
                 )
             await walk_through(
                 expose, _ask, dark=dark, fwhm_px=fwhm_px, exptime=exptime,
-                saturation=saturation, say=say,
+                saturation=saturation, say=say, exposure_min=exposure_min,
             )  # fmt: skip
             seq._event("first_focus_done", telescope=unit.name, method="walk_through")
             return
@@ -669,13 +706,15 @@ async def run_first_focus(r) -> None:
         a = await approach(
             expose, move, start=start, limits=(lo, hi), dark=dark, fwhm_px=fwhm_px,
             step=step, exptime=exptime, saturation=saturation, say=say,
+            exposure_min=exposure_min,
         )  # fmt: skip
         # One frame at the handover: the sweep's exposure (a planet alone
         # clips at the field's exposure at every point).
         sweep_t = float(opts.get("sweep_exptime", 1.0))
         sweep = sweep_settings(
-            await expose(sweep_t), sweep_t, a, fwhm_px=fwhm_px, saturation=0.9 * saturation
-        )
+            await expose(sweep_t), sweep_t, a, fwhm_px=fwhm_px, saturation=0.9 * saturation,
+            exposure_min=exposure_min,
+        )  # fmt: skip
         cfg = AutofocusConfig(
             optics=_optics(opts, a.slope),
             method="sweep",

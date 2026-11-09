@@ -37,6 +37,7 @@ docs/discover.md walks a first exposure from it.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import socket
 import sys
@@ -46,7 +47,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import httpx
+from robofast import alpaca_client
+from robofast.owner import DeviceError
 
 #: The Alpaca discovery port and message (ASCOM Alpaca API, "Discovery").
 DISCOVERY_PORT = 32227
@@ -106,14 +108,13 @@ def discover(
 
 
 def configured_devices(server: str, timeout: float = 5.0) -> list[Device]:
-    """The devices ``server`` (``host:port``) lists on its management API."""
-    r = httpx.get(
-        f"http://{server}/management/v1/configureddevices", timeout=timeout, trust_env=False
-    )
-    r.raise_for_status()
+    """The devices ``server`` (``host:port``) lists on its management API,
+    asked through robofast's Alpaca client
+    (:func:`robofast.alpaca_client.configured_devices`)."""
+    listed = asyncio.run(alpaca_client.configured_devices(server, timeout=timeout))
     return [
         Device(server, d["DeviceType"], int(d["DeviceNumber"]), d.get("DeviceName", ""))
-        for d in r.json()["Value"]
+        for d in listed
     ]
 
 
@@ -209,7 +210,7 @@ def main(argv: list[str] | None = None) -> None:
     for server in servers:
         try:
             devices += configured_devices(server)
-        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        except (DeviceError, ValueError, KeyError, TypeError) as exc:
             print(f"{server}: no device list ({exc!r})", file=sys.stderr)
     width = max([len(d.type) for d in devices] + [4])
     for d in devices:

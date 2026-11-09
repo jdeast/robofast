@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import threading
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -234,28 +235,36 @@ async def test_the_guider_service_points_its_sky_at_each_target(tmp_path):
         await svc.stop()
 
 
-def test_cooling_comes_from_the_site_config(tmp_path):
-    """Each real camera's setpoint is its telescope's ``cooling`` entry in
-    the site config production runs on (docs/cooling.md); there is no
-    command-line setpoint."""
+def test_cooling_comes_from_the_site_config(tmp_path, caplog):
+    """Each real camera's setpoint is its own ``cooling`` entry
+    (``telescopes.<name>.camera.cooling``) in the site config production
+    runs on (docs/cooling.md); there is no command-line setpoint, and a key
+    the sequencer cannot interpret is warned about, not read."""
     site = json.loads((reh.SITES / "aqawan1.json").read_text())
     s = reh.settings_from_args(_args())
     assert s.site_path == reh.SITES / "aqawan1.json"
-    assert s.cooling == {"t1": site["telescopes"]["t1"]["cooling"]}
+    assert s.cooling == {"t1": site["telescopes"]["t1"]["camera"]["cooling"]}
     assert s.cooling["t1"]["setpoint"] == -50.0
     # Another site config: its entries, and only the real telescopes'.
-    site["telescopes"]["t1"]["cooling"] = {"setpoint": -40.0, "tolerance": 1.0}
+    site["telescopes"]["t1"]["camera"]["cooling"] = {"setpoint": -40.0, "tolerance": 1.0}
     other = tmp_path / "site.json"
     other.write_text(json.dumps(site))
     s = reh.settings_from_args(_args(f"site_config={other}"))
     assert s.cooling == {"t1": {"setpoint": -40.0, "tolerance": 1.0}}
-    del site["telescopes"]["t1"]["cooling"]
+    del site["telescopes"]["t1"]["camera"]["cooling"]
     other.write_text(json.dumps(site))
     assert reh.settings_from_args(_args(f"site_config={other}")).cooling == {}
-    site["telescopes"]["t1"]["cooling"] = {"setpoint": -500.0}
+    site["telescopes"]["t1"]["camera"]["cooling"] = {"setpoint": -500.0}
     other.write_text(json.dumps(site))
-    with pytest.raises(reh.RehearsalRefused, match=r"telescopes\.t1\.cooling"):
+    with pytest.raises(reh.RehearsalRefused, match=r"telescopes\.t1\.camera\.cooling"):
         reh.settings_from_args(_args(f"site_config={other}"))
+    # Beside the camera (its old place): not read, and warned about.
+    site["telescopes"]["t1"]["camera"] = "127.0.0.1:11121/0"
+    site["telescopes"]["t1"]["cooling"] = {"setpoint": -50.0}
+    other.write_text(json.dumps(site))
+    with caplog.at_level(logging.WARNING, logger=reh.__name__):
+        assert reh.settings_from_args(_args(f"site_config={other}")).cooling == {}
+    assert "telescopes.t1: ignoring keys it cannot interpret: ['cooling']" in caplog.text
     with pytest.raises(reh.RehearsalRefused, match="No such file"):
         reh.settings_from_args(_args(f"site_config={tmp_path / 'missing.json'}"))
     ns = _args()

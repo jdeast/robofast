@@ -10,6 +10,7 @@ import asyncio
 
 import pytest
 
+from robofast.config import camera_entry
 from robofast.cooling import CameraCooling, CoolingConfig, set_cooling
 from robofast.owner import DeviceOwner, Unsupported
 from robofast.recovery import DevicePolicy, RecoveryLadder
@@ -43,6 +44,50 @@ def test_config():
     ):
         with pytest.raises(ValueError, match=why):
             CoolingConfig.from_dict(bad)
+
+
+def test_cooling_is_the_cameras_own_config():
+    """The setpoint belongs to the camera: ``camera`` is an address, or
+    ``{"address": ..., "cooling": ...}`` (docs/cooling.md)."""
+    cool = {"setpoint": -50.0, "tolerance": 0.75}
+    assert camera_entry("t1", {"camera": "h:1/0"}) == ("h:1/0", None)
+    assert camera_entry("t1", {"camera": {"address": "h:1/0"}}) == ("h:1/0", None)
+    assert camera_entry("t1", {"camera": {"address": "h:1/0", "cooling": cool, "_n": "x"}}) == (
+        "h:1/0",
+        cool,
+    )
+    for bad, why in (
+        ({}, "an Alpaca address"),
+        ({"camera": ""}, "an Alpaca address"),
+        ({"camera": {"cooling": cool}}, "an Alpaca address"),
+        ({"camera": {"address": "h:1/0", "setpoint": -50}}, r"unknown keys \['setpoint'\]"),
+    ):
+        with pytest.raises(ValueError, match=why):
+            camera_entry("t1", bad)
+
+
+def test_the_sequencer_reads_cooling_from_the_camera_only():
+    from robofast.sequencer_service import build_units
+
+    def config(t1):
+        return {"telescopes": {"t1": {"telescope": "127.0.0.1:1/0", **t1}}}
+
+    cool = {"setpoint": -50.0, "tolerance": 0.75}
+    [u] = build_units(
+        config({"camera": {"address": "127.0.0.1:1/0", "cooling": cool}}), Timeline(), 1.0
+    )
+    assert u.cooling is not None and u.cooling.config == CoolingConfig(-50.0, 0.75)
+    [u] = build_units(config({"camera": "127.0.0.1:1/0"}), Timeline(), 1.0)
+    assert u.cooling is None
+    # Beside the camera it is a key the sequencer does not know.
+    with pytest.raises(ValueError, match=r"unknown keys \['cooling'\]"):
+        build_units(config({"camera": "127.0.0.1:1/0", "cooling": cool}), Timeline(), 1.0)
+    with pytest.raises(ValueError, match=r"camera\.cooling\.setpoint"):
+        build_units(
+            config({"camera": {"address": "127.0.0.1:1/0", "cooling": {"setpoint": -500}}}),
+            Timeline(),
+            1.0,
+        )
 
 
 # -- the one path ----------------------------------------------------------------------------

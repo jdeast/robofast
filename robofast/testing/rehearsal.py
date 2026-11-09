@@ -62,11 +62,11 @@ at the real FAU's geometry (docs/demo.md).
   switches a PDU.
 * **Cooling** comes from the site's enclosure config, the file production
   runs on (``--site-config``, default ``sites/minerva/aqawan1.json``): each
-  real telescope's ``cooling`` entry there (docs/cooling.md) keeps its real
-  camera cooled, exactly as in production -- the cooler is set when the
-  sequencer starts and whenever it (re)connects the camera (every recovery
-  rung), and turned back on if found off. A real telescope without one has
-  its cooler left alone. There is no command-line setpoint: the config is
+  real camera's own ``cooling`` entry there (``telescopes.<name>.camera.cooling``;
+  docs/cooling.md) keeps it cooled, exactly as in production -- the cooler
+  is set when the sequencer starts and whenever it (re)connects the camera
+  (every recovery rung), and turned back on if found off. A real camera
+  without one has its cooler left alone. There is no command-line setpoint: the config is
   the one place it is set.
 
 ``python -m robofast.testing.rehearsal --help``; the tests
@@ -97,6 +97,7 @@ import numpy as np
 from robofast import hwgate, sky
 from robofast.autofocus import AutofocusSetup, FocusModel, FocusStore
 from robofast.autofocus_plan import AutofocusTriggers, TriggerConfig
+from robofast.config import camera_entry
 from robofast.cooling import CoolingConfig
 from robofast.dispatch import dispatch_from_config
 from robofast.owner import DeviceOwner
@@ -248,7 +249,7 @@ class RehearsalSettings:
     #: sequencer's ``recovery`` entry; module doc).
     recovery: dict[str, dict[str, Any]] = field(default_factory=dict)
     #: ``--site-config``: the enclosure config production runs on (its
-    #: telescopes' ``cooling``, and the base of the rehearsal's own enclosure
+    #: cameras' ``cooling``, and the base of the rehearsal's own enclosure
     #: config). None: ``sites/minerva/aqawan1.json``.
     site_config: str | None = None
     #: Real telescopes the preflight dropped: name -> why (set by the
@@ -271,11 +272,14 @@ class RehearsalSettings:
                         f"--recovery {name}: {kind} lists powercycle; the rehearsal never"
                         " switches a PDU"
                     )
+        self._warn_unknown_keys()
         for name, entry in self.cooling.items():
             try:
                 CoolingConfig.from_dict(entry)
             except (TypeError, ValueError) as exc:
-                raise ValueError(f"{self.site_path}: telescopes.{name}.cooling: {exc}") from exc
+                raise ValueError(
+                    f"{self.site_path}: telescopes.{name}.camera.cooling: {exc}"
+                ) from exc
         seen: dict[tuple[str, int, int, str], str] = {}
         for name, r in self.real.items():
             for kind, ep in (("telescope", r.telescope), ("camera", r.camera)):
@@ -283,6 +287,26 @@ class RehearsalSettings:
                 if key in seen:
                     raise ValueError(f"{name} {kind} {ep} is also {seen[key]}'s")
                 seen[key] = name
+
+    def _warn_unknown_keys(self) -> None:
+        """Warn about keys of the real telescopes' site entries that the
+        sequencer cannot interpret (the rehearsal builds its own telescope
+        entries, so production's loader never sees these)."""
+        from robofast.sequencer_service import TELESCOPE_KEYS
+
+        tels = self.site()["telescopes"]
+        for name in self.real:
+            entry = tels.get(name)
+            if not isinstance(entry, dict):
+                continue
+            unknown = {k for k in entry if not str(k).startswith("_")} - TELESCOPE_KEYS
+            if unknown:
+                log.warning(
+                    "%s: telescopes.%s: ignoring keys it cannot interpret: %s",
+                    self.site_path,
+                    name,
+                    sorted(unknown),
+                )
 
     @property
     def site_path(self) -> Path:
@@ -300,14 +324,18 @@ class RehearsalSettings:
 
     @property
     def cooling(self) -> dict[str, dict[str, Any]]:
-        """Each real telescope's ``cooling`` entry in the site config (module
-        doc): the only source of the rehearsal's setpoints."""
+        """Each real camera's ``cooling`` entry in the site config
+        (``telescopes.<name>.camera.cooling``; module doc): the only source of
+        the rehearsal's setpoints."""
         tels = self.site()["telescopes"]
-        return {
-            name: tels[name]["cooling"]
-            for name in self.real
-            if isinstance(tels.get(name), dict) and tels[name].get("cooling") is not None
-        }
+        out = {}
+        for name in self.real:
+            if not isinstance(tels.get(name), dict):
+                continue
+            _, cooling = camera_entry(name, tels[name], str(self.site_path))
+            if cooling is not None:
+                out[name] = cooling
+        return out
 
     @property
     def active(self) -> list[str]:
@@ -1090,7 +1118,7 @@ class Rehearsal(SimulatedNight):
                 g = self.guard.spec(name)
                 tels[name] = {
                     "telescope": g,
-                    "camera": str(r.camera),
+                    "camera": {"address": str(r.camera)},
                     "focuser": g,
                     "limits": limits,
                 }
@@ -1098,7 +1126,7 @@ class Rehearsal(SimulatedNight):
                     tels[name]["rotator"] = g
                 if name in cooling:
                     # The site config's own entry, as production (docs/cooling.md).
-                    tels[name]["cooling"] = cooling[name]
+                    tels[name]["camera"]["cooling"] = cooling[name]
             else:
                 a = self.alpaca.address
                 tels[name] = {"telescope": f"{a}/{i}", "camera": f"{a}/{i}", "limits": limits}
@@ -1725,9 +1753,9 @@ def _catalog_config(args: argparse.Namespace) -> dict[str, Any] | None:
 def settings_from_args(args: argparse.Namespace) -> RehearsalSettings:
     if getattr(args, "cooling", None):
         raise RehearsalRefused(
-            "--cooling is gone: each real camera's setpoint comes from its telescope's 'cooling'"
-            " entry in the site config (--site-config, default sites/minerva/aqawan1.json;"
-            " docs/cooling.md)"
+            "--cooling is gone: each real camera's setpoint comes from its own 'cooling' entry"
+            " in the site config (telescopes.<name>.camera.cooling; --site-config, default"
+            " sites/minerva/aqawan1.json; docs/cooling.md)"
         )
     if not args.i_know_the_enclosure_is_closed:
         raise RehearsalRefused(
@@ -1875,8 +1903,9 @@ def main(argv: list[str] | None = None) -> int:
         metavar="FILE",
         default=None,
         help="the site's enclosure config, as production runs it (default"
-        " sites/minerva/aqawan1.json): each real telescope's 'cooling' entry there keeps its"
-        " camera cooled (docs/cooling.md), and it is the base of the rehearsal's enclosure config",
+        " sites/minerva/aqawan1.json): each real camera's 'cooling' entry there"
+        " (telescopes.<name>.camera.cooling) keeps it cooled (docs/cooling.md), and it is"
+        " the base of the rehearsal's enclosure config",
     )
     # Removed: refused with a pointer to the site config (settings_from_args).
     ap.add_argument("--cooling", action="append", default=[], help=argparse.SUPPRESS)

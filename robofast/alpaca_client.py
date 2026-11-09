@@ -271,19 +271,7 @@ class AlpacaDevice:
             raise DeviceTimeout(f"{what}: no answer within {timeout} s") from exc
         except httpx.TransportError as exc:
             raise AlpacaTransportError(f"{what}: {type(exc).__name__}: {exc}") from exc
-        if r.status_code != 200:
-            cls = _BY_STATUS.get(r.status_code, AlpacaHTTPError)
-            raise cls(f"{what}: HTTP {r.status_code}: {r.text.strip()[:200]}", r.status_code)
-        try:
-            body = r.json()
-            number = int(body.get("ErrorNumber", 0))
-        except (ValueError, TypeError, AttributeError) as exc:
-            raise AlpacaProtocolError(f"{what}: not an Alpaca response: {r.text[:200]!r}") from exc
-        if number != 0:
-            cls = error_class(number)
-            msg = body.get("ErrorMessage") or ""
-            raise cls(f"{what}: {cls.__name__} (0x{number:X}): {msg}", number)
-        return body.get("Value")
+        return _value(r, what)
 
     # -- generic -----------------------------------------------------------
 
@@ -361,6 +349,47 @@ class AlpacaDevice:
 
     async def aclose(self) -> None:
         await self._http.aclose()
+
+
+def _value(r: httpx.Response, what: str) -> Any:
+    """An Alpaca response's ``Value``, or its error raised (module doc)."""
+    if r.status_code != 200:
+        cls = _BY_STATUS.get(r.status_code, AlpacaHTTPError)
+        raise cls(f"{what}: HTTP {r.status_code}: {r.text.strip()[:200]}", r.status_code)
+    try:
+        body = r.json()
+        number = int(body.get("ErrorNumber", 0))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise AlpacaProtocolError(f"{what}: not an Alpaca response: {r.text[:200]!r}") from exc
+    if number != 0:
+        cls = error_class(number)
+        msg = body.get("ErrorMessage") or ""
+        raise cls(f"{what}: {cls.__name__} (0x{number:X}): {msg}", number)
+    return body.get("Value")
+
+
+async def configured_devices(
+    address: str, *, timeout: float, transport: httpx.AsyncBaseTransport | None = None
+) -> list[dict[str, Any]]:
+    """The devices the Alpaca server at ``address`` (``host:port``) lists on
+    its Management API (``GET /management/v1/configureddevices``): one dict
+    per device, with ``DeviceName``, ``DeviceType``, ``DeviceNumber`` and
+    ``UniqueID``. Errors as for a device request (module doc)."""
+    what = f"{address} GET management/v1/configureddevices"
+    args = {"ClientID": CLIENT_ID, "ClientTransactionID": 1}
+    async with httpx.AsyncClient(
+        base_url=f"http://{address}/management/v1/", trust_env=False, transport=transport
+    ) as http:
+        try:
+            r = await http.get("configureddevices", params=args, timeout=timeout)
+        except httpx.TimeoutException as exc:
+            raise DeviceTimeout(f"{what}: no answer within {timeout} s") from exc
+        except httpx.TransportError as exc:
+            raise AlpacaTransportError(f"{what}: {type(exc).__name__}: {exc}") from exc
+    value = _value(r, what)
+    if not isinstance(value, list):
+        raise AlpacaProtocolError(f"{what}: Value is not a list: {value!r:.200}")
+    return value
 
 
 async def _read_body(r: httpx.Response) -> bytearray | bytes:

@@ -8,10 +8,13 @@ loopback.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import socket
 
 import pytest
 
+from robofast import alpaca_client
 from robofast.discover import Device, configured_devices, discover, main, starter_config
 from robofast.testing.alpaca_server import FakeAlpacaServer
 from robofast.testing.checks import wait_until
@@ -74,6 +77,31 @@ def test_configured_devices_lists_each_device(plugged_in):
     assert all(d.server == plugged_in.address for d in devices)
 
 
+def test_the_device_list_goes_through_robofasts_alpaca_client(plugged_in, monkeypatch):
+    """One path: the management API is asked through alpaca_client (its
+    ClientID, its error mapping), not a separate HTTP call."""
+    asked = []
+    real = alpaca_client.configured_devices
+
+    async def spy(address, **kw):
+        asked.append(address)
+        return await real(address, **kw)
+
+    monkeypatch.setattr(alpaca_client, "configured_devices", spy)
+    assert configured_devices(plugged_in.address)
+    assert asked == [plugged_in.address]
+
+
+def test_a_server_that_does_not_answer_is_named_and_the_rest_listed(plugged_in, capsys):
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        dead = f"127.0.0.1:{s.getsockname()[1]}"  # nobody listening once closed
+    main(["--server", dead, "--server", plugged_in.address])
+    captured = capsys.readouterr()
+    assert f"{dead}: no device list (AlpacaTransportError" in captured.err
+    assert "5 device(s) on 2 server(s)" in captured.out
+
+
 def test_starter_config_pairs_and_leaves_safety_to_the_operator(plugged_in):
     config = starter_config(configured_devices(plugged_in.address), "classroom")
     a = plugged_in.address
@@ -134,14 +162,16 @@ async def test_first_exposure_from_the_starter_config(plugged_in, tmp_path, caps
     """Discover, write, add the two lines the operator owns, start the
     supervisor and the sequencer: one bias on disk."""
     path = tmp_path / "observatory.json"
-    main(
+    # In a thread, as from a shell: the CLI runs its own event loop.
+    await asyncio.to_thread(
+        main,
         [
             "--address", "127.0.0.1",
             "--port", str(plugged_in.discovery.port),
             "--timeout", "1",
             "--write", str(path),
             "--name", "classroom",
-        ]
+        ],
     )  # fmt: skip
     out = capsys.readouterr().out
     assert "Telescope" in out and f"wrote {path}" in out

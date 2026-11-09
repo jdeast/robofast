@@ -16,7 +16,8 @@ robofast-discover --server 10.0.0.5:11111 # one server, no UDP (a tunnel)
 
 It sends Alpaca discovery (`alpacadiscovery1`, UDP 32227), waits
 `--timeout` seconds (default 2) for every `{"AlpacaPort": N}`, and asks
-each server for its devices (`GET /management/v1/configureddevices`):
+each server for its devices (`GET /management/v1/configureddevices`,
+through robofast's own Alpaca client, `robofast/alpaca_client.py`):
 
 ```
 Camera               127.0.0.1:32323/0        Alpaca Camera Sim

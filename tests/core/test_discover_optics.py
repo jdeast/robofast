@@ -4,12 +4,14 @@ simulated sky (docs/pointing_model.md, "A first calibration")."""
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 from datetime import UTC, datetime
 
 import pytest
 
+from robofast import alpaca_client
 from robofast.astrometry import SolverConfig
 from robofast.catalog import separation
 from robofast.discover import (
@@ -38,9 +40,29 @@ def _served(telescope, camera):
     return server, devices["Telescope"], devices["Camera"]
 
 
+class _Watched:
+    """Records every ``Connected`` the server sets on the device."""
+
+    def __setattr__(self, name, value):
+        if name == "Connected":
+            self.__dict__.setdefault("_connected_sets", []).append(value)
+        super().__setattr__(name, value)
+
+    def connected_sets(self):
+        return self.__dict__.get("_connected_sets", [])
+
+
+class WatchedTelescope(_Watched, FakeTelescope):
+    pass
+
+
+class WatchedCamera(_Watched, FakeCamera):
+    pass
+
+
 @pytest.fixture
 def scope():
-    tel, cam = FakeTelescope(), FakeCamera()
+    tel, cam = WatchedTelescope(), WatchedCamera()
     tel.FocalLength = 0.5  # m
     cam.PixelSizeX = cam.PixelSizeY = 9.0  # um
     server, t, c = _served(tel, cam)
@@ -55,10 +77,51 @@ def test_plate_scale_from_focal_length_and_pixel_size(scope):
 
 
 def test_a_disconnected_device_is_left_disconnected(scope):
+    """Connected false: no client holds it, so the read connects, reads and
+    disconnects (it owned the connection)."""
     tel, cam, t, c = scope
     tel.Connected = cam.Connected = False
+    tel._connected_sets.clear()
+    cam._connected_sets.clear()
     assert read_optics(t, c)["plate_scale"] > 0
     assert tel.Connected is False and cam.Connected is False
+    assert tel.connected_sets() == cam.connected_sets() == [True, False]
+
+
+def test_a_connected_device_is_read_as_it_is_and_never_disconnected(scope):
+    """Connected is device-global: true means another client (robofast,
+    ASCOM Remote) holds it, so Connected is never set, not even to true."""
+    tel, cam, t, c = scope
+    tel.Connected = cam.Connected = True
+    tel._connected_sets.clear()
+    cam._connected_sets.clear()
+    assert read_optics(t, c)["plate_scale"] > 0
+    assert tel.Connected is True and cam.Connected is True
+    assert tel.connected_sets() == cam.connected_sets() == []
+
+
+def test_a_device_it_connected_is_disconnected_even_when_a_read_fails(scope):
+    tel, cam, t, c = scope
+    tel.Connected = cam.Connected = False
+    del cam.PixelSizeY
+    with pytest.raises(OpticsUnavailable, match="PixelSizeY: Alpaca error"):
+        read_optics(t, c)
+    assert cam.Connected is False and cam.connected_sets()[-1] is False
+
+
+def test_the_reads_go_through_robofasts_alpaca_client(scope, monkeypatch):
+    """One path for Alpaca HTTP: the device reads are AlpacaDevice's."""
+    _, _, t, c = scope
+    asked = []
+    real = alpaca_client.AlpacaDevice.get
+
+    async def spy(self, member, **kw):
+        asked.append((self.device_type, member))
+        return await real(self, member, **kw)
+
+    monkeypatch.setattr(alpaca_client.AlpacaDevice, "get", spy)
+    read_optics(t, c)
+    assert ("telescope", "FocalLength") in asked and ("camera", "PixelSizeX") in asked
 
 
 @pytest.mark.parametrize(
@@ -125,9 +188,10 @@ async def test_first_pointing_calibration_from_the_devices(
     # The optics the hardware would report: the focal length that gives the
     # simulated sky's plate scale with the camera's pixels (times the error).
     mount.FocalLength = ARCSEC_PER_UM_PER_MM * cam.PixelSizeX / true_scale / 1000.0 * focal_error
-    server, t, c = _served(mount, cam)
+    # In a thread, as from a shell: robofast-discover runs its own event loop.
+    server, t, c = await asyncio.to_thread(_served, mount, cam)
     try:
-        optics = read_optics(t, c)
+        optics = await asyncio.to_thread(read_optics, t, c)
     finally:
         server.stop()
     unit.pointing.solver = SolverConfig(plate_scale=optics["plate_scale"])

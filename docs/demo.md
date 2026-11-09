@@ -212,14 +212,16 @@ python -m robofast.testing.rehearsal --out /tmp/rehearsal \
   model with `pointing_models`). At the preflight a failing telescope gets
   the ladder once, then is read again, and is dropped (a WARNING, a
   problem in the checks) if it still fails.
-* **`--cooling NAME=C`** or **`NAME=FILE`** (opt-in, per real telescope):
-  keep that real camera cooled at C (or as the JSON `cooling` entry in
-  FILE says; docs/cooling.md), as in production: the cooler is set when the
+* **Cooling from the site config** (`--site-config FILE`, default
+  `sites/minerva/aqawan1.json`, the enclosure config production runs on):
+  each real telescope's `cooling` entry there keeps its real camera cooled
+  (docs/cooling.md), as in production: the cooler is set when the
   sequencer starts and whenever it connects or reconnects the camera (every
   recovery rung: MINERVA T1's Andor driver switches its cooler off on a
-  reconnect), and turned back on, with an alarm, if found off. E.g.
-  `--cooling t1=-50 --cooling t2=5` (legacy SETTEMP). Without it the
-  rehearsal leaves the cooler alone.
+  reconnect), and turned back on, with an alarm, if found off. A real
+  telescope without a `cooling` entry has its cooler left alone. There is
+  no command-line setpoint (`--cooling` is refused): the config is the one
+  source.
 * **Real time.** The clock runs at real speed from now (the real mounts
   point by the real sidereal time). The plan is made at start: `SPECTRUM`
   requests (a B star through iodine, RV standards with iodine, a template

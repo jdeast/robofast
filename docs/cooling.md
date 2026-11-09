@@ -88,10 +88,14 @@ answer the check fails at `StartExposure`, as before.
 
 ## In the rehearsal
 
-`python -m robofast.testing.rehearsal --cooling t1=-50 --cooling t2=5 ...`
-(or `--cooling t1=t1-cooling.json`, a `cooling` entry as above) gives each
-real camera that cooling, exactly as in production. With it, a launcher no
-longer has to switch the coolers on before the rehearsal.
+The rehearsal (`python -m robofast.testing.rehearsal`) takes each real
+camera's cooling from the same place production does: its telescope's
+`cooling` entry in the site's enclosure config, `--site-config FILE`
+(default `sites/minerva/aqawan1.json`: T1 -50 C, T2 +5 C). There is no
+command-line setpoint (the former `--cooling` is refused with a pointer
+here): to change a setpoint, change the config. A real telescope without
+a `cooling` entry has its cooler left alone. A launcher no longer has to
+switch the coolers on before the rehearsal.
 
 ## Simulation
 

@@ -553,6 +553,94 @@ async def test_pwi2_stuck_moving_still_catches_a_stalled_slew(make):
     await tel.aclose()
 
 
+async def test_pwi2_noisy_mount_is_neither_stalled_nor_done_early(make):
+    """PWI2 judges ``moving`` by the servo residuals (legacy
+    cdk700.inPosition: "Telescope moving after it said it was done";
+    windshake): on its target a noisy mount's ``moving`` flickers. The slew
+    is not done on a single "done" read (a settle re-read must agree), is
+    never taken for a stall, and ends after ``slew_noisy_time`` on the
+    target; Status reports the flickers and PWI2's rms residuals."""
+    import json
+
+    sim, server = make("pwi2", stall_time=0.5, slew_settle=0.5, slew_noisy_time=2.0)
+    sim.model.moving_flicker = [False, True]  # every other read
+    tel = await device(server)
+    await tel.set("Tracking", True, timeout=T)
+    lst = await tel.get("SiderealTime", timeout=T)
+    ra, dec = (lst - 1.0) % 24, 20.0
+    await tel.call("SlewToCoordinatesAsync", ra, dec, timeout=T)
+    arrived = None
+    t0 = time.monotonic()
+    while await tel.get("Slewing", timeout=T):
+        if arrived is None and not sim.model.state()["slewing"]:
+            arrived = time.monotonic()
+        assert time.monotonic() - t0 < 30, "slew never ended"
+        await asyncio.sleep(0.05)
+    assert arrived is not None, "Slewing went False before the mount arrived"
+    assert time.monotonic() - arrived > 1.5  # waited out the flicker, not the first "done"
+    assert server.mount.slew_error is None
+    assert not any("stop" in c for c in sim.model.commands)
+    assert server.mount.moving_flickers > 0
+    st = json.loads(await tel.call("Action", "Status", "", timeout=T))
+    assert st["moving_flickers"] > 0 and st["rms_error_arcsec"] == {"alt": 0.1, "az": 0.1}
+    await asyncio.sleep(0.5)
+    assert not await tel.get("Slewing", timeout=T)  # a flicker after the end is not a slew
+    await tel.aclose()
+
+
+async def test_pwi2_slew_done_needs_a_settle_re_read(make):
+    """A steady PWI2: done only once ``moving`` has read False across
+    ``slew_settle`` on the target."""
+    sim, server = make("pwi2", slew_settle=1.5)
+    tel = await device(server)
+    await tel.set("Tracking", True, timeout=T)
+    lst = await tel.get("SiderealTime", timeout=T)
+    await tel.call("SlewToCoordinatesAsync", (lst - 0.5) % 24, 25.0, timeout=T)
+    arrived = None
+    t0 = time.monotonic()
+    while await tel.get("Slewing", timeout=T):
+        if arrived is None and not sim.model.state()["slewing"]:
+            arrived = time.monotonic()
+        assert time.monotonic() - t0 < 30, "slew never ended"
+        await asyncio.sleep(0.05)
+    assert arrived is not None and time.monotonic() - arrived >= 1.2
+    assert server.mount.slew_error is None and server.mount.moving_flickers == 0
+    await tel.aclose()
+
+
+async def test_pwi2_motor_error_fails_the_slew_at_once(make):
+    """A drive error code during a slew (legacy cdk700.inPosition returned
+    False on any): the mount is stopped and Slewing raises the reason."""
+    sim, server = make("pwi2", sim_kw={"slew_rate": 2.0})
+    tel = await device(server)
+    await tel.set("Tracking", True, timeout=T)
+    lst = await tel.get("SiderealTime", timeout=T)
+    await tel.call("SlewToCoordinatesAsync", (lst - 1.0) % 24, 10.0, timeout=T)
+    await asyncio.sleep(0.4)
+    with sim.model.lock:
+        sim.model.motor_errors["alt"] = (5, "Position error exceeded")
+    with pytest.raises(Exception, match="altitude drive error 5"):
+        await until(lambda: _not(tel.get("Slewing", timeout=T)), timeout=5, what="slew")
+    assert any("stop" in c for c in sim.model.commands)
+    await tel.aclose()
+
+
+async def test_pwi2_done_but_off_target_fails(make):
+    """PWI2 takes a goto and never moves (tracked, ``moving`` False): not a
+    finished slew. After ``slew_arrive_timeout`` the slew has failed."""
+    sim, server = make("pwi2", slew_arrive_timeout=1.5)
+    tel = await device(server)
+    await tel.set("Tracking", True, timeout=T)
+    lst = await tel.get("SiderealTime", timeout=T)
+    sim.model.goto_radec = lambda r, d: None  # type: ignore[method-assign]
+    await tel.call("SlewToCoordinatesAsync", (lst - 2.0) % 24, 10.0, timeout=T)
+    await asyncio.sleep(1.0)
+    assert await tel.get("Slewing", timeout=T)  # it may yet start (PWI2 starts late)
+    with pytest.raises(Exception, match="from its target"):
+        await until(lambda: _not(tel.get("Slewing", timeout=T)), timeout=10, what="slew")
+    await tel.aclose()
+
+
 async def test_pwi2_tracking_off_waits_for_an_alt_az_slew_to_arrive(make):
     """MINERVA T1, 2026-11-08: the rehearsal's end action slewed to alt 25
     az 0 and sent tracking off ~2 s later; PWI2 (reporting tracking on during

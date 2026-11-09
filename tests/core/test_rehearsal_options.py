@@ -234,23 +234,31 @@ async def test_the_guider_service_points_its_sky_at_each_target(tmp_path):
         await svc.stop()
 
 
-def test_cooling_from_the_command_line(tmp_path):
-    """``--cooling NAME=C`` or ``NAME=FILE`` (docs/cooling.md)."""
-    assert reh.settings_from_args(_args()).cooling == {}
+def test_cooling_comes_from_the_site_config(tmp_path):
+    """Each real camera's setpoint is its telescope's ``cooling`` entry in
+    the site config production runs on (docs/cooling.md); there is no
+    command-line setpoint."""
+    site = json.loads((reh.SITES / "aqawan1.json").read_text())
+    s = reh.settings_from_args(_args())
+    assert s.site_path == reh.SITES / "aqawan1.json"
+    assert s.cooling == {"t1": site["telescopes"]["t1"]["cooling"]}
+    assert s.cooling["t1"]["setpoint"] == -50.0
+    # Another site config: its entries, and only the real telescopes'.
+    site["telescopes"]["t1"]["cooling"] = {"setpoint": -40.0, "tolerance": 1.0}
+    other = tmp_path / "site.json"
+    other.write_text(json.dumps(site))
+    s = reh.settings_from_args(_args(f"site_config={other}"))
+    assert s.cooling == {"t1": {"setpoint": -40.0, "tolerance": 1.0}}
+    del site["telescopes"]["t1"]["cooling"]
+    other.write_text(json.dumps(site))
+    assert reh.settings_from_args(_args(f"site_config={other}")).cooling == {}
+    site["telescopes"]["t1"]["cooling"] = {"setpoint": -500.0}
+    other.write_text(json.dumps(site))
+    with pytest.raises(reh.RehearsalRefused, match=r"telescopes\.t1\.cooling"):
+        reh.settings_from_args(_args(f"site_config={other}"))
+    with pytest.raises(reh.RehearsalRefused, match="No such file"):
+        reh.settings_from_args(_args(f"site_config={tmp_path / 'missing.json'}"))
     ns = _args()
-    entry = {"setpoint": 5, "tolerance": 0.75, "settle_timeout": 600}
-    (tmp_path / "t1.json").write_text(json.dumps(entry))
     ns.cooling = ["t1=-50"]
-    assert reh.settings_from_args(ns).cooling == {"t1": {"setpoint": -50.0}}
-    ns.cooling = [f"t1={tmp_path / 't1.json'}"]
-    assert reh.settings_from_args(ns).cooling == {"t1": entry}
-    for bad, why in (
-        (["t2=-50"], "not a real telescope"),
-        (["t1=-50", "t1=-40"], "given twice"),
-        (["t1=-500"], "outside"),
-        ([f"t1={tmp_path / 'missing.json'}"], "No such file"),
-        (["t1"], "expected NAME=C"),
-    ):
-        ns.cooling = bad
-        with pytest.raises(reh.RehearsalRefused, match=why):
-            reh.settings_from_args(ns)
+    with pytest.raises(reh.RehearsalRefused, match="--cooling is gone"):
+        reh.settings_from_args(ns)

@@ -328,7 +328,7 @@ from robofast.orbit import Orbit
 from robofast.owner import DeviceError, DeviceOwner, Grant, GrantRevoked, Unsupported
 from robofast.plan import Idle, Observation, PlanProvider, as_plan
 from robofast.pointmodel import PointingCorrector
-from robofast.recovery import RecoveryLadder, RecoveryResult
+from robofast.recovery import MountAccess, RecoveryLadder, RecoveryResult
 from robofast.registry import ValueRegistry
 from robofast.rotcal import RotatorSetup
 from robofast.safety import LeaseRevoked, OpenLease, RecoveryRefused, SafetySupervisor
@@ -481,6 +481,10 @@ class GuiderHook(Protocol):
     async def stop(self, reason: str) -> bool:
         """Stop guiding; bounded, never raises."""
         ...
+
+    # Optional, for the recovery ladder's ``guider`` device
+    # (docs/recovery.md): ``async reconnect()`` (close and open the guide
+    # camera again; raise if it cannot) and ``async status()``.
 
 
 class SpectrographHook(Protocol):
@@ -2061,9 +2065,8 @@ class Sequencer:
             return None
         devices = self._devices(state, unit, tel, cam)
         kind = ladder.device_for(error, {k: o.name for k, (o, _) in devices.items()})
-        if kind is None:
+        if kind is None or (kind == "guider" and unit.guider is None):
             return None
-        owner, grant = devices[kind]
         self._event("recovery_start", gen=state.gen, telescope=unit.name, device=kind)
 
         async def others(device: str, member: str) -> Any:
@@ -2071,13 +2074,28 @@ class Sequencer:
                 return None
             return await devices[device][1].get(member)
 
+        tel_owner = unit.telescope
+        mount = MountAccess(
+            reconnect=lambda: tel_owner.reconnect("recovery"),
+            probe=lambda member: tel.get(member),
+            call=lambda member, *args: tel.call(member, *args),
+        )
+        call: Callable[..., Awaitable[Any]] | None = None
+        if kind == "guider":
+            reconnect, probe = self._guider_access(unit)
+        else:
+            owner, grant = devices[kind]
+            reconnect = lambda: owner.reconnect("recovery")  # noqa: E731
+            probe = lambda member: grant.get(member)  # noqa: E731
+            call = lambda member, *args: grant.call(member, *args)  # noqa: E731
         try:
             result = await ladder.recover(
                 kind,
-                reconnect=lambda: owner.reconnect("recovery"),
-                probe=lambda member: grant.get(member),
+                reconnect=reconnect,
+                probe=probe,
                 others=others,
-                call=lambda member, *args: grant.call(member, *args),
+                call=call,
+                mount=None if kind == "telescope" else mount,
             )
         except GrantRevoked:
             return None  # fenced: the generation's cleanup takes over
@@ -2090,6 +2108,25 @@ class Sequencer:
             tried=[f"{r}: {o}" for r, o in result.tried],
         )
         return result
+
+    @staticmethod
+    def _guider_access(unit: TelescopeUnit) -> tuple[Callable, Callable]:
+        """The recovery ladder's view of a telescope's guider (docs/recovery.md):
+        its ``reconnect`` (the service closes and opens its camera again)
+        and its ``status``."""
+        guider = unit.guider
+
+        async def reconnect() -> None:
+            fn = getattr(guider, "reconnect", None)
+            if fn is None:
+                raise RuntimeError(f"{unit.name}'s guider cannot reconnect its camera")
+            await fn()
+
+        async def probe(member: str) -> Any:
+            fn = getattr(guider, member, None)
+            return {} if fn is None else await fn()
+
+        return reconnect, probe
 
     async def _wait_for(
         self, probe: Callable[[], Awaitable[Any]], done: Callable[[Any], bool], timeout: float

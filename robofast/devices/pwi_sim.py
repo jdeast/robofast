@@ -170,6 +170,14 @@ class CDK700Model:
         self.mech_target: float | None = None
         #: The next this many M3 gotos are answered and ignored.
         self.m3_drops = 0
+        #: PWI2: a noisy mount (servo residuals above PWI2's "MAX RMS
+        #: Encoder Error for Goto", windshake): while tracking at rest,
+        #: ``mount.moving`` follows this pattern, one entry per status read,
+        #: cyclically (``on_target`` the opposite). None: steady.
+        self.moving_flicker: list[bool] | None = None
+        self._flicker_i = 0
+        #: PWI2 motor (drive) error per axis ("alt", "azm"): (code, message).
+        self.motor_errors: dict[str, tuple[int, str]] = {}
         self.homing_axes: tuple[int, ...] = ()
         self.alt, self.mech = alt, az
         self.tracking = False
@@ -589,6 +597,14 @@ def pwi2_status(m: CDK700Model) -> str:
     t_ra, t_dec = m.radec if m.radec is not None else (ra, dec)
     port = m.current_port
     moving = m.slewing or m.homing or not m.tracking or m.stuck_moving  # PWI2's quirks
+    on_target = m.tracking and not m.slewing
+    if m.moving_flicker and m.tracking and not (m.slewing or m.homing):
+        # A noisy mount at rest: PWI2's residual-based flags flicker.
+        moving = m.moving_flicker[m._flicker_i % len(m.moving_flicker)]
+        m._flicker_i += 1
+        on_target = not moving
+    alt_err = m.motor_errors.get("alt", (0, "No error"))
+    azm_err = m.motor_errors.get("azm", (0, "No error"))
 
     def el(tag: str, value: Any) -> str:
         return f"<{tag}>{escape(str(value))}</{tag}>"
@@ -620,7 +636,7 @@ def pwi2_status(m: CDK700Model) -> str:
         dev("rotator2", m.rotators[2], "Degree"),
         "<mount>"
         + el("connected", _b2(m.connected))
-        + el("on_target", _b2(m.tracking and not m.slewing))
+        + el("on_target", _b2(on_target))
         + el("moving", _b2(moving))
         + el("tracking", _b2(m.tracking))
         + el("ra", _sexa(ra, hours=True, places=3))
@@ -635,10 +651,10 @@ def pwi2_status(m: CDK700Model) -> str:
         + el("alt_radian", repr(math.radians(m.alt)))
         + el("azm_rms_error_arcsec", "0.1")
         + el("alt_rms_error_arcsec", "0.1")
-        + el("azm_motor_error_code", "0")
-        + el("alt_motor_error_code", "0")
-        + el("azm_motor_error_message", "No error")
-        + el("alt_motor_error_message", "No error")
+        + el("azm_motor_error_code", str(azm_err[0]))
+        + el("alt_motor_error_code", str(alt_err[0]))
+        + el("azm_motor_error_message", azm_err[1])
+        + el("alt_motor_error_message", alt_err[1])
         + el("azm_enabled", _b2(m.enabled[0]))
         + el("alt_enabled", _b2(m.enabled[1]))
         + el("pointing_model", m.model_file)

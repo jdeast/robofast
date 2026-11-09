@@ -319,7 +319,10 @@ built-in `robofast.devices` plug-in. In short:
   guide on an offset star: `docs/offset_guiding.md`), `/stop`, `/mode`
   (`closed`, or `open`: measure only, for commissioning), `/target` (moves
   the setpoint, keeps the controller's state), `/gains`, `/roi`,
-  `/exposure`, `/locate`, `/calibrate`.
+  `/exposure`, `/locate`, `/calibrate`;
+- `POST /reconnect`: stop guiding if it is, close the guide camera and open
+  it again (state `idle`; 503 if it does not open): the recovery ladder's
+  `reconnect` rung for the `guider` device (docs/recovery.md).
 
 **Telemetry**: state and reason; per frame (ring buffer): centroid, error,
 correction, tip/tilt position, flux, FWHM, latency; over the window:
@@ -359,7 +362,10 @@ failed, preempted or cancelled) it calls `stop()`. Every cleanup (and the
 error path of a telescope) stops the guider **before** it aborts the slew
 and parks. `stop()` is bounded and never raises. A guider that cannot
 acquire, or fails mid-observation, is that telescope's ordinary error
-(back off, give up after `max_consecutive_errors`). A telescope without a
+(back off, give up after `max_consecutive_errors`); with a `guider` entry
+in the telescope's `recovery` policy it first climbs the guider's recovery
+ladder (reconnect the guide camera, restart its driver or the service,
+power-cycle it: docs/recovery.md), like any other device. A telescope without a
 guider reports an observation that asks to guide `unsupported` (not its
 error: robofast.sequencer, "Several telescopes"). Config: per telescope,
 `"guider": "http://host:port"` or `{"url", "acquire_timeout", "timeout",

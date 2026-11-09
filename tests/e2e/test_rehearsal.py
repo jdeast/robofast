@@ -96,8 +96,8 @@ async def test_a_rehearsal_on_fake_real_hardware(tmp_path):
         # Test only: a dark night, ten times faster than real time.
         start=datetime(2026, 11, 10, 4, 0, tzinfo=UTC),
         scale=10.0,
-        # robofast keeps T1's camera cooled (docs/cooling.md); T2's is left alone.
-        cooling={"t1": {"setpoint": -50.0}},
+        # Each camera is kept cooled as the site config says (docs/cooling.md):
+        # sites/minerva/aqawan1.json, T1 -50 C and T2 +5 C (legacy SETTEMP).
     )
     for cam in cams.values():
         cam.CoolerOn = False
@@ -117,7 +117,7 @@ async def test_a_rehearsal_on_fake_real_hardware(tmp_path):
         assert (mount.Altitude, mount.Azimuth) == (60.0, 180.0)
         assert cams[name].exposures_started >= 2, name
     assert cams["t1"].CoolerOn and cams["t1"].SetCCDTemperature == -50.0
-    assert not cams["t2"].CoolerOn and cams["t2"].SetCCDTemperature == -20.0
+    assert cams["t2"].CoolerOn and cams["t2"].SetCCDTemperature == 5.0
     assert all(c == "COMPLETED" for c in outcome.statuses.values()), outcome.statuses
     assert len(outcome.slews) >= 4 and all(r["error_arcsec"] < 1 for r in outcome.slews)
     assert outcome.why_end == "every request done"

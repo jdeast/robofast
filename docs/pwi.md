@@ -155,9 +155,16 @@ the mount) or the M3 port changes, and PWI reports another
 `mount.pointing_model` than the current port's (file names compare
 without directory or case), the server sends `setmodel` for it, once per
 such event; a failure is logged and the next reconnect or port change
-tries again. It moves nothing. The `Status` action reports
-`pointing_model`, `pointing_model_wanted` and every `model_loads` entry
-(port, file, error). PWI2 only: a PWI4 config with `pointing_models` is
+tries again. It moves nothing. PWI2 can take seconds to report the new
+model (on MINERVA's T2, 2026-11-08, still the default model 3 s after
+`setmodel` answered, the new one moments later), so if the answer still
+shows the old model the server re-reads PWI every second in the background
+(the limit watch and Alpaca requests do not wait) for up to
+`model_verify_timeout` (default 15 s), and logs the outcome once: loaded,
+with the time it took, or an error only once the whole wait has passed.
+The `Status` action reports `pointing_model`, `pointing_model_wanted` and
+every `model_loads` entry (port, file, error), added when its outcome is
+known. PWI2 only: a PWI4 config with `pointing_models` is
 refused (robofast sends PWI4 no model request; PWI4 keeps the model loaded
 in its GUI).
 

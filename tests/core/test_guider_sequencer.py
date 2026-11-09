@@ -100,13 +100,14 @@ async def test_cleanup_stops_the_guider_before_parking(make_rig):
     assert not g.guiding
 
 
-async def test_guide_without_a_guider_fails_the_observation(make_rig):
+async def test_guide_without_a_guider_is_unsupported(make_rig):
     plan = StaticPlan([{"name": "x", "exptime": 0.1, "count": 1, "guide": True}], ["t1"])
     rig = make_rig(plan=plan, seq=dict(max_consecutive_errors=1))
     await _run(rig)
-    err = _events(rig, "telescope_error")[0].detail["error"]
-    assert "has no guider" in err
-    assert rig.cams[0].exposures_started == 0 and plan.history[0][2] == "failed"
+    why = _events(rig, "observation_unsupported")[0].detail["reason"]
+    assert "has no guider" in why
+    assert not _events(rig, "telescope_error")
+    assert rig.cams[0].exposures_started == 0 and plan.history[0][2] == "unsupported"
 
 
 async def test_guider_failing_to_acquire_is_the_telescopes_error(make_rig):

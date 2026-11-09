@@ -331,6 +331,19 @@ class Seen:
     def __contains__(self, key: str) -> bool:
         return key in self.ids
 
+    def prepare(self) -> None:
+        """Make sure :meth:`save` can write: create the directory if it is
+        missing; raise :class:`OSError` (with the reason) if it cannot be
+        created or written."""
+        import os
+
+        if self.path is None:
+            return
+        parent = self.path.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        if not os.access(parent, os.W_OK | os.X_OK):
+            raise PermissionError(f"{parent}: not writable")
+
     def add(self, key: str, now: datetime) -> None:
         self.ids[key] = now.isoformat()
 

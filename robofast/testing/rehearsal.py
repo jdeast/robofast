@@ -1109,6 +1109,14 @@ class Rehearsal(SimulatedNight):
             locate_timeout=30.0,
             spectrograph_abort_wait=10.0,
         )
+        # Real time: the guiders get production's acquire_timeout (120 s,
+        # robofast.guider.service.GuiderRemote), not the simulated night's
+        # 30 s: night1108 timed out a faint (G~10) acquisition at 10 s while
+        # its acquisitions took 8-10 s under load.
+        for name in self.telescopes:
+            guider = cfg["telescopes"][name].get("guider")
+            if isinstance(guider, dict):
+                guider["acquire_timeout"] = 120.0
         # Each real telescope's recovery ladder, as in production.
         for name, policy in self.r.recovery.items():
             if name in self.r.real:

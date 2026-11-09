@@ -47,7 +47,9 @@ The model, from the legacy driver's use of PWI (``docs/pwi.md``):
   disabled, not homed, ``Default_Mount_Model.PXP`` loaded; ``--restarted``
   starts a simulator in that state).
 * PWI2 ``device=mount&cmd=setmodel&filename=F`` loads pointing model ``F``
-  (reported as ``mount.pointing_model``; PWI4's ``mount.model.filename``).
+  (reported as ``mount.pointing_model``; PWI4's ``mount.model.filename``),
+  after ``model_delay`` s (default 0; MINERVA's T2 took over 3 s; None:
+  never, a PWI that does not load it).
 * the M3 takes ``m3_time`` s between ports (PWI4 ``m3.port`` -1, PWI2 0
   meanwhile); ``m3_drops`` gotos are answered but ignored, as PWI4
   sometimes does; one
@@ -184,6 +186,9 @@ class CDK700Model:
         self.rotators = {1: _Axis(0.0, rotator_rate), 2: _Axis(0.0, rotator_rate)}
         #: The loaded pointing-model file (PWI2 ``setmodel``; PWI4 reports it).
         self.model_file = model_file
+        #: setmodel takes effect this long after it is answered (None: never).
+        self.model_delay: float | None = 0.0
+        self._model_pending: tuple[str, float] | None = None
         self.ignored: list[str] = []
         self.commands: list[str] = []
         self._t = time.monotonic()
@@ -222,6 +227,8 @@ class CDK700Model:
         with self.lock:
             now = time.monotonic() if now is None else now
             dt, self._t = max(0.0, now - self._t), now
+            if self._model_pending is not None and now >= self._model_pending[1]:
+                self.model_file, self._model_pending = self._model_pending[0], None
             if self.homing_until and now >= self.homing_until and not self.slewing:
                 self.homing_until = 0.0
                 for i in self.homing_axes:
@@ -685,7 +692,12 @@ def pwi2_handle(m: CDK700Model, path: str, q: dict[str, list[str]]) -> str:
             name = q.get("filename", [""])[0]
             if not name:
                 raise _HTTPError(400, "setmodel: no filename")
-            m.model_file = name
+            if m.model_delay is None:
+                pass  # answered, never loaded
+            elif m.model_delay > 0:
+                m._model_pending = (name, time.monotonic() + m.model_delay)
+            else:
+                m.model_file = name
         elif device == "mount" and cmd == "stop":
             m.stop()
         elif device == "mount" and cmd in ("trackingon", "trackingoff"):

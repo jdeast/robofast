@@ -360,9 +360,15 @@ error path of a telescope) stops the guider **before** it aborts the slew
 and parks. `stop()` is bounded and never raises. A guider that cannot
 acquire, or fails mid-observation, is that telescope's ordinary error
 (back off, give up after `max_consecutive_errors`). A telescope without a
-guider fails an observation that asks to guide. Config: per telescope,
+guider reports an observation that asks to guide `unsupported` (not its
+error: robofast.sequencer, "Several telescopes"). Config: per telescope,
 `"guider": "http://host:port"` or `{"url", "acquire_timeout", "timeout",
-"poll_interval", "status_failures"}`.
+"poll_interval", "status_failures"}`. `acquire_timeout` defaults to 120 s:
+an acquisition is an acquisition frame, coarse offsets and settles, and a
+faint star or a loaded guider computer takes many seconds (night1108's
+rehearsal: 8-10 s per acquisition, so its 10 s test setting failed a G~10
+star; the simulated RV night now uses 30 s and the hardware rehearsal
+production's 120 s).
 
 A status read that times out (`timeout`, default 5 s) is transient, not a
 failed guider: the service may be busy, or the computer loaded. While

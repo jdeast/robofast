@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -559,3 +561,48 @@ def test_recovery_options(tmp_path):
     f.write_text(json.dumps({"camera": {"steps": ["home"]}}))
     with pytest.raises(RehearsalRefused, match="telescope step"):
         settings_from_args(args(recovery=[f"t1={f}"]))
+
+
+async def test_a_slow_setmodel_is_waited_for_not_an_error(pwi2, caplog):
+    """night1108: PWI2 on T2 reported the new model over 3 s after setmodel
+    answered, and the server logged a false ERROR. It now re-reads in the
+    background, bounded (model_verify_timeout), and logs the outcome."""
+    sim, server = pwi2()
+    m = sim.model
+    await wait_until(lambda: server.mount._pwi_up and not server.mount._model_due, timeout=5)
+    m.model_delay = 1.5
+    caplog.set_level(logging.INFO, logger="robofast.devices.pwi_server")
+    dev = AlpacaDevice(server.address, "telescope")
+    await dev.connect(timeout=5)
+    try:
+        t0 = time.monotonic()
+        await dev.call("Action", "SelectPort", "fau", timeout=10)
+        # The port change does not wait for the model.
+        assert m.model_file != PORT2 and time.monotonic() - t0 < 1.5
+        await wait_until(lambda: server.mount.model_loads, timeout=10, what="the outcome")
+    finally:
+        await dev.aclose()
+    assert server.mount.model_loads == [(2, PORT2, None)]
+    assert m.model_file == PORT2
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("PWI reports it after" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_setmodel_pwi_never_takes_is_an_error_after_the_wait(pwi2, caplog):
+    sim, server = pwi2(model_verify_timeout=1.0)
+    m = sim.model
+    await wait_until(lambda: server.mount._pwi_up and not server.mount._model_due, timeout=5)
+    m.model_delay = None
+    caplog.set_level(logging.INFO, logger="robofast.devices.pwi_server")
+    dev = AlpacaDevice(server.address, "telescope")
+    await dev.connect(timeout=5)
+    try:
+        await dev.call("Action", "SelectPort", "fau", timeout=10)
+        await wait_until(lambda: server.mount.model_loads, timeout=10, what="the outcome")
+    finally:
+        await dev.aclose()
+    [(port, name, err)] = server.mount.model_loads
+    assert (port, name) == (2, PORT2) and "still reports" in err
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == [
+        f"setmodel {PORT2}: {err}"
+    ]

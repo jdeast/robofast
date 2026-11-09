@@ -224,15 +224,23 @@ async def test_filter_and_port_are_selected_before_the_exposures(make_rig):
         ({"filter": "Halpha"}, {"filterwheels": True}, "no filter 'Halpha'"),
     ],
 )
-async def test_an_unsupported_filter_or_port_fails_the_observation(make_rig, target, kw, error):
-    plan = StaticPlan([{"name": "x", "exptime": 0.1, "count": 1, **target}], ["t1"])
+async def test_an_unsupported_filter_or_port_is_not_observed(make_rig, target, kw, error):
+    """Unsupported: reported with its reason, not the telescope's error (no
+    park, no give-up even at max_consecutive_errors=1), and the next
+    observation goes ahead."""
+    plan = StaticPlan(
+        [{"name": "x", "exptime": 0.1, "count": 1, **target}, {"name": "y", "exptime": 0.1}],
+        ["t1"],
+    )
     rig = make_rig(plan=plan, seq=dict(max_consecutive_errors=1), **kw)
     await rig.start()
     await asyncio.wait_for(asyncio.shield(rig.tasks[-1]), 10)
-    errors = _events(rig, "telescope_error")
-    assert errors and error in errors[0].detail["error"]
-    assert rig.cams[0].exposures_started == 0  # never observed through the wrong one
-    assert plan.history[0][2] == "failed"
+    [why] = _events(rig, "observation_unsupported")
+    assert error in why.detail["reason"]
+    assert not _events(rig, "telescope_error") and not _events(rig, "giving_up")
+    assert rig.cams[0].exposures_started == 1  # only y: never through the wrong one
+    assert [h[1:3] for h in plan.history] == [("x", "unsupported"), ("y", "complete")]
+    assert plan.unsupported_log == [("t1", "x", why.detail["reason"])]
 
 
 async def test_port_action_refused_by_the_mount_is_an_error(make_rig):

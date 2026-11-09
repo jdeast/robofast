@@ -601,7 +601,10 @@ async def test_another_lamp_is_switched_off_first(serve, make_rig):
 
 
 @pytest.mark.parametrize(("lamps", "error"), [(False, "has no lamps"), (True, "no lamp 'ThAr9'")])
-async def test_a_telescope_without_the_lamp_fails_the_observation(serve, make_rig, lamps, error):
+async def test_a_telescope_without_the_lamp_cannot_do_the_observation(
+    serve, make_rig, lamps, error
+):
+    """Unsupported, not the telescope's error: reported, never retried here."""
     plan = StaticPlan([arc(lamp="ThAr9")], ["t1"])
     if lamps:
         rig = lamp_rig(make_rig, serve(), plan, seq=dict(max_consecutive_errors=1))
@@ -609,8 +612,10 @@ async def test_a_telescope_without_the_lamp_fails_the_observation(serve, make_ri
         rig = make_rig(plan=plan, seq=dict(max_consecutive_errors=1))
     await rig.start()
     await asyncio.wait_for(asyncio.shield(rig.tasks[-1]), 10)
-    errors = _events(rig, "telescope_error")
-    assert errors and error in errors[0].detail["error"]
+    [why] = _events(rig, "observation_unsupported")
+    assert error in why.detail["reason"]
+    assert not _events(rig, "telescope_error") and not _events(rig, "giving_up")
+    assert [h[2] for h in plan.history] == ["unsupported"]
     assert rig.cams[0].exposures_started == 0
 
 

@@ -69,9 +69,20 @@ the target's motion, so a guided or fiber configuration is refused.
 
 There is one way to follow: the mount's tracking rates. A telescope whose
 mount cannot set them (ASCOM `CanSetRightAscensionRate` or
-`CanSetDeclinationRate` false) refuses the observation before it slews,
-an `Unsupported` error of that telescope like any other it cannot do
-(no guider, no lamp); it is never followed some other way.
+`CanSetDeclinationRate` false) refuses the observation before it slews
+with `Unsupported`, like anything else it cannot do (no guider, no lamp);
+it is never followed some other way. That is not an error of the
+telescope: the observation is reported `unsupported`, the telescope goes
+on at once with its next target (no park, no backoff, no error count), and
+the dispatch scheduler never offers that configuration to it again; it
+stays eligible on a telescope whose mount has rates, and is refused
+(`FAILED`, with the reasons) once none can do it. The sequencer also reads
+each mount's `CanSetRightAscensionRate`/`CanSetDeclinationRate` before its
+first observation and tells the scheduler, which then never offers a moving
+target to a mount without rates at all (robofast.dispatch, "What a
+telescope cannot do"). On MINERVA's dry run of 2026-11-09 the Unsupported
+was still counted as t1's error: dispatch retried the Eris ToO three times
+and a healthy t1 gave up for the night.
 
 The sequencer slews to the target's place (through the pointing model and
 the slew guard, as every slew), and before each exposure sets

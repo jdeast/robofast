@@ -286,6 +286,12 @@ async def replay(entries: list[dict[str, Any]]) -> ReplayResult:
             sched.set_mode(e.get("mode"), {"observe": e.get("observe")})
         elif kind == "spectrograph":
             sched.set_spectrograph_available(bool(e["available"]), e.get("reason") or "")
+        elif kind == "capabilities":
+            sched.set_capabilities(e["telescope"], e["capabilities"])
+        elif kind == "unsupported":
+            obs = handed.get(e["telescope"])
+            if obs is not None:
+                sched.unsupported(e["telescope"], obs, e.get("reason") or "")
         elif kind == "preempt":
             result.compared += 1
             if i not in used:

@@ -625,7 +625,12 @@ class SimulatedNight:
         for name, t in self.telescopes.items():
             cfg["telescopes"][name]["guider"] = {
                 "url": t.guider_url,
-                "acquire_timeout": 10.0,
+                # Production's default is 120 s. A simulated guider acquires
+                # in ~2 s on an idle machine, but in 8-10 s on a loaded one
+                # (night1108's rehearsal: one G~10 acquisition timed out at
+                # the 10 s this was): 30 s keeps a truly failed acquisition
+                # short without failing a slow one.
+                "acquire_timeout": 30.0,
                 "timeout": 3.0,
                 "poll_interval": 0.5,
             }

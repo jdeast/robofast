@@ -326,6 +326,24 @@ async def test_pointing_model_follows_the_port_and_a_pwi_restart(pwi2):
     ]
 
 
+async def test_concurrent_model_checks_send_one_setmodel(pwi2):
+    """The limit watch and an Alpaca request both check the model at once
+    after PWI comes back: one setmodel, not two (CI flake, 2026-11-09)."""
+    sim, server = pwi2()
+    m = sim.model
+    await wait_until(lambda: server.mount._pwi_up and not server.mount._model_due, timeout=5)
+    with m.lock:
+        m.model_file = "Default_Mount_Model.PXP"
+        m.commands.clear()
+    server.mount._invalidate()  # no cached status from before the change
+    server.mount._model_due = True
+    await asyncio.gather(*(server.mount.check_model() for _ in range(5)))
+    await wait_until(lambda: m.model_file == PORT1, timeout=5)
+    sent = [c for c in m.commands if c.startswith("mount:setmodel")]
+    assert sent == [f"mount:setmodel&filename={PORT1}"]
+    assert server.mount.model_loads[-1:] == [(1, PORT1, None)]
+
+
 async def test_the_right_model_is_left_alone(pwi2):
     sim, server = pwi2()
     with sim.model.lock:

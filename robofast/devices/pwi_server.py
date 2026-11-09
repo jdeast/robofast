@@ -583,6 +583,7 @@ class PWIMount:
         #: is known (after the verify wait, if PWI was slow to report it).
         self.model_loads: list[tuple[int, str, str | None]] = []
         self._model_verify: asyncio.Task | None = None
+        self._model_lock = asyncio.Lock()
 
     # -- reads ----------------------------------------------------------------------
 
@@ -655,6 +656,14 @@ class PWIMount:
         model, send ``setmodel`` for that port (once per check: a failure is
         logged, and the next reconnect or port change tries again)."""
         if not self.models or not self._model_due:
+            return
+        # The limit watch and Alpaca requests both call this: one at a time,
+        # or two callers past the check above would both send setmodel.
+        async with self._model_lock:
+            await self._check_model()
+
+    async def _check_model(self) -> None:
+        if not self._model_due:
             return
         st = await self.status()
         if not st.connected or st.m3_port not in (1, 2):

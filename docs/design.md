@@ -313,9 +313,10 @@ FilterWheel (`Names`) and the wheel moved to it, bounded by
 `Action(port_action, port)` (configurable per telescope: PWI4 on the
 CDK700s), bounded by `port_timeout`. Both happen before the exposures,
 while the enclosure opens. A telescope without a filter wheel or a
-`port_action`, or a filter its wheel lacks, fails that observation (an
-ordinary error of that telescope) rather than observe through the wrong
-one; the dispatch scheduler already keeps such requests off it (section
+`port_action`, or a filter its wheel lacks, reports that observation
+`unsupported` (not an error of that telescope: it goes on with its next
+target, and the dispatch scheduler offers that configuration only to the
+others) rather than observe through the wrong one; the dispatch scheduler already keeps such requests off it (section
 3.7).
 A telescope may also have a **calibration stage** (`calstage`: the FLWO
 60-inch's TRES front end, served as an Alpaca FilterWheel whose `Names` are

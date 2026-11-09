@@ -277,18 +277,19 @@ def _events(rig, what):
 async def test_a_mount_without_rates_cannot_follow(make_rig):
     """One way to follow: the mount's rates. A mount that cannot set them
     (the PWI and TCS servers today) refuses the observation before it slews:
-    an Unsupported error of that telescope, no frames, no rate set."""
+    Unsupported -- reported once, not an error of that telescope (night1108:
+    it was, and a healthy t1 gave up for the night) -- no frames, no rate
+    set."""
     plan = StaticPlan([follow_obs()], ["t1"])
     rig = make_rig(plan=plan)
     await rig.start()
     await asyncio.wait_for(asyncio.shield(rig.tasks[-1]), 20)
-    assert plan.history and {(t, n, out) for t, n, out, _ in plan.history} == {
-        ("t1", "B1", "failed")
-    }
+    assert [(t, n, out) for t, n, out, _ in plan.history] == [("t1", "B1", "unsupported")]
     tel = rig.tels[0]
     assert tel.rate_log == [] and tel.slews == []
-    errors = _events(rig, "telescope_error")
-    assert errors and "cannot set tracking rates" in errors[0].detail["error"]
+    [why] = _events(rig, "observation_unsupported")
+    assert "cannot set tracking rates" in why.detail["reason"]
+    assert not _events(rig, "telescope_error") and not _events(rig, "telescope_backoff")
 
 
 async def test_the_sequencer_sets_the_rates_and_resets_them(make_rig):
@@ -371,3 +372,162 @@ async def test_the_cleanup_resets_the_rates_before_it_parks(make_rig):
     await wait_until(lambda: rig.timeline.events("cleanup_done", "seq"), 10, what="cleanup done")
     assert (tel.RightAscensionRate, tel.DeclinationRate) == (0.0, 0.0)
     assert rig.sequencer.units["t1"].follow_rates is False
+
+
+# -- what a telescope cannot do (night1108) ----------------------------------------
+#
+# MINERVA's live dry run, 2026-11-09: a ToO for Eris (ORBITAL_ELEMENTS) went
+# to t1, whose PWI2 mount cannot set tracking rates. The Unsupported was
+# counted as t1's error, dispatch handed the same request back three times,
+# and a healthy t1 gave up for the night. Unsupported is a property of the
+# (request, telescope) pair: never retried there, still eligible elsewhere,
+# refused once no telescope can do it, and the telescope goes on at once.
+
+NOW = utc("2026-11-10T11:00")  # B1 high in the east at MINERVA
+IMAGER = TelescopeLimits(min_alt=20.0, max_alt=85.0, instruments=("imager",))
+
+
+def _config(cid: str, target: dict) -> dict:
+    return {
+        "id": cid,
+        "type": "EXPOSE",
+        "instrument_type": "imager",
+        "target": target,
+        "instrument_configs": [{"exposure_time": 0.1, "exposure_count": 1}],
+        "guiding_config": {"mode": "OFF"},
+    }
+
+
+def _groups(stars: int = 3) -> list[dict]:
+    """The moving target first (highest priority), then ``stars`` sidereal ones."""
+    out = [
+        {
+            "id": "eris",
+            "ipp_value": 10.0,
+            "observation_type": "NORMAL",
+            "requests": [{"id": "eris-r", "configurations": [_config("eris-c", orbital_target())]}],
+        }
+    ]
+    for i in range(stars):
+        star = {"type": "ICRS", "name": f"star{i}", "ra": 130.0 + i, "dec": 20.0}
+        out.append(
+            {
+                "id": f"s{i}",
+                "ipp_value": 1.0,
+                "observation_type": "NORMAL",
+                "requests": [{"id": f"s{i}-r", "configurations": [_config(f"s{i}-c", star)]}],
+            }
+        )
+    return out
+
+
+def _scheduler(telescopes: list[str], **kw) -> DispatchScheduler:
+    return DispatchScheduler(
+        load_request_groups(_groups()),
+        MINERVA,
+        {t: IMAGER for t in telescopes},
+        clock=Clock(NOW),
+        **kw,
+    )
+
+
+async def test_dispatch_never_offers_an_unsupported_request_to_that_telescope_again():
+    d = _scheduler(["t1", "t2"])
+    obs = await d.next_observation("t1")
+    assert obs.follow is not None  # the moving target first
+    d.unsupported("t1", obs, "t1: the mount cannot set tracking rates")
+    d.report("t1", obs, "unsupported", 0)
+    c = d.requests["eris-r"].configurations[0]
+    assert c.failures == 0 and c.status.schedulable  # not a failure: t2 may do it
+    again = await d.next_observation("t1")
+    assert again.follow is None  # t1 goes on with a star
+    [cand] = d.evaluate("t1", requests=[d.requests["eris-r"]])
+    assert not cand.ok and any("cannot set tracking rates" in r for r in cand.reasons)
+    assert (await d.next_observation("t2")).follow is not None
+
+
+async def test_dispatch_refuses_what_no_telescope_can_do(tmp_path):
+    state = tmp_path / "state.json"
+    d = _scheduler(["t1"], state=state)
+    obs = await d.next_observation("t1")
+    d.unsupported("t1", obs, "t1: the mount cannot set tracking rates")
+    d.report("t1", obs, "unsupported", 0)
+    c = d.requests["eris-r"].configurations[0]
+    assert str(c.status) == "FAILED" and c.failures == 0
+    assert "cannot set tracking rates" in d.refused["eris-c"]
+    assert (await d.next_observation("t1")).follow is None
+    # Kept across a restart: not tried again.
+    again = _scheduler(["t1"], state=state)
+    assert str(again.requests["eris-r"].configurations[0].status) == "FAILED"
+    assert "t1" in again.unsupported_on["eris-c"] and "eris-c" in again.refused
+
+
+async def test_dispatch_filters_a_moving_target_by_the_mounts_rates():
+    """Told the capabilities, the scheduler never offers a moving target to
+    a mount without rates, and refuses it once no mount has them."""
+    d = _scheduler(["t1", "t2"])
+    d.set_capabilities("t1", {"tracking_rates": False})
+    assert (await d.next_observation("t1")).follow is None
+    assert d.requests["eris-r"].configurations[0].status.schedulable
+    d.set_capabilities("t2", {"tracking_rates": False})
+    assert str(d.requests["eris-r"].configurations[0].status) == "FAILED"
+    assert "t1's mount cannot set tracking rates" in d.refused["eris-c"]
+    # A ToO arriving now is refused at intake.
+    too = {
+        **_groups(0)[0],
+        "id": "eris2",
+        "observation_type": "RAPID_RESPONSE",
+        "too": {"deadline": "2026-11-11T00:00:00+00:00"},
+    }
+    too["requests"] = [{"id": "eris2-r", "configurations": [_config("eris2-c", orbital_target())]}]
+    await d.submit_too(too)
+    assert "eris2-c" in d.refused
+
+
+def _rig_with(make_rig, d: DispatchScheduler, telescopes: int, tell: bool):
+    if not tell:
+        d.set_capabilities = None  # the runtime Unsupported alone (the backstop)
+    return make_rig(plan=d, telescopes=telescopes)
+
+
+def _done(d: DispatchScheduler, prefix: str) -> list[str]:
+    return [
+        c.id
+        for r in d.requests.values()
+        for c in r.configurations
+        if c.id.startswith(prefix) and str(c.status) == "COMPLETED"
+    ]
+
+
+@pytest.mark.parametrize("tell", [True, False])
+async def test_a_moving_target_on_a_rateless_mount_does_not_ground_it(make_rig, tell):
+    """One telescope, no rates: the moving request ends refused with the
+    reason, the telescope never errs or gives up, and the stars are observed."""
+    d = _scheduler(["t1"])
+    rig = _rig_with(make_rig, d, 1, tell)
+    await rig.start()
+    await wait_until(lambda: len(_done(d, "s")) == 3, 30, what="the stars observed")
+    assert "cannot set tracking rates" in d.refused["eris-c"]
+    assert str(d.requests["eris-r"].configurations[0].status) == "FAILED"
+    for what in ("telescope_error", "telescope_backoff", "giving_up"):
+        assert not rig.timeline.events(what), what
+    unsupported = _events(rig, "observation_unsupported")
+    assert len(unsupported) == (0 if tell else 1)  # told: never even tried
+    assert rig.tels[0].rate_log == []
+    assert not rig.sequencer.units["t1"].gave_up
+
+
+@pytest.mark.parametrize("tell", [True, False])
+async def test_a_moving_target_runs_on_the_telescope_that_has_rates(make_rig, tell):
+    d = _scheduler(["t1", "t2"])
+    rig = _rig_with(make_rig, d, 2, tell)
+    rig.tels[1].CanSetRightAscensionRate = rig.tels[1].CanSetDeclinationRate = True
+    await rig.start()
+    await wait_until(
+        lambda: len(_done(d, "s")) == 3 and _done(d, "eris"), 30, what="everything observed"
+    )
+    assert [o["telescope"] for o in d.observed["eris-c"]] == ["t2"]
+    assert "eris-c" not in d.refused
+    for what in ("telescope_error", "giving_up"):
+        assert not rig.timeline.events(what), what
+    assert rig.tels[0].rate_log == []

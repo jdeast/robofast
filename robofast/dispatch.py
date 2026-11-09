@@ -72,7 +72,8 @@ re-scored.
 Reports (:meth:`DispatchScheduler.report`): ``complete`` advances the visit
 (and, at its end, records it in the history); ``interrupted`` marks the
 configuration ``ATTEMPTED`` and drops the visit, so it is re-queued; ``failed``
-counts towards ``max_attempts`` (then ``FAILED``). An interrupted or failed
+counts towards ``max_attempts`` (then ``FAILED``); ``unsupported`` (the
+telescope cannot do it: see below) counts nothing. An interrupted or failed
 observation is re-taken whole, unless its configuration has
 ``allow_partial``: then the frames already taken are kept (in the state
 file), and the next visit takes only the rest of that configuration.
@@ -87,6 +88,22 @@ position (``optical_elements.calstage``) only for telescopes whose
 (``optical_elements.lamp``) only for telescopes whose ``lamps`` list it
 (none by default: MINERVA has no lamps). The sequencer then selects them
 (and, for a lamp, switches it on and off: docs/pulizzi.md).
+
+What a telescope cannot do
+--------------------------
+A configuration a telescope reported ``unsupported`` (the sequencer's
+:class:`~robofast.owner.Unsupported`, with its reason through
+:meth:`DispatchScheduler.unsupported`) is never offered to that telescope
+again (a hard constraint, "cannot do it: <reason>"); it stays eligible on
+every other telescope. The sequencer also tells the scheduler what each
+telescope can do before its first observation
+(:meth:`DispatchScheduler.set_capabilities`): a moving (ORBITAL_ELEMENTS)
+target is not offered to a mount without tracking rates
+(``tracking_rates`` false). Once no telescope that has an instrument for
+a configuration can do it, the configuration is *refused*: ``FAILED`` at
+once, with the reasons (logged, in the plan record's ``refused`` entry and
+in :attr:`DispatchScheduler.refused`). Both are kept in the state file, so a
+restart does not try again.
 
 Spectra fed by several telescopes
 ---------------------------------
@@ -476,6 +493,14 @@ class DispatchScheduler:
         #: docs/sky.md), and its results by group id.
         self.vetter = vetter
         self.vetting: dict[str, list[dict[str, Any]]] = {}
+        #: Configuration id -> {telescope: why it cannot do it} (module doc,
+        #: "What a telescope cannot do").
+        self.unsupported_on: dict[str, dict[str, str]] = {}
+        #: Configuration id -> why no telescope can do it (it is FAILED).
+        self.refused: dict[str, str] = {}
+        #: What each telescope can do, as the sequencer read it
+        #: (:meth:`set_capabilities`); a capability not given is not checked.
+        self.capabilities: dict[str, dict[str, bool]] = {}
         for g in groups:
             self._add(g)
         if self.state_path is not None:
@@ -518,6 +543,79 @@ class DispatchScheduler:
         self.spectrograph_down = down
         log.warning("spectrograph %s", "available again" if down is None else f"down: {down}")
         self._record(self.clock(), "spectrograph", available=available, reason=reason)
+
+    def set_capabilities(self, telescope: str, caps: dict[str, bool]) -> None:
+        """What ``telescope`` can do, read from its devices by the sequencer
+        (``tracking_rates``: its mount can set RA and Dec rates, which a
+        moving target needs). A configuration no telescope can then do is
+        refused (module doc)."""
+        if telescope not in self.limits:
+            return
+        new = {**self.capabilities.get(telescope, {}), **{k: bool(v) for k, v in caps.items()}}
+        if new == self.capabilities.get(telescope):
+            return
+        self.capabilities[telescope] = new
+        log.info("%s: capabilities %s", telescope, new)
+        self._record(self.clock(), "capabilities", telescope=telescope, capabilities=new)
+        if self._refuse_undoable(self.requests.values()):
+            self._save_state()
+
+    def unsupported(self, telescope: str, obs: Observation, reason: str) -> None:
+        """``telescope`` cannot do ``obs`` (the sequencer's Unsupported,
+        before it reports ``unsupported``): its configuration is never
+        offered to that telescope again (module doc)."""
+        visit = self._current.get(telescope)
+        if visit is None or visit.obs is not obs or visit.cfg >= len(visit.configs):
+            log.info("%s cannot do %s (not a dispatched visit): %s", telescope, obs.name, reason)
+            return
+        config = visit.config
+        self.unsupported_on.setdefault(config.id, {})[telescope] = reason or "unsupported"
+        log.warning("%s cannot do %s: %s", telescope, config.id, reason)
+        self._record(
+            self.clock(),
+            "unsupported",
+            telescope=telescope,
+            request=visit.request.id,
+            config=config.id,
+            observation=obs.name,
+            reason=reason,
+        )
+
+    def _cannot(self, telescope: str, c: Configuration) -> str | None:
+        """Why ``telescope`` cannot do ``c`` (module doc), or None."""
+        why = self.unsupported_on.get(c.id, {}).get(telescope)
+        if why is not None:
+            return why
+        if c.light and c.target.moving:
+            if self.capabilities.get(telescope, {}).get("tracking_rates") is False:
+                return f"{telescope}'s mount cannot set tracking rates (a moving target)"
+        return None
+
+    def _refuse_undoable(self, requests: Iterable[Request]) -> bool:
+        """Refuse (FAIL) every schedulable configuration of ``requests``
+        that no telescope able to take it can do (module doc). True if any."""
+        changed = False
+        for req in list(requests):
+            for c in req.configurations:
+                if not c.status.schedulable:
+                    continue
+                takers = [
+                    t
+                    for t, lim in self.limits.items()
+                    if (req.telescopes is None or t in req.telescopes)
+                    and self.instrument_for(lim, c) is not None
+                ]
+                whys = {t: self._cannot(t, c) for t in takers}
+                if not takers or any(w is None for w in whys.values()):
+                    continue
+                why = "; ".join(f"{t}: {w}" for t, w in whys.items())
+                c.status = Status.FAILED
+                self._progress.pop(c.id, None)
+                self.refused[c.id] = why
+                changed = True
+                log.error("%s refused: no telescope can do it (%s)", c.id, why)
+                self._record(self.clock(), "refused", request=req.id, config=c.id, reason=why)
+        return changed
 
     def bind_values(self, registry: Any) -> bool:
         """The sequencer's value registry: the seeing source collects the
@@ -714,6 +812,11 @@ class DispatchScheduler:
         else:
             if config.allow_partial:
                 self._progress[config.id] = (visit.ic, visit.done + max(0, frames))
+            if outcome == "unsupported":
+                # Not this request's failure: never here again, and refused
+                # if no telescope can do it (module doc).
+                self.unsupported_on.setdefault(config.id, {}).setdefault(telescope, "unsupported")
+                self._refuse_undoable([visit.request])
             if outcome == "failed" and config.status.schedulable:
                 config.failures += 1
                 if config.failures >= visit.request.max_attempts:
@@ -746,6 +849,7 @@ class DispatchScheduler:
         self._vet(group, now)
         self._add(group)
         self._record(now, "too", group=group.to_dict())
+        self._refuse_undoable(group.requests)
         log.warning(
             "ToO %s received: class %d, policy %s, deadline %s",
             group.id,
@@ -771,6 +875,7 @@ class DispatchScheduler:
         self._add(group)
         self._submitted.add(group.id)
         self._record(self.clock(), "submit", group=group.to_dict())
+        self._refuse_undoable(group.requests)
         log.info("request group %s received (%s)", group.id, group.submitter or "no submitter")
         self._save_state()
         return group.id
@@ -1218,6 +1323,9 @@ class DispatchScheduler:
             reasons.append(f"not for {telescope}")
         for c in configs:
             self._instrument_reasons(telescope, limits, c, reasons)
+            cannot = self._cannot(telescope, c)
+            if cannot is not None:
+                reasons.append(f"cannot do it: {cannot}")
             for ic in c.instrument_configs:
                 if ic.port is not None and ic.port not in limits.ports:
                     reasons.append(f"{telescope} cannot select port {ic.port!r}")
@@ -1803,6 +1911,8 @@ class DispatchScheduler:
                 if g.too is None and g.id in self._submitted
             ],
             "observed": {k: v for k, v in self.observed.items() if v},
+            "unsupported": {k: dict(v) for k, v in self.unsupported_on.items() if v},
+            "refused": dict(self.refused),
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -1829,6 +1939,7 @@ class DispatchScheduler:
             "state": self._state(),
             "held": sorted(self.held),
             "spectrograph_down": self.spectrograph_down,
+            "capabilities": {t: dict(c) for t, c in self.capabilities.items()},
         }
 
     @classmethod
@@ -1851,6 +1962,9 @@ class DispatchScheduler:
         sched.restore_state(snap["state"])
         sched.held = set(snap.get("held") or ())
         sched.spectrograph_down = snap.get("spectrograph_down")
+        sched.capabilities = {
+            t: dict(c) for t, c in (snap.get("capabilities") or {}).items() if t in sched.limits
+        }
         return sched
 
     def _save_state(self) -> None:
@@ -1896,6 +2010,11 @@ class DispatchScheduler:
             for k, v in data.get("configurations", {}).items()
         }
         progress = {k: (int(v[0]), int(v[1])) for k, v in data.get("progress", {}).items()}
+        unsupported = {
+            str(k): {str(t): str(w) for t, w in v.items()}
+            for k, v in data.get("unsupported", {}).items()
+        }
+        refused = {str(k): str(v) for k, v in data.get("refused", {}).items()}
         observed = data.get("observed", {})
         if not isinstance(observed, dict) or not all(
             isinstance(v, list) for v in observed.values()
@@ -1904,6 +2023,8 @@ class DispatchScheduler:
         self.visits = visits
         self.observed = {k: list(v) for k, v in observed.items()}
         self._progress = progress
+        self.unsupported_on = unsupported
+        self.refused = refused
         for g in toos + submitted:
             if g.id in self.groups:
                 continue

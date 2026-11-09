@@ -261,9 +261,16 @@ def build_report(inp: _Inputs, qa: QAConfig | None = None) -> dict[str, Any]:
             outcomes[r.get("outcome")] += 1
             if r.get("outcome") == "failed":
                 failed.append({k: r.get(k) for k in ("telescope", "request", "observation")})
+    # Configurations no telescope could do (dispatch's "refused").
+    refused = [
+        {k: r.get(k) for k in ("request", "config", "reason")}
+        for r in inp.plan
+        if r.get("kind") == "refused"
+    ]
     rep["requests"] = {
         "outcomes": dict(outcomes),
         "failed": failed,
+        "refused": refused,
         "too": sum(1 for r in inp.plan if r.get("kind") == "too"),
         "preemptions": sum(1 for r in inp.plan if r.get("kind") == "preempt"),
     }
@@ -324,7 +331,11 @@ def build_report(inp: _Inputs, qa: QAConfig | None = None) -> dict[str, Any]:
 
     rep["alarms"] = pick("alarm", "giving_up", "frame_write_failed", "quarantined")
     rep["anomalies"] = pick(
-        "telescope_error", "spectrum_dropped", "recovery_done", "observation_failed"
+        "telescope_error",
+        "spectrum_dropped",
+        "recovery_done",
+        "observation_failed",
+        "observation_unsupported",
     )
 
     # -- the QA verdict --
@@ -406,6 +417,7 @@ def render_markdown(rep: dict[str, Any]) -> str:
     L += ["", "## Requests", "", f"Outcomes: {rq['outcomes']}; ToOs {rq['too']};"
           f" preemptions {rq['preemptions']}.", ""]  # fmt: skip
     L += [f"- failed: {f}" for f in rq["failed"]]
+    L += [f"- refused: {f}" for f in rq.get("refused", [])]
     af = rep["autofocus"]
     L += ["", "## Autofocus", "", f"{af['runs']} run(s), {af['failed']} failed.", ""]
     L += [

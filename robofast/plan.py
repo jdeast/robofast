@@ -32,6 +32,14 @@ service use when present:
 * ``set_preempt_callback(fn)`` -- the sequencer passes its ``preempt``;
 * ``async serve()`` -- a background task run alongside the sequencer (the
   dispatch scheduler's ToO intake);
+* ``unsupported(telescope, obs, reason)`` -- called just before ``obs`` is
+  reported ``unsupported``: ``telescope`` cannot do it (the reason is the
+  sequencer's :class:`~robofast.owner.Unsupported`). The plan must not hand
+  ``obs`` to that telescope again (a repeat counts as that telescope's
+  error); the dispatch scheduler offers it to the others, or refuses it;
+* ``set_capabilities(telescope, caps)`` -- what the telescope can do, read
+  from its devices before its first observation (``{"tracking_rates":
+  bool}``), so the plan can avoid handing out what would be unsupported;
 * a ``files`` keyword on ``report`` -- with the sequencer's frame pipeline
   (:mod:`robofast.imaging`) on, the sequencer passes the observation's
   written frames as paths relative to the data root (a ``complete`` report
@@ -60,8 +68,12 @@ from robofast.plugins import Registry, load_config_plugins
 #: How an observation ended, as passed to :meth:`PlanProvider.report`.
 #: "complete": every frame taken. "interrupted": stopped by the enclosure
 #: closing or the sequencer stopping (not its fault; worth retrying).
-#: "failed": a device error or a refused slew.
-OUTCOMES = ("complete", "interrupted", "failed")
+#: "failed": a device error or a refused slew. "unsupported": this telescope
+#: cannot do it (no tracking rates for a moving target, no such filter,
+#: port, lamp or guider): not a fault, and not worth retrying on this
+#: telescope; a plan with ``unsupported(telescope, obs, reason)`` is told
+#: why first (robofast.sequencer, "Several telescopes").
+OUTCOMES = ("complete", "interrupted", "failed", "unsupported")
 
 
 @dataclass
@@ -285,6 +297,8 @@ class _Queues:
 
     def __init__(self, queues: dict[str, Iterable[Observation]]) -> None:
         self.queues = {tel: deque(obs) for tel, obs in queues.items()}
+        #: Observations a telescope could not do: (telescope, name, reason).
+        self.unsupported_log: list[tuple[str, str, str]] = []
         self.history: list[tuple[str, str, str, int]] = []
         #: Frames written per report that had any: (telescope, name, paths).
         self.files: list[tuple[str, str, list[str]]] = []
@@ -308,10 +322,13 @@ class _Queues:
         self.history.append((telescope, obs.name, outcome, frames))
         if files:
             self.files.append((telescope, obs.name, list(files)))
-        if outcome != "complete":
+        if outcome not in ("complete", "unsupported"):  # unsupported: never here again
             if obs.allow_partial and 0 < frames < obs.count:
                 obs = replace(obs, count=obs.count - frames)
             self.queues.setdefault(telescope, deque()).appendleft(obs)
+
+    def unsupported(self, telescope: str, obs: Observation, reason: str) -> None:
+        self.unsupported_log.append((telescope, obs.name, reason))
 
 
 class StaticPlan(_Queues):

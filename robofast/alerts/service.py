@@ -3,7 +3,8 @@
 ``python -m robofast.alerts run --config alerts.json`` runs the configured
 sources until stopped; ``submit --source rubin|gcn|tns FILE...`` puts alert
 files through the same rules (``--dry-run``: print the requests, submit
-nothing); ``check`` loads the config and says what it would run.
+nothing and write nothing: the ``state`` file is read, never written);
+``check`` loads the config and says what it would run.
 
 The config (``sites/minerva/alerts.example.json``)::
 
@@ -17,6 +18,10 @@ The config (``sites/minerva/alerts.example.json``)::
      "rules": [...]}
 
 Every alert is handled once (``state``: ``source:id`` seen, kept 30 days).
+The state's directory is created at startup if it is missing; if it cannot
+be, or is not writable, the service stops there with the reason, before
+any alert is handled (not after: an alert submitted but not marked seen
+would be submitted again).
 At its first start a polled source (TOCP, TNS) only marks what is already
 listed as seen, so the page's history is never submitted. TOCP and TNS
 offer no push, so they are polled; GCN is a Kafka stream (pushed).
@@ -91,6 +96,8 @@ class AlertService:
         self.config = config
         self.dry_run = dry_run
         self.seen = Seen(Path(config.state) if config.state else None).load()
+        if not dry_run:
+            self.seen.prepare()  # OSError now, with the reason, not after the work
         self.submitted: list[dict[str, Any]] = []
 
     async def handle(self, alerts: list[Alert], *, prime: bool = False) -> None:
@@ -124,7 +131,8 @@ class AlertService:
                 )
             except Exception as exc:  # one alert's failure is not the others'
                 log.error("%s %s: ToO %s not submitted: %s", a.source, a.id, group["id"], exc)
-        self.seen.save(now)
+        if not self.dry_run:  # a dry run writes nothing
+            self.seen.save(now)
 
     def _primed(self, source: str) -> bool:
         return any(k.startswith(f"{source}:") for k in self.seen.ids)
@@ -212,7 +220,11 @@ def main(argv: list[str] | None = None) -> int:
         print("rules:", ", ".join(r.name for r in config.rules))
         print("sources:", ", ".join(config.sources) or "none")
         return 0
-    service = AlertService(config, dry_run=args.dry_run)
+    try:
+        service = AlertService(config, dry_run=args.dry_run)
+    except OSError as exc:
+        print(f"alerts: state {config.state}: {exc}", file=sys.stderr)
+        return 2
     if args.command == "submit":
         if not args.source or not args.files:
             ap.error("submit needs --source and alert files")

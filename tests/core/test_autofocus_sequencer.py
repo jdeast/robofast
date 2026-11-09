@@ -160,8 +160,9 @@ async def test_autofocus_needs_a_focuser(make_rig):
     plan.queues["t1"].append(af)
     rig = make_rig(plan=plan, seq={"max_consecutive_errors": 1})
     await run_to_end(rig)
-    [err] = rig.timeline.events("telescope_error")
-    assert "cannot autofocus" in err.detail["error"]
+    [why] = rig.timeline.events("observation_unsupported")
+    assert "cannot autofocus" in why.detail["reason"]
+    assert not rig.timeline.events("telescope_error")
 
 
 # -- the triggers ---------------------------------------------------------------------

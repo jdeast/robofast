@@ -44,6 +44,26 @@ with the enclosure closed before the next lease (so a dead camera cannot
 cycle the enclosure open and shut). The night ends when every telescope has
 finished its plan or given up.
 
+**What a telescope cannot do is not its error.** An observation that needs
+something this telescope lacks -- a moving target on a mount that cannot
+set tracking rates, a filter, M3 port, lamp or guider it does not have --
+raises :class:`Unsupported` (one path per feature: the device says so,
+nothing works around it). That is a property of the (observation,
+telescope) pair, not a fault: the observation is reported ``unsupported``
+(with the reason, to a plan that has ``unsupported(telescope, obs,
+reason)``), the telescope is made ready for its next target as after a
+preemption (exposure, slew, guider, lamps, ADC stopped; no park), its
+error count is untouched, there is no backoff, and it asks the plan for its
+next observation at once. The plan must not hand the same observation to
+the same telescope again (the dispatch scheduler offers it to the others,
+and refuses it if none can); if it does, the repeat counts as an error of
+that telescope, so a plan that ignores ``unsupported`` cannot spin. Where a
+capability can be read from the device the plan is told before the first
+observation (``set_capabilities(telescope, {...})``: ``tracking_rates``,
+the mount's ``CanSetRightAscensionRate`` and ``CanSetDeclinationRate``), so
+it can avoid asking at all; the runtime :class:`Unsupported` stays the
+backstop.
+
 Before any slew the telescope task asks the :class:`SlewGuard` (default:
 allow everything). MEarth North's collision checker will be one; a refused
 slew counts as that telescope's error. Parking is never vetted: it is the
@@ -120,9 +140,9 @@ in the telescope's filter wheel's ``Names`` and the wheel moved to it (bounded
 by ``filter_timeout``); the port is selected with the telescope's Alpaca
 ``Action(port_action, port)`` (PWI4-based CDK700s; bounded by
 ``port_timeout``). A telescope without a filter wheel, or without a
-``port_action``, fails an observation that names one (an ordinary error of
-that telescope), so nothing is ever observed through the wrong filter or
-port.
+``port_action``, reports an observation that names one ``unsupported``
+(not an error of that telescope: see "Several telescopes"), so nothing is
+ever observed through the wrong filter or port.
 
 Saving images
 -------------
@@ -552,6 +572,11 @@ class TelescopeUnit:
     focuser: DeviceOwner | None = None
     autofocus: AutofocusSetup | None = None
     consecutive_errors: int = field(default=0, init=False)
+    #: The observation it last reported ``unsupported`` (cleared by any other
+    #: outcome): the same one again counts as an error (module doc).
+    last_unsupported: str | None = field(default=None, init=False)
+    #: Its capabilities have been read and told to the plan (or tried).
+    capabilities_told: bool = field(default=False, init=False)
     #: Gave up for the night after too many errors in a row.
     gave_up: bool = field(default=False, init=False)
     #: The plan has nothing more for it tonight.
@@ -1545,6 +1570,8 @@ class Sequencer:
                 # plan's answer (a ToO is already queued there).
                 unit.preempt_policy = None
                 unit.wake.clear()
+                if not unit.capabilities_told:
+                    await self._tell_capabilities(state, unit, tel)
                 try:
                     obs = None
                     if state.closed:
@@ -1645,15 +1672,94 @@ class Sequencer:
                         self._event(
                             "giving_up", telescope=unit.name, error=str(exc), level="critical"
                         )
+                except Unsupported as exc:
+                    await self._unsupported(state, unit, tel, cam, obs, taken, exc)
+                    continue
                 except Exception as exc:
                     self._report(unit, obs, "failed", taken)
                     await self._telescope_failed(state, unit, tel, cam, repr(exc))
                 else:
                     self._report(unit, obs, "complete", taken)
                     unit.consecutive_errors = 0
+                unit.last_unsupported = None
         finally:
             unit.idle = unit.exposing = False
             state.leave(unit.name)
+
+    async def _unsupported(
+        self,
+        state: _Generation,
+        unit: TelescopeUnit,
+        tel: Grant,
+        cam: Grant,
+        obs: Observation,
+        taken: list[Any],
+        exc: Unsupported,
+    ) -> None:
+        """``obs`` cannot be done on this telescope (module doc, "Several
+        telescopes"): not its fault. Tell the plan, report it
+        ``unsupported``, make the telescope ready for its next target (no
+        park, no backoff, no error count) and go on."""
+        reason = str(exc)
+        repeat = unit.last_unsupported == obs.name
+        unit.last_unsupported = obs.name
+        hook = getattr(self.plan, "unsupported", None)
+        if hook is not None:
+            try:
+                hook(unit.name, obs, reason)
+            except Exception:  # the plan's bug must not end this telescope's night
+                log.exception("%s: plan.unsupported(%s, %s)", self.name, unit.name, obs.name)
+        self._report(unit, obs, "unsupported", taken)
+        self._event(
+            "observation_unsupported",
+            gen=state.gen,
+            telescope=unit.name,
+            target=obs.name,
+            reason=reason,
+            level="warning",
+        )
+        log.warning("%s: %s cannot do %s: %s", self.name, unit.name, obs.name, reason)
+        if repeat:
+            # The plan ignored the report and asked again: an error, so the
+            # give-up bounds it (a plan must not spin a telescope).
+            await self._telescope_failed(
+                state, unit, tel, cam, f"{obs.name} handed out again after unsupported: {reason}"
+            )
+            return
+        report = CleanupReport(state.gen, [unit.name])
+        if self._spec_job is not None and self._spec_job_owner == unit.name:
+            await self._abort_spectrograph(f"{unit.name}: {reason}", report)
+        await self._make_ready(unit.name, tel, cam, report)
+        if report.errors:
+            # Making it ready failed: that is the telescope's error.
+            await self._telescope_failed(
+                state, unit, tel, cam, f"after unsupported: {'; '.join(report.errors)}"
+            )
+
+    async def _tell_capabilities(self, state: _Generation, unit: TelescopeUnit, tel: Grant) -> None:
+        """Read what the plan can use to avoid an :class:`Unsupported`
+        (module doc) and tell it, once a night per telescope. A read that
+        fails is left out (the runtime check stays the backstop)."""
+        unit.capabilities_told = True
+        hook = getattr(self.plan, "set_capabilities", None)
+        if hook is None:
+            return
+        caps: dict[str, bool] = {}
+        try:
+            async with asyncio.timeout(10.0):
+                caps["tracking_rates"] = bool(
+                    await tel.get("CanSetRightAscensionRate")
+                    and await tel.get("CanSetDeclinationRate")
+                )
+        except (DeviceError, TimeoutError) as exc:
+            log.warning("%s: %s: tracking-rate capability unread: %r", self.name, unit.name, exc)
+        if not caps:
+            return
+        self._event("capabilities", gen=state.gen, telescope=unit.name, **caps)
+        try:
+            hook(unit.name, caps)
+        except Exception:
+            log.exception("%s: plan.set_capabilities(%s)", self.name, unit.name)
 
     async def _idle(self, state: _Generation, unit: TelescopeUnit, tel: Grant, idle: Idle) -> bool:
         """Wait out an :class:`Idle`: stop tracking (so an idle telescope
@@ -4083,6 +4189,15 @@ class Sequencer:
         """Abort the exposure, stop the guider and any slew, and switch its
         lamps off (in parallel), then -- once the spectrograph's abort has ended, or after
         ``spectrograph_abort_wait`` -- park. Every step is bounded."""
+        await self._make_ready(name, tel, cam, report)
+        if spectrograph is not None and not spectrograph.done():
+            await asyncio.wait({spectrograph}, timeout=self.config.spectrograph_abort_wait)
+        await self._park(name, tel, report)
+
+    async def _make_ready(self, name: str, tel: Grant, cam: Grant, report: CleanupReport) -> None:
+        """Everything of the cleanup but the park, in parallel and bounded:
+        abort the exposure, stop the guider and any slew, lamps and ADC
+        off, tracking rates back to 0."""
         await asyncio.gather(
             self._cleanup_camera(name, cam, report),
             self._stop_guider(name, report),
@@ -4091,9 +4206,6 @@ class Sequencer:
             self._cleanup_adc(name, report),
             self._cleanup_rates(name, tel, report),
         )
-        if spectrograph is not None and not spectrograph.done():
-            await asyncio.wait({spectrograph}, timeout=self.config.spectrograph_abort_wait)
-        await self._park(name, tel, report)
 
     async def _cleanup_rates(self, name: str, tel: Grant, report: CleanupReport) -> None:
         """A moving target's tracking rates back to 0 before the park (bounded;

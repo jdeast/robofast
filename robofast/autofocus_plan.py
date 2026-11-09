@@ -170,7 +170,7 @@ class AutofocusTriggers:
                 st.last_failed = False
                 st.temperature = self._value(self.config.temperature_value, telescope)
                 st.fwhm = None  # re-learned from the next frames
-            elif outcome == "failed":
+            elif outcome in ("failed", "unsupported"):
                 st.last_failed = True
             # "interrupted": due again at once (nothing was learned).
             if outcome == "interrupted":

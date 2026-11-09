@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from robofast.alerts import gcn, rubin, tns, tocp
+from robofast.alerts import service as service_mod
 from robofast.alerts.core import Alert, decide, submit, why_not
 from robofast.alerts.service import AlertsConfig, AlertService, main
 from robofast.orbit import Orbit
@@ -276,16 +277,51 @@ def _tocp_alert(name: str, ra: float) -> Alert:
     )
 
 
-async def test_the_service_primes_then_follows_only_new_alerts_once(tmp_path):
+async def test_the_service_primes_then_follows_only_new_alerts_once(tmp_path, monkeypatch):
+    sent = []
+    monkeypatch.setattr(service_mod, "submit", lambda g, _cfg: sent.append(g["id"]) or {})
     state = tmp_path / "seen.json"
     old, new = _tocp_alert("PNV old", 10.0), _tocp_alert("PNV new", 11.0)
-    svc = AlertService(config(state=str(state)), dry_run=True)
+    svc = AlertService(config(state=str(state)))
     await svc.handle([old], prime=True)  # what the page listed at the first start
     await svc.handle([old, new])
-    assert [g["id"] for g in svc.submitted] == ["tocp-PNV_new"]
-    again = AlertService(config(state=str(state)), dry_run=True)  # a restart
+    assert [g["id"] for g in svc.submitted] == sent == ["tocp-PNV_new"]
+    again = AlertService(config(state=str(state)))  # a restart
     await again.handle([old, new])
-    assert again.submitted == []
+    assert again.submitted == [] and sent == ["tocp-PNV_new"]
+
+
+async def test_a_dry_run_writes_no_state(tmp_path):
+    """night1108: ``--dry-run submit`` wrote the seen-state, and crashed after
+    the work when its directory did not exist. A dry run writes nothing."""
+    state = tmp_path / "missing" / "seen.json"
+    svc = AlertService(config(state=str(state)), dry_run=True)
+    await svc.handle([_tocp_alert("PNV new", 11.0)])
+    assert [g["id"] for g in svc.submitted] == ["tocp-PNV_new"]
+    assert not (tmp_path / "missing").exists()
+
+
+async def test_a_missing_state_directory_is_made_at_startup(tmp_path, monkeypatch):
+    monkeypatch.setattr(service_mod, "submit", lambda g, _cfg: {})
+    state = tmp_path / "a" / "b" / "seen.json"
+    svc = AlertService(config(state=str(state)))
+    assert state.parent.is_dir()  # before any alert
+    await svc.handle([_tocp_alert("PNV new", 11.0)])
+    assert "tocp:PNV new" in json.loads(state.read_text())
+
+
+def test_an_unusable_state_directory_stops_the_service_at_startup(tmp_path, capsys):
+    blocker = tmp_path / "file"
+    blocker.write_text("")  # a file where the directory should be
+    cfg = tmp_path / "alerts.json"
+    d = json.loads(EXAMPLE.read_text())
+    d["state"] = str(blocker / "seen.json")
+    cfg.write_text(json.dumps(d))
+    alert = tmp_path / "t.json"
+    alert.write_text(json.dumps(TRANSIENT))
+    assert main(["submit", "--config", str(cfg), "--source", "rubin", str(alert)]) == 2
+    err = capsys.readouterr().err
+    assert "alerts: state" in err and str(blocker) in err
 
 
 def test_the_cli_dry_run_puts_files_through_the_rules(tmp_path, capsys):
@@ -301,6 +337,7 @@ def test_the_cli_dry_run_puts_files_through_the_rules(tmp_path, capsys):
     assert main(["submit", "--config", str(cfg), "--source", "rubin", "--dry-run", *paths]) == 0
     out = capsys.readouterr().out
     assert '"rubin-1001"' in out and '"rubin-2002"' in out
+    assert not (tmp_path / "seen.json").exists()  # a dry run writes nothing
 
 
 async def test_an_alert_end_to_end_through_the_request_api_into_the_scheduler(

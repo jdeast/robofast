@@ -62,7 +62,11 @@ Pointing models (PWI2)
 with it is refused): whenever PWI comes back (the first read, a read after
 PWI did not answer, the mount connecting) or the M3 port changes, and PWI
 reports another ``pointing_model`` than the current port's, the server sends
-``setmodel`` for it (legacy ``cdk700.startPWI``). It moves nothing.
+``setmodel`` for it (legacy ``cdk700.startPWI``). It moves nothing. PWI2
+may take seconds to report the new model (night1108: over 3 s on T2), so
+the server then re-reads it in the background every second, up to
+``model_verify_timeout`` (15 s), and logs the outcome once: loaded (info)
+or, only after the whole wait, an error.
 
 Safety
 ------
@@ -329,6 +333,9 @@ class PWIConfig:
     #: the server sends ``setmodel`` for the current port (legacy
     #: ``cdk700.startPWI``: a restarted PWI2 loads ``Default_Mount_Model.PXP``).
     pointing_models: dict[str, str] = field(default_factory=dict)
+    #: After a ``setmodel``: how long PWI may take to report the new model
+    #: (s), re-read every second in the background, before it is an error.
+    model_verify_timeout: float = 15.0
     #: robofast-pwi-jog: largest relative move per axis (deg) and its timeout.
     max_jog_deg: float = 1.0
     jog_timeout: float = 60.0
@@ -393,6 +400,8 @@ class PWIConfig:
                 raise ValueError("az_wrap_max - az_wrap_min must be at least 360")
         if cfg.park_timeout <= 0:
             raise ValueError("park_timeout must be > 0")
+        if cfg.model_verify_timeout <= 0:
+            raise ValueError("model_verify_timeout must be > 0")
         if cfg.pointing_models:
             if cfg.backend != "pwi2":
                 raise ValueError(
@@ -533,8 +542,10 @@ class PWIMount:
         self._pwi_up = False
         self._was_connected: bool | None = None
         self._was_port: int | None = None
-        #: Every setmodel sent: (port, file, error or None).
+        #: Every setmodel sent: (port, file, error or None), once its outcome
+        #: is known (after the verify wait, if PWI was slow to report it).
         self.model_loads: list[tuple[int, str, str | None]] = []
+        self._model_verify: asyncio.Task | None = None
 
     # -- reads ----------------------------------------------------------------------
 
@@ -627,11 +638,47 @@ class PWIMount:
             log.error("setmodel %s failed: %s", want, exc)
             self.model_loads.append((st.m3_port, want, str(exc)))
             return
-        err = None
-        if after.pointing_model is not None and not same_model(after.pointing_model, want):
-            err = f"PWI still reports {after.pointing_model!r}"
-            log.error("setmodel %s: %s", want, err)
-        self.model_loads.append((st.m3_port, want, err))
+        if after.pointing_model is None or same_model(after.pointing_model, want):
+            self.model_loads.append((st.m3_port, want, None))
+            return
+        # PWI2 can be slow to report the new model: re-read it in the
+        # background (this runs in the limit watch and in Alpaca requests).
+        log.info(
+            "setmodel %s: PWI reports %r so far; checking for up to %g s",
+            want,
+            after.pointing_model,
+            self.config.model_verify_timeout,
+        )
+        if self._model_verify is not None and not self._model_verify.done():
+            self._model_verify.cancel()
+        self._model_verify = asyncio.get_running_loop().create_task(
+            self._verify_model(st.m3_port, want)
+        )
+
+    async def _verify_model(self, port: int, want: str) -> None:
+        """Re-read PWI every second until it reports ``want`` or
+        ``model_verify_timeout`` has passed; record and log the outcome."""
+        t0 = time.monotonic()
+        timeout = self.config.model_verify_timeout
+        seen: str | None = None
+        while True:
+            await asyncio.sleep(min(1.0, max(0.05, timeout / 10)))
+            waited = time.monotonic() - t0
+            try:
+                st = await self.status(0)
+            except PWIError as exc:
+                seen = f"no answer ({exc})"
+            else:
+                seen = repr(st.pointing_model)
+                if st.pointing_model is None or same_model(st.pointing_model, want):
+                    log.info("setmodel %s: PWI reports it after %.1f s", want, waited)
+                    self.model_loads.append((port, want, None))
+                    return
+            if waited >= timeout:
+                err = f"PWI still reports {seen} after {waited:.1f} s"
+                log.error("setmodel %s: %s", want, err)
+                self.model_loads.append((port, want, err))
+                return
 
     def _arm_slew(
         self, target_alt: float, altaz: tuple[float, float] | None, mech: float | None

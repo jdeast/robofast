@@ -8,7 +8,10 @@
     "Where each value comes from, its units and sign convention, and every conflict: sites/minerva/README.md.",
     "No addresses, hostnames or credentials: the legacy files' HOST/IP keys are deliberately not copied.",
     "Units: angles deg, lengths mm, pixel sizes um, plate scales arcsec per unbinned pixel, pixel positions",
-    "0-based (x = column, y = row of the legacy FITS frame), temperatures C, focus in focuser steps (= um)."
+    "0-based (x = column, y = row of the legacy FITS frame), temperatures C, focus in focuser steps (= um).",
+    "T1's and T2's cooler setpoint and tolerance (legacy SETTEMP, MAXTEMPERROR) are not repeated here: they are",
+    "the cameras' own config, aqawan1.json telescopes.tN.camera.cooling (setpoint, tolerance; docs/cooling.md).",
+    "T3's and T4's (no enclosure config yet) stay here as imager.setpoint, imager.max_temp_error."
   ],
   "site": {"name": "Mt. Hopkins (FLWO ridge)", "latitude": 31.680407, "longitude": -110.878977, "elevation": 2316.0},
   "enclosures": {
@@ -45,8 +48,6 @@
         "position_angle": 0.0,
         "flip": false,
         "binning": [1, 1],
-        "setpoint": -50.0,
-        "max_temp_error": 0.75,
         "bias_level": 300,
         "saturation": 60000,
         "gain": null,
@@ -100,8 +101,6 @@
         "position_angle": 0.0,
         "flip": false,
         "binning": [1, 1],
-        "setpoint": 5.0,
-        "max_temp_error": 0.75,
         "bias_level": 1230,
         "saturation": 60000,
         "gain": null,

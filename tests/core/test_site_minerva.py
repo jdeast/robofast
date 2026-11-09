@@ -103,6 +103,31 @@ async def test_enclosure_config_builds_both_services():
         await remote.aclose()
 
 
+async def test_cooling_is_each_cameras_own_config(catalog):
+    """T1 (Andor) -50 C and T2 (Apogee) +5 C, legacy SETTEMP, tolerance
+    0.75 C = legacy MAXTEMPERROR, in the camera's own config
+    (docs/cooling.md); the catalog does not repeat them (one copy)."""
+    config = enclosure_config.load_config(SITE / "aqawan1.json")
+    tels = config["telescopes"]
+    expect = {"t1": -50.0, "t2": 5.0}
+    for name, setpoint in expect.items():
+        assert "cooling" not in tels[name]
+        _, cooling = enclosure_config.camera_entry(name, tels[name])
+        assert (cooling["setpoint"], cooling["tolerance"]) == (setpoint, 0.75)
+        imager = catalog["telescopes"][name]["imager"]
+        assert "setpoint" not in imager and "max_temp_error" not in imager
+    seq, remote = build(config, Timeline(), base=SITE)
+    try:
+        for name, setpoint in expect.items():
+            c = seq.units[name].cooling
+            assert c is not None and (c.config.setpoint, c.config.tolerance) == (setpoint, 0.75)
+    finally:
+        await remote.aclose()
+    # T3 and T4 are in no enclosure config: the catalog keeps theirs.
+    for name in ("t3", "t4"):
+        assert catalog["telescopes"][name]["imager"]["max_temp_error"] == 0.75
+
+
 async def test_autofocus_example_merges_into_the_enclosure_config(tmp_path):
     config = enclosure_config.load_config(SITE / "aqawan1.json")
     af = _json("autofocus.example.json")

@@ -13,7 +13,8 @@ example; its shape::
       "devices": {"dome": "...", "safetymonitor": "...", ...},
       "site": {"latitude": ..., "longitude": ..., "elevation": ...},
       "telescopes": {
-        "t1": {"telescope": "host:port/N", "camera": "host:port/N",
+        "t1": {"telescope": "host:port/N",
+               "camera": "host:port/N",           # or {"address": ..., "cooling": ...}
                "filterwheel": "host:port/N",      # optional
                "calstage": "host:port/N",         # optional: TRES front end
                "lamps": {"switch": "host:port/N", ...},  # optional: docs/pulizzi.md
@@ -30,6 +31,9 @@ A device address is Alpaca ``host:port``, optionally ``host:port/N`` for
 device number N. Telescope names are the names the plan and the logs use.
 ``site`` is where the enclosure is (deg north, deg east, m), for
 :mod:`robofast.when`; a dispatch plan entry carries its own.
+A telescope's ``camera`` is its address, or the camera's own config
+``{"address": "host:port/N", "cooling": {...}}`` (:func:`camera_entry`;
+the cooler setpoint belongs to the camera: docs/cooling.md).
 A telescope's ``limits`` are the altitudes the observer console allows a
 manual slew between (:func:`altitude_limits`); without them (and without a
 dispatch plan that lists the telescope) the console refuses manual slews.
@@ -81,6 +85,31 @@ def telescopes(config: dict[str, Any]) -> dict[str, dict[str, str]]:
         if not isinstance(entry, dict) or "telescope" not in entry:
             raise ValueError(f"telescope {name!r}: expected {{'telescope': ..., 'camera': ...}}")
     return entries
+
+
+#: The keys of a telescope's ``camera`` entry in its dict form.
+CAMERA_KEYS = frozenset({"address", "cooling"})
+
+
+def camera_entry(name: str, entry: dict[str, Any], where: str = "") -> tuple[str, Any]:
+    """A telescope entry's camera: ``(address, cooling)``. ``camera`` is an
+    Alpaca address, or the camera's own config ``{"address": "host:port/N",
+    "cooling": {...}}``; ``cooling`` is its raw entry
+    (:class:`~robofast.cooling.CoolingConfig`; docs/cooling.md), None when the
+    camera has none. ``where`` (the config file) goes into the error
+    messages."""
+    pre = f"{where + ': ' if where else ''}telescopes.{name}"
+    cam = entry.get("camera")
+    if isinstance(cam, str) and cam:
+        return cam, None
+    if not isinstance(cam, dict) or not isinstance(cam.get("address"), str) or not cam["address"]:
+        raise ValueError(
+            f'{pre}.camera: an Alpaca address, or {{"address": "host:port/N", "cooling": {{...}}}}'
+        )
+    unknown = {k for k in cam if not str(k).startswith("_")} - CAMERA_KEYS
+    if unknown:
+        raise ValueError(f"{pre}.camera: unknown keys {sorted(unknown)}")
+    return cam["address"], cam.get("cooling")
 
 
 def altitude_limits(

@@ -4,7 +4,7 @@
 wants into target-of-opportunity request groups, and microlensing events
 into followed series (below). It submits them through the request API
 (`POST /api/toos`, a token with the `too` scope; a series, `POST
-/api/requestgroups`, the `submit` scope), so it never
+/api/requestgroups`, the `submit` scope: Token scopes below), so it never
 touches the control processes: a source outage, a bad alert or a bug here
 costs ToOs, never the night. The scheduler takes a submitted ToO in at once
 (the drop box's doorbell) and preempts by its policy (`design.md` 3.7.1).
@@ -24,8 +24,14 @@ python -m robofast.alerts check  --config alerts.json            # load it, say 
 | `gcn` | GCN notices (JSON, Kafka): Swift BAT-GUANO, Einstein Probe WXT, SVOM, Fermi GBM; retractions and test notices are never followed | gcn.nasa.gov client credentials; the `gcn-kafka` package | pushed |
 | `rubin` | Rubin alerts (LSST alert schema v11): transients; Solar System objects with their MPC orbit | a broker (ANTARES, Fink, Lasair, ALeRCE) | files, via `submit --source rubin` |
 | `ogle` | OGLE-IV's Early Warning System: the season's microlensing events (Bulge and disk) with their point-lens fits (`ews.html`) | public | polled (1800 s in MINERVA's example) |
-| `kmtnet` | KMTNet's events of the season, fits and class (`clear`, `probable`; `not-ulens` never followed), and the OGLE event each is, if KMTNet says (`listpage.dat`) | public; its data are proprietary until the yearly release (read its data policy) | polled |
+| `kmtnet` | KMTNet's events of the season, fits and class (`clear`, `probable`; `not-ulens` never followed), and the OGLE event each is, if KMTNet says (`listpage.dat`) | public page, but its data are proprietary until KMTNet's yearly release: opt-in (off in MINERVA's example; read its data policy before enabling it) | polled |
 | `moa` | MOA's alerts of the year with their fits (the year's index) | public | polled |
+
+A source runs only when it is listed under `sources`. KMTNet is left out
+of MINERVA's example on purpose: its events are public to look at, but its
+data are proprietary until KMTNet's yearly release, so following them is
+the operator's decision, made after reading KMTNet's data policy. To opt
+in, add `"kmtnet": {"poll_seconds": 1800}` to `sources`.
 
 TOCP and TNS offer no push, so they are polled. At its first start a polled
 source only marks what it already lists as seen, so a page's history is
@@ -36,6 +42,24 @@ polled source's saved page (`--dry-run` says what the rules would take).
 The TNS reply fields follow the TNS API documentation; the live API is not
 yet checked here (no bot key). GCN notices are checked against NASA's own
 schema examples (`tests/core/alert_samples`), TOCP against the live page.
+
+## Token scopes
+
+The alerts token always needs the `too` scope. It needs the `submit` scope
+as well only when an enabled source can meet a rule with a `cadence` (the
+microlensing sources, `ogle`, `kmtnet`, `moa`, in MINERVA's example): their
+follow-up is a NORMAL request group (`POST /api/requestgroups`), which the
+request API takes only with `submit`. A ToO-only setup needs `too` alone.
+
+```
+python -m robofast.request_api tokens add --name alerts --scope too --scope submit
+```
+
+`check` prints the scopes a config needs. `run` and `submit` (not
+`--dry-run`) ask the request API who the token is (`GET /api/`) at startup
+and stop with exit code 2, naming the missing scope, if it lacks one (for
+`submit`, the scopes its `--source` needs); if the API cannot be asked then,
+they log a warning and go on.
 
 ## Rules
 
@@ -81,6 +105,13 @@ now on (a tier it never reaches is left out). MINERVA's example:
 | `{"magnified": 10, "min_interval": 3600}` | A ≥ 10: ±5.5 d | hourly |
 | `{"magnified": 100, "min_interval": 600}` | A ≥ 100: ±0.33 d | every 10 min |
 
+The tiers are separate standing requests, by design: near the peak of a
+high-magnification event every tier's window is open at once, so the
+nightly, hourly and 10-minute requests can all come due together and all be
+observed (the nightly visit is one more point in the 10-minute series).
+That is intended: each tier keeps its own cadence when the others' windows
+close, and a tier is never merged into another.
+
 The rule's `match` chooses the events: `min_amax` (the predicted peak
 magnification) and `peak_hours` (`[min, max]`: the peak from `min` to `max`
 hours from now), with `max_mag` the predicted peak I (the surveys' own
@@ -102,4 +133,7 @@ fits of such events were not A > 2000: pinned fits).
 
 The Bulge (RA 17h55m, Dec −29°) peaks at 29° from Mt Hopkins: above
 MINERVA's 21° with the Sun below −12°, 0 h a night from November to
-mid-February, about 0.6 h on 1 March and 2 h on 1 April.
+mid-February, about 0.6 h on 1 March and 2 h on 1 April. A southern site
+such as MEarth-South (Cerro Tololo), where the Bulge passes near the
+zenith, can follow microlensing events months earlier in the season, with
+the same sources and rules in its own alerts config.

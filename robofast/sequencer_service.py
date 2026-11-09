@@ -180,7 +180,13 @@ from robofast.alpaca import alpaca_owner
 from robofast.autofocus import AutofocusSetup
 from robofast.autofocus_plan import AutofocusTriggers, TriggerConfig
 from robofast.cancel import stop_tasks
-from robofast.clock import Clock, clock_from_config
+from robofast.clock import (
+    Clock,
+    NightRule,
+    clock_from_config,
+    moved_to_site,
+    plan_with_night_rule,
+)
 from robofast.config import (
     altitude_limits,
     camera_entry,
@@ -409,6 +415,9 @@ def build(
         clock = clock_from_config(config["clock"], base)
     command_timeout = float(config.get("command_timeout", 5.0))
     images = config.get("images") or {}
+    moved_to_site(images, "images")
+    # The one night rule (robofast.clock): the site's.
+    night_rule = NightRule.from_site(config.get("site"))
     aux: dict[str, dict[str, DeviceOwner]] = {}
     units = build_units(
         config,
@@ -423,7 +432,17 @@ def build(
     if plan is None:
         if "plan" not in config:
             raise ValueError("no plan: give the config a 'plan' entry or use --plan")
-        plan = plan_from_config(config["plan"], names, base=base, clock=clock)
+        plan = plan_from_config(
+            plan_with_night_rule(config["plan"], config.get("site")), names, base=base, clock=clock
+        )
+    record_rule = getattr(getattr(plan, "record", None), "rule", None)
+    if isinstance(record_rule, NightRule) and isinstance(config.get("site"), dict):
+        if record_rule != night_rule:
+            raise ValueError(
+                f"the plan record names nights by {record_rule}, the frames and spectra by"
+                f" {night_rule}: give both sites the same 'timezone' and 'night_rollover_hour'"
+                " (robofast/clock.py)"
+            )
     check_plan_sequences(plan, sequences)
     triggers = None
     if config.get("autofocus_triggers") is not None:
@@ -489,6 +508,7 @@ def build(
         spectra=spectra,
         clock=clock,
         sequences=sequences,
+        night_rule=night_rule,
     )
     if triggers is not None:
         triggers.bind(seq.registry)
@@ -592,8 +612,7 @@ def spectrograph_from_config(
             str(images.get("site", config.get("name", "site"))),
             Site(float(site["latitude"]), float(site["longitude"]), float(site["elevation"])),
             instrument=str(entry["instrument"]),
-            night_rollover_hour=float(images.get("night_rollover_hour", 12.0)),
-            timezone=images.get("timezone"),
+            rule=NightRule.from_site(site),
         )
     return remote, names, recorder
 

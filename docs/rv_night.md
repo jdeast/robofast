@@ -183,8 +183,10 @@ Every path that names a night or stamps a time on what it keeps takes
 the spectrum sidecars and their index (the record's `night` and
 `sequencer_utc`), the raw spectrum's file name (the sequencer sends
 `night` to the spectrograph service), the autofocus results and the
-nightly plan record. In production it is the host's clock (NTP; see
-`docs/deploy.md`). The simulated night (`docs/demo.md`) runs a compressed
+nightly plan record. All of them name the night by one rule,
+`robofast.clock.NightRule`, from the config's `site` (`timezone`,
+`night_rollover_hour`): the MST date of the evening at MINERVA. In
+production it is the host's clock (NTP; see `docs/deploy.md`). The simulated night (`docs/demo.md`) runs a compressed
 clock, and its outputs carry one night name, `n20261109`, everywhere.
 
 ## 4. The metadata: sidecars, and one legal raw file

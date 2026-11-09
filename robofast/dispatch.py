@@ -206,6 +206,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from robofast import sky
+from robofast.clock import NightRule, geo_site, moved_to_site
 from robofast.doorbell import Doorbell
 from robofast.instruments import InstrumentType, instrument_param, resolve
 from robofast.kinds import RequestMapping
@@ -477,6 +478,11 @@ class DispatchScheduler:
         self._progress: dict[str, tuple[int, int]] = {}
         #: The nightly plan record (module doc), or None.
         self.record = record
+        #: The site's night rule (robofast.clock): the record's, else
+        #: standard time at the site's longitude.
+        self.night_rule: NightRule = getattr(record, "rule", None) or NightRule(
+            longitude=site.longitude
+        )
         #: The enclosure's operating mode (set_mode; None: not told).
         self.mode: str | None = None
         #: Normal groups added at run time (:meth:`submit`); kept in the state.
@@ -2057,14 +2063,14 @@ def dispatch_from_config(
     removed)::
 
         {
-          "site": {"latitude": 31.680407, "longitude": -110.878977, "elevation": 2316},
+          "site": {"latitude": 31.680407, "longitude": -110.878977, "elevation": 2316,
+                   "timezone": "America/Phoenix"},   # the night rule (robofast.clock)
           "requests": "requests.json",        # file, or an inline list of groups
           "imports": [{"type": "minerva.legacy_csv", "path": "targets.csv"}],
                                               # optional: a plug-in's importers
           "state": "/var/lib/robofast/aqawan1-dispatch.json",   # optional
           "too_dropbox": "/var/lib/robofast/too",                # optional
-          "record": {"dir": "/var/lib/robofast/plans",            # optional
-                     "night_rollover_hour": 12, "timezone": "America/Phoenix"},
+          "record": {"dir": "/var/lib/robofast/plans"},           # optional
           "telescopes": {"t1": {"instruments": ["spectrograph"], "min_alt": 21}},
           "instruments": {"spectrograph": {"type": "kiwispec"}},   # names' types
           "plugins": ["mysite.robofast"],     # optional: plug-ins (docs/plugins.md)
@@ -2075,9 +2081,9 @@ def dispatch_from_config(
         }
 
     ``record`` (the nightly plan record, :class:`PlanRecord`) is a
-    directory, or ``{"dir": ..., "name": ..., "night_rollover_hour": ...,
-    "timezone": ...}``; without a time zone a night's date is reckoned in
-    the site's mean solar time.
+    directory, or ``{"dir": ..., "name": ...}``; its nights are named by the
+    ``site``'s night rule (:class:`robofast.clock.NightRule`: ``timezone``,
+    ``night_rollover_hour``).
 
     Relative paths are relative to ``base`` (the config file's directory).
     ``telescopes`` must give every telescope of the enclosure its
@@ -2094,7 +2100,8 @@ def dispatch_from_config(
     site = config.pop("site", None)
     if not isinstance(site, dict):
         raise ValueError("dispatch plan: 'site' {latitude, longitude, elevation} is required")
-    site_obj = sky.Site(**site)
+    night_rule = NightRule.from_site(site)
+    site_obj = sky.Site(**geo_site(site))
     tel_cfg = config.pop("telescopes", {}) or {}
     unknown = set(tel_cfg) - set(telescopes)
     if unknown:
@@ -2150,10 +2157,10 @@ def dispatch_from_config(
         if not isinstance(record, dict) or "dir" not in record:
             raise ValueError("dispatch plan: 'record' must be a directory or {'dir': ...}")
         record = dict(record)
+        moved_to_site(record, "dispatch plan: record")
         record_dir = _resolve(record.pop("dir"), base)
-        record.setdefault("longitude", site_obj.longitude)
         try:
-            record = PlanRecord(record_dir, **record)
+            record = PlanRecord(record_dir, rule=night_rule, **record)
         except TypeError as exc:
             raise ValueError(f"dispatch plan: record: {exc}") from exc
     known = {f.name for f in fields(DispatchConfig)}
@@ -2162,7 +2169,7 @@ def dispatch_from_config(
         raise ValueError(f"dispatch plan: unknown keys {sorted(bad)}")
     if dropbox is not None:
         _resolve(dropbox, base).mkdir(parents=True, exist_ok=True)
-    return DispatchScheduler(
+    scheduler = DispatchScheduler(
         groups,
         site_obj,
         limits,
@@ -2175,3 +2182,5 @@ def dispatch_from_config(
         instruments=instruments,
         seeing=seeing,
     )
+    scheduler.night_rule = night_rule
+    return scheduler

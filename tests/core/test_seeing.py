@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from robofast.clock import NightRule
 from robofast.guider.base import VirtualClock
 from robofast.guider.loop import publish_values
 from robofast.plan_record import PlanRecord, read_record
@@ -154,7 +155,7 @@ def _seeing_src(clock, values):
 async def test_max_seeing_follows_the_source_and_is_recorded(tmp_path):
     clock = Clock()
     src = _seeing_src(clock, [2.5])
-    rec = PlanRecord(tmp_path, longitude=MINERVA.longitude)
+    rec = PlanRecord(tmp_path, rule=NightRule(longitude=MINERVA.longitude))
     d = make(
         [group("sharp", constraints={"max_seeing": 2.0}, priority=5), group("any")],
         clock=clock,

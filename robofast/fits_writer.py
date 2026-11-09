@@ -5,9 +5,9 @@ Layout (``docs/data.md``)::
     <data_root>/<site>/<telescope>/n<YYYYMMDD>/n<YYYYMMDD>.<telescope>.<object>.<seq:04d>.fits
 
 ``.fits.fz`` when Rice-compressed. The night is the local date of the
-*evening* (:func:`robofast.plan_record.night_of`, the plan record's
-convention: before ``night_rollover_hour`` local time is the previous
-night), from the sequencer's clock when ``StartExposure`` was sent
+*evening* by the site's :class:`robofast.clock.NightRule` (the one
+rule every night name comes from: before ``night_rollover_hour`` local
+time is the previous night), from the sequencer's clock when ``StartExposure`` was sent
 (``DATE-CMD``; :mod:`robofast.clock`: the one clock every night name
 comes from). ``seq`` counts up per telescope
 and night (the legacy ``getIndex``: one more than the highest number in the
@@ -54,9 +54,8 @@ from typing import Any
 import numpy as np
 from astropy.io import fits
 
-from robofast.clock import Clock, real_clock
+from robofast.clock import Clock, NightRule, real_clock
 from robofast.imagebytes import ImageArray, fits_order
-from robofast.plan_record import night_of
 from robofast.registry import Snapshot, Value
 
 log = logging.getLogger(__name__)
@@ -510,9 +509,7 @@ class FrameStore:
         site: str,
         *,
         compress: bool = False,
-        rollover_hour: float = 12.0,
-        timezone: str | None = None,
-        longitude: float | None = None,
+        rule: NightRule | None = None,
         index: bool = True,
         clock: Clock = real_clock,
         solver: Any = None,
@@ -529,19 +526,13 @@ class FrameStore:
         self.clock = clock
         self.site = safe_name(site)
         self.compress = compress
-        self.rollover_hour = rollover_hour
-        self.timezone = timezone
-        self.longitude = longitude
+        #: The site's night rule (:mod:`robofast.clock`).
+        self.rule = rule or NightRule()
         self.index = index
         self._next: dict[tuple[str, date], int] = {}
 
     def night(self, when: datetime) -> date:
-        return night_of(
-            when,
-            rollover_hour=self.rollover_hour,
-            timezone=self.timezone,
-            longitude=self.longitude,
-        )
+        return self.rule.date(when)
 
     def directory(self, telescope: str, night: date) -> Path:
         return self.root / self.site / safe_name(telescope) / f"n{night:%Y%m%d}"

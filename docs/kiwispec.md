@@ -548,8 +548,12 @@ switch the pump or its valves.
 The raw file is named `n<YYYYMMDD>.<object>.<NNNN>.fits`. The sequencer
 sends the night (`"night"` in `expose` and `calibrate`), from its clock, so
 the raw file, its sidecar's directory and every other night name agree
-(`robofast/clock.py`, `docs/rv_night.md`). Without it the service uses
-the legacy label, `n` + the UTC date. Exposure start times come from the
+(`robofast/clock.py`, `docs/rv_night.md`). Without it the service names
+the night by its config's `site` rule (`"site": {"timezone":
+"America/Phoenix", "night_rollover_hour": 12}`, the rule every night name
+uses), and one name serves both the file and its directory. It never uses
+the bare UTC date (the legacy spectrograph's label), which would rename the
+night at 17:00 MST, during the evening calibrations. Exposure start times come from the
 service's host clock (NTP-disciplined; `docs/deploy.md`); a simulation may
 give it a `clock` (`{"file": "clock.json"}`).
 

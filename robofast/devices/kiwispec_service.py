@@ -68,8 +68,11 @@ queue. This is how two enclosures' sequencers share the one spectrograph
 locks are released in ``finally``.
 
 ``expose`` and ``calibrate`` also take ``"night": "nYYYYMMDD"``: the night
-the raw files are named for (the sequencer's, from its clock; default the
-legacy label, ``n`` + the UTC date, by this service's clock).
+the raw files are named for (the sequencer's, from its clock). Without
+it, the night of this service's clock by the config's ``site`` night rule
+(``{"timezone": "America/Phoenix", "night_rollover_hour": 12}``,
+:class:`robofast.clock.NightRule`, the rule every night name comes from);
+never the bare UT date, which would split a MINERVA night at 17:00 MST.
 
 Safety
 ------
@@ -120,7 +123,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from robofast.cancel import isolated, stop_task
-from robofast.clock import clock_from_config
+from robofast.clock import NightRule, clock_from_config
 from robofast.config import load_device_config, require_keys
 from robofast.devices.kiwispec_aux import (
     AuxChiller,
@@ -232,9 +235,10 @@ def jd(t: datetime.datetime) -> float:
     return t.timestamp() / 86400.0 + JD_UNIX_EPOCH
 
 
-def night(t: datetime.datetime | None = None) -> str:
-    """Legacy night label: ``n`` + the UTC date."""
-    return "n" + (t or datetime.datetime.now(datetime.UTC)).strftime("%Y%m%d")
+def night(t: datetime.datetime | None = None, rule: NightRule | None = None) -> str:
+    """The night ``t`` (default: now) belongs to, by ``rule`` (default:
+    UTC, noon rollover; :class:`robofast.clock.NightRule`)."""
+    return (rule or NightRule()).name(t or datetime.datetime.now(datetime.UTC))
 
 
 # -- config -------------------------------------------------------------------------
@@ -384,6 +388,10 @@ class KiwiSpecConfig:
     #: label come from (:func:`robofast.clock.clock_from_config`, e.g.
     #: ``{"file": "clock.json"}``); default the host's clock.
     clock: dict[str, Any] | None = None
+    #: The night rule for a request that names no night (module doc): the
+    #: site's ``timezone``, ``night_rollover_hour`` (and ``longitude``);
+    #: without it UTC with a noon rollover (logged at start).
+    site: dict[str, Any] | None = None
     #: The SI camera set-up legacy sent at start (initialize_si).
     readout_mode: int = 3
     ccd_format: tuple[int, int, int, int, int, int] = (50, 2090, 1, 0, 2052, 1)
@@ -552,6 +560,12 @@ class KiwiSpec:
         #: client, time.time() when queued].
         self._waiters: deque[list[Any]] = deque()
         self.clock = clock_from_config(config.clock)
+        self.night_rule = NightRule.from_site(config.site)
+        if config.site is None:
+            log.warning(
+                "no 'site' night rule: a request without a night is named by UTC"
+                " (robofast/clock.py; set site.timezone)"
+            )
         self._ids = itertools.count(1)
         self.jobs: dict[int, Job] = {}
         self.current: Job | None = None
@@ -1224,7 +1238,9 @@ class KiwiSpec:
             await self._sleep(c.led_warmup - (time.monotonic() - self.led_on_since))
 
         index = await self.spec.get_index()
-        file_name = f"{f.night or night(self.clock())}.{f.object}.{index:04d}.fits"
+        # One night label for the file name and its directory (module doc).
+        night_label = f.night or night(self.clock(), self.night_rule)
+        file_name = f"{night_label}.{f.object}.{index:04d}.fits"
         await self.spec.call("set_file_name", file_name)
 
         source = c.flux_source if uses_meter else "none"
@@ -1378,7 +1394,7 @@ class KiwiSpec:
             warnings.append(f"header not written: {exc}")
         if c.raw_fits is not None and c.raw_fits.get("rewrite", True):
             job.phase = f"{f.kind}: standardizing the raw file"
-            result["fits"] = await self._standardize(f.night or night(start_utc), file_name)
+            result["fits"] = await self._standardize(night_label, file_name)
             if result["fits"].get("error"):
                 warnings.append(f"raw file not rewritten: {result['fits']['error']}")
         return result

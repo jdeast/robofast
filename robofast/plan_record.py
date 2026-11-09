@@ -3,9 +3,9 @@
 The dispatch scheduler (:mod:`robofast.dispatch`) writes every answer
 it gives and every report it gets to a :class:`PlanRecord`: one file per
 night, ``<dir>/<name>-<YYYY-MM-DD>.jsonl``, where the date is the local date
-of the *evening* (a time before ``night_rollover_hour`` local time belongs
-to the previous date's night). Local time is the ``timezone`` given (an IANA
-name, e.g. ``America/Phoenix``), else the site's mean solar time.
+of the *evening*, by the site's :class:`robofast.clock.NightRule` (the one
+rule every night name comes from: a time before ``night_rollover_hour``
+local time belongs to the previous date's night).
 
 Each line is one JSON object with ``t`` (ISO 8601, UTC) and ``kind``:
 
@@ -44,10 +44,11 @@ import math
 import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
+
+from robofast.clock import NightRule
 
 log = logging.getLogger(__name__)
 
@@ -64,16 +65,9 @@ def night_of(
     timezone: str | None = None,
     longitude: float | None = None,
 ) -> date:
-    """The night ``when`` belongs to: the local date of its evening."""
-    if when.tzinfo is None:
-        raise ValueError("night_of needs an aware datetime")
-    if timezone is not None:
-        local = when.astimezone(ZoneInfo(timezone)).replace(tzinfo=None)
-    else:
-        local = when.astimezone(UTC).replace(tzinfo=None)
-        if longitude is not None:
-            local += timedelta(hours=longitude / 15.0)  # mean solar time
-    return (local - timedelta(hours=rollover_hour)).date()
+    """The night ``when`` belongs to: the local date of its evening
+    (:class:`robofast.clock.NightRule`)."""
+    return NightRule(timezone, longitude, rollover_hour).date(when)
 
 
 def _json_default(value: Any) -> Any:
@@ -103,29 +97,17 @@ class PlanRecord:
         directory: str | Path,
         *,
         name: str = "plan",
-        night_rollover_hour: float = 12.0,
-        timezone: str | None = None,
-        longitude: float | None = None,
+        rule: NightRule | None = None,
     ) -> None:
-        if not 0.0 <= night_rollover_hour < 24.0:
-            raise ValueError(f"night_rollover_hour {night_rollover_hour!r}: expected 0..24")
-        if timezone is not None:
-            ZoneInfo(timezone)  # raises for an unknown zone
         self.directory = Path(directory)
         self.name = name
-        self.rollover_hour = float(night_rollover_hour)
-        self.timezone = timezone
-        self.longitude = longitude
+        #: The site's night rule (:mod:`robofast.clock`).
+        self.rule = rule or NightRule()
         #: Files this process has written a snapshot to.
         self._snapshotted: set[Path] = set()
 
     def night(self, when: datetime) -> date:
-        return night_of(
-            when,
-            rollover_hour=self.rollover_hour,
-            timezone=self.timezone,
-            longitude=self.longitude,
-        )
+        return self.rule.date(when)
 
     def path(self, when: datetime) -> Path:
         return self.directory / f"{self.name}-{self.night(when).isoformat()}.jsonl"

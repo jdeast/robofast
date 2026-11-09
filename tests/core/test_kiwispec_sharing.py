@@ -105,7 +105,8 @@ async def test_an_injected_clock_stamps_the_exposures(sim, tmp_path):  # noqa: F
 
     path = tmp_path / "clock.json"
     ScaledClock(datetime(2026, 11, 10, 3, 0, tzinfo=UTC), 1.0).write(path)
-    server = await KiwiSpecServer(service_config(sim, clock={"file": str(path)})).start(
+    site = {"timezone": "America/Phoenix"}  # the site's night rule (robofast/clock.py)
+    server = await KiwiSpecServer(service_config(sim, clock={"file": str(path)}, site=site)).start(
         status_loop=False
     )
     try:
@@ -113,7 +114,9 @@ async def test_an_injected_clock_stamps_the_exposures(sim, tmp_path):  # noqa: F
             job = await run_job(c, "/expose", {"kind": "bias"})
         r = job["results"][0]
         assert r["start_utc"].startswith("2026-11-10T03:00")
-        assert r["file"].startswith("n20261110.")  # legacy label: the UTC date
+        # No night given: the site's rule, the MST date of the evening (20:00
+        # MST on the 9th), never the UT date (the 10th).
+        assert r["file"].startswith("n20261109.")
     finally:
         await server.stop()
 

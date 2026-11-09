@@ -58,8 +58,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from robofast.clock import real_clock
-from robofast.plan_record import night_of
+from robofast.clock import NightRule, real_clock
 
 if TYPE_CHECKING:  # astropy is imported only when a spectrum is recorded
     from robofast import sky
@@ -155,23 +154,21 @@ class SpectrumRecorder:
     #: The spectrograph's name in the sidecars and the data tree (a site
     #: value: the ``spectrograph`` entry's ``instrument``).
     instrument: str
-    night_rollover_hour: float = 12.0
-    timezone: str | None = None
+    #: The site's night rule (:mod:`robofast.clock`; default: standard
+    #: time at the site's longitude).
+    rule: NightRule | None = None
     #: The sequencer's clock (:mod:`robofast.clock`): the night when a
     #: record does not name one, and ``written``.
     clock: Callable[[], datetime] = real_clock
 
     def __post_init__(self) -> None:
         self.data_root = Path(self.data_root)
+        if self.rule is None:
+            self.rule = NightRule(longitude=self.site.longitude)
 
     def night(self, when: datetime) -> str:
-        d = night_of(
-            when,
-            rollover_hour=self.night_rollover_hour,
-            timezone=self.timezone,
-            longitude=self.site.longitude,
-        )
-        return "n" + d.strftime("%Y%m%d")
+        assert self.rule is not None
+        return self.rule.name(when)
 
     def directory(self, when: datetime) -> Path:
         return self.data_root / self.site_name / self.instrument / self.night(when)

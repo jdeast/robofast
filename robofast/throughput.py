@@ -295,7 +295,8 @@ def record_from_header(
     ``{telescope: {port name: number}}`` as in instruments.json; or the
     first ``file_ports`` text, ``{text: port}``, in the file name, case
     ignored: MINERVA's ``{".FAU.": "fau"}``); the night from the file name (``nYYYYMMDD``), else
-    ``NIGHT``, else from DATE-OBS (local mean time at ``longitude``, UTC
+    ``NIGHT``, else from DATE-OBS (the night rule of
+    :class:`robofast.clock.NightRule`: standard time at ``longitude``, UTC
     without it, rolling over at noon)."""
     tel = str(telescope or h.get("TELESCOP") or "").strip().lower()
     if not tel:

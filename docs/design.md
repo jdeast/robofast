@@ -594,10 +594,11 @@ may be wrong about the 60-inch's focus.
   telescopes whose `filters`, if listed, include it. The sequencer selects
   them (section 3.4).
 - **The nightly plan record** (`robofast/plan_record.py`, plan entry
-  `"record": {"dir": ..., "night_rollover_hour": 12, "timezone": ...}`):
+  `"record": {"dir": ...}`):
   every answer and report as one JSON line, one file per night (the local
-  date of the evening; times before `night_rollover_hour` belong to the
-  previous night; the site's mean solar time without a time zone). Each
+  date of the evening, by the site's night rule, `robofast.clock.NightRule`:
+  the `site`'s `timezone` and `night_rollover_hour`, the same rule every
+  other night name uses). Each
   decision carries the chosen request and configuration, the score and its
   terms, the runners-up with their scores and the top rejected candidates
   with the constraints they failed; then idle answers, visits continued or
@@ -1072,7 +1073,7 @@ support is often worse. So:
 | `idle_release_after` | 15 min | every telescope idle this long: park, release the lease, close (section 3.4) |
 | `filter_timeout`, `port_timeout` | 60 s, 60 s | bounds on a filter wheel move and an M3 port selection |
 | evening start | Sun below -6° | `robofast.when` in the sequencer unit (`deploy/`) |
-| `night_rollover_hour` | 12 | plan record: earlier local times belong to the previous night |
+| `night_rollover_hour` | 12 | `site` key: earlier local times belong to the previous night (every night name; `robofast/clock.py`) |
 | `record_top_n` | 5 | runners-up and rejected candidates recorded per decision |
 | `park_before_close` | off | roll-off roofs: park every telescope (bounded, in parallel) before closing |
 | `park_wait` | 60 s | bound on that park |

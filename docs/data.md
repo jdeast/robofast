@@ -29,7 +29,6 @@ reads those files: the layout, the times, and the header keywords.
 | `queue_size` | 4 | frames per telescope waiting to be written; beyond that the next exposure waits |
 | `imagebytes` | true | download images by the Alpaca ImageBytes transfer (else JSON) |
 | `download_timeout_base`, `download_min_rate` | 30 s, 2 MB/s | download timeout = base + (pixels x 8 bytes for ImageBytes, x 12 for JSON) / rate |
-| `night_rollover_hour`, `timezone` | 12, none | the night convention (below) |
 | `pointing_max_age`, `camera_max_age` | 60 s, 60 s | how long telescope and camera readings stay current |
 | `weather_interval`, `weather_max_age` | 30 s, 300 s | weather polling, and when a weather value goes stale |
 | `enclosure_interval`, `sky_interval` | 10 s, 60 s | shutter/safety and Sun/Moon refresh |
@@ -50,9 +49,13 @@ devices). They are only read, for the headers.
 
 * **Night**: the local date of the evening. A frame taken before
   `night_rollover_hour` (12:00) local time belongs to the previous date's
-  night. Local time comes from `timezone` (an IANA name) if it is set, otherwise
-  from mean solar time at the site's longitude. This is the convention the
-  plan record uses (`robofast.plan_record.night_of`). The night is
+  night. Both keys are the config's `site`'s (`"site": {..., "timezone":
+  "America/Phoenix", "night_rollover_hour": 12}`), not `images`': one rule,
+  `robofast.clock.NightRule`, names every night -- the frames, the spectrum
+  sidecars, the raw spectrum files, the plan record. Local time is
+  `timezone` (an IANA name), else standard time at the site's longitude
+  (UTC + round(longitude / 15) h), else UTC; never the bare UT date, which
+  would split a MINERVA night at 17:00 MST. The night is
   computed from the frame's own `DATE-OBS`.
 * **Object**: the observation's `object`. That is the target name from the
   dispatch scheduler, or the observation name for static and calibration

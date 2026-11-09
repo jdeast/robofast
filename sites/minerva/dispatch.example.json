@@ -15,7 +15,8 @@
     "into too_dropbox (see too.example.json)."
   ],
   "type": "dispatch",
-  "site": {"latitude": 31.680407, "longitude": -110.878977, "elevation": 2316.0},
+  "site": {"latitude": 31.680407, "longitude": -110.878977, "elevation": 2316.0,
+           "timezone": "America/Phoenix"},
   "requests": "requests.example.json",
   "state": "dispatch-state.json",
   "too_dropbox": "too-dropbox",

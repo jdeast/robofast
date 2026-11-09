@@ -25,7 +25,8 @@
   ],
   "name": "flwo60",
   "listen": "127.0.0.1:8160",
-  "site": {"latitude": 31.6809, "longitude": -110.8781, "elevation": 2344.0},
+  "site": {"latitude": 31.6809, "longitude": -110.8781, "elevation": 2344.0,
+           "timezone": "America/Phoenix"},
   "devices": {
     "dome": "127.0.0.1:11141",
     "safetymonitor": "127.0.0.1:11111",

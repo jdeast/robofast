@@ -15,7 +15,8 @@
   "site": {
     "latitude": 31.680407,
     "longitude": -110.878977,
-    "elevation": 2316.0
+    "elevation": 2316.0,
+    "timezone": "America/Phoenix"
   },
   "devices": {
     "dome": "127.0.0.1:11113",

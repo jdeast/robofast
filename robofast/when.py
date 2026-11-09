@@ -38,6 +38,7 @@ from typing import Any
 
 import numpy as np
 
+from robofast.clock import geo_site
 from robofast.config import load_config
 from robofast.sky import Site, offline_iers
 
@@ -130,7 +131,7 @@ def site_from_config(config: dict[str, Any]) -> Site:
         site = config["plan"].get("site")
     if not isinstance(site, dict):
         raise ValueError("no 'site' {latitude, longitude, elevation} in the config (or its plan)")
-    return Site(**site)
+    return Site(**geo_site(site))
 
 
 def _parse_site(text: str) -> Site:

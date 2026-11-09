@@ -52,6 +52,7 @@ from typing import Any
 
 from robofast.adc import HEADER as ADC_HEADER
 from robofast.adc import ADCSwitches
+from robofast.clock import NightRule, moved_to_site
 from robofast.fits_writer import FrameInfo, FrameStore, Optics, WrittenFrame, imagetyp
 from robofast.imagebytes import ImageArray, wire_bytes_per_pixel
 from robofast.owner import DeviceError, DeviceOwner, Grant, GrantRevoked
@@ -94,10 +95,6 @@ class ImagingConfig:
     #: ``download_min_rate`` bytes/s.
     download_timeout_base: float = 30.0
     download_min_rate: float = 2e6
-    #: Night convention (as the plan record's): local time from ``timezone``
-    #: (IANA), else mean solar time at the site's longitude.
-    night_rollover_hour: float = 12.0
-    timezone: str | None = None
     #: How long telescope and camera readings stay current in the registry.
     pointing_max_age: float = 60.0
     camera_max_age: float = 60.0
@@ -128,6 +125,7 @@ class ImagingConfig:
     def from_dict(cls, d: dict[str, Any]) -> ImagingConfig:
         d = dict(d)
         d.pop("_note", None)
+        moved_to_site(d, "images")
         known = set(cls.__dataclass_fields__)
         if set(d) - known:
             raise ValueError(f"images: unknown keys {sorted(set(d) - known)}")
@@ -266,9 +264,7 @@ class Imaging:
             config.data_root,
             config.site,
             compress=config.compress,
-            rollover_hour=config.night_rollover_hour,
-            timezone=config.timezone,
-            longitude=None if site is None else site.get("longitude"),
+            rule=NightRule.from_site(site),
             index=config.index,
         )
         if config.solve is not None:

@@ -68,7 +68,7 @@ import numpy as np
 from robofast import sky
 from robofast.autofocus import AutofocusSetup, FocusModel, FocusStore
 from robofast.autofocus_plan import AutofocusTriggers, TriggerConfig
-from robofast.clock import FileClock, ScaledClock
+from robofast.clock import FileClock, NightRule, ScaledClock
 from robofast.console.hold import send_command
 from robofast.devices.aqawan_server import AqawanConfig, AqawanServer
 from robofast.devices.aqawan_sim import AqawanSim
@@ -847,7 +847,7 @@ class SimulatedNight:
             requests=self._requests(),
             state=str(self.out / "dispatch-state.json"),
             too_dropbox=str(self.out / "too-dropbox"),
-            record={"dir": str(self.out / "plans"), "timezone": "America/Phoenix"},
+            record={"dir": str(self.out / "plans")},
             idle_poll=1.0,
             too_poll=0.3,
             reserve_timeout=5.0,
@@ -1399,7 +1399,7 @@ def output_problems(o: Outcome) -> list[str]:
     if not list(data.glob("minerva/t*/n*/*.frames.jsonl")):
         bad.append("no frame index")
     # One night, by the one clock, everywhere (robofast.clock).
-    want = f"n{o.settings.start - timedelta(hours=12):%Y%m%d}"
+    want = NightRule("America/Phoenix").name(o.settings.start)
     names = night_names(o)
     if names != [want]:
         bad.append(f"night names {names}, expected only {want}")

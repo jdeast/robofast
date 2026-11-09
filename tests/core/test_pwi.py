@@ -553,6 +553,34 @@ async def test_pwi2_stuck_moving_still_catches_a_stalled_slew(make):
     await tel.aclose()
 
 
+async def test_pwi2_alt_az_slew_and_home_leave_the_mount_not_tracking(make):
+    """MINERVA T1, 2026-11-09: PWI2's alt/az move (and its home) turn
+    tracking on, so Tracking read True after a SlewToAltAzAsync to alt 25
+    az 0 sent with tracking off. ASCOM: no tracking after SlewToAltAz; the
+    server turns it off once the slew (or home) of ours is done."""
+    sim, server = make(
+        "pwi2", sim_kw={"altaz_tracks": True, "slew_rate": 10.0, "alt": 40.0, "az": 120.0}
+    )
+    tel = await device(server)
+    await tel.set("Tracking", False, timeout=T)
+    await tel.put("SlewToAltAzAsync", Altitude=25.0, Azimuth=10.0, timeout=T)
+    await asyncio.sleep(0.5)
+    assert sim.model.state()["tracking"]  # PWI2 tracks during the move
+    await until(lambda: _not(tel.get("Slewing", timeout=T)), timeout=30, what="slew end")
+    await until(lambda: _not(tel.get("Tracking", timeout=T)), timeout=5, what="tracking off")
+    st = sim.model.state()
+    assert not st["tracking"]
+    assert abs(st["alt"] - 25.0) < 0.1 and abs((st["az"] - 10.0 + 180) % 360 - 180) < 0.1
+    assert server.mount.slew_error is None
+    # FindHome: PWI2 leaves it tracking too; off once the home is done.
+    await tel.call("FindHome", timeout=T)
+    assert sim.model.state()["tracking"]
+    await until(lambda: _not(tel.get("Slewing", timeout=T)), timeout=30, what="home end")
+    await until(lambda: _not(tel.get("Tracking", timeout=T)), timeout=5, what="tracking off")
+    assert not sim.model.state()["tracking"] and sim.model.state()["homed"]
+    await tel.aclose()
+
+
 async def test_pwi2_noisy_mount_is_neither_stalled_nor_done_early(make):
     """PWI2 judges ``moving`` by the servo residuals (legacy
     cdk700.inPosition: "Telescope moving after it said it was done";

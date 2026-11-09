@@ -107,8 +107,12 @@ Quirks handled:
 * **PWI2 can report tracking on during an alt/az move, and tracking off
   then halts the move midway** (MINERVA T1, 2026-11-08: the rehearsal's
   end action stopped 15 deg short). A tracking off asked during an alt/az
-  slew of ours is sent once the mount is on the target. The simulator's
-  `altaz_tracks` reproduces it.
+  slew of ours is sent once the mount is on the target. PWI2's alt/az move
+  and its home also leave the mount tracking (MINERVA T1, 2026-11-09:
+  `Tracking` read True after a `SlewToAltAzAsync` sent with tracking off);
+  ASCOM wants no tracking after `SlewToAltAz`, so the server sends tracking
+  off once an alt/az slew of ours (or a home) is done. The simulator's
+  `altaz_tracks` reproduces both.
 * **PWI2 can report a tracked mount not moving for a moment after a
   goto** (night 1107; night1108: 4.6 s from goto to on target). A slew the
   server sent stays its slew (`Slewing` true, its target known to the limit

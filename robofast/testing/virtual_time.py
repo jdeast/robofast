@@ -19,6 +19,14 @@ never jumps while a worker thread of the default executor is busy. What it is
 not for: tests whose devices run in other threads or processes on their own
 clocks (simulators behind sockets, child processes); they stay in real time.
 
+``time.monotonic`` itself is patched (the ``time`` module's attribute,
+process-wide) for as long as a marked test runs, and restored after it. So
+every thread sees the virtual clock, not only the loop's: code that a test
+runs in an executor thread (``asyncio.to_thread``, ``run_in_executor``) stamps
+virtual time too, and agrees with the loop. (Code that bound the function
+early, ``from time import monotonic``, would keep the real clock; robofast
+calls ``time.monotonic()``.)
+
 Each read of ``time.monotonic`` advances the clock by 1 us, so stamps taken
 one after another stay strictly ordered, as they are in real time (tests
 compare them with ``<``).

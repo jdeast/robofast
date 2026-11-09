@@ -604,7 +604,7 @@ TIMELINE_IN_SNAPSHOT = 100
 
 def snapshot(seq: Sequencer, interval: float = 5.0) -> dict[str, Any]:
     """The sequencer's state for status pages: per telescope ``state``
-    (``observing``, ``idle``, ``backoff``, ``gave_up``, ``finished`` or
+    (``observing``, ``idle``, ``backoff``, ``escalated``, ``gave_up``, ``finished`` or
     ``waiting`` -- for the enclosure to open), whether it is exposing, and
     what it is observing (from a plan with ``current()``, the dispatch
     scheduler). Stamped with the time and a ``max_age`` (design.md 3.8)."""
@@ -619,6 +619,8 @@ def snapshot(seq: Sequencer, interval: float = 5.0) -> dict[str, Any]:
     for name, u in seq.units.items():
         if u.gave_up:
             state = "gave_up"
+        elif u.escalation is not None:
+            state = "escalated"  # an agent is at work on it (docs/recovery.md)
         elif u.finished:
             state = "finished"
         elif u.retry_at > now:
@@ -637,6 +639,8 @@ def snapshot(seq: Sequencer, interval: float = 5.0) -> dict[str, Any]:
             "current": current.get(name),
             "park_requested": u.park_requested,
             "alarms": list(u.alarms),
+            # Finished incidents, each with its one summary for a person.
+            "incidents": [i.as_dict() for i in u.incidents if i.finished],
         }
     out = {
         "time": datetime.now(UTC).isoformat(),

@@ -55,9 +55,11 @@ PWI restart the `restart` rung fails with "the mount is not homed" and
 bounded (`step_timeout` + `verify_timeout`) and raises an alarm (status
 snapshot, console, notifier) saying what was tried and how it went. A
 device that fails again within `escalate_window` (1 h) starts one rung above
-the last that worked; when no rung is left the telescope **gives up for
-the night** (`giving_up`, reason "recovery ladder exhausted"); the other
-telescopes observe on. A recovered device gets another try regardless of
+the last that worked; when no rung is left the ladder is **escalated**
+(below): an agent hook, if configured, may try to fix it, and a person is
+always told. A telescope that is not brought back **gives up for the
+night** (`giving_up`, reason "recovery ladder exhausted (...); escalation:
+..."); the other telescopes observe on. A recovered device gets another try regardless of
 the consecutive-error count.
 
 Power cycling is guarded: at most `max_powercycles` (1) a night per device
@@ -139,6 +141,133 @@ camera. A mount that does not come back is alarmed
 (`recovery_mount_after_cycle`) and left to the telescope's own ladder at
 its next command. Not allowed on the `telescope` policy itself (its PWI
 restart is its `restart` rung).
+
+## Escalation: an agent, then a person
+
+The ladder's last step (`robofast/escalation.py`). When every rung has
+failed, the sequencer opens an **incident** for the device:
+
+1. With an `agent` hook configured (and the rate limits below allowing),
+   it runs the hook **in the background**. The failing telescope is out of
+   the plan meanwhile (snapshot state `escalated`; it waits like a
+   telescope in an error backoff) and the other telescopes observe on --
+   nothing waits for the agent. Its bound is `agent.timeout` (default
+   1800 s); past it the hook's whole process group gets SIGTERM, then
+   SIGKILL. If the hook exits 0, robofast **checks the device itself**
+   (a fresh connection; the rung's own check: the device answers and a PWI
+   mount is usable) -- the agent's word is never taken. Verified: the
+   telescope rejoins the night (its ladder starts from the first rung
+   again); anything else: it gives up for the night.
+2. **Always**, the incident ends with **one summary for a person**: the
+   error, every rung tried and how it went, the agent's own summary (or
+   "no agent configured", "timed out after ... s", "not run: ..."), and
+   the outcome -- *recovered* (the telescope rejoins) or *dropped for the
+   night, the others observe on*. It is in the sequencer's status snapshot
+   (`telescopes.<t>.incidents`), which the observer console shows as an
+   alarm (the summary as its detail; level `critical` when dropped,
+   `alarm` when recovered) and the alarm notifier sends like any other
+   (docs/notifier.md): **one path**, no second way to page. Each
+   incident's alarm text is its own (`t1 camera incident 1 (<UTC>): ...`),
+   so the notifier sends it once; the agent starting is an event on the
+   console, not a page.
+
+Many hardware faults cannot be fixed remotely, by an agent or a person
+(a dead power supply, a cable, a seized motor): dropping the telescope
+and observing on with the others stays the fallback.
+
+**Rate limits.** At most `max_per_night` (2) agent runs per device per
+night (the sequencer runs one night per process). A fault that comes back
+after the agent "fixed" it (the same device and error, numbers ignored)
+is not escalated again: the telescope is dropped and the summary says so.
+Each incident gets one summary; the notifier deduplicates by alarm id and
+its own per-sink rate limits still apply.
+
+```json
+"recovery": {
+  "escalate": {
+    "agent": {"command": ["/usr/local/bin/robofast-agent-hook"], "timeout": 2700},
+    "max_per_night": 2,
+    "safe": ["The telescope's PC may be rebooted: nothing else runs on it."]
+  },
+  "camera": {"steps": ["reconnect", "restart", "powercycle"], "...": "..."},
+  "telescope": {"steps": ["reconnect", "restart", "home"], "...": "...",
+                "escalate": {"max_per_night": 1}}
+}
+```
+
+`escalate` at the top of a telescope's `recovery` applies to all its
+devices; a device's own `escalate` is merged over it (`"agent": null`
+there: no agent for that device). Keys: `agent` (`command`: argv, no
+shell, `command[0]` an absolute path; `timeout` s; `env`: extra
+environment), `max_per_night` (2), `log_entries` (200: timeline entries
+in the context), `safe` (site lines added to what the agent is told is
+safe), `summary_max` (4000 characters), `workdir` (where the hook's
+temporary directory is made; default the system's). Without `escalate`
+there is no agent, and the person is told at once.
+
+The rehearsal (`robofast.testing.rehearsal`) refuses an `agent`: it
+would act outside the rehearsal's guards. An exhausted ladder there
+still gets its summary.
+
+### The agent hook
+
+The hook lives with the site's deployment, **outside this repository**,
+with whatever hosts and credentials it needs. Its contract:
+
+- **Input.** A JSON context on **stdin** and in the file
+  `$ROBOFAST_ESCALATION_CONTEXT` (mode 600, in a private temporary
+  directory that is also the hook's working directory and is deleted
+  after it exits): `incident`, `time`, `sequencer`, `telescope`,
+  `device`, `device_name`, `error`, `tried` (`[{"rung", "outcome"}]`),
+  `other_telescopes`, `timeout`, `safe` (what it may and may not do:
+  robofast's lines -- the failing telescope is out of the plan and gets
+  only reads until the hook exits; never command the other telescopes,
+  the enclosure, the safety supervisor, the weather station or another
+  device's outlet; do not move the telescope unless a site line allows
+  it; when unsure, change nothing -- then the site's `safe` lines),
+  `contract`, `timeline` (the telescope's recent commands and events) and
+  `status` (the sequencer's status snapshot). Also in the environment:
+  `ROBOFAST_ESCALATION_TELESCOPE`, `_DEVICE`, `_SUMMARY`; the rest is the
+  sequencer's own environment plus `agent.env`.
+- **What it may do.** Try a fix by its own means (restart a service on
+  the telescope's PC, reconnect a driver, read logs ...) within `safe`.
+- **Exit status.** 0: the device should be retried (robofast verifies it);
+  anything else: it could not fix it. Past `timeout` it is killed, with
+  its process group.
+- **Summary.** A short human-readable summary -- the diagnosis, what it
+  did, the result -- written to `$ROBOFAST_ESCALATION_SUMMARY`, or else
+  its stdout (the last `summary_max` characters). It goes to a person
+  verbatim: no secrets.
+
+An example hook that runs a headless coding agent with a diagnosis
+prompt (here Claude Code's non-interactive mode; any agent CLI that takes
+a prompt and can be limited to a set of tools works the same way):
+
+```bash
+#!/bin/bash
+# /usr/local/bin/robofast-agent-hook -- site deployment, not in robofast.
+set -u
+ctx="$ROBOFAST_ESCALATION_CONTEXT"
+prompt="You are the on-call engineer for a robotic telescope. robofast's
+recovery ladder failed for $(jq -r '.telescope + " " + .device' "$ctx").
+The incident (error, every rung tried, recent log, status) is in $ctx;
+read it, and obey its \"safe\" list exactly. Diagnose the fault using
+the site's runbook (/etc/robofast/runbook.md) and the read-only tools you
+have. If, and only if, the runbook's restart procedure for this device
+applies, run it. Then write to $ROBOFAST_ESCALATION_SUMMARY a summary for
+the observer (at most 20 lines): DIAGNOSIS, WHAT I DID, RESULT. Last line
+exactly RETRY if the device should be tried again, else GIVE-UP."
+claude -p "$prompt" \
+  --allowedTools "Read,Bash(/usr/local/bin/site-restart-camera-service:*),Bash(jq:*)" \
+  --max-turns 40 >/dev/null 2>&1
+tail -n 1 "$ROBOFAST_ESCALATION_SUMMARY" 2>/dev/null | grep -qx RETRY
+```
+
+The agent's tools are the site's choice: give it the narrowest set that
+can fix the faults the runbook covers (here one site restart script), and
+nothing that moves hardware, opens the enclosure or switches a PDU. Its
+API key comes from the sequencer's environment (e.g. a systemd
+`LoadCredential=` file the hook reads), never from robofast's config.
 
 ## The restart hook
 
@@ -227,6 +356,13 @@ The outlet map of MINERVA's PDUs is to be taken from the legacy
 
 ## Tests
 
+`tests/core/test_escalation.py` (an agent that fixes the device -- it
+rejoins while the other telescope observed on, and the person gets the
+summary; one that fails, one that exits 0 without fixing it -- robofast's
+own check drops it; one that hangs -- killed with its process group at its
+timeout; no agent configured; the same fault again and `max_per_night`;
+the hook's input, environment and summary; the config merge and its
+refusals; the incident as one console alarm);
 `tests/core/test_pwi_recovery.py` (the `home` rung and the PWI reconnect
 on a PWI2 simulator, a skipped `home`, `pointing_models`, the guard and
 the rehearsal's preflight: recovered, dropped, refused);

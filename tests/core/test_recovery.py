@@ -315,7 +315,9 @@ async def test_sequencer_gives_up_when_the_ladder_is_exhausted(make_rig):
     [give] = rig.timeline.events("giving_up")
     assert "recovery ladder exhausted" in give.detail["reason"]
     assert give.detail["errors"] == 1  # the ladder, not the error count, gave up
-    assert any("giving up tonight" in a for a in unit.alarms)
+    assert any("recovery ladder exhausted" in a for a in unit.alarms)
+    [inc] = rig.timeline.events("incident")
+    assert "no agent configured" in inc.detail["summary"]
     # The other telescope observes on.
     t2 = rig.cams[1].exposures_started
     await wait_until(lambda: rig.cams[1].exposures_started > t2 + 1, timeout=20)

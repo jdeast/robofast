@@ -558,6 +558,16 @@ def test_recovery_options(tmp_path):
     )
     with pytest.raises(RehearsalRefused, match="never switches a PDU"):
         settings_from_args(args(recovery=[f"t1={f}"]))
+    f.write_text(
+        json.dumps(
+            {
+                "escalate": {"agent": {"command": ["/usr/local/bin/agent"]}},
+                "telescope": {"steps": ["reconnect"]},
+            }
+        )
+    )
+    with pytest.raises(RehearsalRefused, match="never runs an agent hook"):
+        settings_from_args(args(recovery=[f"t1={f}"]))
     f.write_text(json.dumps({"camera": {"steps": ["home"]}}))
     with pytest.raises(RehearsalRefused, match="telescope step"):
         settings_from_args(args(recovery=[f"t1={f}"]))

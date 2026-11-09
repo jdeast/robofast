@@ -562,6 +562,14 @@ class Aggregator:
             alarm(tel, f"{tel}: frames lost ({out['frames_failed']})", "critical")
         for text in s.get("alarms") or []:
             alarm(tel, str(text), "alarm")
+        # An escalated incident's one summary (docs/recovery.md): its text is
+        # unique to it, so the notifier sends it once.
+        for inc in s.get("incidents") or []:
+            if isinstance(inc, dict) and inc.get("text"):
+                level = (
+                    inc.get("level") if inc.get("level") in ("alarm", "critical") else "critical"
+                )
+                alarm(tel, str(inc["text"]), level, str(inc.get("summary") or ""))
         for key, label in TELESCOPE_VALUES.items():
             v = values.get(f"{tel}.{key}")
             if isinstance(v, dict):

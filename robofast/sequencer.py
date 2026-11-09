@@ -315,9 +315,10 @@ from robofast.autofocus import (
     term_source,
 )
 from robofast.camera_state import CAMERA_IDLE, image_ready
-from robofast.cancel import stop_task
+from robofast.cancel import stop_task, stop_tasks
 from robofast.clock import Clock, real_clock
 from robofast.cooling import CameraCooling, CoolingStatus
+from robofast.escalation import DEFAULT_SAFE, AgentResult, Incident, fault_signature, run_agent
 from robofast.imagebytes import ImageArray, fits_order
 from robofast.imaging import FrameWriteFailed, Imaging, PendingFrame
 from robofast.instruments import SpectrographBusy, SpectrographError, SpectrographFault
@@ -643,6 +644,14 @@ class TelescopeUnit:
     #: Keeps the camera cooled (docs/cooling.md); None: robofast leaves
     #: its cooler alone.
     cooling: CameraCooling | None = None
+    #: The incident being escalated (an agent working on one of its devices,
+    #: robofast/escalation.py): out of the plan until it ends.
+    escalation: Incident | None = field(default=None, init=False)
+    #: Every incident tonight, finished or not (the status snapshot carries
+    #: the finished ones' summaries to the console and the notifier).
+    incidents: list[Incident] = field(default_factory=list, init=False)
+    #: Set when an escalation ends: wakes whatever waits for it to rejoin.
+    rejoin: asyncio.Event = field(default_factory=asyncio.Event, init=False)
 
     @property
     def active(self) -> bool:
@@ -940,6 +949,11 @@ class Sequencer:
         self.spectrograph_failures = 0
         self.spectrograph_down: str | None = None
         self._spec_recovery: asyncio.Task | None = None
+        #: Escalations running (an agent at work; docs/recovery.md), agent
+        #: runs per (telescope, device) and the faults escalated tonight.
+        self._escalations: set[asyncio.Task] = set()
+        self._agent_runs: dict[tuple[str, str], int] = {}
+        self._faults_escalated: dict[tuple[str, str], str] = {}
         #: Every spectrum and spectrograph calibration frame taken tonight.
         self.spectrum_records: list[dict[str, Any]] = []
         #: Pointing models built tonight (docs/pointing_model.md).
@@ -1196,6 +1210,7 @@ class Sequencer:
         finally:
             task, self._spec_recovery = self._spec_recovery, None
             await stop_task(task, self.config.cancel_ack_timeout)
+            await self._stop_escalations()
 
     async def _run(self) -> None:
         await self._shadow_start()
@@ -1309,10 +1324,13 @@ class Sequencer:
             else:
                 self._event("plan_exhausted")
             return False
+        for u in active:
+            u.rejoin.clear()
         wait = min(u.retry_at for u in active) - time.monotonic()
         if wait > 0:
             self._event("error_backoff", seconds=wait)
-            await asyncio.sleep(wait)
+            # An escalation that ends sooner (rejoins or drops) wakes it.
+            await _wait_any([u.rejoin for u in active], wait)
         return True
 
     # -- the closed phase ---------------------------------------------------
@@ -1976,13 +1994,20 @@ class Sequencer:
         if delay <= 0:
             return True
         state.leave(unit.name)
-        try:
-            await asyncio.wait_for(state.idle.wait(), delay)
-        except TimeoutError:
-            state.working.add(unit.name)
-            return True
-        state.backing_off.add(unit.name)
-        return False
+        while True:
+            # An escalation ending (robofast/escalation.py) wakes it early.
+            await _wait_any([state.idle, unit.rejoin], delay)
+            if state.idle.is_set():
+                if unit.active:
+                    state.backing_off.add(unit.name)
+                return False
+            unit.rejoin.clear()
+            if not unit.active:
+                return False
+            delay = unit.retry_at - time.monotonic()
+            if delay <= 0:
+                state.working.add(unit.name)
+                return True
 
     async def _telescope_failed(
         self, state: _Generation, unit: TelescopeUnit, tel: Grant, cam: Grant, error: str
@@ -2017,12 +2042,15 @@ class Sequencer:
         )
         result = await self._recover_device(state, unit, tel, cam, error)
         if result is not None and result.exhausted:
+            why = self._escalate(unit, result, error)
+            if why is None:
+                return  # an agent is at work: the telescope is out of the plan meanwhile
             unit.gave_up = True
             self._event(
                 "giving_up",
                 telescope=unit.name,
                 errors=unit.consecutive_errors,
-                reason=f"recovery ladder exhausted ({result.device})",
+                reason=f"recovery ladder exhausted ({result.device}); {why}",
                 level="critical",
             )
             return
@@ -2127,6 +2155,220 @@ class Sequencer:
             return {} if fn is None else await fn()
 
         return reconnect, probe
+
+    # -- escalation: the ladder's last step (robofast/escalation.py) ------------------------
+
+    def _escalate(self, unit: TelescopeUnit, result: RecoveryResult, error: str) -> str | None:
+        """``result``'s ladder is exhausted: open an incident. Start its agent
+        in the background (None: the telescope is out of the plan until the
+        agent ends) or, with no agent to run, end the incident at once and
+        return why (the telescope gives up for the night)."""
+        ladder = unit.recovery
+        assert ladder is not None
+        kind = result.device
+        pol = ladder.escalation(kind)
+        inc = Incident(unit.name, kind, len(unit.incidents) + 1, error, list(result.tried))
+        unit.incidents.append(inc)
+        key = (unit.name, kind)
+        sig = (unit.name, fault_signature(kind, error))
+        runs = self._agent_runs.get(key, 0)
+        if pol.agent is None:
+            inc.agent = "no agent configured"
+        elif runs >= pol.max_per_night:
+            inc.agent = (
+                f"not run: the {kind} was escalated {runs} time(s) tonight "
+                f"(max_per_night {pol.max_per_night})"
+            )
+        elif sig in self._faults_escalated:
+            inc.agent = (
+                f"not run: the same fault was escalated at {self._faults_escalated[sig]} "
+                "and came back"
+            )
+        else:
+            self._agent_runs[key] = runs + 1
+            self._faults_escalated[sig] = inc.started
+            inc.agent = "running"
+            unit.escalation = inc
+            # Out of the plan until the agent ends (it wakes the waits sooner).
+            unit.retry_at = (
+                time.monotonic() + pol.timeout + ladder.policies[kind].verify_timeout + 60
+            )
+            self._event(
+                "escalation_start",
+                telescope=unit.name,
+                device=kind,
+                incident=inc.id,
+                timeout=pol.timeout,
+            )
+            context = self._escalation_context(unit, inc, pol)
+            task = asyncio.get_running_loop().create_task(
+                self._run_escalation(unit, inc, pol, context),
+                name=f"{self.name}-escalation-{inc.id}",
+            )
+            self._escalations.add(task)
+            task.add_done_callback(self._escalations.discard)
+            return None
+        inc.finish("dropped", "the recovery ladder is exhausted")
+        self._incident_done(unit, inc)
+        return f"escalation: {inc.agent}"
+
+    async def _stop_escalations(self) -> None:
+        """The sequencer is stopping: kill every agent at work, and end its
+        incident (dropped; the person is told)."""
+        if self._escalations:
+            await stop_tasks(list(self._escalations), self.config.cancel_ack_timeout + 20)
+        for u in self.units.values():
+            if u.escalation is not None:  # cancelled before it started
+                u.escalation.agent = "interrupted: the sequencer stopped"
+                self._end_escalation(u, u.escalation, "the sequencer stopped")
+
+    def _escalation_context(self, unit: TelescopeUnit, inc: Incident, pol: Any) -> dict[str, Any]:
+        """What the agent is given (docs/recovery.md, "The agent hook")."""
+        name = unit.name
+        entries = [
+            e
+            for e in self.timeline.recent(max(1000, pol.log_entries * 5), skip_sent=True)
+            if str(e.get("source", "")).startswith(f"{name}.")
+            or (e.get("detail") or {}).get("telescope") == name
+        ][-pol.log_entries :]
+        try:
+            from robofast.sequencer_service import snapshot
+
+            status = snapshot(self)
+            status.pop("timeline", None)
+        except Exception as exc:  # the context must not fail for want of a status
+            status = {"error": repr(exc)}
+        owner = self._owner(unit, inc.device)
+        return {
+            "schema": 1,
+            "incident": inc.id,
+            "time": inc.started,
+            "sequencer": self.name,
+            "telescope": name,
+            "device": inc.device,
+            "device_name": owner.name if owner is not None else None,
+            "error": inc.error,
+            "tried": [{"rung": r, "outcome": o} for r, o in inc.tried],
+            "other_telescopes": sorted(n for n in self.units if n != name),
+            "timeout": pol.timeout,
+            "safe": [*DEFAULT_SAFE, *pol.safe],
+            "contract": (
+                "Exit 0 if the device should be retried (robofast verifies it "
+                "itself), nonzero otherwise. Write a summary for a person -- "
+                "diagnosis, what you did, the result -- to the file "
+                "$ROBOFAST_ESCALATION_SUMMARY (or stdout)."
+            ),
+            "timeline": entries,
+            "status": status,
+        }
+
+    async def _run_escalation(
+        self, unit: TelescopeUnit, inc: Incident, pol: Any, context: dict[str, Any]
+    ) -> None:
+        """Run the agent, verify the device if it asks for a retry, end the
+        incident (module doc of robofast/escalation.py)."""
+        try:
+            try:
+                res = await run_agent(pol, context)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                res = AgentResult(None, "", error=repr(exc))
+        except asyncio.CancelledError:
+            inc.agent = "interrupted: the sequencer stopped while the agent worked"
+            self._end_escalation(unit, inc, "the sequencer stopped")
+            raise
+        inc.agent_summary = res.summary
+        why: str | None
+        if res.error is not None:
+            inc.agent = f"could not run: {res.error}"
+            why = "the agent could not run"
+        elif res.timed_out:
+            inc.agent = f"timed out after {pol.timeout:g} s (killed)"
+            why = "the agent timed out"
+        elif res.exit != 0:
+            inc.agent = f"exited {res.exit} (could not fix it)"
+            why = "the agent could not fix it"
+        else:
+            inc.agent = "exited 0 (asks for a retry)"
+            try:
+                await self._verify_device(unit, inc.device)
+                why = None
+            except Exception as exc:
+                why = f"robofast's own check after the agent failed: {str(exc)[:200] or exc!r}"
+        self._end_escalation(unit, inc, why)
+
+    async def _verify_device(self, unit: TelescopeUnit, kind: str) -> None:
+        """Robofast's own check that ``kind`` answers (and, a PWI telescope,
+        is usable), never the agent's word: a fresh connection, read through
+        a grant of its own."""
+        if kind == "guider" and unit.recovery is not None:
+            reconnect, probe = self._guider_access(unit)
+            await unit.recovery.verify(kind, reconnect=reconnect, probe=probe)
+            return
+        owner = self._owner(unit, kind)
+        if owner is None or unit.recovery is None:
+            raise RuntimeError(f"no {kind} to verify")
+        grant = owner.grant(f"{self.name}/escalation")
+        try:
+            owner.reconnect("escalation")
+            await unit.recovery.verify(
+                kind,
+                reconnect=lambda: owner.reconnect("escalation"),
+                probe=lambda member: grant.get(member),
+                call=lambda member, *args: grant.call(member, *args),
+            )
+        finally:
+            grant.revoke("escalation verified")
+
+    @staticmethod
+    def _owner(unit: TelescopeUnit, kind: str) -> DeviceOwner | None:
+        return {
+            "telescope": unit.telescope,
+            "camera": unit.camera,
+            "focuser": unit.focuser,
+            "rotator": unit.rotator,
+            "filterwheel": unit.filterwheel,
+            "calstage": unit.calstage,
+        }.get(kind)
+
+    def _end_escalation(self, unit: TelescopeUnit, inc: Incident, why: str | None) -> None:
+        """The agent is done: rejoin (``why`` None: the device was verified)
+        or give up for the night; either way one summary for a person."""
+        unit.escalation = None
+        if why is None:
+            assert unit.recovery is not None
+            inc.finish("recovered", "the device answered robofast's own check")
+            unit.recovery.reset(inc.device)
+            unit.consecutive_errors = 0
+            unit.retry_at = time.monotonic()
+        else:
+            inc.finish("dropped", why)
+            unit.gave_up = True
+            self._event(
+                "giving_up",
+                telescope=unit.name,
+                errors=unit.consecutive_errors,
+                reason=f"recovery ladder exhausted ({inc.device}); escalation: {inc.agent}",
+                level="critical",
+            )
+        self._incident_done(unit, inc)
+        unit.rejoin.set()
+
+    def _incident_done(self, unit: TelescopeUnit, inc: Incident) -> None:
+        """The incident's one summary for a person: the status snapshot
+        carries it to the console and the notifier (docs/notifier.md)."""
+        log.error("%s: %s\n%s", unit.name, inc.text, inc.summary())
+        self._event(
+            "incident",
+            telescope=unit.name,
+            device=inc.device,
+            incident=inc.id,
+            outcome=inc.outcome,
+            agent=inc.agent,
+            level=inc.level,
+            summary=inc.summary()[:4000],
+        )
 
     async def _wait_for(
         self, probe: Callable[[], Awaitable[Any]], done: Callable[[Any], bool], timeout: float

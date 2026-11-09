@@ -272,6 +272,11 @@ class RehearsalSettings:
                         f"--recovery {name}: {kind} lists powercycle; the rehearsal never"
                         " switches a PDU"
                     )
+                if pol.escalation.agent is not None:
+                    raise ValueError(
+                        f"--recovery {name}: {kind} has an escalate.agent; the rehearsal never"
+                        " runs an agent hook (it would act outside the rehearsal's guards)"
+                    )
         self._warn_unknown_keys()
         for name, entry in self.cooling.items():
             try:

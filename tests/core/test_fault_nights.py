@@ -34,6 +34,28 @@ I6  no light exposure starts while the dome is not open.
 
 ``FAULT_NIGHTS`` (default 20) and ``FAULT_SEED`` (default 0) choose the
 seeds; a failure names its seed, and the same seed replays the same night.
+
+Every real-world failure that is fixed gets a simulated regression test
+(docs/design.md, "Testing and CI"): here when it is a whole-night or timing
+failure (one that needs the shipped timings, many hours, or faults
+overlapping), otherwise in the most fitting tier (a unit or scenario test
+in ``tests/core``, the simulator tier, the e2e night). To add one here:
+
+1. Reproduce it on the fakes: a device behaviour the fakes lack goes into
+   ``robofast/testing/fakes.py`` (or the device's fake server) first, with
+   a test of its own.
+2. Add a fault kind: a name in ``KINDS`` (listed as often as it should be
+   drawn), and its on and off in ``apply()`` (``on`` True when it starts,
+   False when it ends; overlapping faults of one kind on one device are
+   reference-counted there already). If the truth changes (the fault makes
+   the sky unsafe, say), say so where ``unsafe`` is computed in the loop.
+3. If no invariant above would catch it, add one, checked against the
+   fakes' truth, not the timeline, with its own ``I<n>`` prefix in the
+   violation message.
+4. Check that it has teeth: with the fix reverted, some seed fails (a
+   ``FAULT_SEED``/``FAULT_NIGHTS`` range wide enough to draw the fault);
+   with the fix, ``FAULT_NIGHTS=100`` passes. Name the failure (night
+   report, issue or PR) in the commit message.
 """
 
 from __future__ import annotations

@@ -67,7 +67,9 @@ jobs:
       # In parallel (pytest-xdist, one worker per runner core): ~4x faster
       # than serial, and it keeps the tests honest about shared state.
       - name: Run unit tests
-        run: python -m pytest -n auto -m "not alpaca_sim and not e2e" --durations=10
+        # `-m` here replaces pyproject's addopts marker filter, so it names
+        # every tier with its own job (fault nights: the fault-nights job).
+        run: python -m pytest -n auto -m "not alpaca_sim and not e2e and not fault_nights" --durations=10
 
   # Integration tier: the same scenarios against the official ASCOM Alpaca
   # OmniSimulators (Linux x64 build, pinned and checksum-verified).
@@ -330,7 +332,9 @@ jobs:
 
   # Seeded nights of faults at the shipped timings, on the virtual clock
   # (tests/core/test_fault_nights.py): a fixed range of seeds, so a failure
-  # names a seed that replays the same night locally.
+  # names a seed that replays the same night locally. It runs on every PR
+  # but is NOT in the `test` gate's needs (not required, for now: JDE
+  # 2026-11-09); a red fault-nights job still deserves a look before merging.
   fault-nights:
     name: fault-nights
     runs-on: ubuntu-latest

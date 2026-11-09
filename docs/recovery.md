@@ -196,10 +196,27 @@ its own per-sink rate limits still apply.
 ```
 
 `escalate` at the top of a telescope's `recovery` applies to all its
-devices; a device's own `escalate` is merged over it (`"agent": null`
-there: no agent for that device). Keys: `agent` (`command`: argv, no
+devices; a device's own `escalate` is merged over it.
+
+**Skipping the agent.** The agent step is optional. With no `agent` (or
+no `escalate` at all) there is none; `"agent": false` -- or the shorthand
+`"escalate": false` -- skips it explicitly, for a telescope (at the top
+of its `recovery`) or for one device of a telescope that has a hook (in
+that device's entry). A site that wants no agent anywhere simply
+configures none. Either way an exhausted ladder goes straight to the
+person: the telescope is dropped for the night and the summary says
+"Agent: no agent configured" or "Agent: skipped by the config
+(escalate.agent: false)".
+
+```json
+"recovery": {
+  "escalate": {"agent": {"command": ["/usr/local/bin/robofast-agent-hook"]}},
+  "camera": {"steps": ["reconnect", "restart"], "...": "...", "escalate": {"agent": false}},
+  "telescope": {"steps": ["reconnect", "restart", "home"], "...": "..."}
+}
+``` Keys: `agent` (`command`: argv, no
 shell, `command[0]` an absolute path; `timeout` s; `env`: extra
-environment), `max_per_night` (2), `log_entries` (200: timeline entries
+environment; or `false`: skipped), `max_per_night` (2), `log_entries` (200: timeline entries
 in the context), `safe` (site lines added to what the agent is told is
 safe), `summary_max` (4000 characters), `workdir` (where the hook's
 temporary directory is made; default the system's). Without `escalate`
@@ -360,7 +377,8 @@ The outlet map of MINERVA's PDUs is to be taken from the legacy
 rejoins while the other telescope observed on, and the person gets the
 summary; one that fails, one that exits 0 without fixing it -- robofast's
 own check drops it; one that hangs -- killed with its process group at its
-timeout; no agent configured; the same fault again and `max_per_night`;
+timeout; no agent configured; the agent skipped by config (`"agent":
+false`, `"escalate": false`); the same fault again and `max_per_night`;
 the hook's input, environment and summary; the config merge and its
 refusals; the incident as one console alarm);
 `tests/core/test_pwi_recovery.py` (the `home` rung and the PWI reconnect

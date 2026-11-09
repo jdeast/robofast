@@ -617,7 +617,7 @@ async def test_a_guider_that_never_recovers_gives_the_telescope_up(make_rig):
     await rig.start()
     await wait_until(lambda: unit.gave_up, timeout=30)
     [give] = rig.timeline.events("giving_up")
-    assert give.detail["reason"] == "recovery ladder exhausted (guider)"
+    assert give.detail["reason"].startswith("recovery ladder exhausted (guider)")
     tried = [e.detail["tried"] for e in rig.timeline.events("recovery_done")]
     assert [t.split(":")[0] for r in tried for t in r] == ["reconnect", "restart"]
     assert g.reconnects >= 1

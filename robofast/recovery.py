@@ -154,10 +154,10 @@ class DevicePolicy:
     #: may first travel ~100 deg to its NoWrap sensor (docs/pwi.md).
     home_timeout: float = 300.0
     #: The last step: the agent hook and its limits (robofast/escalation.py).
-    escalate: dict[str, Any] | None = None
+    escalate: dict[str, Any] | bool | None = None
 
     def __post_init__(self) -> None:
-        self.escalation = EscalationPolicy.from_dict(self.escalate)
+        self.escalation = EscalationPolicy.from_dict(_escalate_entry(self.escalate))
         bad = [s for s in self.steps if s not in RUNGS]
         if bad:
             raise ValueError(f"recovery steps {bad}: expected some of {RUNGS}")
@@ -218,6 +218,18 @@ async def _reconnect(reconnect: Callable[[], Any]) -> None:
     r = reconnect()
     if inspect.isawaitable(r):
         await r
+
+
+def _escalate_entry(e: Any) -> dict[str, Any]:
+    """An ``escalate`` entry as a mapping: ``false`` is ``{"agent": false}``
+    (straight from the exhausted ladder to the person)."""
+    if e is None:
+        return {}
+    if e is False:
+        return {"agent": False}
+    if not isinstance(e, dict):
+        raise ValueError("recovery.escalate: a mapping, or false")
+    return dict(e)
 
 
 class Skipped(Exception):
@@ -331,14 +343,13 @@ class RecoveryLadder:
     @classmethod
     def from_config(cls, telescope: str, d: dict[str, Any], **kw: Any) -> RecoveryLadder:
         d = {k: v for k, v in dict(d).items() if not k.startswith("_")}
-        top = d.pop("escalate", None) or {}
-        if not isinstance(top, dict):
-            raise ValueError("recovery.escalate: a mapping")
+        top = _escalate_entry(d.pop("escalate", None))
         policies = {}
         for k, v in d.items():
             v = dict(v)
-            if top or v.get("escalate"):
-                v["escalate"] = {**top, **(v.get("escalate") or {})}
+            own = _escalate_entry(v.get("escalate"))
+            if top or own:
+                v["escalate"] = {**top, **own}
             policies[k] = DevicePolicy.from_dict(v)
         return cls(telescope, policies, **kw)
 

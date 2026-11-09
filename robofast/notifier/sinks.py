@@ -1,4 +1,5 @@
-"""Where notifications go: email, a chat webhook, a command (docs/notifier.md).
+"""Where notifications go: email, a chat webhook, a command, and phones --
+ntfy, Pushover, Twilio SMS (docs/notifier.md).
 
 Every sink has ``name`` and ``async send(notification)``, which delivers or
 raises; its :class:`~robofast.notifier.core.SinkWorker` adds the
@@ -24,7 +25,7 @@ from collections.abc import Callable
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import urlsplit
 
 import httpx
@@ -207,10 +208,250 @@ class WebhookSink:
             client = httpx.AsyncClient(trust_env=False, follow_redirects=False)
         try:
             r = await isolated(client.post(url, json=self.payload(n), timeout=self.timeout))
-            r.raise_for_status()
+            check_response(self.name, r)
         finally:
             if own:
                 await client.aclose()
+
+
+def check_response(name: str, r: httpx.Response) -> None:
+    """Raise on a non-2xx answer, naming the sink and the status but never the
+    URL (it may carry a token or a private topic)."""
+    if not r.is_success:
+        raise httpx.HTTPStatusError(f"{name}: HTTP {r.status_code}", request=r.request, response=r)
+
+
+def check_https(name: str, url: str) -> None:
+    u = urlsplit(url)
+    if u.scheme == "https" or (u.scheme == "http" and is_loopback(u.hostname or "")):
+        return
+    raise ValueError(f"{name}: the URL must be https (or http to loopback)")
+
+
+class _HTTPSink:
+    """Shared by the phone sinks: one POST per message with ``httpx`` (no
+    redirects, no proxy environment), https only (plain http to loopback,
+    for a self-hosted server on the same host or a test)."""
+
+    name: str
+    timeout: float
+    _client: httpx.AsyncClient | None
+
+    async def post(self, url: str, **kw: Any) -> httpx.Response:
+        check_https(self.name, url)
+        client = self._client
+        own = client is None
+        if own:
+            client = httpx.AsyncClient(trust_env=False, follow_redirects=False)
+        try:
+            r = await isolated(client.post(url, timeout=self.timeout, **kw))
+            check_response(self.name, r)
+            return r
+        finally:
+            if own:
+                await client.aclose()
+
+
+def _cut(text: str, n: int) -> str:
+    tail = "\n... (truncated)"
+    return text if len(text) <= n else text[: n - len(tail)] + tail
+
+
+#: ``digest``, ``suppressed`` and ``test`` are not urgent, whatever their level.
+QUIET_KINDS = ("digest", "suppressed", "test", "clear", "ack")
+
+
+# -- ntfy ----------------------------------------------------------------------------------------
+
+
+class NtfySink(_HTTPSink):
+    """Publish to an `ntfy <https://ntfy.sh>`_ topic (the public server or a
+    self-hosted one): JSON to the server's root, ``{"topic", "title",
+    "message", "priority", "tags"}``. The phone runs the ntfy app subscribed
+    to the topic. On a public server the topic name is the only secret
+    unless the topic is reserved with an access token: give it as
+    ``topic_file`` and the token (``tk_...``, sent as a Bearer token) as
+    ``token_file``. Priority by level: ``priorities`` (default info 2,
+    warning 3, alarm 4, critical 5 -- urgent, which the Android app may let
+    through Do Not Disturb); a digest, clear, ack or test is 3."""
+
+    PRIORITIES: ClassVar[dict[str, int]] = {"info": 2, "warning": 3, "alarm": 4, "critical": 5}
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        server: str = "https://ntfy.sh",
+        topic: str | None = None,
+        topic_file: str | None = None,
+        token_file: str | None = None,
+        priorities: dict[str, int] | None = None,
+        tags: list[str] | None = None,
+        click: str | None = None,
+        max_text: int = 3500,
+        timeout: float = 10.0,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        if (topic is None) == (topic_file is None):
+            raise ValueError(f"ntfy {name}: give exactly one of topic and topic_file")
+        self.name, self.server = name, server.rstrip("/")
+        check_https(f"ntfy {name}", self.server)
+        self._topic, self.topic_file, self.token_file = topic, topic_file, token_file
+        self.topic()  # a missing or unprotected file fails at start, not at 3 am
+        if token_file:
+            read_secret_text(token_file)
+        self.priorities = {**self.PRIORITIES, **(priorities or {})}
+        self.tags = list(tags or [])
+        self.click, self.max_text = click, int(max_text)
+        self.timeout, self._client = float(timeout), client
+
+    def topic(self) -> str:
+        t = self._topic if self._topic is not None else read_secret_text(str(self.topic_file))
+        if not t or "/" in t:
+            raise ValueError(f"ntfy {self.name}: a topic name (no slashes)")
+        return t
+
+    def payload(self, n: Notification) -> dict[str, Any]:
+        prio = 3 if n.kind in QUIET_KINDS else int(self.priorities.get(n.level, 3))
+        out: dict[str, Any] = {
+            "topic": self.topic(),
+            "title": n.subject[:250],
+            "message": _cut(n.body, self.max_text),
+            "priority": max(1, min(5, prio)),
+            "tags": [*self.tags, n.level],
+        }
+        if self.click:
+            out["click"] = self.click
+        return out
+
+    async def send(self, n: Notification) -> None:
+        headers = {}
+        if self.token_file:
+            headers["Authorization"] = f"Bearer {read_secret_text(self.token_file)}"
+        await self.post(self.server + "/", json=self.payload(n), headers=headers)
+
+
+# -- Pushover ------------------------------------------------------------------------------------
+
+
+class PushoverSink(_HTTPSink):
+    """`Pushover <https://pushover.net>`_'s message API (a form POST).
+    ``credentials_file``: ``{"token": <the application's API token>, "user":
+    <the user or group key>}``. Priority by level: ``priorities`` (default
+    info -1, warning 0, alarm 1, critical 2). Priority 2 is Pushover's
+    *emergency*: repeated every ``retry`` s (>= 30) until acknowledged in
+    the app or ``expire`` s (<= 10800) pass -- a pager."""
+
+    PRIORITIES: ClassVar[dict[str, int]] = {"info": -1, "warning": 0, "alarm": 1, "critical": 2}
+    API = "https://api.pushover.net/1/messages.json"
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        credentials_file: str,
+        api_url: str = API,
+        priorities: dict[str, int] | None = None,
+        retry: int = 120,
+        expire: int = 3600,
+        sound: str | None = None,
+        device: str | None = None,
+        timeout: float = 10.0,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self.name, self.api_url = name, api_url
+        check_https(f"pushover {name}", api_url)
+        self.credentials_file = credentials_file
+        creds = read_secret_json(credentials_file)
+        if not {"token", "user"} <= set(creds):
+            raise ValueError(f"{credentials_file}: needs token and user")
+        if not 30 <= int(retry) or not 0 < int(expire) <= 10800:
+            raise ValueError(f"pushover {name}: retry >= 30 s, 0 < expire <= 10800 s")
+        self.priorities = {**self.PRIORITIES, **(priorities or {})}
+        self.retry, self.expire = int(retry), int(expire)
+        self.sound, self.device = sound, device
+        self.timeout, self._client = float(timeout), client
+
+    def form(self, n: Notification) -> dict[str, str]:
+        creds = read_secret_json(self.credentials_file)
+        prio = 0 if n.kind in QUIET_KINDS else int(self.priorities.get(n.level, 0))
+        prio = max(-2, min(2, prio))
+        out = {
+            "token": str(creds["token"]),
+            "user": str(creds["user"]),
+            "title": n.subject[:250],
+            "message": _cut(n.body, 1024),
+            "priority": str(prio),
+            "timestamp": str(int(n.time)),
+        }
+        if prio == 2:
+            out["retry"], out["expire"] = str(self.retry), str(self.expire)
+        if self.sound:
+            out["sound"] = self.sound
+        if self.device:
+            out["device"] = self.device
+        return out
+
+    async def send(self, n: Notification) -> None:
+        await self.post(self.api_url, data=self.form(n))
+
+
+# -- Twilio SMS ----------------------------------------------------------------------------------
+
+
+class TwilioSink(_HTTPSink):
+    """An SMS through `Twilio <https://www.twilio.com>`_'s Messages API, one
+    to each of ``to``, from ``sender`` (a Twilio number) or a
+    ``messaging_service_sid``. ``credentials_file``: ``{"account_sid": ...,
+    "auth_token": ...}`` (HTTP basic auth). The text is the subject and the
+    start of the body, cut to ``max_text`` characters (an SMS segment is
+    160; each costs)."""
+
+    API = "https://api.twilio.com"
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        credentials_file: str,
+        to: list[str] | str,
+        sender: str | None = None,
+        messaging_service_sid: str | None = None,
+        api_url: str = API,
+        max_text: int = 600,
+        timeout: float = 15.0,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        if (sender is None) == (messaging_service_sid is None):
+            raise ValueError(f"twilio {name}: give exactly one of sender and messaging_service_sid")
+        self.name, self.api_url = name, api_url.rstrip("/")
+        check_https(f"twilio {name}", self.api_url)
+        self.credentials_file = credentials_file
+        creds = read_secret_json(credentials_file)
+        if not {"account_sid", "auth_token"} <= set(creds):
+            raise ValueError(f"{credentials_file}: needs account_sid and auth_token")
+        self.to = [to] if isinstance(to, str) else list(to)
+        if not self.to:
+            raise ValueError(f"twilio {name}: no recipients")
+        self.sender, self.service = sender, messaging_service_sid
+        self.max_text = int(max_text)
+        self.timeout, self._client = float(timeout), client
+
+    def text(self, n: Notification) -> str:
+        return _cut(f"{n.subject}\n{n.body}", self.max_text)
+
+    async def send(self, n: Notification) -> None:
+        creds = read_secret_json(self.credentials_file)
+        sid = str(creds["account_sid"])
+        url = f"{self.api_url}/2010-04-01/Accounts/{sid}/Messages.json"
+        auth = (sid, str(creds["auth_token"]))
+        for number in self.to:
+            form = {"To": number, "Body": self.text(n)}
+            if self.sender:
+                form["From"] = self.sender
+            else:
+                form["MessagingServiceSid"] = str(self.service)
+            await self.post(url, data=form, auth=auth)
 
 
 # -- command hook ------------------------------------------------------------------------------
@@ -281,12 +522,20 @@ SINK_TYPES: Registry[type] = Registry("notifier sink type")
 SINK_TYPES.register("email", EmailSink)
 SINK_TYPES.register("webhook", WebhookSink)
 SINK_TYPES.register("command", CommandSink)
+SINK_TYPES.register("ntfy", NtfySink)
+SINK_TYPES.register("pushover", PushoverSink)
+SINK_TYPES.register("twilio", TwilioSink)
 
 __all__ = [
     "SINK_TYPES",
     "CommandSink",
     "EmailSink",
+    "NtfySink",
+    "PushoverSink",
+    "TwilioSink",
     "WebhookSink",
+    "check_https",
+    "check_response",
     "check_secret_file",
     "is_loopback",
     "read_secret_json",

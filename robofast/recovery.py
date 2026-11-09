@@ -73,6 +73,11 @@ the telescope parked (``requires_parked``) and the camera idle and, if
 ``camera_warm_above`` is set, warmer than that (so a cooled CCD is never
 cut off cold) -- each check skipped only for the device being cycled
 itself when it cannot answer.
+
+An exhausted ladder is **escalated** (robofast/escalation.py): an agent
+hook, if configured, gets the incident to try a fix, and a person always
+gets one summary of it. ``escalate`` in a telescope's ``recovery`` entry
+applies to every device; a device's own ``escalate`` is merged over it.
 """
 
 from __future__ import annotations
@@ -87,6 +92,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from robofast.cancel import isolated
+from robofast.escalation import EscalationPolicy
 
 log = logging.getLogger(__name__)
 
@@ -147,8 +153,11 @@ class DevicePolicy:
     #: The ``home`` rung's bound (s): a CDK700 homes in 33-58 s, but azimuth
     #: may first travel ~100 deg to its NoWrap sensor (docs/pwi.md).
     home_timeout: float = 300.0
+    #: The last step: the agent hook and its limits (robofast/escalation.py).
+    escalate: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        self.escalation = EscalationPolicy.from_dict(self.escalate)
         bad = [s for s in self.steps if s not in RUNGS]
         if bad:
             raise ValueError(f"recovery steps {bad}: expected some of {RUNGS}")
@@ -322,7 +331,33 @@ class RecoveryLadder:
     @classmethod
     def from_config(cls, telescope: str, d: dict[str, Any], **kw: Any) -> RecoveryLadder:
         d = {k: v for k, v in dict(d).items() if not k.startswith("_")}
-        return cls(telescope, {k: DevicePolicy.from_dict(v) for k, v in d.items()}, **kw)
+        top = d.pop("escalate", None) or {}
+        if not isinstance(top, dict):
+            raise ValueError("recovery.escalate: a mapping")
+        policies = {}
+        for k, v in d.items():
+            v = dict(v)
+            if top or v.get("escalate"):
+                v["escalate"] = {**top, **(v.get("escalate") or {})}
+            policies[k] = DevicePolicy.from_dict(v)
+        return cls(telescope, policies, **kw)
+
+    def escalation(self, kind: str) -> EscalationPolicy:
+        """``kind``'s escalation policy (module doc)."""
+        return self.policies[kind].escalation
+
+    def reset(self, kind: str) -> None:
+        """Start ``kind``'s ladder from its first rung again (after an
+        escalation brought it back)."""
+        self.level.pop(kind, None)
+        self.last_failure.pop(kind, None)
+
+    async def verify(self, kind: str, *, reconnect, probe, call=None) -> None:
+        """Check ``kind`` answers and (a PWI telescope) is usable, as after a
+        rung, bounded by its ``verify_timeout``; raise if not."""
+        pol = self.policies[kind]
+        async with asyncio.timeout(pol.verify_timeout + 10):
+            await self._verify(kind, pol, reconnect, probe, call)
 
     def device_for(self, error: str, names: dict[str, str]) -> str | None:
         """Which device an error came from: ``names`` maps device kind to
@@ -391,7 +426,7 @@ class RecoveryLadder:
             return res
         res = RecoveryResult(kind, tried, False, True)
         self.history.append(res)
-        self.alarm(f"{who}: recovery ladder exhausted ({', '.join(pol.steps)}): giving up tonight")
+        self.alarm(f"{who}: recovery ladder exhausted ({', '.join(pol.steps)}): escalating")
         return res
 
     async def _verify(self, kind: str, pol: DevicePolicy, reconnect, probe, call=None) -> None:

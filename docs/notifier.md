@@ -1,9 +1,13 @@
 # The alarm notifier
 
 `robofast/notifier/` sends the observer console's alarms off the page:
-by email, to a chat channel (a Slack-style webhook), or by running a command
-(to page or phone the observer on duty at the 60-inch, for example). It is
-its own small process:
+by email, to a chat channel (a Slack-style webhook), to phones (ntfy,
+Pushover, Twilio SMS), or by running a command (to page or phone the
+observer on duty at the 60-inch, for example). It also carries each
+recovery incident's summary (docs/recovery.md, "Escalation"): the
+sequencer puts it in its status snapshot, the console shows it as an
+alarm, and the notifier sends it like any other. It is its own small
+process:
 
 ```
 python -m robofast.notifier --config notifier.json           # run
@@ -26,7 +30,7 @@ shows, with the same ids:
 | Source | What raises an alarm |
 |---|---|
 | safety supervisor, `GET /status` | its own alarms (shutter not reaching the commanded state, heartbeat, ...), an enclosure fault, a quarantined lease, a revoked lease not released, the supervisor not answering (critical) |
-| sequencer, its `status_file` snapshot | quarantined or needing an operator (critical), not running (snapshot stale or missing), a telescope that gave up for the night or lost frames (critical) |
+| sequencer, its `status_file` snapshot | quarantined or needing an operator (critical), not running (snapshot stale or missing), a telescope that gave up for the night or lost frames (critical), each finished recovery incident with its summary (critical if the telescope was dropped, alarm if it recovered) |
 | each guider, `GET /status` | failed, its own alarms, not answering |
 | KiwiSpec, `GET /status` | its alarms, not answering |
 | weather bridge, `GET /weather/status` | *would close* (shadow rain), not answering |
@@ -161,9 +165,83 @@ script that calls the observer's phone.
  "timeout": 30, "min_level": "critical", "on": ["escalate"]}
 ```
 
+### `ntfy`
+
+Publishes to an [ntfy](https://ntfy.sh) topic -- the public server or a
+self-hosted one (`server`, default `https://ntfy.sh`) -- as JSON
+(`topic`, `title`, `message`, `priority`, `tags`); the phone runs the ntfy
+app subscribed to the topic. Priority by level (`priorities`, default
+info 2, warning 3, alarm 4, critical 5 = *urgent*, which the Android app
+can let through Do Not Disturb); a digest, clear, ack, suppressed or test
+message is 3. On a public server anyone who knows the topic can read it:
+give it as `topic_file`, and reserve it with an access token
+(`token_file`, `tk_...`, sent as a Bearer token).
+
+```
+{"type": "ntfy", "topic_file": "$CREDENTIALS_DIRECTORY/ntfy-topic",
+ "token_file": "$CREDENTIALS_DIRECTORY/ntfy-token",
+ "min_level": "alarm", "on": ["raise", "escalate"]}
+```
+
+### `pushover`
+
+[Pushover](https://pushover.net)'s message API (a form POST).
+`credentials_file`: `{"token": <application API token>, "user": <user or
+group key>}`. Priority by level (`priorities`, default info -1, warning 0,
+alarm 1, critical 2). Priority 2 is Pushover's *emergency*: repeated every
+`retry` s (default 120, at least 30) until someone acknowledges it in the
+app or `expire` s (default 3600, at most 10800) pass -- a real pager; the
+iOS app can deliver it as a critical alert through silent mode. Message
+1024 characters, title 250.
+
+```
+{"type": "pushover", "credentials_file": "$CREDENTIALS_DIRECTORY/pushover.json",
+ "min_level": "critical", "on": ["raise", "escalate"], "retry": 120, "expire": 3600}
+```
+
+### `twilio`
+
+An SMS through [Twilio](https://www.twilio.com)'s Messages API, one per
+number in `to`, from `sender` (a Twilio number) or a
+`messaging_service_sid`. `credentials_file`: `{"account_sid": ...,
+"auth_token": ...}`. The text is the subject and the start of the body,
+cut to `max_text` (600) characters (each 160-character segment costs). A
+US number must be registered for application-to-person messaging (A2P
+10DLC, or a verified toll-free number) before carriers deliver it.
+
+```
+{"type": "twilio", "credentials_file": "$CREDENTIALS_DIRECTORY/twilio.json",
+ "sender": "+1...", "to": ["+1..."], "min_level": "critical", "on": ["escalate"]}
+```
+
+`ntfy`, `pushover` and `twilio` take `timeout` (10 s; Twilio 15 s) and,
+for tests or a self-hosted server, `server` / `api_url`; like `webhook`
+they need `https` (plain `http` only to loopback), follow no redirects,
+ignore proxy variables, and name only the sink and the HTTP status in an
+error -- never the URL, topic or credentials.
+
+### Paging a phone
+
+US carriers have shut their email-to-SMS gateways (AT&T and Cricket in
+June 2025, T-Mobile's `tmomail.net` stopped delivering in late 2024,
+Verizon's `vtext.com` is being phased out), so the `email` sink no longer
+reaches a phone as a text. Practical options from a Linux host:
+
+| Channel | Cost / account | Wakes a sleeping phone | Sink |
+|---|---|---|---|
+| Pushover | an account; a one-time app purchase per platform after a trial; an application token | yes: priority 2 repeats until acknowledged; critical alerts on iOS | `pushover` |
+| ntfy | free (ntfy.sh) or self-hosted; an account only to reserve a topic | urgent priority (Android can bypass Do Not Disturb) | `ntfy` |
+| Twilio SMS | a paid account, a number, A2P 10DLC or toll-free registration | as loud as a text | `twilio` |
+| Slack / Mattermost | a workspace and an incoming webhook | only as its app's notifications | `webhook` |
+| Telegram bot, Signal (`signal-cli`) | a bot token / a registered number and a Java daemon | as the app's notifications | `command` with the site's own script |
+
+For the observer on duty: **Pushover** as the pager (critical, `on:
+["raise", "escalate"]`) and **ntfy** or the chat webhook for everything
+else.
+
 ### Secrets
 
-Credentials files and `url_file` must be regular files that neither group nor
+Credentials files, `url_file`, `topic_file` and `token_file` must be regular files that neither group nor
 others can read or write (mode `0600` or `0400`); anything else is refused,
 at start and at each read. `$CREDENTIALS_DIRECTORY` in their paths is
 expanded, so systemd's `LoadCredential=` can hand them over
@@ -206,7 +284,11 @@ STARTTLS-then-login sequence on a fake SMTP class, implicit TLS and the
 loopback-only plain relay; the credentials permission check; the webhook's
 payload and its https rule; the command hook's stdin and environment, its
 exit status and its timeout killing it; and the config, `--check` and
-`--test`. Nothing leaves the machine.
+`--test`. `tests/core/test_notifier_phones.py`: `ntfy`, `pushover`,
+`twilio` and the generic (`raw`) webhook against a fake HTTP server on
+loopback -- the payload, the priority by level, the credentials from mode
+600 files, and errors that never name a secret. Nothing leaves the
+machine.
 
 ## Not done yet
 

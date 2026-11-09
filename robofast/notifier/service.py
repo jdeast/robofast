@@ -16,7 +16,7 @@ The config (``deploy/notifier.example.json``)::
       "escalate_after": 600, "escalate_level": "critical",
       "digest_at": "08:00", "timezone": "America/Phoenix",
       "ignore": ["^sequencer not running"],
-      "sinks": {"<name>": {"type": "email" | "webhook" | "command",
+      "sinks": {"<name>": {"type": "email" | "webhook" | "command" | "ntfy" | "pushover" | "twilio",
                            "min_level": ..., "on": [...], "rate": {"max": 20, "window": 3600},
                            "timeout": ..., "retries": ..., ...the sink's own keys}}
     }
@@ -63,7 +63,7 @@ TOP_KEYS = {
 }
 WORKER_KEYS = {"min_level", "on", "rate", "timeout", "retries", "retry_base", "retry_max"}
 WORKER_KEYS |= {"queue_size", "type", "deliver_timeout"}
-PATH_KEYS = ("credentials_file", "url_file")
+PATH_KEYS = ("credentials_file", "url_file", "topic_file", "token_file")
 
 
 def _path(p: str, base: Path) -> str:

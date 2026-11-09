@@ -473,15 +473,17 @@ async def test_sequencer_selects_the_calstage_before_exposing(make_rig):
     ("kw", "error"),
     [({}, "has no calibration stage"), ({"calstages": True}, "no calstage position 'in'")],
 )
-async def test_an_unknown_calstage_fails_the_observation(make_rig, kw, error):
+async def test_an_unknown_calstage_is_unsupported(make_rig, kw, error):
+    """Not the telescope's error: reported unsupported, never observed."""
     plan = StaticPlan([{"name": "x", "calstage": "in", "exptime": 0.1, "count": 1}], ["t1"])
     rig = make_rig(plan=plan, seq=dict(max_consecutive_errors=1), **kw)
     await rig.start()
     await asyncio.wait_for(asyncio.shield(rig.tasks[-1]), 10)
-    errors = _events(rig, "telescope_error")
-    assert errors and error in errors[0].detail["error"]
+    [why] = _events(rig, "observation_unsupported")
+    assert error in why.detail["reason"]
+    assert not _events(rig, "telescope_error")
     assert rig.cams[0].exposures_started == 0
-    assert plan.history[0][2] == "failed"
+    assert plan.history[0][2] == "unsupported"
 
 
 async def test_sequencer_drives_the_real_server(make_rig, serve):

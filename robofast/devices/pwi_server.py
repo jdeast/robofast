@@ -1102,6 +1102,11 @@ class PWIMount:
         self._homing_since = None
         self._home_at = (st.alt_deg, st.az_deg)
         log.info("homing done (axes %s); PWI homed: %s", self._homing_axes, st.homed)
+        if st.tracking:
+            # PWI2's home leaves the mount tracking (MINERVA T1, 2026-11-09);
+            # a homed mount stands still, as after an alt/az slew.
+            with contextlib.suppress(PWIError):
+                await self._send(lambda: self.pwi.tracking(False), "tracking off (home done)")
         if st.homed is None:
             self._homed_without_flag(st, self._homing_axes, "robofast-pwi-server FindHome")
         return False
@@ -1245,6 +1250,10 @@ class PWIMount:
         mech = await self._place_azimuth(st, az, what)
         self._watch_latched = False
         self._arm_slew(alt, (alt, az), mech)
+        # ASCOM: the mount does not track after SlewToAltAz. PWI2's alt/az
+        # move turns tracking on (MINERVA T1, 2026-11-09): tracking off is
+        # sent once the slew is on its target (not before: it halts the move).
+        self._untrack_on_arrival = True
         self._moving_since = time.monotonic()
         await self._send(lambda: self.pwi.goto_altaz(alt, az), f"goto alt {alt:.4f} az {az:.4f}")
 

@@ -11,8 +11,9 @@ One mount model (:class:`CDK700Model`) behind either front end:
   (fields as in the legacy ``telstateunknown.xml``). PWI2's quirk is kept:
   ``mount.moving`` is ``True`` whenever tracking is off; ``stuck_moving``
   makes it ``True`` always (as MINERVA T1's PWI2 after a restart);
-  ``altaz_tracks`` reports tracking on during an alt/az move, and tracking
-  off halts that move (as MINERVA T1's PWI2, 2026-11-08).
+  ``altaz_tracks`` reports tracking on during an alt/az move (and a home),
+  leaves it on after, and tracking off halts that move (as MINERVA T1's
+  PWI2, 2026-11-08/09).
 
 The model, from the legacy driver's use of PWI (``docs/pwi.md``):
 
@@ -324,6 +325,8 @@ class CDK700Model:
             self.mech_target = float(self.home_pos[1]) if 0 in axes else self.mech
             self.homing_axes = axes
             self.homing_until = time.monotonic() + self.home_time
+            if self.altaz_tracks:
+                self.tracking = True  # PWI2 on MINERVA T1: a home leaves it tracking
 
     def goto_radec(self, ra: float, dec: float) -> None:
         if self._can_move("goto_radec"):

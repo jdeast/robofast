@@ -202,6 +202,15 @@ The only component allowed to open or close an enclosure
   `duty_grace` later the supervisor revokes the lease and closes. Going
   off duty closes an open enclosure. MINERVA (the Aqawan heartbeat) is
   unaffected (`docs/console.md`, "Operator duty").
+- **No enclosure is a device, not a branch.** A telescope with no enclosure
+  (a classroom tripod) runs the same supervisor on two devices of
+  `robofast-no-enclosure-server`: the sky, a Dome that opens and closes at
+  once, and the operator's duty, a SafetyMonitor safe only while an
+  operator is on duty. `park_before_close` and its interlock make a
+  revoked lease park the telescopes; the config says `"enclosure": "none"`
+  and is refused if it asks for anything that needs an enclosure or lets
+  it run unattended (`docs/no_enclosure.md`). One path per feature: a
+  site's quirks belong in its devices, not in the supervisor.
 - **A crashed sequencer's lease.** It expires and the enclosure closes, but
   it is never released, so nothing is granted until it is cleared. Only its
   restarted sequencer (`recover`, same holder name) or an operator (`clear`,

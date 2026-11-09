@@ -261,6 +261,42 @@ jobs:
           name: conformu-kiwispec-aux-logs
           path: ${{ runner.temp }}/conformu-kiwispec-aux
           if-no-files-found: warn
+  # ConformU against the no-enclosure server (scripts/conformu_no_enclosure.py):
+  # the sky Dome and the operator-duty SafetyMonitor (docs/no_enclosure.md),
+  # about 3 minutes, in parallel with the other ConformU jobs.
+  conformu-no-enclosure:
+    name: conformu-no-enclosure
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade "pip>=25.1"
+          python -m pip install --group core
+      - name: Cache the ConformU download
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/robofast/conformu
+          key: conformu-${{ runner.os }}-${{ hashFiles('scripts/fetch_conformu.sh') }}
+      - name: Fetch ConformU
+        run: |
+          set -euo pipefail
+          bin=$(scripts/fetch_conformu.sh "$HOME/.cache/robofast/conformu" | tail -1)
+          echo "CONFORMU_BIN=$bin" >> "$GITHUB_ENV"
+      - name: ConformU against the no-enclosure Dome and SafetyMonitor server
+        run: python scripts/conformu_no_enclosure.py --conformu "$CONFORMU_BIN" --out "${{ runner.temp }}/conformu-no-enclosure"
+      - name: Upload ConformU logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: conformu-no-enclosure-logs
+          path: ${{ runner.temp }}/conformu-no-enclosure
+          if-no-files-found: warn
   # End to end: a whole simulated MINERVA RV night (docs/demo.md) on
   # simulators and fakes, the scheduler's clock compressed: calibrations,
   # autofocus, spectra fed by two telescopes, imaging, bad weather, a ToO,
@@ -329,7 +365,7 @@ jobs:
   test:
     name: test
     if: always()
-    needs: [pytest, alpaca-sim, conformu, conformu-pwi, conformu-kiwispec-aux, e2e, lint, install]
+    needs: [pytest, alpaca-sim, conformu, conformu-pwi, conformu-kiwispec-aux, conformu-no-enclosure, e2e, lint, install]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any required job did not succeed
@@ -339,6 +375,7 @@ jobs:
           echo "conformu:   ${{ needs.conformu.result }}"
           echo "conformu-pwi: ${{ needs.conformu-pwi.result }}"
           echo "conformu-kiwispec-aux: ${{ needs.conformu-kiwispec-aux.result }}"
+          echo "conformu-no-enclosure: ${{ needs.conformu-no-enclosure.result }}"
           echo "e2e:        ${{ needs.e2e.result }}"
           echo "lint:       ${{ needs.lint.result }}"
           echo "install:    ${{ needs.install.result }}"
@@ -347,6 +384,7 @@ jobs:
           test "${{ needs.conformu.result }}" = "success"
           test "${{ needs.conformu-pwi.result }}" = "success"
           test "${{ needs.conformu-kiwispec-aux.result }}" = "success"
+          test "${{ needs.conformu-no-enclosure.result }}" = "success"
           test "${{ needs.e2e.result }}" = "success"
           test "${{ needs.lint.result }}" = "success"
           test "${{ needs.install.result }}" = "success"

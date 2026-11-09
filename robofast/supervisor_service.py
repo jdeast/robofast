@@ -27,6 +27,10 @@ fields)::
                  "fault_action": "Faults"}
     }
 
+A telescope with no enclosure says ``"enclosure": "none"`` and names
+:mod:`robofast.devices.no_enclosure_server` (the sky, the operator's duty)
+as its dome and safety monitor (:func:`check_enclosure`;
+docs/no_enclosure.md).
 ``observingconditions``, ``telescopes`` (needed for ``park_before_close``;
 no lease is granted unless every one reports ``AtPark``) and ``heartbeat``
 are optional; ``mode`` and ``modes`` are the enclosure's operating modes
@@ -365,6 +369,50 @@ class SupervisorServer:
 # -- the process ------------------------------------------------------------------
 
 
+def check_enclosure(config: dict[str, Any], scfg: SafetyConfig) -> bool:
+    """True for an enclosure; False for ``"enclosure": "none"`` (a telescope
+    with no enclosure, docs/no_enclosure.md), after refusing, naming the
+    key, what such a site cannot use or must have.
+
+    There the dome is the sky and the safety monitor the operator's duty
+    (:mod:`robofast.devices.no_enclosure_server`); the supervisor runs as
+    for any enclosure. Nothing closes over the telescopes, so a revoked
+    lease must park them (``park_before_close``, held by the interlock,
+    ``require_park_before_close``, until every one reports ``AtPark``), and
+    nothing closes if the supervisor dies, so it must stay attended only.
+    """
+    enclosure = config.get("enclosure")
+    if enclosure is None:
+        return True
+    if enclosure != "none":
+        raise ValueError(f'enclosure: {enclosure!r}: "none" (no enclosure) or leave it out')
+    devices = config.get("devices") or {}
+    problems = [
+        f"devices.{k}: there is nothing to read it from"
+        for k in ("observingconditions", "heartbeat")
+        if k in devices
+    ]
+    if not telescopes(config):
+        problems.append("telescopes: name at least one (a revoked lease parks them)")
+    safety = config.get("safety") or {}
+    for key in ("heartbeat_interval", "fault_action", "fault_auto_clear"):
+        if safety.get(key):
+            problems.append(f"safety.{key}: needs an enclosure")
+    if safety.get("allow_unattended_without_watchdog"):
+        problems.append(
+            "safety.allow_unattended_without_watchdog: nothing parks the telescopes if the"
+            " supervisor dies, so a site with no enclosure stays attended only"
+        )
+    if not scfg.attended_only:
+        problems.append("safety.attended_only: must be true (an operator on duty)")
+    for key in ("park_before_close", "require_park_before_close"):
+        if not getattr(scfg, key):
+            problems.append(f"safety.{key}: must be true (a revoked lease parks the telescopes)")
+    if problems:
+        raise ValueError('enclosure "none": ' + "; ".join(problems))
+    return False
+
+
 def build(
     config: dict[str, Any], timeline: Timeline, *, mode_store: ModeStore | None = None
 ) -> SafetySupervisor:
@@ -376,8 +424,12 @@ def build(
     devices = config["devices"]
     require_keys(devices, ["dome", "safetymonitor"], "devices")
     scfg = SafetyConfig(**config.get("safety", {}))
+    enclosure = check_enclosure(config, scfg)
     modes = modes_from_config(
-        config, attended_floor=bool(scfg.attended_only), fault_action=bool(scfg.fault_action)
+        config,
+        attended_floor=bool(scfg.attended_only),
+        fault_action=bool(scfg.fault_action),
+        enclosure=enclosure,
     )
     if mode_store is None:
         mode_store = ModeStore(mode_path(config))

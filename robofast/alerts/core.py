@@ -426,6 +426,20 @@ def submit(group: dict[str, Any], api: ApiConfig) -> dict[str, Any]:
     return r.json()
 
 
+def whoami(api: ApiConfig) -> dict[str, Any]:
+    """The request API's ``GET /api/`` for the alerts token: its ``name``
+    and ``scopes``; raises if the token cannot be read or the API asked."""
+    import httpx
+
+    token = Path(api.token_file).read_text().strip()
+    r = httpx.get(
+        api.url.rstrip("/") + "/api/", headers={"Authorization": f"Token {token}"}, timeout=10
+    )
+    if r.status_code >= 300:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+    return r.json()
+
+
 def utc(text: str | None) -> datetime | None:
     """An ISO time as aware UTC (naive means UTC); None if absent or bad."""
     if not text:

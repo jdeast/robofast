@@ -326,15 +326,17 @@ def test_the_rules_take_microlensing_by_peak_time_and_magnification():
     assert "not microlensing" in decide(gone, rules(), gone.peak)[1]
 
 
-async def test_a_refit_event_is_followed_once_and_once_across_surveys(tmp_path):
+async def test_a_refit_event_is_followed_once_and_once_across_surveys(tmp_path, monkeypatch):
     """KMT-2026-BLG-9554 is OGLE-2026-BLG-9004 (KMT names it; OGLE's own fit on
     the page has umin 0.000, no peak: here a refit gives it one). Made-up events."""
+    # Submitted (to nobody), not a dry run: a dry run writes no seen file.
+    monkeypatch.setattr(service_mod, "submit", lambda g, _cfg: {})
     state = tmp_path / "seen.json"
     o = {a.id: a for a in ogle.parse(page("ogle_ews_synthetic.html"))}
     k = {a.id: a for a in kmtnet.parse(page("kmtnet_listpage_synthetic.dat"))}
     kmt = k["KMT-2026-BLG-9554"]  # u0 0.045: A 22.2
     now = kmt.peak - timedelta(days=2)
-    svc = AlertService(config(state=str(state)), dry_run=True)
+    svc = AlertService(config(state=str(state)))
     first = dataclasses.replace(kmt, u0=0.5, amax=magnification(0.5))  # an earlier fit: A 2.2
     await svc.handle([first], prime=True, now=now)  # never primed: it updates
     assert svc.submitted == [] and "kmtnet:KMT-2026-BLG-9554" not in svc.seen
@@ -345,11 +347,11 @@ async def test_a_refit_event_is_followed_once_and_once_across_surveys(tmp_path):
     # OGLE's name for the star, once its fit has a peak: by position (OGLE names no twin)
     refit = dataclasses.replace(o["OGLE-2026-BLG-9004"], u0=0.045, amax=22.2, mag=16.0)
     assert decide(refit, rules(), now)[0] is not None
-    again = AlertService(config(state=str(state)), dry_run=True)  # a restart
+    again = AlertService(config(state=str(state)))  # a restart
     await again.handle([kmt, refit], now=now)
     assert again.submitted == []
     # the other way round: OGLE's followed first, KMTNet's alias names it
-    other = AlertService(config(state=str(tmp_path / "other.json")), dry_run=True)
+    other = AlertService(config(state=str(tmp_path / "other.json")))
     await other.handle([refit], now=now)
     await other.handle([dataclasses.replace(kmt, ra=0.0, dec=0.0)], now=now)  # not by position
     assert [g["id"] for g in other.submitted] == ["ogle-OGLE-2026-BLG-9004"]
@@ -459,7 +461,7 @@ async def test_a_missing_state_directory_is_made_at_startup(tmp_path, monkeypatc
     svc = AlertService(config(state=str(state)))
     assert state.parent.is_dir()  # before any alert
     await svc.handle([_tocp_alert("PNV new", 11.0)])
-    assert "tocp:PNV new" in json.loads(state.read_text())
+    assert "tocp:PNV new" in json.loads(state.read_text())["ids"]
 
 
 def test_an_unusable_state_directory_stops_the_service_at_startup(tmp_path, capsys):
@@ -474,6 +476,59 @@ def test_an_unusable_state_directory_stops_the_service_at_startup(tmp_path, caps
     assert main(["submit", "--config", str(cfg), "--source", "rubin", str(alert)]) == 2
     err = capsys.readouterr().err
     assert "alerts: state" in err and str(blocker) in err
+
+
+def test_submit_scope_is_needed_only_with_a_cadence_source_enabled():
+    """A cadence rule's follow-up is a NORMAL group (the submit scope); a
+    ToO-only setup needs the too scope alone."""
+    assert config().scopes() == ["too", "submit"]  # ogle and moa are on
+    too_only = {"tocp": {}, "gcn": config().sources["gcn"]}
+    assert config(sources=too_only).scopes() == ["too"]
+    assert config(sources={"kmtnet": {}}).scopes() == ["too", "submit"]
+    assert config().scopes(["rubin"]) == ["too"]  # submit --source rubin
+
+
+def _cli_config(tmp_path, **over) -> Path:
+    cfg = tmp_path / "alerts.json"
+    d = json.loads(EXAMPLE.read_text())
+    d["state"] = str(tmp_path / "seen.json")
+    d.update(over)
+    cfg.write_text(json.dumps(d))
+    return cfg
+
+
+def test_check_names_the_scopes(tmp_path, capsys):
+    assert main(["check", "--config", str(_cli_config(tmp_path))]) == 0
+    assert "token scopes needed: too, submit" in capsys.readouterr().out
+
+
+def test_a_token_without_submit_stops_a_cadence_source_at_startup(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(service_mod, "whoami", lambda _api: {"name": "a", "scopes": ["too"]})
+    sent = []
+    monkeypatch.setattr(service_mod, "submit", lambda g, _cfg: sent.append(g) or {})
+    page = SAMPLES / "ogle_ews_synthetic.html"
+    cfg = str(_cli_config(tmp_path))
+    assert main(["submit", "--config", cfg, "--source", "ogle", str(page)]) == 2
+    assert "lacks the submit scope" in capsys.readouterr().err and sent == []
+    # A ToO source needs only too; an admin token has every scope.
+    alert = tmp_path / "t.json"
+    alert.write_text(json.dumps(TRANSIENT))
+    assert main(["submit", "--config", cfg, "--source", "rubin", str(alert)]) == 0
+    monkeypatch.setattr(service_mod, "whoami", lambda _api: {"name": "a", "scopes": ["admin"]})
+    assert main(["submit", "--config", cfg, "--source", "ogle", str(page)]) == 0
+
+
+def test_an_api_that_cannot_be_asked_does_not_stop_the_service(tmp_path, monkeypatch, caplog):
+    def down(_api):
+        raise ConnectionError("refused")
+
+    monkeypatch.setattr(service_mod, "whoami", down)
+    monkeypatch.setattr(service_mod, "submit", lambda g, _cfg: {})
+    alert = tmp_path / "t.json"
+    alert.write_text(json.dumps(TRANSIENT))
+    cfg = str(_cli_config(tmp_path))
+    assert main(["submit", "--config", cfg, "--source", "rubin", str(alert)]) == 0
+    assert "could not ask the request API" in caplog.text
 
 
 def test_the_cli_dry_run_puts_files_through_the_rules(tmp_path, capsys):

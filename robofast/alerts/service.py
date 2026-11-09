@@ -51,6 +51,7 @@ from typing import Any
 
 from robofast.alerts import gcn, kmtnet, moa, ogle, rubin, tns, tocp
 from robofast.alerts.core import (
+    SOURCES,
     Alert,
     ApiConfig,
     Rule,
@@ -60,6 +61,7 @@ from robofast.alerts.core import (
     load_rules,
     submit,
     utc,
+    whoami,
 )
 
 log = logging.getLogger("robofast.alerts")
@@ -100,6 +102,27 @@ class AlertsConfig:
             d.get("state"),
             sources,
         )
+
+    def scopes(self, sources: list[str] | None = None) -> list[str]:
+        """The request-API scopes the alerts token needs: ``too``, plus
+        ``submit`` when one of ``sources`` (default: the enabled ones) can
+        meet a rule with a ``cadence`` (a NORMAL group, ``POST
+        /api/requestgroups``: the microlensing follow-up)."""
+        enabled = set(self.sources if sources is None else sources)
+        cadenced = any(
+            "cadence" in r.too and enabled & set(r.match.get("sources", SOURCES))
+            for r in self.rules
+        )
+        return ["too", "submit"] if cadenced else ["too"]
+
+
+def lacking_scopes(config: AlertsConfig, sources: list[str] | None = None) -> list[str]:
+    """The scopes of :meth:`AlertsConfig.scopes` the token lacks, asked of
+    the request API (``GET /api/``); raises if it cannot be asked."""
+    have = set(whoami(config.api).get("scopes") or [])
+    if "admin" in have:
+        return []
+    return [s for s in config.scopes(sources) if s not in have]
 
 
 def _page(mod, url: str | None):
@@ -256,12 +279,29 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "check":
         print("rules:", ", ".join(r.name for r in config.rules))
         print("sources:", ", ".join(config.sources) or "none")
+        print("token scopes needed:", ", ".join(config.scopes()))
         return 0
     try:
         service = AlertService(config, dry_run=args.dry_run)
     except OSError as exc:
         print(f"alerts: state {config.state}: {exc}", file=sys.stderr)
         return 2
+    if not args.dry_run:
+        # A token that lacks a scope it needs stops here, not one refusal per
+        # alert. An API that cannot be asked now is not a reason to stop.
+        sources = [args.source] if args.command == "submit" and args.source else None
+        try:
+            lacking = lacking_scopes(config, sources)
+        except Exception as exc:
+            log.warning("could not ask the request API for the token's scopes: %s", exc)
+        else:
+            if lacking:
+                print(
+                    f"alerts: the token lacks the {', '.join(lacking)} scope"
+                    f" (needs {', '.join(config.scopes(sources))}; docs/alerts.md)",
+                    file=sys.stderr,
+                )
+                return 2
     if args.command == "submit":
         if not args.source or not args.files:
             ap.error("submit needs --source and alert files")

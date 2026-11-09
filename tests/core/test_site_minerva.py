@@ -173,7 +173,9 @@ def test_alerts_config_loads():
 
     cfg = AlertsConfig.from_dict(_json("alerts.example.json"))
     assert len(cfg.rules) == 6
-    assert sorted(cfg.sources) == ["gcn", "kmtnet", "moa", "ogle", "tns", "tocp"]
+    # KMTNet is opt-in: its data are proprietary until its yearly release.
+    assert sorted(cfg.sources) == ["gcn", "moa", "ogle", "tns", "tocp"]
+    assert cfg.scopes() == ["too", "submit"]  # OGLE and MOA are followed by cadence
 
 
 def test_request_api_config_loads(tmp_path):

@@ -30,8 +30,21 @@ enclosure config (:mod:`robofast.config`) with what the devices said:
   cannot report one (an Alpaca error, a focal length of 0 or less, pixels
   that are not square) stops ``--write`` with an error naming the device
   and the member, and nothing is written; ``--no-optics`` writes the config
-  without them. To read them, a device that reports itself not connected
-  is connected, read and disconnected again; nothing else is set.
+  without them. They are read through robofast's Alpaca client
+  (:mod:`robofast.alpaca_client`).
+
+``Connected`` is the device's, shared by every client of it (robofast's
+processes, ASCOM Remote, any other program), not one client's own. So a
+device that reports ``Connected`` true is read without touching
+``Connected``, and is never disconnected: another client holds it. One
+that reports false is held by no client: it is connected, read and
+disconnected again, since the read owned the connection. Nothing else is
+set. A disconnect is not always harmless: some drivers act on it (an
+Andor camera's turns its cooler off). That is why robofast-discover is a
+setup-time tool, run when a telescope is first set up, never during
+operations: with robofast running, its devices are connected and are only
+read; with them idle, a camera whose driver cools only while connected is
+left disconnected again.
 
 It never writes ``devices`` (the dome, the safety monitor, the weather),
 ``limits``, ``site``, ``mode`` or ``safety``: those are the operator's
@@ -55,8 +68,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 from robofast import alpaca_client
 from robofast.owner import DeviceError
 
@@ -74,9 +85,6 @@ PAIRED = {
 
 #: Arcsec per radian / 1000: plate scale [arcsec/px] = this * um / mm.
 ARCSEC_PER_UM_PER_MM = 206.264806
-
-#: The ClientID robofast-discover reads devices with.
-CLIENT_ID = 32227
 
 #: Device types the starter config never wires: each is named in ``_note``.
 OPERATOR = ("Dome", "SafetyMonitor", "ObservingConditions")
@@ -138,38 +146,46 @@ class OpticsUnavailable(RuntimeError):
     """A device could not report a value the plate scale needs."""
 
 
-def _alpaca(client: httpx.Client, d: Device, member: str, value: Any = None) -> Any:
-    """GET (or with ``value``, PUT) ``member`` of ``d``; an Alpaca error is
-    :class:`OpticsUnavailable` naming the device and the member."""
-    url = f"http://{d.server}/api/v1/{d.type.lower()}/{d.number}/{member.lower()}"
-    what = f"{d.type} {d.spec} ({d.name}) {member}"
-    try:
-        if value is None:
-            r = client.get(url, params={"ClientID": CLIENT_ID, "ClientTransactionID": 1})
-        else:
-            data = {member: value, "ClientID": CLIENT_ID, "ClientTransactionID": 1}
-            r = client.put(url, data=data)
-        r.raise_for_status()
-        body = r.json()
-    except (httpx.HTTPError, ValueError) as exc:
-        raise OpticsUnavailable(f"{what}: {exc!r}") from exc
-    if body.get("ErrorNumber"):
-        number, message = body["ErrorNumber"], body.get("ErrorMessage")
-        raise OpticsUnavailable(f"{what}: Alpaca error {number}: {message}")
-    return body.get("Value")
+async def _read(d: Device, members: list[str], timeout: float) -> list[Any]:
+    """Read ``members`` of ``d`` through robofast's Alpaca client.
 
-
-def _read(client: httpx.Client, d: Device, members: list[str]) -> list[Any]:
-    """Read ``members`` of ``d``; a device that reports itself not
-    connected is connected for the reads and disconnected after."""
-    connect = _alpaca(client, d, "Connected") is not True
-    if connect:
-        _alpaca(client, d, "Connected", "true")
+    Alpaca's ``Connected`` is the device's, not this client's: every client
+    of the device (robofast's processes, ASCOM Remote, another program)
+    shares it. So a device that reports ``Connected`` true is read as it is,
+    and is never disconnected here: someone else holds it. One that reports
+    false has no client holding it: it is connected for the reads and
+    disconnected after, since this read owned the connection. Nothing else
+    is set. (Some drivers act on a disconnect, e.g. an Andor camera's turns
+    its cooler off: the module doc.)"""
+    what = f"{d.type} {d.spec} ({d.name})"
+    dev = alpaca_client.AlpacaDevice(d.server, d.type, d.number)
+    member = "Connected"
     try:
-        return [_alpaca(client, d, m) for m in members]
+        owned = await dev.get("Connected", timeout=timeout) is not True
+        if owned:
+            await dev.set("Connected", True, timeout=timeout)
+        try:
+            values = []
+            for member in members:
+                values.append(await dev.get(member, timeout=timeout))
+        finally:
+            if owned:  # this read connected it: give it back as it was
+                try:
+                    await dev.set("Connected", False, timeout=timeout)
+                except DeviceError:
+                    member = "Connected"
+                    raise
+        return values
+    except DeviceError as exc:
+        raise OpticsUnavailable(f"{what} {member}: Alpaca error: {exc}") from exc
     finally:
-        if connect:
-            _alpaca(client, d, "Connected", "false")
+        await dev.aclose()
+
+
+async def _read_optics(telescope: Device, camera: Device, timeout: float) -> tuple[Any, ...]:
+    (focal_m,) = await _read(telescope, ["FocalLength"], timeout)
+    px, py = await _read(camera, ["PixelSizeX", "PixelSizeY"], timeout)
+    return focal_m, px, py
 
 
 def read_optics(telescope: Device, camera: Device, timeout: float = 5.0) -> dict[str, float]:
@@ -177,9 +193,7 @@ def read_optics(telescope: Device, camera: Device, timeout: float = 5.0) -> dict
     from the telescope's ``FocalLength`` (m) and the camera's ``PixelSizeX``
     and ``PixelSizeY`` (um); :class:`OpticsUnavailable` naming the device
     and member that cannot report one."""
-    with httpx.Client(timeout=timeout, trust_env=False) as client:
-        (focal_m,) = _read(client, telescope, ["FocalLength"])
-        px, py = _read(client, camera, ["PixelSizeX", "PixelSizeY"])
+    focal_m, px, py = asyncio.run(_read_optics(telescope, camera, timeout))
     what = f"Telescope {telescope.spec} ({telescope.name}) FocalLength"
     if not isinstance(focal_m, (int, float)) or not focal_m > 0:
         raise OpticsUnavailable(f"{what}: {focal_m!r} m, not a focal length")

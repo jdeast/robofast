@@ -48,9 +48,25 @@ It never overwrites a file. What it writes:
 | `name`, `listen` | `--name`; the supervisor on `127.0.0.1:8100` |
 
 For the plate scale it reads the telescope's `FocalLength` and the
-camera's `PixelSizeX` and `PixelSizeY`; a device that reports itself not
-connected is connected for the read and disconnected after (nothing else
-is set). A device that cannot report one (an Alpaca error, a focal length
+camera's `PixelSizeX` and `PixelSizeY`, through robofast's own Alpaca
+client (`robofast/alpaca_client.py`).
+
+Alpaca's `Connected` belongs to the device, not to one client: every
+client of it shares it (robofast's processes, ASCOM Remote, another
+program on the telescope PC). So `Connected` false means no client holds
+the device. The rule:
+
+- a device that reports `Connected` true is read without touching
+  `Connected`, and is **never** disconnected: another client holds it;
+- a device that reports `Connected` false is connected, read and
+  disconnected again: the read owned the connection.
+
+Nothing else is set. A disconnect is not harmless for every driver: some
+act on it, e.g. an Andor camera's driver turns the cooler off (and
+MINERVA T1's Andor driver turns it off on a connect too: the fake camera's
+`cooler_off_on_connect`). That is
+why `robofast-discover` is a setup-time tool, for when a telescope is
+first set up, and not for use during operations. A device that cannot report one (an Alpaca error, a focal length
 of 0 or less, pixels that are not square) stops `--write` with an error
 naming the device and the member, and nothing is written. Many mounts do
 not know the focal length of the telescope on them: then write the

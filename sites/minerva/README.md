@@ -86,7 +86,7 @@ inputs.
 | imager detector 2048 x 2048 | `imager.detector` | `imager_tN.ini` X1..X2, Y1..Y2 (0..2047) |
 | imager make, model, serial | `imager.manufacturer`, `.model`, `.serial` | `imager_tN.ini` MANUFACTURER, MODEL, SERIAL; `imager_server_tN.ini` CAMERADRIVER |
 | binning 1x1 | `binning` | `imager_tN.ini`, `fau_tN.ini` XBIN, YBIN |
-| cooler setpoint, tolerance | `imager.setpoint`, `.max_temp_error` | `imager_tN.ini` SETTEMP, MAXTEMPERROR (MAXCOOLING is read but never used by `imager.py`; not copied) |
+| cooler setpoint, tolerance: T1 -50 C, T2 +5 C, T3/T4 -50 C; all 0.75 C | T1, T2: `aqawan1.json` `telescopes.tN.camera.cooling` `setpoint`, `tolerance` (the camera's own config, the only copy; docs/cooling.md); T3, T4: `imager.setpoint`, `.max_temp_error` | `imager_tN.ini` SETTEMP, MAXTEMPERROR (MAXCOOLING is read but never used by `imager.py`; not copied) |
 | bias level, saturation (ADU) | `bias_level`, `saturation` | `imager_tN.ini`, `fau_tN.ini` BIASLEVEL, SATURATION |
 | gain, read noise | `null`: unknown | in no `.ini`. `ascomcam.py` tries to read a GAIN key that no file has. Measure them. |
 | pointing centre (0-based px) | `imager.pointing_center` | `imager_tN.ini` XCENTER, YCENTER |

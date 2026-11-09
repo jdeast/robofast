@@ -6,12 +6,16 @@ cooler on. The code is `robofast/cooling.py`; the sequencer drives it.
 
 ## Configuration
 
-A telescope's `cooling` entry, beside its `camera` in the enclosure config
-(`robofast/sequencer_service.py`; `sites/minerva/aqawan1.json`):
+The setpoint is a property of the camera, so cooling is part of the
+camera's own config: the telescope's `camera` entry in the enclosure
+config, written as `{"address": ..., "cooling": {...}}` instead of a bare
+address (`robofast.config.camera_entry`; `robofast/sequencer_service.py`;
+`sites/minerva/aqawan1.json`):
 
 ```json
-"t1": {"telescope": "...", "camera": "...",
-       "cooling": {"setpoint": -50.0, "tolerance": 0.75, "settle_timeout": 900}}
+"t1": {"telescope": "...",
+       "camera": {"address": "host:port/N",
+                  "cooling": {"setpoint": -50.0, "tolerance": 0.75, "settle_timeout": 900}}}
 ```
 
 | Key | Default | Meaning |
@@ -22,13 +26,29 @@ A telescope's `cooling` entry, beside its `camera` in the enclosure config
 | `restart_interval` | 300 | a cooler found off is turned back on at most once per this, s |
 | `poll` | 5 | temperature poll while waiting to settle, s |
 
-A bare number is a setpoint with the defaults. Without a `cooling` entry
-robofast leaves that camera's cooler alone.
+A bare number is a setpoint with the defaults. A camera given as a bare
+address, or without a `cooling` entry, has its cooler left alone.
+
+There is one place for it. To migrate a config that had `cooling` beside
+the camera (`telescopes.<name>.cooling`, before 2026-11-09), move the entry
+unchanged into the camera:
+
+```json
+"t1": {"camera": "host:port/N", "cooling": {...}}                 (old)
+"t1": {"camera": {"address": "host:port/N", "cooling": {...}}}    (the camera's own)
+```
+
+A key left beside the camera is not read: the sequencer refuses it as it
+does any telescope key it does not know (`unknown keys ['cooling']`), and
+the rehearsal warns about any key of a real telescope's site entry it
+cannot interpret.
 
 MINERVA: T1 (Andor) -50 C, T2 (Apogee) +5 C -- the legacy `imager_t1.ini` /
 `imager_t2.ini` `SETTEMP` (T2's is legacy's odd choice, kept as is) -- with
-legacy's 0.75 C tolerance (`sites/minerva/instruments.json`,
-`max_temp_error`).
+`tolerance` 0.75 C, legacy's `MAXTEMPERROR` (`max_temp_error`). These live
+only in `sites/minerva/aqawan1.json`; the reference catalog
+`sites/minerva/instruments.json` does not repeat T1's and T2's (it keeps
+only the out-of-service T3's and T4's).
 
 ## One path
 
@@ -89,11 +109,11 @@ answer the check fails at `StartExposure`, as before.
 ## In the rehearsal
 
 The rehearsal (`python -m robofast.testing.rehearsal`) takes each real
-camera's cooling from the same place production does: its telescope's
-`cooling` entry in the site's enclosure config, `--site-config FILE`
+camera's cooling from the same place production does: the camera's own
+`cooling` entry (`telescopes.<name>.camera.cooling`) in the site's enclosure config, `--site-config FILE`
 (default `sites/minerva/aqawan1.json`: T1 -50 C, T2 +5 C). There is no
 command-line setpoint (the former `--cooling` is refused with a pointer
-here): to change a setpoint, change the config. A real telescope without
+here): to change a setpoint, change the config. A real camera without
 a `cooling` entry has its cooler left alone. A launcher no longer has to
 switch the coolers on before the rehearsal.
 

@@ -1,8 +1,10 @@
 """Keeping an imaging camera cooled (docs/cooling.md).
 
-A telescope's ``cooling`` entry (beside its ``camera``; robofast/sequencer_service.py)::
+A camera's ``cooling`` entry, part of the camera's own config in the
+enclosure config (:func:`robofast.config.camera_entry`)::
 
-    "cooling": {"setpoint": -50, "tolerance": 1.0, "settle_timeout": 900}
+    "camera": {"address": "host:port/N",
+               "cooling": {"setpoint": -50, "tolerance": 1.0, "settle_timeout": 900}}
 
 makes robofast keep that camera's CCD at ``setpoint`` (C) all night, with
 nothing outside robofast setting coolers. One path sets the cooler,

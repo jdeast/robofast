@@ -78,10 +78,11 @@ and optionally:
   (:class:`~robofast.recovery.RecoveryLadder`; docs/recovery.md):
   reconnect, restart the vendor software, home a PWI mount (telescope),
   power-cycle its PDU outlet, then give up for the night.
-* per telescope, ``cooling``: keep its camera cooled
-  (:class:`~robofast.cooling.CoolingConfig`; docs/cooling.md):
-  ``{"setpoint": C, "tolerance": C, "settle_timeout": s}`` (``tolerance``
-  default 1, ``settle_timeout`` 900). robofast sets ``SetCCDTemperature``
+* per telescope, the camera's own ``cooling`` (``"camera": {"address":
+  "host:port/N", "cooling": {...}}``; :func:`~robofast.config.camera_entry`):
+  keep the camera cooled (:class:`~robofast.cooling.CoolingConfig`;
+  docs/cooling.md): ``{"setpoint": C, "tolerance": C, "settle_timeout": s}``
+  (``tolerance`` default 1, ``settle_timeout`` 900). robofast sets ``SetCCDTemperature``
   and ``CoolerOn`` whenever it connects or reconnects the camera (startup,
   every recovery rung), turns a cooler found off back on (an alarm), and
   lets light frames wait, bounded, for the CCD to settle (``COOLOK`` in
@@ -182,6 +183,7 @@ from robofast.cancel import stop_tasks
 from robofast.clock import Clock, clock_from_config
 from robofast.config import (
     altitude_limits,
+    camera_entry,
     device_address,
     load_config,
     require_keys,
@@ -221,7 +223,6 @@ TELESCOPE_KEYS = {
     "lamps",
     "adc",
     "limits",
-    "cooling",
 }
 
 
@@ -243,6 +244,7 @@ def build_units(
     for name, entry in telescopes(config).items():
         if "camera" not in entry:
             raise ValueError(f"telescope {name!r} has no camera")
+        camera_address, cooling_entry = camera_entry(name, entry)
         unknown = set(entry) - TELESCOPE_KEYS
         if unknown:
             raise ValueError(f"telescope {name!r}: unknown keys {sorted(unknown)}")
@@ -259,7 +261,7 @@ def build_units(
         ):
             if kind not in entry:
                 continue
-            spec = entry[kind]
+            spec = camera_address if kind == "camera" else entry[kind]
             if kind == "adc":
                 spec, adc_switches[name] = adc_entry(spec, f"telescope {name!r}: adc")
             address, number = device_address(spec)
@@ -328,13 +330,13 @@ def build_units(
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"telescope {name!r}: {exc}") from exc
         cooling = None
-        if entry.get("cooling") is not None:
+        if cooling_entry is not None:
             from robofast.cooling import CameraCooling, CoolingConfig
 
             try:
-                cooling = CameraCooling(name, CoolingConfig.from_dict(entry["cooling"]))
+                cooling = CameraCooling(name, CoolingConfig.from_dict(cooling_entry))
             except (TypeError, ValueError) as exc:
-                raise ValueError(f"telescope {name!r}: {exc}") from exc
+                raise ValueError(f"telescope {name!r}: camera.{exc}") from exc
         guider = None
         if "guider" in entry:
             from robofast.guider.service import GuiderRemote

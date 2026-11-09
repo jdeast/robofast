@@ -2172,7 +2172,9 @@ class Sequencer:
         key = (unit.name, kind)
         sig = (unit.name, fault_signature(kind, error))
         runs = self._agent_runs.get(key, 0)
-        if pol.agent is None:
+        if pol.skipped:
+            inc.agent = "skipped by the config (escalate.agent: false)"
+        elif pol.agent is None:
             inc.agent = "no agent configured"
         elif runs >= pol.max_per_night:
             inc.agent = (

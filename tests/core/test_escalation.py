@@ -377,3 +377,52 @@ async def test_after_an_agent_the_guider_is_checked_through_its_service(make_rig
         await rig.sequencer._verify_device(unit, "guider")
     unit.guider.state = "idle"
     await rig.sequencer._verify_device(unit, "guider")
+
+
+@pytest.mark.parametrize("own", [{"agent": False}, False], ids=["agent-false", "escalate-false"])
+async def test_the_agent_step_can_be_skipped_by_config(make_rig, tmp_path, own):
+    """A telescope with an agent, its camera's skipped: straight from the
+    exhausted ladder to the person, and the telescope is dropped."""
+    cmd = agent(tmp_path, "(work / 'ran').touch()\n")
+    rig = make_rig(exptime=0.05, count=200, telescopes=2, seq={"error_backoff": 0.1})
+    cam = MendableCamera()
+    unit = rig.sequencer.units["t1"]
+    unit.camera = DeviceOwner("t1.camera", lambda: cam, rig.timeline, default_timeout=0.5)
+    unit.recovery = RecoveryLadder.from_config(
+        "t1",
+        {
+            "escalate": {"agent": {"command": cmd, "timeout": 30}},
+            "camera": {"steps": ["reconnect"], "verify_timeout": 0.1, "escalate": own},
+        },
+        sleep=no_sleep,
+    )
+    assert unit.recovery.escalation("camera").skipped
+    await break_it(rig, cam)
+    await wait_until(lambda: unit.gave_up, timeout=20)
+    assert not rig.timeline.events("escalation_start") and not (tmp_path / "ran").exists()
+    [inc] = incident_events(rig)
+    assert inc.detail["outcome"] == "dropped"
+    assert "Agent: skipped by the config (escalate.agent: false)" in inc.detail["summary"]
+    [give] = rig.timeline.events("giving_up")
+    assert "skipped by the config" in give.detail["reason"]
+
+
+def test_skipping_the_agent_in_config():
+    hook = {"command": ["/usr/bin/true"]}
+    ladder = RecoveryLadder.from_config(
+        "t1",
+        {
+            "escalate": {"agent": hook},
+            "camera": {"escalate": {"agent": False}},
+            "focuser": {"escalate": False},
+            "telescope": {},
+        },
+    )
+    assert ladder.escalation("camera").skipped and ladder.escalation("camera").agent is None
+    assert ladder.escalation("focuser").skipped
+    assert ladder.escalation("telescope").agent == hook
+    whole = RecoveryLadder.from_config("t1", {"escalate": False, "camera": {}})
+    assert whole.escalation("camera").skipped
+    assert not RecoveryLadder.from_config("t1", {"camera": {}}).escalation("camera").skipped
+    with pytest.raises(ValueError):
+        RecoveryLadder.from_config("t1", {"escalate": {"agent": True}, "camera": {}})

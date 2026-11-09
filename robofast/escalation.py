@@ -72,9 +72,10 @@ class EscalationPolicy:
     """A device's escalation (docs/recovery.md): the ``escalate`` entry of a
     telescope's ``recovery``, merged with the device's own."""
 
-    #: ``{"command": [argv...], "timeout": s}``; None: no agent, the person
-    #: is told at once.
-    agent: dict[str, Any] | None = None
+    #: ``{"command": [argv...], "timeout": s}``; None (omitted): no agent;
+    #: ``False``: the agent step skipped explicitly (e.g. one device of a
+    #: telescope that has one). Either way the person is told at once.
+    agent: dict[str, Any] | bool | None = None
     #: Agent runs per device per night (the sequencer runs one night).
     max_per_night: int = 2
     #: Timeline entries of the telescope in the context.
@@ -88,6 +89,12 @@ class EscalationPolicy:
     workdir: str | None = None
 
     def __post_init__(self) -> None:
+        if self.agent is True:
+            raise ValueError("recovery.escalate.agent: a hook {command: [...]}, or false")
+        #: The config skips the agent step explicitly (``agent: false``).
+        self.skipped = self.agent is False
+        if self.agent is False:
+            self.agent = None
         if self.agent is not None:
             if not isinstance(self.agent, dict):
                 raise ValueError("recovery.escalate.agent: {command: [...], timeout: s}")

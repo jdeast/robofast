@@ -110,7 +110,9 @@ test = [
     # The serial-URL path, against simulators on loopback.
     "pyserial>=3.5",
     "pytest>=8",
-    "pytest-asyncio>=0.25",
+    # 1.4.0 added the pytest_asyncio_loop_factories hook, which
+    # tests/core/conftest.py uses for the virtual-time loop.
+    "pytest-asyncio>=1.4.0",
     "pytest-timeout>=2.3",
     # Parallel fast tier in CI (`-n auto`); optional locally.
     "pytest-xdist>=3.6",

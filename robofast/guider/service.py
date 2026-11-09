@@ -46,6 +46,11 @@ calibrated) or 503 (a device failed).
   ``POST /roi`` ``{"size"}``, ``POST /exposure`` ``{"exposure", "gain"?}``.
 * ``POST /locate`` -- find the fiber with the backlight; it becomes the
   target. 409 while guiding.
+* ``POST /reconnect`` -- stop guiding (if it is), close the guide camera and
+  open it again (the recovery ladder's ``reconnect`` rung for the
+  ``guider`` device, docs/recovery.md; legacy ``imager.recover()``'s
+  disconnect and reconnect); the state becomes ``idle``. 503 if the camera
+  does not open.
 * ``POST /calibrate`` ``{"device": "tiptilt"|"mount", "step", "exposure"?,
   "frames"?, "settle"?}`` -- measure and save that device's matrix (for
   this ``port``). 409 while guiding.
@@ -485,6 +490,26 @@ class GuiderService:
             self.flux_reporter.start()
         return self
 
+    async def reconnect_camera(self) -> None:
+        """Stop guiding, close the camera and open it again (``POST
+        /reconnect``); raises :class:`GuiderError` if it does not open."""
+        g = self.guider
+        if g.running:
+            await g.stop("reconnecting the camera")
+        cam = self.parts.camera
+        with contextlib.suppress(Exception):
+            await cam.close()
+        try:
+            await cam.open()
+        except GuiderError:
+            g._set_state("failed", "camera did not reopen")
+            raise
+        except Exception as exc:
+            g._set_state("failed", f"camera did not reopen: {exc!r}")
+            raise GuiderError(f"camera did not reopen: {type(exc).__name__}: {exc}") from exc
+        g._set_state("idle", "camera reconnected")
+        log.warning("guider %s: camera reconnected", self.config.scope)
+
     async def stop(self) -> None:
         with contextlib.suppress(Exception):
             await self.guider.stop("service stopping")
@@ -641,6 +666,11 @@ class GuiderService:
                 if "gain" in args:
                     g.config.gain = None if args["gain"] is None else float(args["gain"])
                 return 200, {"exposure": g.config.exposure, "gain": g.config.gain}
+            if parts == ["reconnect"]:
+                self._refuse_if_busy()
+                async with self._hold("reconnect"):
+                    await self.reconnect_camera()
+                return 200, self.status()
             if parts == ["locate"]:
                 self._refuse_if_busy()
                 if g.running:
@@ -1035,6 +1065,18 @@ class GuiderRemote:
         if self.registry is not None:
             self._poll = asyncio.create_task(self._poll_loop(), name=f"guider-poll-{self.scope}")
         return st
+
+    async def reconnect(self) -> dict[str, Any]:
+        """Close and open the guide camera again (``POST /reconnect``; the
+        recovery ladder's ``guider`` reconnect rung). Raises
+        :class:`GuiderError` (bounded by ``acquire_timeout``)."""
+        self.started = False
+        bound = max(self.timeout, self.acquire_timeout)
+        try:
+            async with asyncio.timeout(bound):
+                return await self._call("POST", "/reconnect", {}, timeout=bound)
+        except TimeoutError as exc:
+            raise GuiderError(f"guider {self.scope}: camera not reconnected in {bound} s") from exc
 
     async def locate(self, timeout: float | None = None) -> tuple[float, float]:
         """Find the fiber with the backlight (``POST /locate``); it becomes

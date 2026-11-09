@@ -4,8 +4,8 @@ it gives up on a telescope for the night (docs/recovery.md).
 Legacy MINERVA had ``recover()``, ``killPWI``/``restartPWI`` and
 ``powercycle`` in ``cdk700.py``, called ad hoc. Here each device of a
 telescope (``telescope``, ``camera``, ``focuser``, ``rotator``,
-``filterwheel``) may have a :class:`DevicePolicy` listing the rungs to
-climb, in order:
+``filterwheel``, ``guider``) may have a :class:`DevicePolicy` listing the
+rungs to climb, in order:
 
 1. ``reconnect`` -- drop the device's Alpaca client and connect afresh;
 2. ``restart`` -- restart the vendor software through a configured hook
@@ -21,7 +21,26 @@ climb, in order:
    unavailable, never counted as a recovery);
 4. ``powercycle`` -- power-cycle the device's PDU outlet through the PDU's
    Alpaca Switch server (:mod:`robofast.devices.pdu_server`,
-   ``Action("PowerCycle")``), wait for it to boot, reconnect.
+   ``Action("PowerCycle")``), wait for it to boot, reconnect. A camera that
+   shares its power and USB with the mount (MINERVA's "black box": legacy
+   ``imager.recover()`` shut the telescope down and killed PWI before
+   power-cycling a camera, and started PWI and initialized the mount
+   after) says so: ``powercycle.requires_pwi_stop`` with ``pwi_stop`` and
+   ``pwi_start`` hooks (as ``restart``). The rung then stops PWI, cycles,
+   starts PWI (also when the cycle failed), and brings the mount back
+   (reconnect, ``MountConnect``/``MotorsEnable``, ``home`` if the server
+   allows it). It needs ``requires_parked``.
+
+The ``guider`` is a device too (the guider service of
+:mod:`robofast.guider.service` and its camera, the FAU camera on MINERVA):
+any guider failure (``GuiderError``: an acquisition that times out, a
+camera that stops answering) climbs its ladder before it counts towards
+giving up, as for any other device. ``reconnect`` asks the service to close
+and open its camera again (``POST /reconnect``); ``restart`` is the hook
+that restarts the camera's driver (e.g. the ASCOM Remote server of an
+Alpaca guide camera) or the guider service itself; ``powercycle`` the guide
+camera's outlet (often with ``requires_pwi_stop``). Its check is the
+service's ``GET /status``, answering and not ``failed``.
 
 Every reconnection runs the device owner's ``on_connect`` hook: a cooled
 camera's cooler is set again there (robofast/cooling.py; MINERVA T1's
@@ -59,6 +78,7 @@ itself when it cannot answer.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -70,7 +90,15 @@ from robofast.cancel import isolated
 
 log = logging.getLogger(__name__)
 
-__all__ = ["RUNGS", "DevicePolicy", "PDUSwitch", "RecoveryLadder", "RecoveryResult"]
+__all__ = [
+    "RUNGS",
+    "DevicePolicy",
+    "MountAccess",
+    "PDUSwitch",
+    "RecoveryLadder",
+    "RecoveryResult",
+    "is_guider_error",
+]
 
 RUNGS = ("reconnect", "restart", "home", "powercycle")
 #: Rungs only a telescope has.
@@ -79,7 +107,7 @@ TELESCOPE_RUNGS = ("home",)
 NOT_IMPLEMENTED = (0x400, 0x40C)
 #: robofast's PDU server's power-cycle action (``powercycle.action``).
 POWERCYCLE_ACTION = "PowerCycle"
-DEVICES = ("telescope", "camera", "focuser", "rotator", "filterwheel")
+DEVICES = ("telescope", "camera", "focuser", "rotator", "filterwheel", "guider")
 #: The member read to check a device answers.
 VERIFY = {
     "telescope": "AtPark",
@@ -87,6 +115,8 @@ VERIFY = {
     "focuser": "Position",
     "rotator": "Position",
     "filterwheel": "Position",
+    # The guider service's GET /status (the sequencer's probe for it).
+    "guider": "status",
 }
 
 
@@ -101,7 +131,10 @@ class DevicePolicy:
     #: ``{"pdu": "host:port", "switch": id, "boot_time": s, "action":
     #: name}`` (the PDU's Alpaca Switch server, the switch id of this
     #: device's outlet, and the server's power-cycle action: default
-    #: ``"PowerCycle"``, robofast's PDU server's).
+    #: ``"PowerCycle"``, robofast's PDU server's). ``"requires_pwi_stop":
+    #: true`` with ``"pwi_stop"`` and ``"pwi_start"`` hooks (as ``restart``):
+    #: the device shares power/USB with the mount, so PWI is stopped before
+    #: the cycle and started after (module doc).
     powercycle: dict[str, Any] | None = None
     step_timeout: float = 180.0
     verify_timeout: float = 60.0
@@ -131,6 +164,19 @@ class DevicePolicy:
             action = self.powercycle.get("action", POWERCYCLE_ACTION)
             if not isinstance(action, str) or not action:
                 raise ValueError("recovery.powercycle.action: an Alpaca action name")
+            if self.powercycle.get("requires_pwi_stop"):
+                for key in ("pwi_stop", "pwi_start"):
+                    hook = self.powercycle.get(key)
+                    if not isinstance(hook, dict) or not (hook.get("command") or hook.get("url")):
+                        raise ValueError(
+                            f"recovery.powercycle.requires_pwi_stop: needs a {key} hook"
+                            " (a command or a url)"
+                        )
+                if not self.requires_parked:
+                    raise ValueError(
+                        "recovery.powercycle.requires_pwi_stop: needs requires_parked"
+                        " (the telescope is shut down for the cycle)"
+                    )
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> DevicePolicy:
@@ -139,6 +185,30 @@ class DevicePolicy:
         if set(d) - known:
             raise ValueError(f"recovery: unknown keys {sorted(set(d) - known)}")
         return cls(**d)
+
+
+@dataclass
+class MountAccess:
+    """The telescope, for a rung of another device that restarts PWI
+    (``powercycle.requires_pwi_stop``): as :meth:`RecoveryLadder.recover`'s
+    ``reconnect``, ``probe`` and ``call``."""
+
+    reconnect: Callable[[], Any]
+    probe: Callable[[str], Awaitable[Any]]
+    call: Callable[..., Awaitable[Any]]
+
+
+def is_guider_error(error: str) -> bool:
+    """A guider's failure, from the sequencer's error text (a
+    ``GuiderError``'s repr or message)."""
+    return "GuiderError" in error or error.startswith("guider ")
+
+
+async def _reconnect(reconnect: Callable[[], Any]) -> None:
+    """``reconnect()``, awaited if it returns an awaitable."""
+    r = reconnect()
+    if inspect.isawaitable(r):
+        await r
 
 
 class Skipped(Exception):
@@ -233,6 +303,8 @@ class RecoveryLadder:
             only = [s for s in pol.steps if s in TELESCOPE_RUNGS]
             if only and kind != "telescope":
                 raise ValueError(f"recovery.{kind}: {only} is a telescope step")
+            if kind == "telescope" and (pol.powercycle or {}).get("requires_pwi_stop"):
+                raise ValueError("recovery.telescope: requires_pwi_stop is for a camera's cycle")
         self.telescope = telescope
         self.policies = policies
         self.alarm = alarm or (lambda text: None)
@@ -254,10 +326,14 @@ class RecoveryLadder:
 
     def device_for(self, error: str, names: dict[str, str]) -> str | None:
         """Which device an error came from: ``names`` maps device kind to
-        its owner name (DeviceError messages start with it)."""
+        its owner name (DeviceError messages start with it). A guider's
+        error (``GuiderError``; robofast.guider.service.GuiderRemote's
+        messages start with ``guider``) is the ``guider``'s."""
         for kind, name in names.items():
             if kind in self.policies and f"{name}." in error:
                 return kind
+        if "guider" in self.policies and is_guider_error(error):
+            return "guider"
         return None
 
     async def recover(
@@ -268,12 +344,16 @@ class RecoveryLadder:
         probe: Callable[[str], Awaitable[Any]],
         others: Callable[[str, str], Awaitable[Any]] | None = None,
         call: Callable[..., Awaitable[Any]] | None = None,
+        mount: MountAccess | None = None,
     ) -> RecoveryResult:
         """Climb ``kind``'s ladder (module doc). ``reconnect()`` drops its
-        client; ``probe(member)`` reads one of its members; ``others(device,
+        client (it may return an awaitable: the guider's asks its service);
+        ``probe(member)`` reads one of its members; ``others(device,
         member)`` reads another device of the telescope (for the power-cycle
         preconditions); ``call(member, *args)`` calls one of its methods
-        (a telescope's PWI actions and ``FindHome``; None: none)."""
+        (a telescope's PWI actions and ``FindHome``; None: none). ``mount``
+        reaches the telescope itself, to bring it back after a power cycle
+        with ``requires_pwi_stop``."""
         pol = self.policies[kind]
         now = self.clock()
         if now - self.last_failure.get(kind, -1e18) > pol.escalate_window:
@@ -288,7 +368,7 @@ class RecoveryLadder:
             bound = pol.home_timeout if rung == "home" else pol.step_timeout
             try:
                 async with asyncio.timeout(bound + pol.verify_timeout):
-                    await self._rung(rung, kind, pol, reconnect, probe, others, call)
+                    await self._rung(rung, kind, pol, reconnect, probe, others, call, mount)
                     await self._verify(kind, pol, reconnect, probe, call)
             except Skipped as exc:
                 why = str(exc)
@@ -319,7 +399,9 @@ class RecoveryLadder:
         last: Exception | None = None
         while True:
             try:
-                await probe(VERIFY[kind])
+                value = await probe(VERIFY[kind])
+                if kind == "guider" and isinstance(value, dict) and value.get("state") == "failed":
+                    raise RuntimeError(f"the guider is failed: {value.get('reason')}")
                 if kind == "telescope":
                     await self._usable(probe, call, need_homed="home" in pol.steps)
                 return
@@ -327,7 +409,8 @@ class RecoveryLadder:
                 raise
             except Exception as exc:
                 last = exc
-                reconnect()
+                if kind != "guider":  # its reconnect is a rung, not a cheap client drop
+                    await _reconnect(reconnect)
             if self.clock() >= deadline:
                 raise RuntimeError(f"still not answering: {last}")
             await self.sleep(min(2.0, pol.verify_timeout / 10))
@@ -424,9 +507,11 @@ class RecoveryLadder:
             await call("Park")
             await self._until_still(probe)
 
-    async def _rung(self, rung, kind, pol: DevicePolicy, reconnect, probe, others, call) -> None:
+    async def _rung(
+        self, rung, kind, pol: DevicePolicy, reconnect, probe, others, call, mount=None
+    ) -> None:
         if rung == "reconnect":
-            reconnect()
+            await _reconnect(reconnect)
             if kind == "telescope":
                 await self._mount_up(kind, probe, call)
             return
@@ -439,20 +524,58 @@ class RecoveryLadder:
             self.event("recovery_restart", device=kind, output=out[-200:])
             if pol.restart.get("settle"):
                 await self.sleep(float(pol.restart["settle"]))
-            reconnect()
+            await _reconnect(reconnect)
             if kind == "telescope":
                 await self._mount_up(kind, probe, call)
             return
         assert rung == "powercycle" and pol.powercycle is not None
         await self._may_cycle(kind, pol, probe, others)
         pc = pol.powercycle
-        self.cycles.setdefault(kind, []).append(self.clock())
-        await self.pdu(str(pc["pdu"])).cycle(
-            int(pc["switch"]), action=str(pc.get("action", POWERCYCLE_ACTION))
-        )
-        self.event("recovery_powercycle", device=kind, switch=int(pc["switch"]))
-        await self.sleep(float(pc.get("boot_time", 60.0)))
-        reconnect()
+        pwi = bool(pc.get("requires_pwi_stop"))
+        if pwi:
+            # Shared power/USB with the mount (module doc): PWI goes down
+            # first and is started again whatever the cycle does.
+            out = await self.hook(pc["pwi_stop"], pol.step_timeout)
+            self.event("recovery_pwi_stop", device=kind, output=out[-200:])
+        try:
+            self.cycles.setdefault(kind, []).append(self.clock())
+            await self.pdu(str(pc["pdu"])).cycle(
+                int(pc["switch"]), action=str(pc.get("action", POWERCYCLE_ACTION))
+            )
+            self.event("recovery_powercycle", device=kind, switch=int(pc["switch"]))
+            await self.sleep(float(pc.get("boot_time", 60.0)))
+        finally:
+            if pwi:
+                await self._pwi_back(kind, pc, pol, mount)
+        await _reconnect(reconnect)
+
+    async def _pwi_back(
+        self, kind: str, pc: dict[str, Any], pol: DevicePolicy, mount: MountAccess | None
+    ) -> None:
+        """After a power cycle that stopped PWI: start it, then bring the
+        mount back (reconnect, MountConnect/MotorsEnable, home if allowed).
+        The mount's own state is the telescope's: problems are alarmed, and
+        the telescope's next command (and its ladder) deals with them."""
+        out = await self.hook(pc["pwi_start"], pol.step_timeout)
+        self.event("recovery_pwi_start", device=kind, output=out[-200:])
+        if pc["pwi_start"].get("settle"):
+            await self.sleep(float(pc["pwi_start"]["settle"]))
+        if mount is None:
+            self.alarm(f"{self.telescope} {kind}: PWI restarted; the mount was not reinitialized")
+            return
+        try:
+            await _reconnect(mount.reconnect)
+            await self._mount_up("telescope", mount.probe, mount.call)
+            try:
+                await self._home("telescope", mount.probe, mount.call)
+            except Skipped as exc:
+                log.warning("%s: after the %s power cycle, no home: %s", self.telescope, kind, exc)
+        except Exception as exc:
+            why = str(exc) or type(exc).__name__
+            self.event("recovery_mount_after_cycle", device=kind, ok=False, error=why[:200])
+            self.alarm(
+                f"{self.telescope} {kind}: PWI restarted, mount not reinitialized: {why[:120]}"
+            )
 
     async def _may_cycle(self, kind: str, pol: DevicePolicy, probe, others) -> None:
         done = self.cycles.get(kind, [])

@@ -111,6 +111,90 @@ def test_the_guard_refuses_slews_outside_the_limits(mount, guard):
     assert slew["error_arcsec"] == 0.0 and 60 < slew["alt"] < 75 and "seconds" in slew
 
 
+class LateMount(Mount):
+    """A PWI2 that reads Slewing False for a moment after the goto, before
+    it starts moving (night1108: the guard recorded t1's slew as ended
+    0.24 s after the goto, 25 deg from its target)."""
+
+    def __init__(self, start_delay: float) -> None:
+        super().__init__()
+        self._slew_time = 0.5
+        self.start_delay = start_delay
+        self._start_at = 0.0
+        self._goal: tuple[float, float] | None = None
+
+    def SlewToCoordinatesAsync(self, ra: float, dec: float) -> None:
+        self.slews.append((ra, dec))
+        self._goal = (ra, dec)
+        self._start_at = self._now() + self.start_delay
+        self._slew_until = self._start_at + self._slew_time
+
+    def _sync(self) -> None:
+        if self._goal is not None and self._now() >= self._slew_until:
+            self.ra, self.dec = self._goal
+            self._goal = None
+
+    @property
+    def Slewing(self) -> bool:
+        self._sync()
+        return self._start_at <= self._now() < self._slew_until
+
+    @property
+    def RightAscension(self) -> float:
+        self._sync()
+        return self.ra
+
+    @property
+    def Declination(self) -> float:
+        self._sync()
+        return self.dec
+
+
+def test_a_slew_ends_when_the_mount_has_slewn_not_before_it_starts():
+    """A Slewing False before the mount ever read Slewing True ends the
+    slew's record only if the mount is already on the target."""
+    import time
+
+    m = LateMount(start_delay=0.4)
+    srv = FakeAlpacaServer({"telescope": m, "focuser": FakeFocuser()}).start()
+    ep = Endpoint.parse(f"{srv.address}/0")
+    g = MountGuard(
+        {"t1": {"telescope": ep, "focuser": ep, "rotator": None}},
+        limits=(MIN_ALT, MAX_ALT),
+        site=(MINERVA.latitude, MINERVA.longitude),
+        clock=lambda: NIGHT,
+    ).start()
+    try:
+        lst = lst_hours(NIGHT, MINERVA.longitude)
+        put(g, "telescope/0/tracking", Tracking=True)
+        assert (
+            put(g, "telescope/0/slewtocoordinatesasync", RightAscension=lst, Declination=10.0)[
+                "ErrorNumber"
+            ]
+            == 0
+        )
+        assert get(g, "telescope/0/slewing")["Value"] is False  # not started yet
+        assert "seconds" not in g.slews[0]
+        seen = False
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 5:
+            v = get(g, "telescope/0/slewing")["Value"]
+            seen = seen or v
+            if seen and not v:
+                break
+            time.sleep(0.01)
+        [slew] = g.slews
+        assert seen and slew["seconds"] >= 0.9 and slew["error_arcsec"] == 0.0
+        # A slew to where the mount already is ends at the first False.
+        put(g, "telescope/0/slewtocoordinatesasync", RightAscension=lst, Declination=10.0)
+        m._start_at = m._slew_until = 0.0  # PWI: nothing to do
+        assert get(g, "telescope/0/slewing")["Value"] is False
+        assert g.slews[1]["error_arcsec"] == 0.0 and g.slews[1]["seconds"] < 0.4
+    finally:
+        g.stop()
+        srv.stop()
+
+
 def test_the_guard_refuses_slews_outside_the_azimuth_window(mount):
     m, _, srv = mount
     ep = Endpoint.parse(f"{srv.address}/0")

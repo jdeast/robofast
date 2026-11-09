@@ -8,8 +8,8 @@ the usual backoff. It replaces legacy `cdk700.recover()`, `killPWI` /
 
 ## The ladder
 
-Per device (`telescope`, `camera`, `focuser`, `rotator`, `filterwheel`), the
-rungs listed in `steps`, in order:
+Per device (`telescope`, `camera`, `focuser`, `rotator`, `filterwheel`,
+`guider`), the rungs listed in `steps`, in order:
 
 1. `reconnect` -- drop the device's Alpaca client; the next command connects
    afresh (`DeviceOwner.reconnect`).
@@ -28,7 +28,9 @@ rungs listed in `steps`, in order:
    that is not a PWI server or that reports itself homed.
 4. `powercycle` -- `Action("PowerCycle", "<switch>")` on the PDU's Alpaca
    Switch server (below), `boot_time` s, reconnect. A PDU server whose
-   action is named differently: `powercycle.action`.
+   action is named differently: `powercycle.action`. A device that
+   shares its power and USB with the mount says so (`requires_pwi_stop`,
+   below).
 
 On a telescope served by robofast's PWI server, `reconnect` and `restart`
 also reconnect PWI to the mount: `Action("MountConnect")` if `Status` says
@@ -43,7 +45,8 @@ runs on each fresh connection -- because MINERVA T1's Andor ASCOM driver
 switches its cooler off whenever it is connected again.
 
 After each rung the device must answer (`AtPark`, `CameraState`, `Position`
-read within `verify_timeout`), else the next rung is tried. A PWI telescope
+read within `verify_timeout`; the guider: `GET /status` answering and not
+`failed`), else the next rung is tried. A PWI telescope
 must also be usable: `Status` shows it connected with both axes enabled
 and, when its steps include `home`, homed. A mount that answers but is not
 usable fails the rung at once (no waiting out `verify_timeout`): after a
@@ -85,6 +88,58 @@ model again (`pointing_models`, docs/pwi.md).
 }
 ```
 
+## The guider
+
+The guider (`robofast/guider/service.py` and its guide camera: MINERVA's
+FAU cameras) is a device of the ladder. Any guider failure -- an
+acquisition that times out (night1108: T2 gave up after three "not guiding
+after 10 s" in a row, without trying anything), a guide camera that stops
+answering, a guider that fails mid-observation -- is a `GuiderError`, and
+with a `guider` policy it climbs the guider's ladder before it counts
+towards giving up, exactly as the other devices (a recovered guider gets
+another try; an exhausted ladder gives the telescope up). The rungs,
+after legacy `imager.recover()` (disconnect and reconnect; quit, then kill
+MaxIm; power-cycle):
+
+- `reconnect`: `POST /reconnect` to the guider service -- it stops
+  guiding, closes the guide camera and opens it again;
+- `restart`: the hook restarts what serves the camera -- for an Alpaca
+  guide camera its driver (e.g. the ASCOM Remote server on the
+  telescope's PC: the counterpart of legacy's MaxIm restart), or the
+  guider service itself -- and must exit 0 once it answers; then
+  `reconnect`;
+- `powercycle`: the guide camera's PDU outlet.
+
+```json
+"guider": {
+  "steps": ["reconnect", "restart", "powercycle"],
+  "restart": {"command": ["ssh", "t2-pc", "restart-fau-camera"], "settle": 10},
+  "powercycle": {"pdu": "127.0.0.1:11120", "switch": 4, "boot_time": 30,
+                 "requires_pwi_stop": true,
+                 "pwi_stop": {"command": ["ssh", "t2-pc", "stop-pwi"]},
+                 "pwi_start": {"command": ["ssh", "t2-pc", "start-pwi"], "settle": 10}}
+}
+```
+
+## Power and USB shared with the mount (`requires_pwi_stop`)
+
+MINERVA's cameras share a power and USB "black box" with the mount:
+legacy `imager.recover()` shut the telescope down and killed PWI before
+it power-cycled a camera, and started PWI and initialized the telescope
+after. robofast makes that an explicit option of a camera's (or the
+guider's) `powercycle` rung, never hidden coupling:
+`"requires_pwi_stop": true` with `pwi_stop` and `pwi_start` hooks (the
+`restart` hook's contract: `pwi_start` exits 0 once PWI answers). It needs
+`requires_parked` (the default): the rung refuses unless the telescope is
+parked. It then runs `pwi_stop`, cycles the outlet, waits `boot_time`, and
+runs `pwi_start` -- also when the cycle failed -- then brings the mount
+back as the telescope's ladder would (reconnect, `MountConnect`,
+`MotorsEnable`, `home` if the PWI server allows it), and reconnects the
+camera. A mount that does not come back is alarmed
+(`recovery_mount_after_cycle`) and left to the telescope's own ladder at
+its next command. Not allowed on the `telescope` policy itself (its PWI
+restart is its `restart` rung).
+
 ## The restart hook
 
 `restart.command` is run as given (no shell), with `step_timeout` as its
@@ -109,8 +164,9 @@ restarts a PWI2 simulator process.
 ## In the rehearsal
 
 `python -m robofast.testing.rehearsal --recovery t1=t1-recovery.json`
-(one per real telescope; the JSON is a `recovery` entry as above, without
-`powercycle`: the rehearsal never switches a PDU) gives the night's
+(one per real telescope; the JSON is a `recovery` entry as above, a
+`guider` policy included, without `powercycle`: the rehearsal never
+switches a PDU) gives the night's
 sequencer that ladder, exactly as in production; the rehearsal's mount
 guard forwards to that telescope what the ladder sends (`Action("Status")`,
 `MountConnect`, `MotorsEnable`, `FindHome`) and still never a real `Park`
@@ -182,5 +238,6 @@ and read-only communities, credentials file mode, the hardware gate, the
 Alpaca server incl. protected outlets and the cycle rate limit, a silent
 PDU); `tests/core/test_recovery.py` (each rung, escalation and
 exhaustion, the power-cycle guards, step bounds, a cycle through the real
-server and simulator, and the sequencer recovering one telescope or giving
-up on it while the other observes on).
+server and simulator, `requires_pwi_stop`, the guider's ladder on a
+simulated guider service, and the sequencer recovering one telescope or
+giving up on it while the other observes on).

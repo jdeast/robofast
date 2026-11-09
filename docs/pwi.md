@@ -110,10 +110,39 @@ Quirks handled:
   slew of ours is sent once the mount is on the target. The simulator's
   `altaz_tracks` reproduces it.
 * **PWI2 can report a tracked mount not moving for a moment after a
-  goto** (night 1107). A slew the server sent stays its slew (`Slewing`
-  true, its target known to the limit watch) until the mount is on the
-  target, or PWI says it is not slewing and nothing has moved for
-  `stall_time` s.
+  goto** (night 1107; night1108: 4.6 s from goto to on target). A slew the
+  server sent stays its slew (`Slewing` true, its target known to the limit
+  watch) until the mount is on the target. A PWI2 that says the slew is done
+  (or, untracked, cannot say) while the mount stands still off its target
+  for `slew_arrive_timeout` (30 s) has failed the slew: the server stops
+  the mount and `Slewing` raises the reason.
+* **PWI2 decides `moving` from the mount's servo residuals.** A noisy mount
+  (windshake, a poorly tuned servo) can read `moving` False and then True
+  again on its target: legacy `cdk700.inPosition` waited 1 s after
+  `moving` went False, read again, and logged "Telescope moving after it
+  said it was done". So a PWI2 slew of ours is complete only when the mount
+  is on its target and still **and** PWI2 has read done (`moving` False, or
+  `on_target` True) on reads `slew_settle` (1 s) apart with no `moving`
+  True between. Each `moving` True after a done read is logged (a warning
+  with PWI2's rms residuals) and counted (`moving_flickers` in
+  `Action("Status")`); a mount whose flag keeps flickering on its target is
+  done after `slew_noisy_time` (10 s) on it, with a warning -- never a
+  stall. A slew during which PWI2 reports a motor (drive) error code
+  (`alt_motor_error_code`/`azm_motor_error_code` not 0) fails at once: the
+  server stops the mount and `Slewing` raises the code and message, as
+  legacy `inPosition` returned False on one. The simulator's
+  `moving_flicker` and `motor_errors` reproduce both.
+
+  **Tuning:** the threshold is PWI2's own setting "MAX RMS Encoder Error
+  for Goto" (PWI2, Mount tab; legacy cdk700.py, JDE 2015-10-06). PWI2's HTTP
+  API does not report it, so robofast cannot read it: `Action("Status")`
+  reports what it is compared with, PWI2's `rms_error_arcsec` (`alt`, `az`;
+  `mount.alt_rms_error_arcsec`, `mount.azm_rms_error_arcsec`). If
+  "moving again after it read done" warnings or non-zero `moving_flickers`
+  show up on still nights, raise that setting in PWI2 a little above the
+  rms the mount shows when settled on a target (and note the value in the
+  site's deployment notes); on windy nights some flicker is expected and
+  only delays the end of a slew by up to `slew_noisy_time`.
 * **PWI4 reports only the GUI-selected focuser and rotator** ("Select from
   M3" must be ticked in PWI4; nothing in the API can check it), and
   `rotator.mech_position_degs` is always Rotator index 0's.
@@ -351,7 +380,8 @@ way. Without `az_wrap_min`/`az_wrap_max` PWI chooses, as before.
 `max_pulse_ms`, `limit_margin`, `watch_interval`, `stop_distance`,
 `slew_speed`, `glitch_speed`, `track_speed_max`, `goto_margin`,
 `slew_tolerance`, `stall_time`, `stall_move`, `moving_speed`,
-`slew_report_min`, `park_tolerance`, `park_timeout`, `az_wrap_min`,
+`slew_report_min`, `slew_settle`, `slew_noisy_time` and
+`slew_arrive_timeout` (PWI2), `park_tolerance`, `park_timeout`, `az_wrap_min`,
 `az_wrap_max`, `status_max_age`, `request_timeout`,
 `aperture_diameter`, `focal_length`, `max_jog_deg` (at most 10),
 `jog_timeout`, `home_timeout`, `home_alt`, `home_az`, `home_tolerance`,

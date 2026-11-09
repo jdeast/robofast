@@ -27,7 +27,11 @@ and Rotator, read for the FITS headers) only through this guard, which:
   park;
 * records every park, unpark and slew (with the mount's own position read
   back when the slew ends: the pointing error against the commanded
-  position, and how long the slew took), for the rehearsal's report.
+  position, and how long the slew took), for the rehearsal's report. A
+  slew ends at the first ``Slewing`` False after a ``Slewing`` True, or at
+  a ``Slewing`` False with the mount within ``arrive_arcsec`` of the
+  target: a PWI2 may not have started moving yet when ``Slewing`` is first
+  read (night1108: a slew "ended" 0.24 s after its goto, 25 deg away).
 
 :meth:`MountGuard.lock` refuses every command from then on (the harness
 locks the guard before its end action, so nothing robofast still sends can
@@ -315,6 +319,11 @@ class MountGuard(ThreadingHTTPServer):
         self.locked = False
         self._parked = dict.fromkeys(devices, False)
         self._pending: dict[str, dict[str, Any]] = {}
+        #: The pending slew has read Slewing True (telescope -> bool).
+        self._seen_slewing: dict[str, bool] = {}
+        #: A Slewing False ends a slew never seen slewing only this close
+        #: to its target (arcsec; robofast's PWI server's slew_tolerance).
+        self.arrive_arcsec = 360.0
         self._lock = threading.Lock()
         self._local = threading.local()
         self._clients: list[httpx.Client] = []
@@ -473,30 +482,56 @@ class MountGuard(ThreadingHTTPServer):
         with self._lock:
             self.slews.append(rec)
             self._pending[route.name] = rec
+            self._seen_slewing[route.name] = False
         self.events.append((rec["t"], route.name, "slew"))
 
     def slew_status(self, route: _Route, data: bytes) -> None:
-        """A ``Slewing`` read: the first False after a slew ends it (records
-        the mount's position, the pointing error and the slew's duration)."""
+        """A ``Slewing`` read: a False after a True, or a False with the
+        mount on the target (module doc), ends the slew (records the mount's
+        position, the pointing error and the slew's duration)."""
         try:
             d = json.loads(data)
         except ValueError:
             return
-        if d.get("ErrorNumber") or d.get("Value") is not False:
+        value = d.get("Value")
+        if d.get("ErrorNumber") or not isinstance(value, bool):
             return
         with self._lock:
-            rec = self._pending.pop(route.name, None)
-        if rec is None:
-            return
-        rec["seconds"] = round(time.monotonic() - rec["t"], 2)
-        try:
-            ra, dec = (
-                float(self._get(route, "rightascension")),
-                float(self._get(route, "declination")),
-            )
-        except Exception as exc:  # the report says so; the night goes on
-            rec["error"] = repr(exc)
-            return
+            rec = self._pending.get(route.name)
+            if rec is None:
+                return
+            if value:
+                self._seen_slewing[route.name] = True
+                return
+            seen = self._seen_slewing.get(route.name, False)
+        end = time.monotonic()
+        pos: tuple[float, float] | None = None
+        if not seen:
+            # Not seen moving yet: done only if it is there already.
+            try:
+                pos = (
+                    float(self._get(route, "rightascension")),
+                    float(self._get(route, "declination")),
+                )
+            except Exception:
+                return  # read again at the next Slewing
+            if separation(rec["ra"], rec["dec"], *pos) > self.arrive_arcsec:
+                return
+        with self._lock:
+            if self._pending.get(route.name) is not rec:
+                return  # another read ended it, or a new slew replaced it
+            del self._pending[route.name]
+        rec["seconds"] = round(end - rec["t"], 2)
+        if pos is None:
+            try:
+                pos = (
+                    float(self._get(route, "rightascension")),
+                    float(self._get(route, "declination")),
+                )
+            except Exception as exc:  # the report says so; the night goes on
+                rec["error"] = repr(exc)
+                return
+        ra, dec = pos
         rec.update(
             mount_ra=ra,
             mount_dec=dec,

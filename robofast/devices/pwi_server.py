@@ -89,7 +89,16 @@ Safety
   slew or ``AbortSlew``. So does an axis PWI disables during a slew (a
   drive fault), and a park not done within ``park_timeout``. A mount on its
   target (``slew_tolerance``) and still has finished its slew whatever PWI
-  says (PWI2's ``moving`` can stick True).
+  says (PWI2's ``moving`` can stick True). PWI2 judges ``moving`` by the
+  mount's servo residuals, so a noisy mount (windshake) can flicker it
+  (legacy ``cdk700.inPosition``: "Telescope moving after it said it was
+  done"): a PWI2 slew is done only on its target and still **and** with
+  ``moving`` False (or ``on_target`` True) on reads ``slew_settle`` s apart;
+  a mount on its target whose flag keeps flickering is done after
+  ``slew_noisy_time`` s, never declared stalled. A PWI2 that says the slew is
+  done while the mount is still and off its target for ``slew_arrive_timeout``
+  s has failed, and so has a slew during which PWI reports a motor (drive)
+  error code: the mount is stopped and ``Slewing`` raises the reason.
 * With ``az_wrap_min``/``az_wrap_max`` (mechanical azimuth, PWI4), every
   goto picks the mechanical angle of its azimuth inside that range nearest
   the current one and sets PWI4's axis-0 wrap range so PWI goes there; it
@@ -290,6 +299,18 @@ class PWIConfig:
     moving_speed: float = 0.02
     #: Slewing is reported true this long after a motion command (s).
     slew_report_min: float = 1.0
+    #: PWI2: a slew on its target is done once ``moving`` reads False (or
+    #: ``on_target`` True) on reads this far apart (s) with no ``moving``
+    #: True between (legacy cdk700.inPosition re-read after 1 s).
+    slew_settle: float = 1.0
+    #: PWI2: on its target and still, but ``moving`` keeps flickering
+    #: (servo residuals above PWI2's "MAX RMS Encoder Error for Goto"):
+    #: done after this long (s), with a warning (docs/pwi.md).
+    slew_noisy_time: float = 10.0
+    #: PWI2: says the slew is done (or cannot say: untracked) while the mount
+    #: is still and off its target: failed after this long (s) from the goto
+    #: (PWI2 may start moving seconds after a goto).
+    slew_arrive_timeout: float = 30.0
     park_tolerance: float = 0.5
     #: Park fails (mount stopped, Slewing raises) if not parked after this (s).
     park_timeout: float = 180.0
@@ -384,6 +405,8 @@ class PWIConfig:
             raise ValueError("glitch_speed must be above slew_speed")
         if cfg.stall_time <= 0 or cfg.stall_move <= 0:
             raise ValueError("need stall_time > 0 and stall_move > 0")
+        if cfg.slew_settle < 0 or cfg.slew_noisy_time <= 0 or cfg.slew_arrive_timeout <= 0:
+            raise ValueError("need slew_settle >= 0, slew_noisy_time > 0, slew_arrive_timeout > 0")
         if cfg.track_speed_max <= 0 or cfg.goto_margin < 0 or cfg.slew_tolerance <= 0:
             raise ValueError("need track_speed_max > 0, goto_margin >= 0, slew_tolerance > 0")
         if cfg.m3_retries < 0 or cfg.m3_resend_after <= 0:
@@ -460,6 +483,14 @@ def _truthy(v: Any) -> bool:
     return str(v).strip().lower() in ("true", "1", "yes")
 
 
+def _num(v: Any) -> float | None:
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
+
+
 def j2000_to_date(ra_h: float, dec: float) -> tuple[float, float]:
     """Mean J2000 RA/Dec precessed to now (FK5), for altitude checks."""
     from astropy import units as u
@@ -529,6 +560,12 @@ class PWIMount:
         self._done_goto: tuple[float, float | None, float | None] | None = None
         #: A stalled slew is being stopped (Slewing stays true meanwhile).
         self._failing = False
+        #: PWI2 settle (:meth:`_pwi2_settled`): since when the slew of ours
+        #: has been on its target and still, and reading done ("quiet").
+        self._arrived_since: float | None = None
+        self._quiet_since: float | None = None
+        #: PWI2 read ``moving`` True again on the target after it read done.
+        self.moving_flickers = 0
         #: Tracking off was asked during an alt/az slew of ours: sent once
         #: the mount is on the target (on PWI2 it halts a slew midway).
         self._untrack_on_arrival = False
@@ -693,6 +730,8 @@ class PWIMount:
         self._failing = False
         self._untrack_on_arrival = False
         self._stall_ref = None
+        self._arrived_since = None
+        self._quiet_since = None
         self.slew_error = None
 
     def _disarm_slew(self, completed: bool = False) -> None:
@@ -706,6 +745,8 @@ class PWIMount:
         self._goto_mech = None
         self._goto_app = None
         self._stall_ref = None
+        self._arrived_since = None
+        self._quiet_since = None
 
     def _fail_slew(self, why: str) -> None:
         self._disarm_slew()
@@ -794,6 +835,68 @@ class PWIMount:
             return False
         return _sep_deg(here[1], here[0] * 15.0, there[1], there[0] * 15.0) <= tol
 
+    def _target_known(self, st: PWIStatus) -> bool:
+        """:meth:`_at_target` can say (the slew in progress has a target it
+        can compare the mount's position with)."""
+        if self._goto_altaz is not None:
+            return True
+        if self.target_ra is None or self.target_dec is None:
+            return False
+        return (
+            st.ra2000_hours is not None and st.dec2000_deg is not None
+        ) or self._goto_app is not None
+
+    def _target_sep(self, st: PWIStatus) -> float | None:
+        """How far (deg) the mount is from the slew's target, if known."""
+        if self._goto_altaz is not None:
+            return _sep_deg(st.alt_deg, st.az_deg, *self._goto_altaz)
+        if self.target_ra is None or self.target_dec is None:
+            return None
+        if st.ra2000_hours is not None and st.dec2000_deg is not None:
+            here, there = (st.ra2000_hours, st.dec2000_deg), (self.target_ra, self.target_dec)
+        elif self._goto_app is not None:
+            here, there = (st.ra_hours, st.dec_deg), self._goto_app
+        else:
+            return None
+        return _sep_deg(here[1], here[0] * 15.0, there[1], there[0] * 15.0)
+
+    def _pwi2_settled(self, st: PWIStatus, now: float) -> bool:
+        """A PWI2 slew of ours on its target and still: done once PWI2 reads
+        done (``moving`` not True, or ``on_target``) on reads ``slew_settle``
+        s apart with no ``moving`` True between; or, if its ``moving`` keeps
+        flickering (servo residuals: a noisy mount, windshake), once it has
+        been on the target and still for ``slew_noisy_time`` s."""
+        cfg = self.config
+        if self._arrived_since is None:
+            self._arrived_since = now
+        quiet = st.slewing is not True or _truthy(st.raw.get("mount.on_target"))
+        if quiet:
+            if self._quiet_since is None:
+                self._quiet_since = now
+            return now - self._quiet_since >= cfg.slew_settle
+        if self._quiet_since is not None:
+            self.moving_flickers += 1
+            log.warning(
+                "PWI2 reports the mount moving again %.1f s after it read done, on the target"
+                " (rms alt %s, az %s arcsec): servo residuals above PWI2's 'MAX RMS Encoder Error"
+                " for Goto' (windshake or a noisy mount; docs/pwi.md); waiting for it to settle",
+                now - self._quiet_since,
+                st.raw.get("mount.alt_rms_error_arcsec"),
+                st.raw.get("mount.azm_rms_error_arcsec"),
+            )
+            self._quiet_since = None
+        if now - self._arrived_since >= cfg.slew_noisy_time:
+            log.warning(
+                "slew complete: on the target and still for %.1f s although PWI2 keeps reporting"
+                " moving (rms alt %s, az %s arcsec; tune PWI2's 'MAX RMS Encoder Error for Goto',"
+                " docs/pwi.md)",
+                now - self._arrived_since,
+                st.raw.get("mount.alt_rms_error_arcsec"),
+                st.raw.get("mount.azm_rms_error_arcsec"),
+            )
+            return True
+        return False
+
     def _arrived(self, st: PWIStatus) -> bool:
         """A slew of ours has ended on its target: there, and not moving."""
         return self._at_target(st) and self.speed < self.config.moving_speed
@@ -829,8 +932,29 @@ class PWIMount:
             with contextlib.suppress(PWIError):
                 await self._send(self.pwi.stop, "stop (axis disabled)")
             return
+        bad = [
+            f"{axis} drive error {err[0]}{' (' + err[1] + ')' if err[1] else ''}"
+            for axis, err in (("altitude", st.alt_motor_error), ("azimuth", st.az_motor_error))
+            if err is not None and err[0] != 0
+        ]
+        if bad:
+            # Legacy cdk700.inPosition failed a slew on any motor error code.
+            self._failing = True
+            self._disarm_slew()
+            with contextlib.suppress(PWIError):
+                await self._send(self.pwi.stop, "stop (drive error)")
+            self._fail_slew(f"slew failed: PWI reports {' and '.join(bad)}; mount stopped")
+            return
+        pwi2 = st.backend == "pwi2"
+        parking = self.park_state in ("parking", "parked")
         settled = now - self._moving_since > cfg.slew_report_min
         if settled and self._arrived(st):
+            if pwi2 and not parking:
+                # PWI2's moving is residual-based: done once it has read done
+                # across slew_settle (or flickered for slew_noisy_time).
+                if self._pwi2_settled(st, now):
+                    await self._slew_done(st)
+                return
             # On the target and still: done, whatever PWI's own flag says
             # (PWI2's ``moving`` stuck True after a PWI2 restart, night 1107).
             if st.slewing is True:
@@ -840,6 +964,27 @@ class PWIMount:
                     st.az_deg,
                 )
             await self._slew_done(st)
+            return
+        self._arrived_since = None
+        self._quiet_since = None
+        if pwi2 and not parking and self._target_known(st) and st.slewing is not True:
+            # PWI2 reads done (or cannot say: untracked) but the mount is not
+            # on its target: it may not have started yet (seconds after a
+            # goto, night 1107/1108); still and off target for
+            # slew_arrive_timeout, the slew has failed.
+            if now - self._moving_since > cfg.slew_arrive_timeout and self.speed < cfg.moving_speed:
+                sep = self._target_sep(st)
+                self._failing = True
+                self._disarm_slew()
+                with contextlib.suppress(PWIError):
+                    await self._send(self.pwi.stop, "stop (slew not on its target)")
+                self._fail_slew(
+                    f"slew failed: PWI2 reports the slew done but the mount has stood"
+                    f" {sep if sep is not None else float('nan'):.3f} deg from its target"
+                    f" (beyond slew_tolerance {cfg.slew_tolerance:g}) {cfg.slew_arrive_timeout:g}"
+                    f" s after the goto (alt {st.alt_deg:.3f}, az {st.az_deg:.3f})"
+                )
+            self._stall_ref = None
             return
         if st.slewing is not True:
             # Not on the target: PWI's word that it is done counts only once
@@ -852,6 +997,9 @@ class PWIMount:
             ):
                 await self._slew_done(st)
             self._stall_ref = None
+            return
+        if self._at_target(st):
+            self._stall_ref = None  # settling on the target (moving: servo residuals)
             return
         # Progress: toward an alt/az target whose mechanical azimuth is known
         # (a mount pushing against an obstruction may still creep), else any
@@ -1343,6 +1491,16 @@ class PWIMount:
             "home_record": sorted(self.home_record.axes(st)),
             "unhomed_override": self.unhomed_ok,
             "slew_error": self.slew_error,
+            # PWI2 judges "moving" by the servo residuals against its "MAX RMS
+            # Encoder Error for Goto" (not readable through its HTTP API;
+            # docs/pwi.md): the residuals, and how often moving flickered.
+            "rms_error_arcsec": {
+                "alt": _num(st.raw.get("mount.alt_rms_error_arcsec")),
+                "az": _num(st.raw.get("mount.azm_rms_error_arcsec")),
+            }
+            if st.backend == "pwi2"
+            else None,
+            "moving_flickers": self.moving_flickers,
             "m3_resends": self.m3_resends,
             "pointing_model": st.pointing_model,
             "pointing_model_wanted": self.models.get(st.m3_port),

@@ -336,3 +336,286 @@ async def test_the_power_cycle_action_is_configurable():
     assert r.recovered and pdu.actions == ["CycleOutlet"]
     with pytest.raises(ValueError, match=r"powercycle\.action"):
         DevicePolicy.from_dict({**policy, "powercycle": {**policy["powercycle"], "action": ""}})
+
+
+# -- a camera sharing power with the mount (requires_pwi_stop) -------------------------------
+
+PWI_CYCLE = {
+    **FULL,
+    "steps": ["powercycle"],
+    "powercycle": {
+        **FULL["powercycle"],
+        "requires_pwi_stop": True,
+        "pwi_stop": {"command": ["stop-pwi"]},
+        "pwi_start": {"command": ["start-pwi"]},
+    },
+}
+
+
+class FakeMount:
+    """The telescope as a PWI server sees it after PWI is started again."""
+
+    def __init__(self, order: list[str]) -> None:
+        self.order = order
+        self.status = {"pwi": {"connected": False, "az_enabled": False, "alt_enabled": False}}
+
+    def reconnect(self) -> None:
+        self.order.append("mount reconnect")
+
+    async def probe(self, member: str):
+        return {"SupportedActions": ["Status"], "CanFindHome": False, "AtPark": True}[member]
+
+    async def call(self, member: str, *args):
+        if member == "Action" and args[0] == "Status":
+            import json
+
+            return json.dumps(self.status)
+        self.order.append(f"{member} {args[0] if args else ''}".strip())
+        if args and args[0] == "MountConnect":
+            self.status["pwi"]["connected"] = True
+
+
+async def test_a_camera_sharing_power_with_the_mount_stops_and_starts_pwi():
+    """Legacy imager.recover(): telescope shut down and PWI killed before a
+    camera's power cycle, PWI started and the mount initialized after."""
+    from robofast.recovery import MountAccess
+
+    order: list[str] = []
+    dev = Device(fixed_by="powercycle")
+
+    class PDU(FakePDU):
+        async def cycle(self, switch, action="PowerCycle"):
+            order.append("cycle")
+            await super().cycle(switch, action)
+
+    async def hook(h, timeout):
+        order.append(h["command"][0])
+        return "ok"
+
+    mount = FakeMount(order)
+
+    async def read(device, member):
+        return {"AtPark": True, "CameraState": 0}[member]
+
+    r = await ladder(PWI_CYCLE, pdu=PDU(dev), hook=hook).recover(
+        "camera",
+        reconnect=dev.reconnect,
+        probe=dev.probe,
+        others=read,
+        mount=MountAccess(mount.reconnect, mount.probe, mount.call),
+    )
+    assert r.recovered
+    assert order == [
+        "stop-pwi",
+        "cycle",
+        "start-pwi",
+        "mount reconnect",
+        "Action MountConnect",
+        "Action MotorsEnable",
+    ]
+    # Not parked: refused before PWI is touched.
+    order.clear()
+
+    async def unparked(device, member):
+        return {"AtPark": False, "CameraState": 0}[member]
+
+    r = await ladder(PWI_CYCLE, pdu=PDU(Device()), hook=hook).recover(
+        "camera", reconnect=dev.reconnect, probe=dev.probe, others=unparked
+    )
+    assert not r.recovered and "not parked" in r.tried[0][1] and order == []
+
+
+async def test_pwi_is_started_again_when_the_cycle_fails():
+    order: list[str] = []
+
+    class BrokenPDU(FakePDU):
+        async def cycle(self, switch, action="PowerCycle"):
+            raise RuntimeError("PDU does not answer")
+
+    async def hook(h, timeout):
+        order.append(h["command"][0])
+        return "ok"
+
+    async def read(device, member):
+        return {"AtPark": True, "CameraState": 0}[member]
+
+    alarms: list[str] = []
+    dev = Device()
+    r = await ladder(PWI_CYCLE, pdu=BrokenPDU(), hook=hook, alarms=alarms).recover(
+        "camera", reconnect=dev.reconnect, probe=dev.probe, others=read
+    )
+    assert not r.recovered and "PDU does not answer" in r.tried[0][1]
+    assert order == ["stop-pwi", "start-pwi"]
+    assert any("mount was not reinitialized" in a for a in alarms)
+
+
+def test_requires_pwi_stop_validation():
+    pc = PWI_CYCLE["powercycle"]
+    with pytest.raises(ValueError, match="pwi_start hook"):
+        DevicePolicy.from_dict({**PWI_CYCLE, "powercycle": {**pc, "pwi_start": None}})
+    with pytest.raises(ValueError, match="requires_parked"):
+        DevicePolicy.from_dict({**PWI_CYCLE, "requires_parked": False})
+    with pytest.raises(ValueError, match="for a camera"):
+        RecoveryLadder.from_config("t1", {"telescope": PWI_CYCLE})
+    RecoveryLadder.from_config("t1", {"camera": PWI_CYCLE, "guider": PWI_CYCLE})
+
+
+# -- the guider ------------------------------------------------------------------------------
+
+GUIDER_POLICY = {"steps": ["reconnect", "restart"], "restart": OK_HOOK, "verify_timeout": 0.5}
+
+
+def test_guider_errors_are_the_guiders():
+    lad = RecoveryLadder.from_config("t2", {"guider": {"steps": ["reconnect"]}})
+    names = {"telescope": "t2.telescope", "camera": "t2.camera"}
+    for error in (
+        "GuiderError('guider t2: not guiding after 10.0 s (acquiring: )')",
+        "guider t2: failed: star lost 4 times",
+    ):
+        assert lad.device_for(error, names) == "guider"
+    assert lad.device_for("DeviceError('t2.camera.StartExposure: x')", names) is None
+    assert RecoveryLadder("t2", {}).device_for("GuiderError('guider t2: x')", names) is None
+
+
+async def test_guider_ladder_on_the_guider_service(tmp_path):
+    """The guider's rungs against the real service on its simulator:
+    ``reconnect`` closes and opens the guide camera (POST /reconnect);
+    a camera that will not open fails it, and the restart hook (the
+    camera's driver restarted) mends it."""
+    from robofast.guider.base import GuiderError
+    from robofast.guider.service import GuiderRemote, GuiderService
+    from tests.core.test_guider_loop import _service_config
+
+    svc = await GuiderService(_service_config(tmp_path, calibrations={})).start()
+    remote = GuiderRemote(svc.url, scope="t2", acquire_timeout=10)
+    cam = svc.tap._camera
+    opens = {"n": 0, "dead": False}
+    real_open = cam.open
+
+    async def open_():
+        opens["n"] += 1
+        if opens["dead"]:
+            raise GuiderError("camera not found on USB")
+        await real_open()
+
+    cam.open = open_
+    try:
+        svc.guider._set_state("failed", "acquisition failed: no star")
+        lad = RecoveryLadder.from_config(
+            "t2",
+            {"guider": GUIDER_POLICY},
+            sleep=no_sleep,
+        )
+
+        async def probe(member):
+            return await getattr(remote, member)()
+
+        r = await lad.recover("guider", reconnect=remote.reconnect, probe=probe)
+        assert r.recovered and r.tried == [("reconnect", "ok")] and opens["n"] == 1
+        st = await remote.status()
+        assert st["state"] == "idle" and st["reason"] == "camera reconnected"
+
+        # The camera does not reopen: reconnect fails; the restart hook mends it.
+        opens["dead"] = True
+
+        async def hook(h, timeout):
+            opens["dead"] = False
+            return "camera driver restarted"
+
+        lad = RecoveryLadder.from_config(
+            "t2",
+            {"guider": GUIDER_POLICY},
+            sleep=no_sleep,
+            hook=hook,
+        )
+        r = await lad.recover("guider", reconnect=remote.reconnect, probe=probe)
+        assert [s for s, _ in r.tried] == ["reconnect", "restart"] and r.recovered
+        assert "camera not found on USB" in r.tried[0][1]
+        assert (await remote.status())["state"] == "idle"
+    finally:
+        await remote.stop("teardown")
+        await svc.stop()
+
+
+class RecoverableGuider:
+    """A guider that cannot acquire until its camera is reconnected
+    (``fails`` acquisitions in all; None: never acquires)."""
+
+    def __init__(self, fails: int | None) -> None:
+        self.fails = fails
+        self.starts = 0
+        self.reconnects = 0
+        self.broken = False
+
+    async def start(self, **params):
+        self.starts += 1
+        if self.broken or self.fails is None:
+            from robofast.guider.base import GuiderError
+
+            self.broken = True
+            raise GuiderError("guider t1: not guiding after 10.0 s (acquiring: )")
+        return {"state": "guiding"}
+
+    async def check(self):
+        return None
+
+    async def stop(self, reason):
+        return True
+
+    async def reconnect(self):
+        self.reconnects += 1
+        if self.fails is not None:
+            self.fails -= 1
+            self.broken = self.fails > 0
+        return {"state": "idle"}
+
+    async def status(self):
+        return {"state": "idle"}
+
+
+async def test_sequencer_climbs_the_guiders_ladder_before_giving_up(make_rig):
+    """night1108: T2's guider timed out three acquisitions in a row and the
+    telescope gave up without trying anything. Now each guider failure
+    climbs the guider's ladder first, like any device."""
+    from robofast.plan import StaticPlan
+
+    plan = StaticPlan([{"name": "x", "exptime": 0.05, "count": 2, "guide": True}], ["t1"])
+    rig = make_rig(plan=plan, seq={"error_backoff": 0.1, "max_consecutive_errors": 3})
+    unit = rig.sequencer.units["t1"]
+    g = unit.guider = RecoverableGuider(fails=1)
+    g.broken = True
+    unit.recovery = RecoveryLadder.from_config(
+        "t1", {"guider": {"steps": ["reconnect"], "verify_timeout": 0.05}}, sleep=no_sleep
+    )
+    await rig.start()
+    await wait_until(lambda: any(h[2] == "complete" for h in plan.history), timeout=20)
+    [done] = rig.timeline.events("recovery_done")
+    assert done.detail["device"] == "guider" and done.detail["recovered"]
+    assert g.reconnects == 1 and plan.history[-1][2] == "complete" and not unit.gave_up
+    assert "t1 guider: recovered by reconnect" in unit.alarms
+
+
+async def test_a_guider_that_never_recovers_gives_the_telescope_up(make_rig):
+    from robofast.plan import StaticPlan
+
+    plan = StaticPlan([{"name": "x", "exptime": 0.05, "count": 2, "guide": True}], ["t1"])
+    rig = make_rig(plan=plan, seq={"error_backoff": 0.1, "max_consecutive_errors": 3})
+    unit = rig.sequencer.units["t1"]
+    g = unit.guider = RecoverableGuider(fails=None)
+
+    async def failing_hook(h, timeout):
+        raise RuntimeError("ASCOM Remote would not restart")
+
+    unit.recovery = RecoveryLadder.from_config(
+        "t1",
+        {"guider": {"steps": ["reconnect", "restart"], "restart": OK_HOOK, "verify_timeout": 0.05}},
+        sleep=no_sleep,
+        hook=failing_hook,
+    )
+    await rig.start()
+    await wait_until(lambda: unit.gave_up, timeout=30)
+    [give] = rig.timeline.events("giving_up")
+    assert give.detail["reason"] == "recovery ladder exhausted (guider)"
+    tried = [e.detail["tried"] for e in rig.timeline.events("recovery_done")]
+    assert [t.split(":")[0] for r in tried for t in r] == ["reconnect", "restart"]
+    assert g.reconnects >= 1

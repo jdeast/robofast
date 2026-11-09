@@ -60,13 +60,14 @@ at the real FAU's geometry (docs/demo.md).
   without a recovery policy fails, or when no real telescope is left. A
   policy may not power-cycle (``powercycle``): the rehearsal never
   switches a PDU.
-* **Cooling** (``--cooling NAME=C`` or ``NAME=FILE``, per real telescope;
-  FILE is a sequencer ``cooling`` entry, docs/cooling.md, e.g.
-  ``{"setpoint": -50, "tolerance": 1, "settle_timeout": 900}``): robofast
-  keeps that real camera cooled, exactly as in production -- the cooler is
-  set when the sequencer starts and whenever it (re)connects the camera
-  (every recovery rung), and turned back on if found off. Without it the
-  rehearsal leaves the real camera's cooler alone.
+* **Cooling** comes from the site's enclosure config, the file production
+  runs on (``--site-config``, default ``sites/minerva/aqawan1.json``): each
+  real telescope's ``cooling`` entry there (docs/cooling.md) keeps its real
+  camera cooled, exactly as in production -- the cooler is set when the
+  sequencer starts and whenever it (re)connects the camera (every recovery
+  rung), and turned back on if found off. A real telescope without one has
+  its cooler left alone. There is no command-line setpoint: the config is
+  the one place it is set.
 
 ``python -m robofast.testing.rehearsal --help``; the tests
 (``tests/e2e/test_rehearsal.py``) run it on fake mounts and cameras served
@@ -246,9 +247,10 @@ class RehearsalSettings:
     #: ``--recovery NAME=FILE``: a real telescope's recovery policy (the
     #: sequencer's ``recovery`` entry; module doc).
     recovery: dict[str, dict[str, Any]] = field(default_factory=dict)
-    #: ``--cooling NAME=C|FILE``: a real camera's cooling (the sequencer's
-    #: ``cooling`` entry; module doc).
-    cooling: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: ``--site-config``: the enclosure config production runs on (its
+    #: telescopes' ``cooling``, and the base of the rehearsal's own enclosure
+    #: config). None: ``sites/minerva/aqawan1.json``.
+    site_config: str | None = None
     #: Real telescopes the preflight dropped: name -> why (set by the
     #: rehearsal; they take no part in the night).
     dropped: dict[str, str] = field(default_factory=dict)
@@ -270,9 +272,10 @@ class RehearsalSettings:
                         " switches a PDU"
                     )
         for name, entry in self.cooling.items():
-            if name not in self.real and name not in self.dropped:
-                raise ValueError(f"--cooling {name}: not a real telescope (--telescope)")
-            CoolingConfig.from_dict(entry)
+            try:
+                CoolingConfig.from_dict(entry)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{self.site_path}: telescopes.{name}.cooling: {exc}") from exc
         seen: dict[tuple[str, int, int, str], str] = {}
         for name, r in self.real.items():
             for kind, ep in (("telescope", r.telescope), ("camera", r.camera)):
@@ -280,6 +283,31 @@ class RehearsalSettings:
                 if key in seen:
                     raise ValueError(f"{name} {kind} {ep} is also {seen[key]}'s")
                 seen[key] = name
+
+    @property
+    def site_path(self) -> Path:
+        return Path(self.site_config) if self.site_config else SITES / "aqawan1.json"
+
+    def site(self) -> dict[str, Any]:
+        """The site's enclosure config (``site_config``)."""
+        try:
+            cfg = json.loads(self.site_path.read_text())
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"--site-config {self.site_path}: {exc}") from exc
+        if not isinstance(cfg, dict) or not isinstance(cfg.get("telescopes"), dict):
+            raise ValueError(f"--site-config {self.site_path}: no 'telescopes'")
+        return cfg
+
+    @property
+    def cooling(self) -> dict[str, dict[str, Any]]:
+        """Each real telescope's ``cooling`` entry in the site config (module
+        doc): the only source of the rehearsal's setpoints."""
+        tels = self.site()["telescopes"]
+        return {
+            name: tels[name]["cooling"]
+            for name in self.real
+            if isinstance(tels.get(name), dict) and tels[name].get("cooling") is not None
+        }
 
     @property
     def active(self) -> list[str]:
@@ -1043,7 +1071,8 @@ class Rehearsal(SimulatedNight):
             self.telescopes[name] = Telescope(name, None, None, None)  # type: ignore[arg-type]
 
     def _enclosure(self) -> dict[str, Any]:
-        cfg = json.loads((SITES / "aqawan1.json").read_text())
+        cfg = self.r.site()
+        cooling = self.r.cooling
         cfg.pop("_note", None)
         assert self.guard is not None
         cfg["devices"] = {
@@ -1067,6 +1096,9 @@ class Rehearsal(SimulatedNight):
                 }
                 if r.rotator is not None:
                     tels[name]["rotator"] = g
+                if name in cooling:
+                    # The site config's own entry, as production (docs/cooling.md).
+                    tels[name]["cooling"] = cooling[name]
             else:
                 a = self.alpaca.address
                 tels[name] = {"telescope": f"{a}/{i}", "camera": f"{a}/{i}", "limits": limits}
@@ -1121,10 +1153,6 @@ class Rehearsal(SimulatedNight):
         for name, policy in self.r.recovery.items():
             if name in self.r.real:
                 cfg["telescopes"][name]["recovery"] = policy
-        # Each real camera's cooling, as in production (docs/cooling.md).
-        for name, entry in self.r.cooling.items():
-            if name in self.r.real:
-                cfg["telescopes"][name]["cooling"] = entry
         # Dark frames: nothing measures them (no FWHM, no plate solving).
         cfg["images"].update(
             imagebytes=True,
@@ -1681,28 +1709,6 @@ def _recovery(specs: list[str], real: dict[str, Any]) -> dict[str, dict[str, Any
     return out
 
 
-def _cooling(specs: list[str], real: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """``--cooling NAME=C`` (a setpoint, the rest default) or ``NAME=FILE``
-    (a sequencer ``cooling`` entry, JSON): each real camera's cooling."""
-    out: dict[str, dict[str, Any]] = {}
-    for name, spec in _named(specs, "cooling", "NAME=C|FILE").items():
-        if name not in real:
-            raise RehearsalRefused(f"--cooling {name}: not a real telescope (--telescope)")
-        try:
-            entry: Any = {"setpoint": float(spec)}
-        except ValueError:
-            try:
-                entry = json.loads(Path(spec).read_text())
-            except (OSError, ValueError) as exc:
-                raise RehearsalRefused(f"--cooling {name}={spec}: {exc}") from exc
-        try:
-            CoolingConfig.from_dict(entry)
-        except (TypeError, ValueError) as exc:
-            raise RehearsalRefused(f"--cooling {name}={spec}: {exc}") from exc
-        out[name] = entry
-    return out
-
-
 def _catalog_config(args: argparse.Namespace) -> dict[str, Any] | None:
     source = getattr(args, "catalog_source", None)
     cache = getattr(args, "catalog_dir", None)
@@ -1717,6 +1723,12 @@ def _catalog_config(args: argparse.Namespace) -> dict[str, Any] | None:
 
 
 def settings_from_args(args: argparse.Namespace) -> RehearsalSettings:
+    if getattr(args, "cooling", None):
+        raise RehearsalRefused(
+            "--cooling is gone: each real camera's setpoint comes from its telescope's 'cooling'"
+            " entry in the site config (--site-config, default sites/minerva/aqawan1.json;"
+            " docs/cooling.md)"
+        )
     if not args.i_know_the_enclosure_is_closed:
         raise RehearsalRefused(
             "this moves real mounts and exposes real cameras: close the enclosure, check it is"
@@ -1759,7 +1771,7 @@ def settings_from_args(args: argparse.Namespace) -> RehearsalSettings:
             kiwispec_url=getattr(args, "kiwispec", None),
             catalog_guide=_catalog_config(args),
             recovery=_recovery(getattr(args, "recovery", None) or [], real),
-            cooling=_cooling(getattr(args, "cooling", None) or [], real),
+            site_config=getattr(args, "site_config", None),
         )
     except ValueError as exc:
         raise RehearsalRefused(str(exc)) from exc
@@ -1859,14 +1871,15 @@ def main(argv: list[str] | None = None) -> int:
         " dropped if it still fails, and in the night it is the sequencer's ladder",
     )
     ap.add_argument(
-        "--cooling",
-        action="append",
-        metavar="NAME=C|FILE",
-        default=[],
-        help="keep a real telescope's camera cooled: its setpoint in C (e.g. t1=-50), or a JSON"
-        " file in the sequencer's 'cooling' schema (docs/cooling.md); robofast sets the cooler"
-        " at the start and whenever it (re)connects the camera",
+        "--site-config",
+        metavar="FILE",
+        default=None,
+        help="the site's enclosure config, as production runs it (default"
+        " sites/minerva/aqawan1.json): each real telescope's 'cooling' entry there keeps its"
+        " camera cooled (docs/cooling.md), and it is the base of the rehearsal's enclosure config",
     )
+    # Removed: refused with a pointer to the site config (settings_from_args).
+    ap.add_argument("--cooling", action="append", default=[], help=argparse.SUPPRESS)
     ap.add_argument("--log-level", default="WARNING")
     args = ap.parse_args(argv)
     if isinstance(args.duration, str):

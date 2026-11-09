@@ -316,7 +316,7 @@ from robofast.autofocus import (
 )
 from robofast.camera_state import CAMERA_IDLE, image_ready
 from robofast.cancel import stop_task, stop_tasks
-from robofast.clock import Clock, real_clock
+from robofast.clock import Clock, NightRule, real_clock
 from robofast.cooling import CameraCooling, CoolingStatus
 from robofast.escalation import DEFAULT_SAFE, AgentResult, Incident, fault_signature, run_agent
 from robofast.imagebytes import ImageArray, fits_order
@@ -901,6 +901,7 @@ class Sequencer:
         spectra: SpectrumRecorder | None = None,
         clock: Clock | None = None,
         sequences: dict[str, Any] | None = None,
+        night_rule: NightRule | None = None,
     ) -> None:
         units = list(telescopes)
         if telescope is not None or camera is not None:
@@ -944,6 +945,13 @@ class Sequencer:
             imaging.set_clock(self.clock)
         if spectra is not None:
             spectra.clock = self.clock
+        #: The site's night rule (robofast.clock; :attr:`night_rule`).
+        self._night_rule = night_rule
+        if night_rule is not None:
+            if imaging is not None:
+                imaging.store.rule = night_rule
+            if spectra is not None:
+                spectra.rule = night_rule
         #: Spectrograph health (module doc): faults in a row, and why it is
         #: down (None: up).
         self.spectrograph_failures = 0
@@ -3808,14 +3816,25 @@ class Sequencer:
         except Exception:
             return set()
 
-    def _night_name(self, when: datetime) -> str | None:
-        """The night ``when`` belongs to (``n<YYYYMMDD>``), as the spectrum
-        sidecars and the frames name it; None with neither."""
+    @property
+    def night_rule(self) -> NightRule | None:
+        """The site's night rule (robofast.clock): every night name the
+        sequencer writes or asks for -- the frames, the sidecars, the raw
+        spectrum file names -- comes from this one rule and the clock. The
+        one given (sequencer_service.build gives the site's), else the
+        spectrum sidecars', else the frames'."""
+        if self._night_rule is not None:
+            return self._night_rule
         if self.spectra is not None:
-            return self.spectra.night(when)
+            return self.spectra.rule
         if self.imaging is not None:
-            return f"n{self.imaging.store.night(when):%Y%m%d}"
+            return self.imaging.store.rule
         return None
+
+    def _night_name(self, when: datetime) -> str | None:
+        """The night ``when`` belongs to (``n<YYYYMMDD>``), by the one night
+        rule the frames and the spectrum sidecars use; None without one."""
+        return None if self.night_rule is None else self.night_rule.name(when)
 
     def _spec_name(self, telescope: str) -> str:
         return self.spectrograph_names.get(telescope, telescope)

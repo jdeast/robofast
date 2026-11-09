@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from robofast import sky
+from robofast.clock import NightRule
 from robofast.dispatch import (
     DispatchConfig,
     DispatchScheduler,
@@ -497,7 +498,7 @@ async def test_guide_auto_follows_the_recommendation(tmp_path):
         }
         return g
 
-    rec = PlanRecord(tmp_path, longitude=MINERVA.longitude)
+    rec = PlanRecord(tmp_path, rule=NightRule(longitude=MINERVA.longitude))
     d = make(
         [auto("faint", 19.0), auto("bright", 9.0)],
         limits={"t1": tlimits()},

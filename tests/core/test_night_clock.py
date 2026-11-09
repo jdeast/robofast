@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from robofast.autofocus_plan import AutofocusTriggers
-from robofast.clock import FileClock, ScaledClock, clock_from_config, real_clock
+from robofast.clock import FileClock, NightRule, ScaledClock, clock_from_config, real_clock
 from robofast.console.hold import OperatorHold
 from robofast.plan import Idle, Observation, StaticPlan
 from robofast.plan_record import PlanRecord, read_record, replay
@@ -66,7 +66,7 @@ async def test_a_time_scaled_night_has_one_night_name_everywhere(make_rig, tmp_p
     record all take the sequencer's (simulated) clock -- not the wall
     clock, which is days away."""
     clock = ScaledClock(SIM, 50.0)
-    record = PlanRecord(tmp_path / "plans", timezone="America/Phoenix")
+    record = PlanRecord(tmp_path / "plans", rule=NightRule("America/Phoenix"))
 
     class Recorded(StaticPlan):
         """A static plan with the dispatch scheduler's ``clock`` and ``record``."""
@@ -90,7 +90,7 @@ async def test_a_time_scaled_night_has_one_night_name_everywhere(make_rig, tmp_p
         "testsite",
         MTHOPKINS,
         "kiwispec",
-        timezone="America/Phoenix",
+        rule=NightRule("America/Phoenix"),
         clock=clock,
     )
     seq.units["t1"].guider = FakeGuider(rig.timeline, "t1")
@@ -127,7 +127,7 @@ async def test_a_time_scaled_night_has_one_night_name_everywhere(make_rig, tmp_p
 async def test_a_held_telescope_is_not_reserved_to_feed_a_spectrum(tmp_path):
     from .test_dispatch import Clock, make
 
-    rec = PlanRecord(tmp_path, longitude=MTHOPKINS.longitude)
+    rec = PlanRecord(tmp_path, rule=NightRule(longitude=MTHOPKINS.longitude))
     d = make([_rv_group("rv")], clock=Clock(), limits=_limits(), instruments=KIWISPEC, record=rec)
     # The console's hold reaches the scheduler through the plan wrappers.
     hold = OperatorHold(AutofocusTriggers(d), ["t1", "t2"], tmp_path / "control")
@@ -154,7 +154,7 @@ async def test_a_held_telescope_is_not_reserved_to_feed_a_spectrum(tmp_path):
 async def test_no_spectra_while_the_spectrograph_is_down_imaging_goes_on(tmp_path):
     from .test_dispatch import Clock, make
 
-    rec = PlanRecord(tmp_path, longitude=MTHOPKINS.longitude)
+    rec = PlanRecord(tmp_path, rule=NightRule(longitude=MTHOPKINS.longitude))
     d = make(
         [_rv_group("rv", priority=5.0), _img_group()],
         clock=Clock(),

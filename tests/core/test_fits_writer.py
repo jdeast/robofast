@@ -11,6 +11,7 @@ import pytest
 from astropy.io import fits
 
 from robofast import fits_writer as fw
+from robofast.clock import NightRule
 from robofast.fits_writer import FrameInfo, FrameStore, Optics
 from robofast.imagebytes import ImageArray
 from robofast.registry import Snapshot, ValueRegistry, publish_static, sun_and_moon
@@ -258,9 +259,9 @@ def image(nx=32, ny=24, value=100) -> ImageArray:
 
 
 def test_layout_night_and_round_trip(tmp_path):
-    store = FrameStore(tmp_path, "minerva", longitude=SITE["longitude"])
+    store = FrameStore(tmp_path, "minerva", rule=NightRule(longitude=SITE["longitude"]))
     w = store.write(info(registry()), image())
-    # 05:06 UTC is 21:42 local mean time at -110.88: the night of the 13th.
+    # 05:06 UTC is 22:06 standard time (UTC-7) at -110.88: the night of the 13th.
     assert w.night == date(2026, 11, 13)
     assert w.relpath == "minerva/t1/n20261113/n20261113.t1.HD_1234.0001.fits"
     assert w.path == tmp_path / w.relpath
@@ -279,13 +280,13 @@ def test_layout_night_and_round_trip(tmp_path):
 
 
 def test_night_by_timezone(tmp_path):
-    store = FrameStore(tmp_path, "s", timezone="America/Phoenix", rollover_hour=12)
+    store = FrameStore(tmp_path, "s", rule=NightRule("America/Phoenix", rollover_hour=12))
     assert store.night(datetime(2026, 11, 14, 18, 59, tzinfo=UTC)) == date(2026, 11, 13)
     assert store.night(datetime(2026, 11, 14, 19, 0, tzinfo=UTC)) == date(2026, 11, 14)
 
 
 def test_never_overwrites_and_numbers_count_up(tmp_path):
-    store = FrameStore(tmp_path, "minerva", longitude=SITE["longitude"])
+    store = FrameStore(tmp_path, "minerva", rule=NightRule(longitude=SITE["longitude"]))
     d = store.directory("t1", date(2026, 11, 13))
     d.mkdir(parents=True)
     # Something already holds number 7 (another object): the next is 8.
@@ -295,7 +296,7 @@ def test_never_overwrites_and_numbers_count_up(tmp_path):
     assert w1.seq == 8
     # A second store (another process) that does not know about w1 picks
     # the next free number too, never w1's.
-    other = FrameStore(tmp_path, "minerva", longitude=SITE["longitude"])
+    other = FrameStore(tmp_path, "minerva", rule=NightRule(longitude=SITE["longitude"]))
     other._next[("t1", date(2026, 11, 13))] = 8  # it believes 8 is free
     w2 = other.write(info(registry(), object="HD 1234"), image(value=5))
     assert w2.seq == 9 and existing.read_bytes() == b"precious"
@@ -306,7 +307,7 @@ def test_never_overwrites_and_numbers_count_up(tmp_path):
 
 
 def test_a_failed_write_leaves_nothing_behind(tmp_path, monkeypatch):
-    store = FrameStore(tmp_path, "minerva", longitude=SITE["longitude"])
+    store = FrameStore(tmp_path, "minerva", rule=NightRule(longitude=SITE["longitude"]))
 
     def boom(*a, **kw):
         raise OSError(28, "No space left on device")
@@ -319,7 +320,9 @@ def test_a_failed_write_leaves_nothing_behind(tmp_path, monkeypatch):
 
 
 def test_rice_compression(tmp_path):
-    store = FrameStore(tmp_path, "minerva", longitude=SITE["longitude"], compress=True)
+    store = FrameStore(
+        tmp_path, "minerva", rule=NightRule(longitude=SITE["longitude"]), compress=True
+    )
     w = store.write(info(registry()), image())
     assert w.path.name.endswith(".0001.fits.fz")
     with fits.open(w.path, checksum=True, disable_image_compression=True) as raw:

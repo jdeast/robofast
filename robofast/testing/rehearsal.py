@@ -1245,7 +1245,7 @@ class Rehearsal(SimulatedNight):
             requests=make_requests(r, start, end, targets),
             state=str(self.out / "dispatch-state.json"),
             too_dropbox=str(self.out / "too-dropbox"),
-            record={"dir": str(self.out / "plans"), "timezone": "America/Phoenix"},
+            record={"dir": str(self.out / "plans")},
             idle_poll=r.idle_poll,
             too_poll=5.0,
             reserve_timeout=120.0 * r.scale,

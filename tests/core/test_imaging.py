@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from astropy.io import fits
 
+from robofast.clock import NightRule
 from robofast.imaging import Imaging, ImagingConfig
 from robofast.plan import StaticPlan
 from robofast.testing.checks import wait_until
@@ -260,7 +261,8 @@ async def test_the_service_builds_the_pipeline_from_the_config(tmp_path):
     try:
         im = seq.imaging
         assert im is not None and im.store.root == tmp_path / "frames"
-        assert im.store.longitude == config["site"]["longitude"]
+        assert im.store.rule == NightRule.from_site(config["site"]) == seq.night_rule
+        assert im.store.rule.timezone == "America/Phoenix"
         assert im.telemetry.weather is not None and im.telemetry.supervisor is remote
         assert set(im._aux) == {"t1"} and len(im.owners) == 2  # focuser, weather
         assert im.registry.get("site.latitude").value == config["site"]["latitude"]

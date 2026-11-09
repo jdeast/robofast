@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from robofast.clock import NightRule
 from robofast.guider.base import GuiderError
 from robofast.plan import CalibrationPlan, Observation, StaticPlan
 from robofast.sky import Site
@@ -492,7 +493,7 @@ async def test_dispatch_reserves_the_feed_and_only_the_leader_counts(tmp_path):
     from .test_dispatch import NIGHT, Clock, make
 
     clock = Clock()
-    rec = PlanRecord(tmp_path, longitude=MTHOPKINS.longitude)
+    rec = PlanRecord(tmp_path, rule=NightRule(longitude=MTHOPKINS.longitude))
     # An idle member is woken (preempt "next": nothing is interrupted).
     d0 = make([_rv_group("rv")], limits=_limits(), instruments=KIWISPEC)
     woken = []

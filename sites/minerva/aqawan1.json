@@ -24,7 +24,8 @@
   ],
   "name": "aqawan1",
   "listen": "127.0.0.1:8100",
-  "site": {"latitude": 31.680407, "longitude": -110.878977, "elevation": 2316.0},
+  "site": {"latitude": 31.680407, "longitude": -110.878977, "elevation": 2316.0,
+           "timezone": "America/Phoenix"},
   "devices": {
     "dome": "127.0.0.1:11113",
     "safetymonitor": "127.0.0.1:11111",

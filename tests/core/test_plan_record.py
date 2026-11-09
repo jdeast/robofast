@@ -9,6 +9,7 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
+from robofast.clock import NightRule
 from robofast.dispatch import dispatch_from_config
 from robofast.plan import Idle, Observation
 from robofast.plan_record import PlanRecord, main, night_of, read_record, replay
@@ -18,10 +19,11 @@ LON = MINERVA.longitude
 
 
 def test_night_is_the_local_date_of_the_evening():
-    # Mean solar time at Mt. Hopkins is UTC - 7.39 h.
+    # Without a time zone: standard time at the longitude, UTC-7 at Mt.
+    # Hopkins (as America/Phoenix), not mean solar time (UTC-7.39 h).
     assert night_of(datetime(2026, 11, 15, 7, tzinfo=UTC), longitude=LON) == date(2026, 11, 14)
-    assert night_of(datetime(2026, 11, 15, 19, tzinfo=UTC), longitude=LON) == date(2026, 11, 14)
-    assert night_of(datetime(2026, 11, 15, 20, tzinfo=UTC), longitude=LON) == date(2026, 11, 15)
+    assert night_of(datetime(2026, 11, 15, 18, 59, tzinfo=UTC), longitude=LON) == date(2026, 11, 14)
+    assert night_of(datetime(2026, 11, 15, 19, tzinfo=UTC), longitude=LON) == date(2026, 11, 15)
     # A time zone, and another rollover hour.
     tz = "America/Phoenix"  # UTC-7, no DST
     noon = datetime(2026, 11, 15, 19, tzinfo=UTC)
@@ -34,9 +36,11 @@ def test_night_is_the_local_date_of_the_evening():
 
 def test_record_validates_its_settings(tmp_path):
     with pytest.raises(ValueError):
-        PlanRecord(tmp_path, night_rollover_hour=24)
+        NightRule(rollover_hour=24)
     with pytest.raises(Exception):  # noqa: B017 (ZoneInfoNotFoundError)
-        PlanRecord(tmp_path, timezone="Mars/Olympus_Mons")
+        NightRule("Mars/Olympus_Mons")
+    with pytest.raises(ValueError, match="site"):
+        NightRule.from_site({"timezone": "Mars/Olympus_Mons"})
 
 
 def _scheduler(tmp_path, clock):
@@ -48,7 +52,7 @@ def _scheduler(tmp_path, clock):
         group("c", ha=-1.5, priority=1),
         group("e", ha=-2.5, priority=0.5),
     ]
-    record = PlanRecord(tmp_path / "plans", longitude=LON)
+    record = PlanRecord(tmp_path / "plans", rule=NightRule(longitude=LON))
     return make(groups, clock=clock, record=record)
 
 
@@ -158,7 +162,7 @@ async def test_replay_from_a_mid_night_restart(tmp_path):
     again = make(
         [g.to_dict() for g in d.groups.values() if g.too is None],
         clock=clock,
-        record=PlanRecord(tmp_path / "plans", longitude=LON),
+        record=PlanRecord(tmp_path / "plans", rule=NightRule(longitude=LON)),
     )
     again.restore_state(d._state())
     await again.next_observation("t2")
@@ -188,15 +192,26 @@ def test_a_torn_last_line_is_skipped(tmp_path, caplog):
 
 def test_record_in_the_plan_entry(tmp_path):
     entry = {
-        "site": {"latitude": 31.68, "longitude": -110.88, "elevation": 2316},
+        "site": {
+            "latitude": 31.68,
+            "longitude": -110.88,
+            "elevation": 2316,
+            "timezone": "America/Phoenix",
+            "night_rollover_hour": 14,
+        },
         "requests": [],
         "telescopes": {"t1": {"instruments": ["imager"], "min_alt": 21, "max_alt": 83}},
-        "record": {"dir": "plans", "night_rollover_hour": 14, "timezone": "America/Phoenix"},
+        "record": {"dir": "plans"},
     }
     d = dispatch_from_config(entry, ["t1"], base=tmp_path)
-    assert d.record.directory == tmp_path / "plans" and d.record.rollover_hour == 14
-    d = dispatch_from_config({**entry, "record": "plans"}, ["t1"], base=tmp_path)
-    assert d.record.longitude == -110.88 and d.record.timezone is None
+    assert d.record.directory == tmp_path / "plans"
+    assert d.record.rule == NightRule("America/Phoenix", rollover_hour=14) == d.night_rule
+    site = {k: v for k, v in entry["site"].items() if k in ("latitude", "longitude", "elevation")}
+    d = dispatch_from_config({**entry, "site": site, "record": "plans"}, ["t1"], base=tmp_path)
+    assert d.record.rule.longitude == -110.88 and d.record.rule.timezone is None
+    # The night keys are the site's, not the record's (robofast/clock.py).
+    with pytest.raises(ValueError, match="moved to the config's 'site'"):
+        dispatch_from_config({**entry, "record": {"dir": "x", "timezone": "UTC"}}, ["t1"])
     with pytest.raises(ValueError, match="record"):
         dispatch_from_config({**entry, "record": {"night_rollover_hour": 3}}, ["t1"])
     with pytest.raises(ValueError, match="record"):

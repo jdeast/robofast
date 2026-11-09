@@ -35,6 +35,7 @@
   "spectrograph": {"host": "127.0.0.1", "port": 44445},
   "camera": {"host": "127.0.0.1", "port": 2055},
   "allow_hardware": false,
+  "site": {"timezone": "America/Phoenix", "night_rollover_hour": 12},
   "telescopes": ["T1", "T2", "T3", "T4"],
   "stage_positions": null,
   "slit_flat_led": false,

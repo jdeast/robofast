@@ -22,7 +22,8 @@
   "site": {
     "latitude": -30.172472,
     "longitude": -70.800139,
-    "elevation": 2124.0
+    "elevation": 2124.0,
+    "timezone": "America/Santiago"
   },
   "devices": {
     "dome": "127.0.0.1:11150",

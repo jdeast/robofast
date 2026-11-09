@@ -178,6 +178,7 @@ from robofast.api_auth import (
     inside_git_worktree,
 )
 from robofast.cancel import isolated
+from robofast.clock import plan_with_night_rule
 from robofast.config import load_config, telescopes
 from robofast.dispatch import DispatchScheduler, dispatch_from_config
 from robofast.doorbell import ring
@@ -1214,15 +1215,14 @@ class RequestApi:
                     # template's expected ones.
                     if "files" not in rec and tmpl is not None:
                         t = datetime.fromisoformat(o["time"])
-                        local = view.site.night_start(t) + timedelta(
-                            hours=view.site.longitude / 15.0
-                        )
                         rec["files"] = [
                             self._data_path(
                                 tmpl,
                                 {
                                     "enclosure": enc.name,
-                                    "night": local.strftime("%Y%m%d"),
+                                    # The night the frame was written
+                                    # under: the site's one rule.
+                                    "night": f"{view.night_rule.date(t):%Y%m%d}",
                                     "telescope": o["telescope"],
                                     "group": entry["id"],
                                     "request": r["id"],
@@ -1918,6 +1918,8 @@ def build_enclosures(
             plan, plan_base = load_config(ppath), ppath.parent
         else:
             plan, plan_base = config.get("plan", {}), cpath.parent
+        # The plan's site takes the enclosure site's night rule (robofast.clock).
+        plan = plan_with_night_rule(plan, config.get("site"))
         out[name] = Enclosure(
             name, config, plan, config_base=cpath.parent, plan_base=plan_base, clock=clock
         )

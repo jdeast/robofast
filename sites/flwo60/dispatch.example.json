@@ -13,7 +13,8 @@
     "state is relative to this file here; use an absolute path in production."
   ],
   "type": "dispatch",
-  "site": {"latitude": 31.6809, "longitude": -110.8781, "elevation": 2344.0},
+  "site": {"latitude": 31.6809, "longitude": -110.8781, "elevation": 2344.0,
+           "timezone": "America/Phoenix"},
   "requests": "requests.example.json",
   "state": "dispatch-state.json",
   "instruments": {

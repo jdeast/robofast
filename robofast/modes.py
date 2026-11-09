@@ -244,12 +244,15 @@ def modes_from_config(
     *,
     attended_floor: bool = False,
     fault_action: bool = True,
+    enclosure: bool = True,
     where: str = "",
 ) -> ModeSet:
     """The ``mode`` and ``modes`` entries of an enclosure config (module
     doc). ``attended_floor``: the enclosure's ``safety.attended_only``;
     ``fault_action``: it has a fault channel (``fault_auto_clear`` true needs
-    one). Errors name the entry's path (``where``: the file)."""
+    one); ``enclosure`` false: there is none (``"enclosure": "none"``), so
+    the built-in modes that only watch one are left out and a configured
+    one is an error. Errors name the entry's path (``where``: the file)."""
     pre = f"{where}: " if where else ""
     raw = config.get("modes")
     if raw is None:
@@ -257,7 +260,9 @@ def modes_from_config(
     if not isinstance(raw, dict):
         raise ValueError(f"{pre}modes: {{name: {{...}}}} (docs/modes.md)")
     modes: dict[str, ModePolicy] = {
-        name: p for name, p in BUILTIN_MODES.items() if not (attended_floor and unattended(p))
+        name: p
+        for name, p in BUILTIN_MODES.items()
+        if not (attended_floor and unattended(p)) and (enclosure or p.enclosure != "watch")
     }
     for name, entry in raw.items():
         if not isinstance(name, str) or not name.isidentifier():
@@ -285,6 +290,8 @@ def modes_from_config(
                 " duty_expiry 'close' (or the site opts in:"
                 " safety.allow_unattended_without_watchdog, docs/modes.md)"
             )
+        if not enclosure and policy.enclosure == "watch":
+            raise ValueError(f"{at}: enclosure 'watch' needs an enclosure (this site has none)")
         if policy.fault_auto_clear and not fault_action:
             raise ValueError(f"{at}.fault_auto_clear: needs safety.fault_action (a fault channel)")
         modes[name] = policy

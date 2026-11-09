@@ -187,6 +187,19 @@ def test_a_half_written_config_names_what_is_wrong(changes, message):
     assert message in str(exc.value)
 
 
+def test_the_cli_names_a_half_written_config(tmp_path, capsys):
+    from robofast.supervisor_service import main
+
+    path = tmp_path / "classroom.json"
+    path.write_text(
+        json.dumps(_config(devices={"dome": SKY, "safetymonitor": SKY, "heartbeat": SKY}))
+    )
+    with pytest.raises(SystemExit) as exc:
+        main(["--config", str(path)])
+    assert exc.value.code == 2
+    assert "devices.heartbeat" in capsys.readouterr().err
+
+
 # -- in process: the supervisor on the sky and the operator's duty ------------------
 
 

@@ -1052,6 +1052,25 @@ support is often worse. So:
   ToOs; an observation that ignores the preemption). OmniSim serves one telescope
   and camera, so the simulator tier runs a second OmniSim for the second
   pair.
+- **Fault nights** (`-m fault_nights`, `tests/core/test_fault_nights.py`):
+  seeded 10 h nights of the supervisor, sequencer and dispatch scheduler on
+  the fakes, on the virtual clock (`robofast/testing/virtual_time.py`), at
+  the shipped timings, with random overlapping faults (weather, frozen
+  feeds, failing or hung devices, ToOs), checked against the fakes' ground
+  truth every simulated second. Off by default; its own CI job runs 20
+  seeds on every PR, not (yet) part of the required gate. A failure names
+  its seed, and the seed replays the night: `FAULT_SEED=12 FAULT_NIGHTS=1
+  python -m pytest -m fault_nights tests/core/test_fault_nights.py`.
+- **Every fixed real-world failure gets a simulated regression test**
+  (JDE 2026-11-09). A failure met on a dry run, a night or the hardware is
+  not fixed until a test reproduces it on simulated devices, fails without
+  the fix and passes with it. It goes in the fault nights when it is a
+  whole-night or timing failure (it needs the shipped timings, hours of
+  night, or faults overlapping), otherwise in the tier where it fits best:
+  a unit or scenario test in the fast tier, the simulator tier, or the e2e
+  night. Behaviour the fakes lack is added to them first (the fake mirrors
+  the real device, e.g. `cooler_off_on_connect`). How to add a fault
+  night: the module doc of `tests/core/test_fault_nights.py`.
 - `master` requires the `test` gate check.
 
 ## 6. Defaults (proposed; to be confirmed)

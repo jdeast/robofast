@@ -69,6 +69,7 @@ robofast-pulizzi-server = "robofast.devices.pulizzi_server:main"
 robofast-adc-server = "robofast.devices.adc_server:main"
 robofast-kiwispec-aux-server = "robofast.devices.kiwispec_aux_server:main"
 robofast-pwi-server = "robofast.devices.pwi_server:main"
+robofast-no-enclosure-server = "robofast.devices.no_enclosure_server:main"
 robofast-pwi-jog = "robofast.devices.pwi_jog:main"
 
 # Entry-point group `robofast.plugins`: a site package's plug-ins (plan types,

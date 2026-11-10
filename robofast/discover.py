@@ -59,17 +59,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import contextvars
 import json
+import logging
 import socket
 import sys
 import time
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from robofast import alpaca_client
 from robofast.owner import DeviceError
+
+log = logging.getLogger(__name__)
 
 #: The Alpaca discovery port and message (ASCOM Alpaca API, "Discovery").
 DISCOVERY_PORT = 32227
@@ -161,9 +167,14 @@ async def _read(d: Device, members: list[str], timeout: float) -> list[Any]:
     dev = alpaca_client.AlpacaDevice(d.server, d.type, d.number)
     member = "Connected"
     try:
+        held = _SESSION.get()
+        key = f"{d.type} {d.spec}"
         owned = await dev.get("Connected", timeout=timeout) is not True
         if owned:
             await dev.set("Connected", True, timeout=timeout)
+            if held is not None:  # the session disconnects it, once, at its end
+                held[key] = d
+                owned = False
         try:
             values = []
             for member in members:
@@ -188,12 +199,44 @@ async def _read_optics(telescope: Device, camera: Device, timeout: float) -> tup
     return focal_m, px, py
 
 
+#: The open :func:`session`'s devices it connected (by type and spec).
+_SESSION: contextvars.ContextVar[dict[str, Device] | None] = contextvars.ContextVar(
+    "discover_session", default=None
+)
+
+
 def read_members(d: Device, members: list[str], timeout: float = 5.0) -> list[Any]:
     """Read ``members`` of ``d`` (connected for the reads if it is not, as
     :func:`read_optics` does); :class:`OpticsUnavailable` naming the one
     that cannot be read."""
-    with httpx.Client(timeout=timeout, trust_env=False) as client:
-        return _read(client, d, members)
+    return asyncio.run(_read(d, members, timeout))
+
+
+@contextlib.contextmanager
+def session(timeout: float = 5.0) -> Iterator[None]:
+    """One connected session for several reads (:func:`read_members`,
+    :func:`read_optics`): a device this module connects (it reported itself
+    not connected) stays connected until the session ends, and is then
+    disconnected once (a connect can take seconds, and some mounts home on
+    it). Devices someone else holds are left as they are, as always."""
+    held: dict[str, Device] = {}
+    token = _SESSION.set(held)
+    try:
+        yield
+    finally:
+        _SESSION.reset(token)
+
+        async def release() -> None:
+            for d in held.values():
+                dev = alpaca_client.AlpacaDevice(d.server, d.type, d.number)
+                try:
+                    await dev.set("Connected", False, timeout=timeout)
+                except DeviceError as exc:
+                    log.warning("%s %s: disconnecting: %s", d.type, d.spec, exc)
+                finally:
+                    await dev.aclose()
+
+        asyncio.run(release())
 
 
 def read_optics(telescope: Device, camera: Device, timeout: float = 5.0) -> dict[str, float]:

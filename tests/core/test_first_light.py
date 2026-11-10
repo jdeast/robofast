@@ -1,4 +1,4 @@
-"""``python -m robofast``: first light, from a telescope plugged in to a
+"""``robofast first-light``: first light, from a telescope plugged in to a
 solved light frame, with no file written by hand (robofast.first_light,
 docs/first_light.md). The telescope is robofast's simulated one on the
 synthetic sky (robofast.testing.sky_device), found by Alpaca discovery on
@@ -6,8 +6,11 @@ loopback."""
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import sys
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,6 +32,7 @@ def device(tmp_path):
     d = SkyDevice(
         catalog={"cache_dir": str(tmp_path / "sky")},
         pointing_error={"IH": 150.0, "ID": -40.0, "NP": 20.0},
+        clock=lambda: HELD,
         focuser=False,  # in focus, fixed: these tests are not about focus
     ).start()
     yield d
@@ -60,11 +64,17 @@ class _HeldClock(datetime):
         return HELD if tz is None or tz is UTC else HELD.astimezone(tz)
 
 
-@pytest.fixture
-def held_device(tmp_path, monkeypatch, request):
+@pytest.fixture(autouse=True)
+def _night(monkeypatch):
+    """Every test's clock is HELD, a dark night at SITE (the Sun gate,
+    robofast.sun_gate, refuses daylight: these tests are not about it)."""
     import robofast.first_light
 
     monkeypatch.setattr(robofast.first_light, "datetime", _HeldClock)
+
+
+@pytest.fixture
+def held_device(tmp_path, monkeypatch, request):
     d = SkyDevice(
         catalog={"cache_dir": str(tmp_path / "sky")},
         pointing_error={"IH": 150.0, "ID": -40.0, "NP": 20.0},
@@ -97,15 +107,20 @@ def test_one_command_to_a_solved_first_light_frame(held_device, tmp_path, capsys
     assert Path(printed.removeprefix("first light frame: ")).is_file()  # the printed path opens
     assert device.mount.AtPark  # parked at the end
     config = json.loads((tmp_path / "run" / "observatory.json").read_text())
-    assert config["enclosure"] == "none" and "devices" not in config
+    # No enclosure, as devices (docs/no_enclosure.md), and a safety the
+    # supervisor accepts for it.
+    assert config["enclosure"] == "none"
+    assert config["devices"] == {"dome": "127.0.0.1:11130", "safetymonitor": "127.0.0.1:11130"}
+    assert config["safety"]["attended_only"] and config["safety"]["park_before_close"]
+    assert "supervisor_url" not in config
     assert config["images"]["telescopes"]["t1"]["plate_scale"] == pytest.approx(1.5, rel=1e-4)
 
 
 @pytest.mark.parametrize(
     "extra, message",
     [
-        (["--yes"], "one of the arguments --no-enclosure --dome is required"),
-        (["--dome", "127.0.0.1:9/0", "--yes"], "--dome needs --safety-monitor"),
+        (["--yes"], "one of the arguments --no-enclosure --supervisor is required"),
+        (["--no-enclosure", "--supervisor", "http://127.0.0.1:9", "--yes"], "not allowed with"),
     ],
 )
 def test_what_is_never_guessed_must_be_said(device, tmp_path, capsys, extra, message):
@@ -145,12 +160,10 @@ class _OnTime(FakeTelescope):
 
     @property
     def SiderealTime(self) -> float:  # type: ignore[override]
-        from datetime import UTC, datetime
-
         from robofast.first_light import _lst_hours
 
         lat, lon = (float(v) for v in SITE.split(","))
-        return _lst_hours((lat, lon, 0.0), datetime.now(UTC))
+        return _lst_hours((lat, lon, 0.0), HELD)
 
 
 def test_a_camera_without_a_pixel_size_stops_naming_it(tmp_path, capsys):
@@ -206,55 +219,125 @@ def test_runs_where_the_event_loop_has_no_signal_handlers(device, tmp_path, caps
     assert entry["solve"]["solved"]
 
 
-def test_an_enclosure_with_unsafe_weather_stays_closed_and_says_why(device, tmp_path, capsys):
-    from robofast.testing.fakes import FakeDome, FakeSafetyMonitor, FakeWeather
+# -- an enclosure: first light under the site's own supervisor ------------------------
 
-    weather = FakeWeather(safe=False)
-    dome = FakeDome()
-    enclosure = FakeAlpacaServer({"dome": dome, "safetymonitor": FakeSafetyMonitor(weather)})
-    enclosure.start()
-    a = enclosure.address
+
+@contextlib.contextmanager
+def _site_supervisor(device, *, safe=True, lease=False, duty=True, **safety):
+    """The site's supervisor service (robofast-supervisor's build and HTTP
+    API) on a fake dome and safety monitor, in a thread of its own, as at a
+    permanent installation: first light is only its client. ``lease``: a
+    lease is out to another sequencer first."""
+    from robofast import supervisor_service
+    from robofast.modes import ModeStore
+    from robofast.testing.fakes import FakeDome, FakeSafetyMonitor, FakeWeather
+    from robofast.timeline import Timeline
+
+    dome = FakeDome(travel=1.0)
+    monitor = FakeSafetyMonitor(FakeWeather(safe=safe))
+    enclosure = FakeAlpacaServer({"dome": dome, "safetymonitor": monitor}).start()
+    config = {
+        "name": "site",
+        "devices": {"dome": enclosure.address, "safetymonitor": enclosure.address},
+        "telescopes": {"t1": {"telescope": f"{device.address}/0"}},
+        "safety": {"reopen_hold": 1.0, "poll_interval": 0.5, **safety},
+    }
+    loop = asyncio.new_event_loop()
+    ready = threading.Event()
+    box: dict = {}
+
+    async def serve():
+        sup = supervisor_service.build(config, Timeline(), mode_store=ModeStore(None))
+        server = await supervisor_service.SupervisorServer(sup, "127.0.0.1", 0).start()
+        box.update(sup=sup, url=server.url)
+        task = asyncio.create_task(sup.run())
+        if duty:  # the site's default mode opens only with an operator on duty
+            sup.duty_on("site operator", "first light test")
+        if lease:
+            await sup.request_open("another-sequencer")
+        ready.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+            await server.stop()
+
+    thread = threading.Thread(target=lambda: loop.run_until_complete(_runner(serve, box)))
+    thread.start()
+    assert ready.wait(30), "the site's supervisor did not start"
     try:
-        with pytest.raises(SystemExit) as exc:
-            main(_args(device, tmp_path, "--dome", f"{a}/0", "--safety-monitor", f"{a}/0",
-                       "--timeout", "15"))  # fmt: skip
+        yield box["url"], dome
     finally:
+        loop.call_soon_threadsafe(box["task"].cancel)
+        thread.join(30)
+        loop.close()
         enclosure.stop()
+
+
+async def _runner(serve, box):
+    box["task"] = asyncio.current_task()
+    with contextlib.suppress(asyncio.CancelledError):
+        await serve()
+
+
+def test_an_enclosure_needs_its_supervisor_running(device, tmp_path, capsys):
+    """At an enclosure first light starts no supervisor of its own: with
+    none answering at --supervisor it is refused, and nothing moves."""
+    with pytest.raises(SystemExit) as exc:
+        main(_args(device, tmp_path, "--supervisor", "http://127.0.0.1:9", "--yes"))
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and "no supervisor answers at http://127.0.0.1:9" in err, err
+    assert "start robofast-supervisor" in err, err
+    assert device.camera.exposures_started == 0 and not device.mount.slews
+
+
+def test_an_enclosure_whose_supervisor_has_a_lease_out_is_refused(device, tmp_path, capsys):
+    with _site_supervisor(device, lease=True) as (url, _dome):
+        with pytest.raises(SystemExit) as exc:
+            main(_args(device, tmp_path, "--supervisor", url, "--yes"))
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and "has a lease out" in err and "another-sequencer" in err, err
+    assert device.camera.exposures_started == 0 and not device.mount.slews
+
+
+def test_an_enclosure_with_nobody_on_duty_is_refused(device, tmp_path, capsys):
+    with _site_supervisor(device, duty=False) as (url, _dome):
+        with pytest.raises(SystemExit) as exc:
+            main(_args(device, tmp_path, "--supervisor", url, "--yes"))
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and "nobody is" in err and "on duty" in err, err
+    assert device.camera.exposures_started == 0 and not device.mount.slews
+
+
+def test_an_enclosure_with_unsafe_weather_stays_closed_and_says_why(device, tmp_path, capsys):
+    with _site_supervisor(device, safe=False) as (url, dome):
+        with pytest.raises(SystemExit) as exc:
+            main(_args(device, tmp_path, "--supervisor", url, "--timeout", "15"))
+        state = dome.state()
     assert exc.value.code == 1
     err = capsys.readouterr().err
-    assert "not done after 15 s" in err and "SafetyMonitor.IsSafe=False" in err
+    assert "not done after 15 s" in err and "SafetyMonitor.IsSafe=False" in err, err
     assert device.camera.exposures_started == 0  # nothing exposed
-    assert dome.state() == 1  # closed
+    assert state == 1  # closed
 
 
-def test_an_enclosure_is_closed_when_it_returns(device, tmp_path, capsys, monkeypatch):
-    """With safe weather the enclosure opens (after the reopen hold, shortened
-    here by the test alone), first light solves, and the command returns only
-    once the enclosure reads closed, saying so."""
-    from robofast import first_light
-    from robofast.testing.fakes import FakeDome, FakeSafetyMonitor, FakeWeather
-
-    config = first_light.first_light_config
-
-    def short_hold(*args, **kwargs):
-        c = config(*args, **kwargs)
-        c["safety"] = {"reopen_hold": 1.0, "poll_interval": 0.5}  # the test's, not robofast's
-        return c
-
-    monkeypatch.setattr(first_light, "first_light_config", short_hold)
-    dome = FakeDome(travel=2.0)
-    safe = FakeSafetyMonitor(FakeWeather(safe=True))
-    enclosure = FakeAlpacaServer({"dome": dome, "safetymonitor": safe}).start()
-    a = enclosure.address
-    try:
-        main(_args(device, tmp_path, "--dome", f"{a}/0", "--safety-monitor", f"{a}/0", "--yes"))
+def test_first_light_under_an_enclosures_supervisor(device, tmp_path, capsys):
+    """With safe weather the site's supervisor opens the enclosure (after
+    its reopen hold, shortened here by the test alone), first light solves
+    as its client, and returns once that supervisor reads it closed."""
+    with _site_supervisor(device) as (url, dome):
+        main(_args(device, tmp_path, "--supervisor", url, "--yes"))
         state = dome.state()
-    finally:
-        enclosure.stop()
     out = capsys.readouterr().out
     assert json.loads(out.strip().splitlines()[-1])["first_light"]["solve"]["solved"]
     assert state == 1, state  # closed, not closing
     assert "enclosure closed" in out
+    config = json.loads((tmp_path / "run" / "observatory.json").read_text())
+    assert config["supervisor_url"] == url and "devices" not in config
+    assert "enclosure" not in config and "safety" not in config  # the site's, not first light's
+    assert device.mount.AtPark
 
 
 def _ctrl_c_after_the_first_exposure(device):
@@ -318,7 +401,6 @@ def test_the_zenith_is_the_sites_not_the_mounts(device, tmp_path, capsys):
     """The zenith is the site's by this computer's clock, not the mount's:
     with the mount's clock half a minute fast (inside the clock check's
     limit), the frame is at the zenith of the site given."""
-    from datetime import UTC, datetime
 
     from robofast.catalog import separation
     from robofast.first_light import _lst_hours
@@ -333,9 +415,8 @@ def test_the_zenith_is_the_sites_not_the_mounts(device, tmp_path, capsys):
     main(_args(device, tmp_path, "--no-enclosure", "--yes"))
     out = capsys.readouterr().out
     solve = json.loads(out.strip().splitlines()[-1])["first_light"]["solve"]
-    taken = datetime.fromisoformat(solve["date_obs"]).replace(tzinfo=UTC)
     lat, lon = (float(v) for v in SITE.split(","))
-    zenith_ra = _lst_hours((lat, lon, 0.0), taken) * 15.0
+    zenith_ra = _lst_hours((lat, lon, 0.0), HELD) * 15.0  # the sky is held at HELD
     assert separation(solve["ra"], solve["dec"], zenith_ra, lat) < 1.0
     assert "arcmin from the zenith" in out
 
@@ -403,7 +484,7 @@ def test_first_light_asks_eight_matched_stars_of_a_solve(device, tmp_path):
     config = first_light.first_light_config(
         discover.configured_devices(device.address),
         site=(42.38, -71.13, 0.0),
-        enclosure=None,
+        supervisor_url=None,
         catalog={"source": "synthetic"},
         plugins=[],
     )
@@ -511,7 +592,7 @@ def test_a_mount_that_never_parks_is_named_in_the_last_line(tmp_path, capsys):
             main(["--site", SITE, "--no-enclosure", "--yes", "--server", server.address,
                   "--dir", str(tmp_path / "run"), "--catalog-dir", str(tmp_path / "cat"),
                   "--plugin", "robofast.testing.sky_device:register", "--catalog", "synthetic",
-                  "--timeout", "6"])  # fmt: skip
+                  "--timeout", "15"])  # fmt: skip
     finally:
         server.stop()
     last = [ln for ln in capsys.readouterr().err.splitlines() if ln.startswith("first light")]
@@ -587,7 +668,10 @@ def test_the_telescopes_site_is_asked_and_a_no_moves_nothing(tmp_path, capsys, m
     """A mount with no GPS reports its factory site, which may be another
     continent: the question shows it, and a no stops first light."""
     far = SkyDevice(
-        catalog={"cache_dir": str(tmp_path / "sky")}, latitude=34.1, longitude=-118.3
+        catalog={"cache_dir": str(tmp_path / "sky")},
+        latitude=34.1,
+        longitude=-118.3,
+        clock=lambda: HELD,
     ).start()
     asked: list[str] = []
     monkeypatch.setattr("builtins.input", lambda prompt: asked.append(prompt) or "n")
@@ -726,6 +810,7 @@ def _wrong_clock_device(tmp_path, hours: float) -> SkyDevice:
     d = SkyDevice(
         catalog={"cache_dir": str(tmp_path / "sky")},
         pointing_error={"IH": 150.0, "ID": -40.0, "NP": 20.0},
+        clock=lambda: HELD,
         focuser=False,  # in focus, fixed: these tests are about the clock
     )
     d.mount.__class__ = WrongClockMount
@@ -773,8 +858,6 @@ def test_the_setup_reads_connect_each_device_once(tmp_path):
     """Before anything moves, first light reads the site, the clock, the
     optics and the chip in one connected session: each device is connected
     once (and once more by the sequencer), not once a read."""
-    from datetime import UTC, datetime
-
     from robofast.first_light import _lst_hours
 
     lat, lon = (float(v) for v in SITE.split(","))
@@ -803,7 +886,7 @@ def test_the_setup_reads_connect_each_device_once(tmp_path):
 
         @property
         def SiderealTime(self):  # type: ignore[override]
-            return _lst_hours((lat, lon, 0.0), datetime.now(UTC))
+            return _lst_hours((lat, lon, 0.0), HELD)
 
     class Cam(Counting, FakeCamera):
         def __init__(self):
@@ -900,7 +983,7 @@ def test_an_unknown_focus_target_is_refused_before_anything_moves(held_device, t
 
 @pytest.mark.parametrize("held_device", [True], indirect=True)
 def test_focus_on_a_named_star(held_device, tmp_path, capsys):
-    from robofast.first_focus import PLANETS, targets_up
+    from robofast.autofocus_coarse import PLANETS, targets_up
 
     up = [t.name for t in targets_up((42.38, -71.13, 0.0), HELD) if t.name not in dict(PLANETS)]
     name = up[-1]  # not the brightest: the one asked for
@@ -984,3 +1067,150 @@ def test_the_park_words_are_said_after_the_cleanup_has_parked(held_device, tmp_p
     err = capsys.readouterr().err
     assert d.mount.AtPark
     assert "the telescope parked" in err and "park it by hand" not in err, err
+
+
+# -- the Sun gate (robofast.sun_gate; docs/first_light.md, "The Sun") -------------------
+
+
+def _clock(start: datetime, *, running: bool = False):
+    """A first-light clock at ``start`` (moving on in real time if ``running``)."""
+    t0 = time.monotonic()
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            from datetime import timedelta
+
+            t = start + timedelta(seconds=time.monotonic() - t0 if running else 0.0)
+            return t if tz is None or tz is UTC else t.astimezone(tz)
+
+    return Clock
+
+
+def test_daylight_is_refused_before_anything_moves(device, tmp_path, capsys, monkeypatch):
+    import robofast.first_light
+
+    noon = datetime(2026, 11, 7, 17, 0, tzinfo=UTC)  # local noon at SITE
+    monkeypatch.setattr(robofast.first_light, "datetime", _clock(noon))
+    with pytest.raises(SystemExit) as exc:
+        main(_args(device, tmp_path, "--no-enclosure", "--yes"))
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and "the Sun is up" in err and "did not move" in err, err
+    assert not device.mount.slews and device.camera.exposures_started == 0
+    assert not (tmp_path / "run" / "observatory.json").exists()
+
+
+def test_daylight_is_refused_under_an_enclosure_too(device, tmp_path, capsys, monkeypatch):
+    """The Sun gate is first light's, before the supervisor is asked."""
+    import robofast.first_light
+
+    noon = datetime(2026, 11, 7, 17, 0, tzinfo=UTC)
+    monkeypatch.setattr(robofast.first_light, "datetime", _clock(noon))
+    with pytest.raises(SystemExit) as exc:
+        main(_args(device, tmp_path, "--supervisor", "http://127.0.0.1:9", "--yes"))
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and "the Sun is up" in err, err
+    assert "no supervisor answers" not in err
+
+
+def test_twilight_above_the_limit_given_is_refused(device, tmp_path, capsys):
+    """--max-sun-alt is honoured: just below the Sun's altitude now, refused."""
+    from robofast import sun_gate
+
+    lat, lon = (float(v) for v in SITE.split(","))
+    (alt,) = sun_gate.sun_altitudes((lat, lon, 0.0), [HELD])
+    with pytest.raises(SystemExit) as exc:
+        main(_args(device, tmp_path, "--no-enclosure", "--yes", "--max-sun-alt", f"{alt - 1:.1f}"))
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and "the Sun is up" in err, err
+    assert not device.mount.slews
+
+
+@pytest.mark.parametrize(
+    "flag, value", [("--max-sun-alt", "5"), ("--min-sun-separation", "5")]
+)  # fmt: skip
+def test_the_sun_gate_cannot_be_turned_off(device, tmp_path, capsys, flag, value):
+    with pytest.raises(SystemExit) as exc:
+        main(_args(device, tmp_path, "--no-enclosure", "--yes", flag, value))
+    assert exc.value.code == 2 and "at " in capsys.readouterr().err
+
+
+def test_a_field_near_the_sun_is_refused_before_anything_moves(
+    device, tmp_path, capsys, monkeypatch
+):
+    from astropy.coordinates import get_body
+    from astropy.time import Time
+
+    import robofast.first_light
+
+    sun = get_body("sun", Time(HELD))
+    monkeypatch.setattr(
+        robofast.first_light,
+        "_sun_targets",
+        lambda *a: [("a calibration field", float(sun.ra.deg) + 10, float(sun.dec.deg))],
+    )
+    with pytest.raises(SystemExit) as exc:
+        main(_args(device, tmp_path, "--no-enclosure", "--yes"))
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and "deg from the Sun" in err and "did not move" in err, err
+    assert not device.mount.slews and device.camera.exposures_started == 0
+
+
+def test_the_dawn_stops_first_light_and_parks(device, tmp_path, capsys, monkeypatch):
+    """The Sun reaching the gate's altitude while first light runs stops it,
+    and the telescope parks (here the dawn is moved to a few seconds in)."""
+    from datetime import timedelta
+
+    import robofast.first_light
+    from robofast import sun_gate
+
+    monkeypatch.setattr(robofast.first_light, "datetime", _clock(HELD, running=True))
+    real = sun_gate.check_dark
+
+    def soon(site, when, max_sun_alt=sun_gate.MAX_SUN_ALT):
+        real(site, when, max_sun_alt)
+        return when + timedelta(seconds=6)
+
+    monkeypatch.setattr(sun_gate, "check_dark", soon)
+    with pytest.raises(SystemExit) as exc:
+        main(_args(device, tmp_path, "--no-enclosure", "--yes", "--timeout", "120"))
+    err = capsys.readouterr().err
+    assert exc.value.code == 1 and "the Sun has reached" in err, err
+    assert "the telescope parked" in err and device.mount.AtPark, err
+
+
+# -- the command: `robofast first-light`; `robofast` alone runs nothing --------------
+
+
+def test_robofast_alone_prints_the_commands_and_runs_nothing(capsys):
+    from robofast import cli
+
+    cli.main([])
+    out = capsys.readouterr().out
+    assert "first-light" in out and "usage: robofast COMMAND" in out
+
+
+def test_robofast_first_light_help(capsys):
+    from robofast import cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["first-light", "--help"])
+    assert exc.value.code == 0 and "robofast first-light" in capsys.readouterr().out
+
+
+def test_an_unknown_command_is_refused(capsys):
+    from robofast import cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["first-light-now"])
+    assert exc.value.code == 2 and "unknown command" in capsys.readouterr().err
+
+
+def test_python_m_robofast_prints_the_commands():
+    import subprocess
+
+    root = Path(__file__).resolve().parents[2]
+    r = subprocess.run(
+        [sys.executable, "-m", "robofast"], cwd=root, capture_output=True, text=True, timeout=60
+    )
+    assert r.returncode == 0 and "first-light" in r.stdout, r.stderr

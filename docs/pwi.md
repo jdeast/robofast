@@ -327,6 +327,27 @@ pipeline writes `DriverInfo` into each light frame's header as `MNTSWVER`
   the watch stops a slew the server sent, `Slewing` raises: the slew failed,
   and nobody mistakes where it stopped for the target.
   The jog tool applies the same coast to its own limit check.
+* **The limit watch stands aside while the mount is not homed or is
+  homing.** Until a CDK700 is homed its encoders count from wherever the
+  controller powered up (both axes ~0 deg after a power cycle), and a home
+  search runs in that frame before PWI resets it: the alt/az PWI reports
+  then are not sky positions. On MINERVA T2 (2026-11-09) a findhome sent
+  to PWI2 directly searched downward from 0-18 deg; the watch read that as
+  below `min_alt` and sent `stop` four times, aborting every altitude home
+  (with the server stopped the home finished at 45.85 deg). So the watch
+  enforces no alt/az limits while PWI reports a home in progress (PWI2
+  `is_finding_home`, whoever sent it), while a `FindHome` the server sent
+  is running, or while the mount is not homed by the same test the moves
+  use (PWI2 `encoders_have_been_set`; PWI4 `axisN.is_homed` where
+  reported, else robofast's home record; unknown counts as not homed).
+  PWI's own limit sensors and the controller protect the mount meanwhile.
+  It logs one warning when it suspends and one when it resumes (an info
+  line if the reason changes in between), and Action `Status` reports
+  `watch_suspended` (the reason, or null). Speeds are measured afresh once
+  it resumes. Robofast's own moves while unhomed stay refused, and nothing
+  in the server interrupts PWI's home: a due pointing-model check
+  (`setmodel`) also waits until the home is over. A homed mount is watched
+  exactly as above.
 * **Stalled slews**: see "Quirks handled" (PWI4 at its own limit). A slew
   to an alt/az target (and a park) must make progress toward it: at least
   `stall_move` deg in `stall_time` s on the axis furthest from its target,
@@ -409,7 +430,10 @@ reports slewing forever), the axis-0 wrap range (`--wrap-min`; mechanical
 azimuth is continuous and a goto ends inside the wrap range),
 `CDK700Model.az_mech_min` (an azimuth obstruction), `m3.port` -1 while the
 M3 moves, dropped M3 gotos (`CDK700Model.m3_drops`), a controller power cycle
-(`CDK700Model.power_cycle`: disconnected, not homed, both axes at 0), and a
+(`CDK700Model.power_cycle`: disconnected, not homed, both axes at 0; with
+`home_search` a home of the unhomed altitude axis first searches that many
+degrees downward, then the encoders are set and the reading jumps to the
+home, as T2's PWI2 did on 2026-11-09), and a
 PWI restart (`CDK700Model.pwi_restart`, `GET /robofast-sim/restart`, or a
 new simulator started with `--restarted`: disconnected, motors disabled,
 not homed, `Default_Mount_Model.PXP` loaded). PWI2 `setmodel` replaces the

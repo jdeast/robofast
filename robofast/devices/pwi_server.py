@@ -82,6 +82,10 @@ Safety
   with nothing of ours moving the mount, a fast read is read again before
   it counts (``track_speed_max``); a slew of ours moving toward a target
   inside the limits is predicted to stop within ``goto_margin`` of it.
+  It enforces nothing while the mount is not homed or a home is in progress
+  (PWI's ``is_finding_home``, whoever sent it): the alt/az are then not sky
+  positions (MINERVA T2, 2026-11-09: it aborted PWI2's own homes). Logged
+  once each way; Action ``Status`` reports ``watch_suspended``.
 * A slew this server sent that PWI reports slewing but that does not move
   (``stall_time``, ``stall_move``) has failed -- PWI4 accepts a goto beyond
   its own axis limits, stops at the limit and reports slewing forever: the
@@ -544,6 +548,8 @@ class PWIMount:
         self.watch_glitches = 0
         self.pulse_until = 0.0
         self._watch_latched = False
+        #: Why the limit watch is not enforcing the sky limits now (None: it is).
+        self.watch_suspended: str | None = None
         self._park_task: asyncio.Task | None = None
         #: The record of homes robofast commanded (a PWI4 without a homed flag).
         self.home_record = HomeRecord(config.home_record_path())
@@ -666,8 +672,10 @@ class PWIMount:
         if not self._model_due:
             return
         st = await self.status()
-        if not st.connected or st.m3_port not in (1, 2):
-            return  # still due: once the mount is connected and on a port
+        if not st.connected or st.m3_port not in (1, 2) or st.finding_home:
+            # Still due: once the mount is connected, on a port, and not in
+            # the middle of a home (which nothing here interrupts).
+            return
         self._model_due = False
         want = self.models.get(st.m3_port)
         if want is None or same_model(st.pointing_model, want):
@@ -1504,6 +1512,7 @@ class PWIMount:
             "limits": [self.config.min_alt, self.config.max_alt],
             "watch_stops": self.watch_stops,
             "watch_glitches": self.watch_glitches,
+            "watch_suspended": self.watch_suspended,
             "homed": self.is_homed(st),
             "homed_here": sorted(self.homed_here),
             "home_record": sorted(self.home_record.axes(st)),
@@ -1551,6 +1560,27 @@ class PWIMount:
             heading = False  # homing may cross the limits
         return outside or heading, out_now or heading, rest
 
+    def _watch_suspend_reason(self, st: PWIStatus) -> str | None:
+        """Why the alt/az PWI reports are not sky positions now, so the
+        limit watch must not act on them (None: they are). An unhomed mount's
+        encoders count from wherever the controller powered up (a CDK700
+        reads ~0 deg on both axes), and a home search runs in that frame and
+        then resets it: stopping on those numbers aborts the home (MINERVA
+        T2, 2026-11-09). PWI's own limit sensors and the controller protect
+        the mount meanwhile; robofast's own moves stay refused while unhomed."""
+        if st.finding_home:
+            return "PWI is finding home"
+        if self._homing_since is not None:
+            return "a home robofast sent is in progress"
+        homed = self.is_homed(st)
+        if homed is True:
+            return None
+        if homed is False:
+            if st.backend == "pwi2":
+                return "mount not homed (PWI2 encoders_have_been_set false)"
+            return "mount not homed (PWI reports an axis not homed)"
+        return "mount homed state unknown (no homed flag from PWI, no robofast home record)"
+
     def _commanded_motion(self) -> bool:
         """Motion of ours is under way (a slew, a park, a home)."""
         return (
@@ -1589,6 +1619,32 @@ class PWIMount:
                 confirmed = False
                 continue
             await self._check_stall(st)
+            why = self._watch_suspend_reason(st)
+            if why != self.watch_suspended:
+                if why is not None and self.watch_suspended is not None:
+                    log.info("limit watch still suspended: %s", why)
+                elif why is not None:
+                    log.warning(
+                        "limit watch suspended: %s; alt %.2f az %.2f are not sky positions"
+                        " (PWI's limit sensors and the controller protect the mount)",
+                        why,
+                        st.alt_deg,
+                        st.az_deg,
+                    )
+                else:
+                    log.warning(
+                        "limit watch resumed (homed): alt %.2f az %.2f against [%s, %s]",
+                        st.alt_deg,
+                        st.az_deg,
+                        cfg.min_alt,
+                        cfg.max_alt,
+                    )
+                self.watch_suspended = why
+            if why is not None:
+                # Speeds start afresh once the frame is the sky's again.
+                hist.clear()
+                confirmed = False
+                continue
             t, alt, mech = self._st_at, st.alt_deg, st.az_mech_deg
             if hist and t - hist[-1][0] <= 1e-3:
                 continue  # the same read again

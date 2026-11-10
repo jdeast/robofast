@@ -3,45 +3,55 @@
 ::
 
     pip install .          # the repository or a wheel built from it (not on PyPI yet)
-    python -m robofast --no-enclosure      # or: robofast ...
+    robofast first-light --no-enclosure          # a telescope on a tripod
+    robofast first-light --supervisor URL        # under an enclosure's supervisor
 
 One command, for a classroom or a first night: it finds the telescope and
 camera (Alpaca discovery, :mod:`robofast.discover`), reads their plate
-scale from them, writes the enclosure config itself (``--dir``, default
-``first-light/``; it never overwrites one), and runs robofast's own safety
-supervisor and sequencer on it, in this process: a focus, from however
-far out, on the brightest planet or star up (robofast.first_focus), a
-first pointing calibration from three plate solves (docs/pointing_model.md, "A first
-calibration"), then one light frame near the zenith, plate-solved
+scale from them, writes the config itself (``--dir``, default
+``first-light/``; it never overwrites one), and runs robofast's sequencer
+on it, in this process: a focus, from however far out, on the brightest
+planet or star up (the autofocus's coarse mode, docs/autofocus.md), a
+first pointing calibration from three plate solves (docs/pointing_model.md,
+"A first calibration"), then one light frame near the zenith, plate-solved
 (docs/sky.md). It prints where the frame points and exits 0 once it is
 solved; 1 if robofast could not get there, saying why.
+
+**The Sun** (:mod:`robofast.sun_gate`): first light is refused while the
+Sun is above ``--max-sun-alt`` (default -12 deg, nautical twilight) and
+stops when it rises to it; nothing it points at (the focus target, the
+calibration's fields, the zenith) is within ``--min-sun-separation``
+(default 30 deg) of the Sun. With an enclosure or without.
+
+**The enclosure** is never guessed; it is said:
+
+* ``--no-enclosure`` (a telescope on a tripod): the operator on duty
+  judges the weather. First light runs the safety supervisor here, in this
+  process, on the no-enclosure devices (docs/no_enclosure.md: the sky as a
+  dome, the operator's duty as the safety monitor), with the person running
+  it on duty. They are asked first whether the sky is clear and whether
+  they will stay with the telescope; Ctrl-C, or the end, takes them off
+  duty, and the telescope parks.
+* ``--supervisor URL``: a permanent installation, whose enclosure the
+  site's own supervisor service (``robofast-supervisor``) runs. First light
+  starts no supervisor: it is a client of that one, as a sequencer is (it
+  asks it for a lease, and the enclosure opens and closes only by its
+  rules). It is refused if that supervisor does not answer, has a lease out
+  to another sequencer, or has a critical alarm.
 
 The site is the telescope's own (``SiteLatitude``, ``SiteLongitude``; a GPS
 mount fills them; its elevation is not read: 0 m), or ``--site LAT,LON[,ELEV]``,
 which is used instead. The telescope's site is shown and asked about (a
-mount with no GPS may report its factory site, another continent: points
-laid for it can be below the real horizon); a telescope that cannot
-report its site, or reports 0, 0, with no ``--site``, stops before anything
-moves. The pointing run lays its points in altitude from it; a site
-hundreds of km off still calibrates (docs/first_light.md, "The site").
-
-What it never reads or guesses, and so asks for in words:
-
-* the enclosure: ``--no-enclosure`` (a telescope on a tripod: the operator
-  on duty judges the weather; robofast.safety, "No enclosure"), or
-  ``--dome HOST:PORT/N --safety-monitor HOST:PORT/N``.
-
-Light frames need the supervisor's lease. With ``--no-enclosure`` that is
-an operator on duty: the person running this command, who is asked first
-whether the sky is clear and whether they will stay with the telescope
-(and whether the telescope's site is where it stands; ``--yes`` answers
-yes to all of it). Their duty lasts while the command runs; Ctrl-C,
-or the end, takes them off duty, and the telescope parks.
+mount with no GPS may report its factory site, another continent); a
+telescope that cannot report its site, or reports 0, 0, with no ``--site``,
+stops before anything moves (docs/first_light.md, "The site").
 
 The catalog is ``--catalog`` (default ``gaia``: Gaia DR3 tiles, docs/sky.md),
 downloaded for the four frames before the telescope moves. ``--plugin`` loads plug-ins first (the
 simulated telescope's ``synthetic`` sky: ``--plugin
 robofast.testing.sky_device:register --catalog synthetic``).
+
+First proposed and written by Guven Gurkan (PR #132).
 """
 
 from __future__ import annotations
@@ -59,11 +69,11 @@ import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx
 
-from robofast import discover
+from robofast import discover, sun_gate
 from robofast.catalog import separation
 from robofast.timeline import Timeline
 
@@ -102,6 +112,19 @@ CLOCK_LIMIT = 1.0
 UNSOLVED_LIMIT = 6
 
 
+#: Where the written config puts the no-enclosure devices (the sky and the
+#: operator's duty) for ``robofast-no-enclosure-server``; first light itself
+#: serves them on a free loopback port.
+NO_ENCLOSURE_LISTEN = "127.0.0.1:11130"
+
+#: The coarse focus's first exposure (s), on a planet or a bright star.
+FOCUS_EXPTIME = 0.01
+#: The focus sweep's exposure (s), on the field around it.
+SWEEP_EXPTIME = 1.0
+#: Seeing (FWHM, arcsec) the focus plans for.
+SEEING = 2.5
+
+
 class FirstLightError(RuntimeError):
     """What stopped first light (printed; exit status 1)."""
 
@@ -127,16 +150,18 @@ def first_light_config(
     devices: list[discover.Device],
     *,
     site: tuple[float, float, float],
-    enclosure: dict[str, str] | None,
+    supervisor_url: str | None,
     catalog: dict[str, Any],
     plugins: list[str],
     exptime: float = EXPTIME,
     name: str = "first-light",
 ) -> dict[str, Any]:
-    """The enclosure config first light runs on: the starter config of
+    """The config first light runs on: the starter config of
     :func:`robofast.discover.starter_config` (with the optics read from the
-    devices), and what the operator said (``site``; ``enclosure`` None: no
-    enclosure, else ``{"dome": spec, "safetymonitor": spec}``)."""
+    devices), and what the operator said (``site``; ``supervisor_url`` None:
+    no enclosure, the no-enclosure devices at :data:`NO_ENCLOSURE_LISTEN`
+    (docs/no_enclosure.md); else the site's running supervisor, which owns
+    the enclosure: no devices of it are written here)."""
     _one_telescope(devices)  # before anything is read from, or connected on, any of them
     config = discover.starter_config(devices, name, optics=True)
     scopes = config["telescopes"]
@@ -146,13 +171,22 @@ def first_light_config(
     lat, lon, elev = site
     optics = config["images"]["telescopes"][tel]
     config["_note"].append(
-        "Written by robofast first light (python -m robofast); site and enclosure from"
+        "Written by robofast first light (robofast first-light); site and enclosure from"
         " its command line."
     )
-    if enclosure is None:
+    if supervisor_url is None:
+        # No enclosure, as devices (docs/no_enclosure.md): the sky and the
+        # operator's duty, served by robofast-no-enclosure-server.
         config["enclosure"] = "none"
+        config["devices"] = {"dome": NO_ENCLOSURE_LISTEN, "safetymonitor": NO_ENCLOSURE_LISTEN}
+        config["safety"] = {
+            "attended_only": True,
+            "park_before_close": True,
+            "require_park_before_close": True,
+            "reopen_hold": 0,
+        }
     else:
-        config["devices"] = dict(enclosure)
+        config["supervisor_url"] = supervisor_url
     config["site"] = {"latitude": lat, "longitude": lon, "elevation": elev}
     if plugins:
         config["plugins"] = list(plugins)
@@ -300,29 +334,31 @@ def _target(config: dict[str, Any], name: str) -> dict[str, Any]:
 
 def _focus_step(
     config: dict[str, Any],
-    devices: list[discover.Device],
     site: tuple[float, float, float],
     when: datetime,
     *,
-    attended: bool,
     reads: dict[str, Any],
     focus_on: str | None = None,
-) -> str:
-    """Put the focus step first in the plan (robofast.first_focus): on the
-    brightest planet or star up, from the devices' optics. Returns what it
-    says about it (one line)."""
-    from robofast import first_focus
+    min_sun_separation: float = sun_gate.MIN_SUN_SEPARATION,
+) -> tuple[str, Any]:
+    """Put the focus step first in the plan: an autofocus observation in its
+    coarse mode (docs/autofocus.md, "Coarse mode") on the brightest planet
+    or star up and away from the Sun (or ``focus_on``), and the telescope's
+    autofocus entry from the devices' optics. Returns what it says about it
+    (one line) and the target (None: no focus step)."""
+    from robofast import autofocus_coarse as coarse
 
     (tel,) = config["telescopes"]
     scope = config["telescopes"][tel]
-    if "focuser" not in scope and not attended:
+    if "focuser" not in scope:
         return (
-            "no focuser: no focus step (--yes answers no walk-through: run without --yes"
-            " to focus by hand, the program saying which way to turn)"
+            "no focuser to drive: no focus step (focus by hand first: docs/first_light.md,"
+            ' "Focus")',
+            None,
         )
-    target = first_focus.bright_target(site, when, focus_on)
+    target = coarse.bright_target(site, when, focus_on, min_sun_separation=min_sun_separation)
     if target is None:
-        return "no planet or bright star is up to focus on: no focus step"
+        return "no planet or bright star is up, away from the Sun: no focus step", None
     focal, aperture, area, full = (reads[k] for k in ("focal", "aperture", "area", "full"))
     optics = config["images"]["telescopes"][tel]
     pixel = optics["plate_scale"] * float(focal) * 1000.0 / discover.ARCSEC_PER_UM_PER_MM
@@ -330,59 +366,39 @@ def _focus_step(
     if area is not None and aperture is not None:
         disk = math.pi * (float(aperture) / 2) ** 2
         obstruction = math.sqrt(max(0.0, 1.0 - float(area) / disk))
-    f_ratio = reads.get("f_ratio") or (float(focal) / float(aperture) if aperture else None)
-    settings: dict[str, Any] = {
-        "f_ratio": f_ratio,
-        "pixel_size": pixel,
-        "plate_scale": optics["plate_scale"],
-        "obstruction": round(obstruction, 3),
-        "fwhm_px": 2.5 / optics["plate_scale"],
+    f_ratio = reads.get("f_ratio") or float(focal) / float(aperture)
+    # The telescope's autofocus entry (docs/autofocus.md): the fine sweep,
+    # and the coarse mode the focus step asks for, from what the devices said.
+    scope["autofocus"] = {
+        "optics": {
+            "f_ratio": round(f_ratio, 4),
+            "pixel_size": round(pixel, 4),
+            "pixel_scale": optics["plate_scale"],
+            "obstruction": round(obstruction, 3),
+            "um_per_step": float(reads.get("step") or 1.0),
+        },
+        "method": "sweep",
+        "exptime": _within(SWEEP_EXPTIME, reads),
+        "coarse_exptime": _within(FOCUS_EXPTIME, reads),
         "saturation": float(full),
-        "exptime": _within(0.01, reads),
-        "sweep_exptime": _within(1.0, reads),
-        "exposure_min": float(reads.get("emin") or 0.0),
-        "mag": target.mag,
-        # The listed stars up now (name, V mag): a too-bright target's stop
-        # names one of them for --focus-on.
-        "stars_up": [
-            [t.name, t.mag]
-            for t in first_focus.targets_up(site, when)
-            if t.name != target.name and t.name not in dict(first_focus.PLANETS)
-        ],
+        "max_seeing": SEEING,
+        "measure": {"saturation": 0.9 * float(full)},
     }
-    if "focuser" in scope:
-        settings["um_per_step"] = reads.get("step") or 1.0
-        # The telescope's autofocus entry (docs/autofocus.md): what gives the
-        # sequencer its focuser; its sweep finishes the focus step.
-        scope["autofocus"] = {
-            "optics": {
-                k: settings[k] for k in ("f_ratio", "pixel_size", "obstruction", "um_per_step")
-            }
-            | {"pixel_scale": settings["plate_scale"]},
-            "method": "sweep",
-            "exptime": settings["sweep_exptime"],
-            "measure": {"saturation": 0.9 * settings["saturation"]},
-        }
-    else:
-        settings["walk_through"] = True  # a person is there (no --yes)
     config["plan"]["targets"].insert(
         0,
         {
             "name": "first-focus",
-            "kind": "first_focus",
+            "kind": "autofocus",
             "ra_hours": round(target.ra / 15.0, 6),
             "dec_deg": round(target.dec, 5),
-            "exptime": settings["exptime"],
             "object": target.name,
-            "autofocus": settings,
+            "autofocus": {"mode": "coarse"},
         },
     )
-    config.setdefault("plugins", [])
-    if "robofast.first_focus:register" not in config["plugins"]:
-        config["plugins"].append("robofast.first_focus:register")
-    first_focus.register()
-    how = "with the focuser" if "focuser" in scope else "by hand: you turn the knob"
-    return f"focus first, {how}, on {target.name} (altitude {target.alt:.0f} deg)"
+    return (
+        f"focus first, with the focuser, on {target.name} (altitude {target.alt:.0f} deg)",
+        target,
+    )
 
 
 def _zenith(config: dict[str, Any], lst_hours: float) -> None:
@@ -579,11 +595,12 @@ def _frames(tl: Timeline) -> str:
     return out + (f" (last: {'; '.join(errors[-2:])})" if errors else "")
 
 
-async def _focus_failed(tl: Timeline) -> str:
-    """The focus step's failure (robofast.first_focus), once it is reported."""
-    while not tl.events("first_focus_failed"):
+async def _observation_failed(tl: Timeline) -> str:
+    """The first observation that failed (the focus, the calibration), in
+    its own words, once it is reported: first light stops there."""
+    while not tl.events("observation_failed"):
         await asyncio.sleep(0.5)
-    return str(tl.events("first_focus_failed")[-1].detail.get("error"))
+    return str(tl.events("observation_failed")[-1].detail.get("error"))
 
 
 def _parked_words(parked: bool, waited: float) -> str:
@@ -596,15 +613,39 @@ def _parked_words(parked: bool, waited: float) -> str:
     )
 
 
+#: A device's role in the owner's name (``t1.focuser``), in plain words.
+_ROLES = {"focuser": "the focuser", "telescope": "the mount", "camera": "the camera"}
+
+
+def device_words(exc: Exception | str) -> str:
+    """A device's error, its device first in plain words ("the focuser: ...")."""
+    import re
+
+    text = str(exc)
+    m = re.search(r"\b(focuser|telescope|camera)\b", text.split(": ", 1)[0])
+    return f"{_ROLES[m.group(1)]}: {text}" if m else text
+
+
 async def _telescope_failed(tl: Timeline) -> str:
     """The sequencer's telescope error (a slew, a device), once it is
     reported, in the device's words (it then parks and backs off for
     minutes; first light does not wait for the back-off)."""
-    from robofast.first_focus import device_words
-
     while not tl.events("telescope_error"):
         await asyncio.sleep(0.5)
     return device_words(str(tl.events("telescope_error")[-1].detail.get("error")))
+
+
+def _unsolved(tl: Timeline) -> bool:
+    """Calibration frames taken, and none solved."""
+    return bool(tl.events("pointing_point_unsolved")) and not tl.events("pointing_point")
+
+
+def _not_solved(tl: Timeline) -> str:
+    return (
+        f"the frames did not solve: {_frames(tl)}; check the plate scale"
+        " (the telescope's FocalLength and the camera's pixel size), the focus,"
+        " and that the sky is clear"
+    )
 
 
 async def _unsolvable(tl: Timeline) -> None:
@@ -616,35 +657,209 @@ async def _unsolvable(tl: Timeline) -> None:
         await asyncio.sleep(0.5)
 
 
-def _waiting(sup: Any) -> str:
-    """What the supervisor says, for a first light that did not finish."""
-    st = sup.status()
-    out = f"the supervisor: {st['reason']}; opening allowed: {st['open_allowed']}"
-    if st.get("lease") is None:
+async def _echo(tl: Timeline) -> None:
+    """Print the focus as it goes: the coarse mode's lines (docs/autofocus.md)
+    and where it ended."""
+    seen = 0
+    while True:
+        events = [e for e in tl.events() if e.what in ("autofocus_coarse_step", "autofocus_done")]
+        for e in events[seen:]:
+            if e.what == "autofocus_coarse_step":
+                print(e.detail.get("line"), flush=True)
+            elif e.detail.get("success"):
+                err = e.detail.get("focus_err") or 0
+                print(f"focus: done at position {e.detail['focus']:.0f} (+-{err:.0f} steps)",
+                      flush=True)  # fmt: skip
+        seen = len(events)
+        await asyncio.sleep(0.2)
+
+
+async def _sun_rises(until: datetime | None) -> None:
+    """Return once this computer's clock reaches ``until`` (the Sun at the
+    gate's altitude: :func:`robofast.sun_gate.check_dark`); never if None."""
+    while True:
+        if until is not None:
+            left = (until - datetime.now(UTC)).total_seconds()
+            if left <= 0:
+                return
+        await asyncio.sleep(1.0 if until is None else min(5.0, max(0.05, left)))
+
+
+def _waiting(st: dict[str, Any]) -> str:
+    """What the supervisor says (its ``status()``), for a first light that
+    did not finish."""
+    out = f"the supervisor: {st.get('reason')}; opening allowed: {st.get('open_allowed')}"
+    lease = st.get("lease")  # in process: its repr; over HTTP: its state
+    if not (isinstance(lease, str) or _outstanding(st) is not None):
         out += "; no lease granted"
-        if sup.alarms:
-            out += f" (its last alarm: {sup.alarms[-1]})"
-    hold = sup.config.reopen_hold
-    if sup.enclosure and st["safe"] and not st["open_allowed"]:
-        out += f" (an enclosure opens after {hold:g} s of safe weather: safety.reopen_hold)"
+        if st.get("alarms"):
+            out += f" (its last alarm: {st['alarms'][-1]})"
+    duty = st.get("duty") or {}
+    if duty.get("attended_only") and not duty.get("on_duty"):
+        out += "; nobody is on duty there (the observer console's duty)"
     return out
 
 
-def _close_bound(sup: Any) -> float:
-    return sup.config.shutter_timeout + 3 * sup.config.poll_interval
+class _Local:
+    """No enclosure: the safety supervisor here, in this process, on the
+    no-enclosure devices (docs/no_enclosure.md), with ``operator`` on duty
+    while first light runs."""
+
+    def __init__(self, config: dict[str, Any], workdir: Path, operator: str, tl: Timeline):
+        self.config, self.workdir, self.operator, self.tl = config, workdir, operator, tl
+
+    async def start(self) -> str:
+        from robofast import supervisor_service
+        from robofast.devices.no_enclosure_server import NoEnclosureConfig, NoEnclosureServer
+        from robofast.modes import ModeStore
+
+        holder: list[Any] = []
+
+        def duty() -> tuple[bool, str]:
+            who = holder[0].duty_status()["on_duty"] if holder else None
+            return who is not None, f"operator {who} on duty" if who else "no operator on duty"
+
+        self.sky = NoEnclosureServer(
+            NoEnclosureConfig(
+                name=str(self.config.get("name", "first-light")),
+                listen="127.0.0.1:0",
+                supervisor="(in process)",
+                poll_interval=0.5,
+                stale_after=5.0,
+            ),
+            duty=duty,
+        ).start()
+        here = {
+            **self.config,
+            "devices": {"dome": self.sky.address, "safetymonitor": self.sky.address},
+        }
+        self.sup = sup = supervisor_service.build(
+            here, self.tl, mode_store=ModeStore(self.workdir / "mode.json")
+        )
+        holder.append(sup)
+        self.server = await supervisor_service.SupervisorServer(sup, "127.0.0.1", 0).start()
+        self.task = asyncio.create_task(sup.run(), name="supervisor")
+        sup.duty_on(self.operator, "first light (robofast first-light)")
+        self.sky.duty.poll()  # the safety monitor reads the duty now, not at its next poll
+
+        async def keep_duty() -> None:
+            while True:
+                await asyncio.sleep(max(1.0, sup.config.duty_ttl / 3))
+                sup.duty_renew(self.operator)
+
+        self.duty = asyncio.create_task(keep_duty(), name="duty")
+        return self.server.url
+
+    def status(self) -> dict[str, Any]:
+        return self.sup.status()
+
+    async def refresh(self) -> None:
+        pass
+
+    async def parked(self) -> bool:
+        return await self.sup._telescopes_parked()
+
+    async def stop(self) -> None:
+        self.duty.cancel()
+        self.sup.duty_off(self.operator, "first light over")
+        # The sky "closes" through the supervisor's own loop (the lease is
+        # gone; park_before_close has parked the telescope).
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.sup.config.shutter_timeout + 3 * self.sup.config.poll_interval
+        while loop.time() < deadline and self.sup.outstanding() is not None:
+            await asyncio.sleep(min(0.5, self.sup.config.poll_interval))
+        self.task.cancel()
+        with contextlib.suppress(BaseException):
+            await self.task
+        await self.server.stop()
+        self.sky.stop()
 
 
-async def _enclosure_closed(sup: Any) -> bool:
-    """Wait (bounded) for the supervisor to read the shutter closed."""
-    from robofast.safety import Shutter
+def _outstanding(status: dict[str, Any]) -> dict[str, Any] | None:
+    """The supervisor's lease (its ``GET /status``) that blocks a new one:
+    granted and not released (an orphan, revoked but never released, too)."""
+    lease = status.get("lease")
+    if isinstance(lease, dict) and not lease.get("released"):
+        return lease
+    return None
 
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + _close_bound(sup)
-    while loop.time() < deadline:
-        if sup.shutter == Shutter.CLOSED and sup.outstanding() is None:
-            return True
-        await asyncio.sleep(min(0.5, sup.config.poll_interval))
-    return False
+
+class _Remote:
+    """An enclosure: the site's own supervisor service at ``url``, which
+    first light is a client of (it starts none). ``telescope``: the mount,
+    read for AtPark at the end."""
+
+    #: How long first light waits, at the end, for the enclosure to read closed.
+    CLOSE_WAIT = 300.0
+
+    def __init__(self, url: str, telescope: discover.Device):
+        self.url, self.telescope = url.rstrip("/"), telescope
+        self._last: dict[str, Any] = {}
+
+    async def _get(self) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+            r = await client.get(f"{self.url}/status")
+            r.raise_for_status()
+            self._last = r.json()
+            return self._last
+
+    async def start(self) -> str:
+        try:
+            st = await self._get()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise FirstLightError(
+                f"no supervisor answers at {self.url} ({exc!r}): at an enclosure, first light"
+                " runs under the site's own supervisor service; start robofast-supervisor on"
+                " the site's config, or give its address with --supervisor"
+            ) from exc
+        lease = _outstanding(st)
+        if lease is not None:
+            holder = lease.get("holder")
+            raise FirstLightError(
+                f"the supervisor at {self.url} has a lease out ({holder}): another sequencer"
+                " is observing; stop it first"
+            )
+        duty = st.get("duty") or {}
+        if duty.get("attended_only") and not duty.get("on_duty"):
+            raise FirstLightError(
+                f"the supervisor at {self.url} opens only with an operator on duty, and nobody"
+                " is: go on duty at the observer console (docs/console.md), then run again"
+            )
+        if st.get("critical"):
+            raise FirstLightError(
+                f"the supervisor at {self.url} has a critical alarm"
+                f" ({'; '.join(map(str, st.get('alarms', [])[-2:]))}): clear it at the observer"
+                " console first"
+            )
+        return self.url
+
+    def status(self) -> dict[str, Any]:
+        return self._last
+
+    async def refresh(self) -> None:
+        with contextlib.suppress(httpx.HTTPError, ValueError):
+            await self._get()
+
+    async def parked(self) -> bool:
+        try:
+            (at,) = await asyncio.to_thread(discover.read_members, self.telescope, ["AtPark"])
+        except discover.OpticsUnavailable:
+            return False
+        return at is True
+
+    async def stop(self) -> None:
+        # The site's supervisor closes the enclosure by its own rules once
+        # the lease is released; say whether it reads closed.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.CLOSE_WAIT
+        while loop.time() < deadline:
+            try:
+                st = await self._get()
+            except (httpx.HTTPError, ValueError):
+                break
+            if st.get("shutter") == "CLOSED" and _outstanding(st) is None:
+                return
+            await asyncio.sleep(2.0)
 
 
 async def run(
@@ -655,68 +870,77 @@ async def run(
     timeout: float = 1800.0,
     stop: asyncio.Event | None = None,
     started: float | None = None,
+    dark_until: datetime | None = None,
+    telescope: discover.Device | None = None,
+    focus: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run first light on ``config`` (already written in ``workdir``);
     return the first-light frame's index entry, with its solve. Raises
     :class:`FirstLightError` saying what stopped it; ``stop`` set (Ctrl-C),
     or this task cancelled (Ctrl-C where the loop has no signal handlers),
     stops the sequencer, whose cleanup parks, and raises
-    :class:`FirstLightStopped` saying whether every telescope parked.
+    :class:`FirstLightStopped` saying whether the telescope parked.
     ``timeout`` counts from ``started`` (:func:`time.monotonic`; default
-    now)."""
-    from robofast import sequencer_service, supervisor_service
+    now); ``dark_until``: when the Sun reaches the gate's altitude, which
+    stops it as a failure. With ``supervisor_url`` in the config (an
+    enclosure) the site's supervisor is used (``telescope``: the mount, for
+    AtPark); else one runs here on the no-enclosure devices."""
+    from robofast import sequencer_service
 
     tl = Timeline(maxlen=20000)
-    sup = supervisor_service.build(config, tl)
-    server = await supervisor_service.SupervisorServer(sup, "127.0.0.1", 0).start()
-    config = {**config, "supervisor_url": server.url}
-    seq, remote = sequencer_service.build(config, tl, base=workdir)
+    remote_url = config.get("supervisor_url")
+    if remote_url:
+        assert telescope is not None
+        side: _Local | _Remote = _Remote(remote_url, telescope)
+    else:
+        side = _Local(config, workdir, operator, tl)
+    url = await side.start()
+    try:
+        seq, remote = sequencer_service.build({**config, "supervisor_url": url}, tl, base=workdir)
+    except BaseException:
+        await side.stop()
+        raise
     (tel,) = config["telescopes"]
-    sup_task = asyncio.create_task(sup.run(), name="supervisor")
-
-    async def keep_duty() -> None:
-        while True:
-            await asyncio.sleep(max(1.0, sup.config.duty_ttl / 3))
-            sup.duty_renew(operator)
-
-    duty = None
-    if sup._attended_only():
-        sup.duty_on(operator, "first light (python -m robofast)")
-        duty = asyncio.create_task(keep_duty(), name="duty")
     seq_task = asyncio.create_task(
         sequencer_service.run(seq, remote, handle_signals=False), name="sequencer"
     )
     stop = stop or asyncio.Event()
-    stopped, parked = False, False
+    stopped, parked, waited = False, False, 0.0
     failure: str | None = None  # why first light stops, said after the cleanup
     try:
-        stop_wait = asyncio.create_task(stop.wait(), name="stop")
-        unsolvable = asyncio.create_task(_unsolvable(tl), name="unsolvable")
-        unfocused = asyncio.create_task(_focus_failed(tl), name="unfocused")
-        failed = asyncio.create_task(_telescope_failed(tl), name="failed")
+        watchers = {
+            "stop": asyncio.create_task(stop.wait(), name="stop"),
+            "unsolvable": asyncio.create_task(_unsolvable(tl), name="unsolvable"),
+            "failed": asyncio.create_task(_observation_failed(tl), name="failed"),
+            "error": asyncio.create_task(_telescope_failed(tl), name="error"),
+            "sun": asyncio.create_task(_sun_rises(dark_until), name="sun"),
+        }
+        echo = asyncio.create_task(_echo(tl), name="echo")
         left = timeout - (time.monotonic() - started) if started is not None else timeout
-        done, _ = await asyncio.wait({seq_task, stop_wait, unsolvable, unfocused, failed},
+        done, _ = await asyncio.wait({seq_task, *watchers.values()},
                                      timeout=max(1.0, left),
                                      return_when=asyncio.FIRST_COMPLETED)  # fmt: skip
-        stop_wait.cancel()
-        unsolvable.cancel()
-        unfocused.cancel()
-        failed.cancel()
+        for w in (*watchers.values(), echo):
+            w.cancel()
         stopped = stop.is_set()
         if stopped:
             pass
-        elif unfocused in done:
-            failure = f"focus: {unfocused.result()}"
-        elif failed in done:
-            failure = failed.result()
-        elif unsolvable in done:
+        elif watchers["sun"] in done:
             failure = (
-                f"the frames did not solve: {_frames(tl)}; check the plate scale"
-                " (the telescope's FocalLength and the camera's pixel size), the focus,"
-                " and that the sky is clear"
+                "the Sun has reached the gate's altitude (--max-sun-alt): stopped for the dawn;"
+                f" {_frames(tl)}"
             )
+        elif watchers["failed"] in done and _unsolved(tl):
+            failure = _not_solved(tl)
+        elif watchers["failed"] in done:
+            failure = _advice(watchers["failed"].result(), focus)
+        elif watchers["error"] in done:
+            failure = watchers["error"].result()
+        elif watchers["unsolvable"] in done:
+            failure = _not_solved(tl)
         elif not done:
-            failure = f"not done after {timeout:g} s; {_frames(tl)}; {_waiting(sup)}"
+            await side.refresh()
+            failure = f"not done after {timeout:g} s; {_frames(tl)}; {_waiting(side.status())}"
     except asyncio.CancelledError:
         stopped = True  # Ctrl-C where the loop has no signal handlers (Windows)
     finally:
@@ -729,27 +953,20 @@ async def run(
         # Every stop says what the mount did, read once the cleanup is over.
         if stopped or failure is not None:
             try:
-                parked = await sup._telescopes_parked()
+                parked = await side.parked()
             except Exception:  # an unreadable mount: not known to be parked
                 parked = False
-        if duty is not None:
-            duty.cancel()
-            sup.duty_off(operator, "first light over")
-        # The enclosure closes through the supervisor's own enclosure loop
-        # (the lease is gone); first light returns once it reads closed.
-        closed = await _enclosure_closed(sup) if sup.enclosure else None
-        sup_task.cancel()
-        with contextlib.suppress(BaseException):
-            await sup_task
-        await server.stop()
+        alarms = list(side.status().get("alarms") or [])
+        await side.stop()
+        closed = side.status().get("shutter") if remote_url else None
     if stopped:
-        raise FirstLightStopped(parked, "; ".join(list(sup.alarms)[-2:]))
+        raise FirstLightStopped(parked, "; ".join(map(str, alarms[-2:])))
     if failure is not None:
         raise FirstLightError(f"{failure}; {_parked_words(parked, waited)}")
-    if closed is False:
+    if remote_url and closed != "CLOSED":
         raise FirstLightError(
-            f"the enclosure did not read closed within {_close_bound(sup):g} s"
-            f" (shutter {sup.status()['shutter']}): check it now"
+            f"the site's supervisor did not read the enclosure closed within"
+            f" {_Remote.CLOSE_WAIT:g} s of the end (shutter {closed}): check it now"
         )
     errors = [e.detail.get("error") for e in tl.events("telescope_error")]
     if not seq.pointing_models:
@@ -771,13 +988,58 @@ async def run(
     if not solve.get("ra") and solve.get("ra") != 0:
         raise FirstLightError(f"the first-light frame {entry.get('file')} did not solve: {solve}")
     entry["model"] = seq.pointing_models[-1].model.terms
-    entry["enclosure"] = None if closed is None else "closed"
+    entry["enclosure"] = None if closed is None else str(closed).lower()
     return entry
+
+
+def _advice(error: str, focus: dict[str, Any] | None) -> str:
+    """A failed observation's error, with what to do for a target too bright
+    for the camera's shortest exposure (the coarse focus's): the brightest
+    listed star up now faint enough (:func:`robofast.autofocus_coarse.fainter_star`).
+    ``focus``: the focus target's ``mag`` and the ``stars_up`` (name, V mag)."""
+    import re
+
+    from robofast.autofocus_coarse import fainter_star
+
+    m = re.search(
+        r"shortest exposure \(([0-9.eE+-]+) s; focus needs about ([0-9.eE+-]+) s\)", error
+    )
+    if m is None or focus is None:
+        return error
+    star = fainter_star(
+        [(str(n), float(v)) for n, v in focus.get("stars_up", [])],
+        float(focus.get("mag", 0.0)),
+        need=float(m.group(2)),
+        shortest=float(m.group(1)),
+    )
+    if star is None:
+        return (
+            f"{error}: run again with --focus-on NAME, a fainter star up now (docs/first_light.md)"
+        )
+    return f"{error}: run again with --focus-on {star[0]} (V {star[1]:g}, up now)"
+
+
+def _sun_targets(
+    config: dict[str, Any], site: tuple[float, float, float], when: datetime
+) -> list[tuple[str, float, float]]:
+    """Where first light will point (name, RA, Dec deg): the calibration's
+    fields over its span, and the zenith (the focus target is chosen away
+    from the Sun: :func:`_focus_step`)."""
+    fields = _fields(config, site, when, _calibration_span(config))
+    *cal, zenith = fields
+    return [("a calibration field", ra, dec) for ra, dec in cal] + [("the zenith", *zenith)]
+
+
+def _fail(text: str) -> NoReturn:
+    print(f"first light: {text}", file=sys.stderr)
+    sys.exit(1)
 
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(
-        prog="robofast", description=__doc__.split("\n\n")[0], epilog="docs/first_light.md"
+        prog="robofast first-light",
+        description=__doc__.split("\n\n")[0],
+        epilog="docs/first_light.md",
     )
     ap.add_argument(
         "--site",
@@ -787,10 +1049,14 @@ def main(argv: list[str] | None = None) -> None:
     enc.add_argument(
         "--no-enclosure",
         action="store_true",
-        help="no dome or roof: the operator on duty judges the weather",
+        help="no dome or roof: the operator on duty judges the weather (docs/no_enclosure.md)",
     )
-    enc.add_argument("--dome", metavar="HOST:PORT/N", help="the enclosure's Alpaca Dome")
-    ap.add_argument("--safety-monitor", metavar="HOST:PORT/N", help="with --dome")
+    enc.add_argument(
+        "--supervisor",
+        metavar="URL",
+        help="an enclosure: the site's running supervisor service (robofast-supervisor),"
+        " which first light asks for a lease",
+    )
     ap.add_argument("--address", default="255.255.255.255", help="where to send discovery")
     ap.add_argument("--discovery-port", type=int, default=discover.DISCOVERY_PORT)
     ap.add_argument("--server", action="append", default=[], metavar="HOST:PORT")
@@ -817,22 +1083,36 @@ def main(argv: list[str] | None = None) -> None:
         type=float,
         help="the telescope's focal ratio, for a mount that does not report its aperture",
     )
+    ap.add_argument(
+        "--max-sun-alt",
+        type=float,
+        default=sun_gate.MAX_SUN_ALT,
+        help=f"refuse, and stop, with the Sun above this altitude (deg; default"
+        f" {sun_gate.MAX_SUN_ALT:g}, nautical twilight; at most {sun_gate.MAX_SUN_ALT_CEILING:g})",
+    )
+    ap.add_argument(
+        "--min-sun-separation",
+        type=float,
+        default=sun_gate.MIN_SUN_SEPARATION,
+        help=f"point nowhere nearer the Sun than this (deg; default"
+        f" {sun_gate.MIN_SUN_SEPARATION:g}; at least {sun_gate.MIN_SUN_SEPARATION_FLOOR:g})",
+    )
     ap.add_argument("--timeout", type=float, default=1800.0, help="give up after (s)")
     ap.add_argument("--log-level", default="WARNING")
     args = ap.parse_args(argv)
     started = time.monotonic()  # --timeout counts from here
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        sun_gate.check_limits(args.max_sun_alt, args.min_sun_separation)
+    except ValueError as exc:
+        ap.error(str(exc))
     site = None
     if args.site:
         try:
             site = _site(args.site)
         except ValueError as exc:
             ap.error(str(exc))
-    if args.dome and not args.safety_monitor:
-        ap.error("--dome needs --safety-monitor (the enclosure's weather verdict)")
-    enclosure = (
-        None if args.no_enclosure else {"dome": args.dome, "safetymonitor": args.safety_monitor}
-    )
+    supervisor_url = args.supervisor
     workdir = Path(args.dir)
     path = workdir / "observatory.json"
     if path.exists():
@@ -842,17 +1122,15 @@ def main(argv: list[str] | None = None) -> None:
     load_plugins(args.plugin)
     servers = list(args.server) or discover.discover(args.address, args.discovery_port, 2.0)
     if not servers:
-        print(f"no Alpaca server answered discovery at {args.address}", file=sys.stderr)
-        sys.exit(1)
+        _fail(f"no Alpaca server answered discovery at {args.address}")
     devices: list[discover.Device] = []
     for server in servers:  # as robofast-discover: a server with no device list is named
         try:
             devices += discover.configured_devices(server)
-        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
-            print(f"first light: {server}: no device list ({exc!r})", file=sys.stderr)
+        except Exception as exc:  # as robofast-discover: named, and passed over
+            print(f"first light: {server}: no device list ({exc})", file=sys.stderr)
     if not devices:
-        print("first light: no Alpaca device answered", file=sys.stderr)
-        sys.exit(1)
+        _fail("no Alpaca device answered")
     for d in devices:
         print(f"found {d.type:<20} {d.spec:<24} {d.name}")
     # One connected session for the reads before anything moves: each device
@@ -868,14 +1146,17 @@ def main(argv: list[str] | None = None) -> None:
             else:
                 whose = "--site"
         except (FirstLightError, discover.OpticsUnavailable) as exc:
-            print(f"first light: {exc}; give the site with --site LAT,LON", file=sys.stderr)
-            sys.exit(1)
+            _fail(f"{exc}; give the site with --site LAT,LON")
         print(f"site {site[0]:.5f}, {site[1]:.5f}, {site[2]:g} m: {whose}")
+        # The Sun first: in daylight nothing else is asked or read.
+        try:
+            sun_gate.check_dark(site, datetime.now(UTC), args.max_sun_alt)
+        except sun_gate.SunGateError as exc:
+            _fail(f"{exc}; the telescope did not move")
         try:
             _check_clock(_one_telescope(devices), site)
         except (FirstLightError, discover.OpticsUnavailable) as exc:
-            print(f"first light: {exc}", file=sys.stderr)
-            sys.exit(1)
+            _fail(str(exc))
         catalog: dict[str, Any] = {"source": args.catalog}
         if args.catalog_dir:
             catalog["cache_dir"] = str(Path(args.catalog_dir).resolve())
@@ -883,14 +1164,13 @@ def main(argv: list[str] | None = None) -> None:
             config = first_light_config(
                 devices,
                 site=site,
-                enclosure=enclosure,
+                supervisor_url=supervisor_url,
                 catalog=catalog,
                 plugins=args.plugin,
                 exptime=args.exptime,
             )
         except (FirstLightError, discover.OpticsUnavailable) as exc:
-            print(f"first light: {exc}", file=sys.stderr)
-            sys.exit(1)
+            _fail(str(exc))
         (tel,) = config["telescopes"]
         print(f"plate scale {config['images']['telescopes'][tel]['plate_scale']} arcsec/pixel")
         camera = next(
@@ -900,27 +1180,32 @@ def main(argv: list[str] | None = None) -> None:
         )
         try:
             size = discover.read_members(camera, ["CameraXSize", "CameraYSize"])
-            # A focus step can happen with a focuser, or a person (no --yes).
-            focusable = "focuser" in config["telescopes"][tel] or not args.yes
-            reads = _focus_reads(config, devices, args.f_ratio) if focusable else {}
+            reads = (
+                _focus_reads(config, devices, args.f_ratio)
+                if "focuser" in config["telescopes"][tel]
+                else {}
+            )
         except discover.OpticsUnavailable as exc:
-            print(f"first light: {exc}", file=sys.stderr)
-            sys.exit(1)
+            _fail(str(exc))
     for line in reads.get("said", []):
         print(f"first light: {line}", flush=True)
-    if args.focus_on:  # a name first light cannot use is refused before the question
-        from robofast import first_focus
+    from robofast import autofocus_coarse
 
+    if args.focus_on:  # a name first light cannot use is refused before the question
         try:
-            first_focus.bright_target(site, datetime.now(UTC), args.focus_on)
-        except first_focus.FocusError as exc:
-            print(f"first light: {exc}", file=sys.stderr)
-            sys.exit(1)
+            autofocus_coarse.bright_target(
+                site,
+                datetime.now(UTC),
+                args.focus_on,
+                min_sun_separation=args.min_sun_separation,
+            )
+        except autofocus_coarse.FocusError as exc:
+            _fail(str(exc))
     # One question: what robofast cannot see, and what the operator must
     # confirm. A mount with no GPS reports its factory site, which may be
     # another continent: points laid for it can be below the real horizon.
     asks = []
-    if enclosure is None:
+    if supervisor_url is None:
         asks.append(
             "No enclosure: robofast cannot see the weather. Is the sky clear, and will you"
             " stay with the telescope until this finishes?"
@@ -932,8 +1217,7 @@ def main(argv: list[str] | None = None) -> None:
     if asks and not args.yes:
         answer = input("\n".join(asks) + " [y/N] ")
         if answer.strip().lower() not in ("y", "yes"):
-            print("first light: not started", file=sys.stderr)
-            sys.exit(1)
+            _fail("not started")
         started = time.monotonic()  # the time taken to answer is not counted
     try:
         radius = _field_radius(config["images"]["telescopes"][tel]["plate_scale"], size)
@@ -961,37 +1245,54 @@ def main(argv: list[str] | None = None) -> None:
                 flush=True,
             )
     except (FirstLightError, discover.OpticsUnavailable) as exc:
-        print(f"first light: {exc}", file=sys.stderr)
-        sys.exit(1)
+        _fail(str(exc))
     except KeyboardInterrupt:
-        print("first light: stopped while fetching the catalog; the telescope did not move",
-              file=sys.stderr)  # fmt: skip
-        sys.exit(1)
+        _fail("stopped while fetching the catalog; the telescope did not move")
     # The zenith now, from the site and this computer's clock (the mount's
     # clock is not read: docs/first_light.md), after the download.
     planned = datetime.now(UTC)
     _zenith(config, _lst_hours(site, planned))
-    from robofast import first_focus
-
+    # The Sun again, now, for everything first light will point at: still
+    # dark (the download took time), and nothing near it.
     try:
-        print(
-            "first light: "
-            + _focus_step(
-                config,
-                devices,
-                site,
-                planned,
-                attended=not args.yes,
-                reads=reads,
-                focus_on=args.focus_on,
-            )
+        dark_until = sun_gate.check_dark(site, planned, args.max_sun_alt)
+        margin = _calibration_span(config) / 240.0  # the sky's turn over the calibration, deg
+        sun_gate.check_targets(
+            site, planned, _sun_targets(config, site, planned), args.min_sun_separation, margin
         )
-    except (discover.OpticsUnavailable, first_focus.FocusError) as exc:
-        print(f"first light: {exc}", file=sys.stderr)
-        sys.exit(1)
+        said, target = _focus_step(
+            config,
+            site,
+            planned,
+            reads=reads,
+            focus_on=args.focus_on,
+            min_sun_separation=args.min_sun_separation,
+        )
+    except (sun_gate.SunGateError, discover.OpticsUnavailable, autofocus_coarse.FocusError) as exc:
+        _fail(f"{exc}; the telescope did not move")
+    print(f"first light: {said}")
+    focus = None
+    if target is not None:
+        focus = {
+            "mag": target.mag,
+            # The listed stars up now (name, V mag): a too-bright target's
+            # stop names one of them for --focus-on.
+            "stars_up": [
+                (t.name, t.mag)
+                for t in autofocus_coarse.targets_up(site, planned, args.min_sun_separation)
+                if t.name != target.name and t.name not in dict(autofocus_coarse.PLANETS)
+            ],
+        }
+    if dark_until is not None:
+        print(
+            f"first light: dark (the Sun below {args.max_sun_alt:g} deg) until"
+            f" {dark_until:%H:%M} UTC; it stops then"
+        )
     workdir.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(config, indent=2) + "\n")
     print(f"wrote {path}")
+    if supervisor_url is not None:
+        print(f"first light: under the site's supervisor at {supervisor_url}")
     print("first light: a pointing calibration (3 plate solves), then one frame at the zenith")
 
     async def go() -> dict[str, Any]:
@@ -1003,21 +1304,23 @@ def main(argv: list[str] | None = None) -> None:
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, stop.set)
         return await run(
-            config, workdir, args.operator, timeout=args.timeout, stop=stop, started=started
+            config,
+            workdir,
+            args.operator,
+            timeout=args.timeout,
+            stop=stop,
+            started=started,
+            dark_until=dark_until,
+            telescope=_one_telescope(devices),
+            focus=focus,
         )
 
     try:
         entry = asyncio.run(go())
     except FirstLightError as exc:
-        print(f"first light: {exc}", file=sys.stderr)
-        sys.exit(1)
+        _fail(str(exc))
     except KeyboardInterrupt:  # a second Ctrl-C, before the cleanup finished
-        print(
-            "first light: stopped before the cleanup finished; the telescope may NOT be"
-            " parked: check it now",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        _fail("stopped before the cleanup finished; the telescope may NOT be parked: check it now")
     solve = entry["solve"]
     target_ra, target_dec = _target(config, "first-light")["ra_hours"] * 15.0, site[0]
     ra, dec = float(solve["ra"]), float(solve["dec"])

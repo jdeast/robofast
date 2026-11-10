@@ -5,10 +5,12 @@ light frame (`robofast/first_light.py`):
 
 ```sh
 pip install .        # this repository, or a wheel built from it (robofast is not on PyPI yet)
-python -m robofast --no-enclosure
+robofast first-light --no-enclosure                   # a telescope on a tripod
+robofast first-light --supervisor http://HOST:8100    # under an enclosure's supervisor
 ```
 
-(`robofast ...` is the same command.) It:
+(`python -m robofast first-light ...` is the same command; `robofast` or
+`python -m robofast` alone prints the subcommands and runs nothing.) It:
 
 1. finds the telescope and camera by Alpaca discovery (docs/discover.md;
    `--address 127.0.0.1` for devices served on this machine, `--server
@@ -18,17 +20,17 @@ python -m robofast --no-enclosure
    site", below; `--site` to give another);
 3. writes the enclosure config itself, `first-light/observatory.json`
    (`--dir`; it never overwrites one);
-4. asks you, with no enclosure, whether the sky is clear and whether you
+4. checks the Sun ("The Sun", below): in daylight, or with the Sun above
+   `--max-sun-alt` (default -12 deg), it stops here;
+5. asks you, with no enclosure, whether the sky is clear and whether you
    will stay with the telescope, and, when the site is the telescope's,
    whether that is where it stands (`--yes` answers yes to all of it): you
    are then the operator on duty (docs/no_enclosure.md) until it finishes;
-5. runs robofast's safety supervisor and sequencer on that config, in this
-   process: a first pointing calibration from three plate solves
+6. runs robofast's sequencer on that config, in this process: a focus
+   ("Focus", below), a first pointing calibration from three plate solves
    (docs/pointing_model.md, "A first calibration"), then one light frame
-   at the zenith, plate-solved (docs/sky.md);
-6. with an enclosure, takes you off duty and waits until the supervisor
-   reads it closed (bounded by `safety.shutter_timeout`; if it does not
-   close, it exits 1 saying so);
+   at the zenith, plate-solved (docs/sky.md). The lease it observes under
+   comes from a safety supervisor ("The enclosure", below);
 7. prints the frame, where it points, how far that is from the target, and
    the pointing model, and exits 0. Anything that stops it exits 1 and
    says what, with what the supervisor says (weather, the reopen hold, the
@@ -36,8 +38,10 @@ python -m robofast --no-enclosure
 
 The frames and their index are under `first-light/data/` (docs/data.md),
 the pointing model under `first-light/pointing/`. The config it wrote is
-an ordinary enclosure config: `robofast-supervisor` and
-`robofast-sequencer` run it as they run any other.
+an ordinary config: with no enclosure, `robofast-no-enclosure-server`
+(on 127.0.0.1:11130), `robofast-supervisor` and `robofast-sequencer` run
+it as they run any other (docs/no_enclosure.md); under an enclosure,
+`robofast-sequencer` runs it against the site's supervisor.
 
 What each line means and what to do after it: docs/first_light_lines.md.
 
@@ -49,7 +53,7 @@ or what it must never guess:
 | | |
 |---|---|
 | `--no-enclosure` | a telescope with no dome or roof: the operator on duty judges the weather. |
-| `--dome HOST:PORT/N --safety-monitor HOST:PORT/N` | an enclosure, and the device whose verdict decides whether it may open. robofast lists the Dome and SafetyMonitor it finds but never chooses one. The enclosure opens only after the weather has been safe for the reopen hold (`safety.reopen_hold`, 20 min by default). |
+| `--supervisor URL` | an enclosure: the site's running supervisor service, which owns it. robofast never chooses a Dome or SafetyMonitor it finds. |
 
 It stops, naming what, when a device cannot report what it needs (a mount
 that does not know its focal length or its site, a camera with no pixel
@@ -70,6 +74,59 @@ sequencer's cleanup (which waits for the park) is over: "the telescope
 parked", or, only if it had not parked by then, "park it by hand now"
 with the time waited. It is one run that stops: running it again takes a
 new `--dir` and focuses again.
+
+## The enclosure
+
+First light never runs an enclosure itself; the safety supervisor does
+(docs/design.md), in one of two ways.
+
+* **No enclosure** (`--no-enclosure`): first light runs the supervisor
+  here, in this process, on the no-enclosure devices (docs/no_enclosure.md:
+  the sky as a Dome that opens and closes at once, the operator's duty as
+  the SafetyMonitor), served on a free loopback port. That is the
+  supervisor's one path, with nothing special for first light: you are on
+  duty while it runs (renewed for you), and going off duty, Ctrl-C or the
+  end revokes the lease, the sequencer parks, and the supervisor parks the
+  telescope again before it "closes" the sky (`park_before_close`, held by
+  the park interlock until the mount reports parked).
+* **An enclosure** (`--supervisor URL`, a permanent installation): the
+  site's own `robofast-supervisor` runs it, and first light starts no
+  supervisor: it asks that one for a lease, as `robofast-sequencer` does,
+  and the enclosure opens and closes only by its rules (its weather, its
+  reopen hold, its modes, its operator duty). First light refuses, before
+  anything moves, if no supervisor answers there ("start robofast-supervisor
+  on the site's config"), if it has a lease out to another sequencer
+  (another program is observing: stop it first), or if it has a critical
+  alarm. At the end it releases the lease and says whether the supervisor
+  then reads the enclosure closed. The telescope first light drives must
+  be one of the site supervisor's telescopes, so that its
+  `park_before_close` parks it: first light cannot check that from the
+  supervisor's API; it is the site's config.
+
+## The Sun
+
+`robofast/sun_gate.py`. With an enclosure or without:
+
+* **Only in the dark.** First light is refused while the Sun is above
+  `--max-sun-alt` (default **-12 deg**: the end of nautical twilight, the
+  dispatch scheduler's default too), saying when it next is, and checked
+  again once the catalog is downloaded. While it runs, it stops (the
+  sequencer parks) when the Sun rises to that altitude. Nautical rather
+  than astronomical twilight (-18): the bright stars, planets and plate
+  solves first light needs are there by then, and the Sun is far below
+  the horizon (the calibration's fields, above 25 deg altitude, are then
+  at least 37 deg from it).
+* **Nowhere near the Sun.** Nothing it points at (the focus target, the
+  calibration's fields over their span, the zenith) may be within
+  `--min-sun-separation` (default **30 deg**) of the Sun: a focus target
+  that is (Venus, low in a twilight sky, can be) is passed
+  over for the next brightest; one named with `--focus-on` is refused;
+  a field is refused before anything moves.
+
+Neither rule can be turned off: `--max-sun-alt` is at most 0 (the Sun
+below the horizon) and `--min-sun-separation` at least 15 deg. With the
+defaults the second rule only matters at a site where the first is
+loosened.
 
 ## The site
 
@@ -137,69 +194,45 @@ the calibration below the horizon, it only stops the frames solving.
 ## Focus
 
 A telescope plugged in for the first time can be so far from focus that
-its stars are disks larger than the chip, and nothing can be measured:
-so first light focuses first (`robofast/first_focus.py`), on the
-brightest planet up, else the brightest star (above 30 deg, from the site
-and this computer's clock; the Moon is not used yet: on a small chip it
-is a disk with no edge in the frame, which needs its own measure).
-`--focus-on NAME` chooses it instead, from these: Venus, Jupiter, Mars,
-Saturn; Sirius, Canopus, Arcturus, Vega, Capella, Rigel, Procyon,
-Betelgeuse, Altair, Aldebaran, Antares, Spica, Pollux, Fomalhaut, Deneb,
-Regulus. A name not on the list, or one below 30 deg now, is refused
-before anything moves.
+its stars are disks larger than the chip, and nothing can be measured.
+So first light focuses first, with the autofocus's **coarse mode**
+(docs/autofocus.md, "Coarse mode": the defocused disk's light, then its
+donut, then the fine sweep), as an ordinary `autofocus` observation, on
+the brightest planet up, else the brightest star (above 30 deg and at
+least `--min-sun-separation` from the Sun, from the site and this
+computer's clock; the Moon is not used: on a small chip it is a disk with
+no edge in the frame). `--focus-on NAME` chooses it instead, from these:
+Venus, Jupiter, Mars, Saturn; Sirius, Canopus, Arcturus, Vega, Capella,
+Rigel, Procyon, Betelgeuse, Altair, Aldebaran, Antares, Spica, Pollux,
+Fomalhaut, Deneb, Regulus. A name not on the list, one below 30 deg now,
+or one too near the Sun is refused before anything moves.
 
-* **Light, then a donut.** Far from focus a star is the image of the
-  telescope's opening, a disk of diameter D = |dz| / N (docs/autofocus.md):
-  its light is spread, so the signal is the frame's level over the sky
-  beside the target (two frames there first, at the exposure and at a
-  quarter of it: many cameras have no shutter for a dark, and the two give
-  the camera's bias, which a shorter exposure keeps). The focuser steps the
-  way the level rises until the disk is whole on the chip. A frame that
-  clips is taken again at a quarter of the exposure, as long as that clips
-  fewer pixels (a hot pixel stays clipped at any exposure, and is not the
-  star's light). Two frames a known step apart then give the disk's
-  size per step, measured (the focuser's units and how far it moves the
-  focal plane are not assumed), and where it reaches zero. A planet in
-  focus is a small disk, which measures as a donut a few pixels across: so
-  from a start already near focus on a planet it still takes the donut's
-  two frames (a few frames more, the same focus).
-* **Then the autofocus's sweep** (docs/autofocus.md) from there, which
-  fits the curve and so does not need that slope to be exact. One frame
-  at the sweep's exposure first: if the only stars in it clip (a planet
-  alone), the sweep is taken at the approach's last unclipped exposure
-  times (seeing / star size)^2, on that one star, or every point of it
-  would clip.
-* **The camera's exposure limits.** Every focus frame is within the
-  camera's `ExposureMin` and `ExposureMax` (where it reports them): the
-  bright frames start at 0.01 s or its minimum, and are never shortened
-  below it. A target too bright for the shortest exposure stops first
+The telescope's `autofocus` entry is written from what the devices report:
+the focal ratio from `FocalLength` and `ApertureDiameter` (or
+`--f-ratio`), the obstruction from `ApertureArea`, the pixel size from the
+plate scale, the camera's full scale (`MaxADU`), the focuser's `StepSize`;
+focus frames stay within the camera's `ExposureMin` and `ExposureMax`.
+The same coarse mode is every autofocus's fallback when its fine mode
+fails, at night too (docs/autofocus.md).
+
+* **A target too bright** for the camera's shortest exposure stops first
   light, saying so and what to run next: `--focus-on` with the brightest
-  listed star up then that is fainter by the magnitudes the exposure is
-  short (2.5 log10 of the camera's shortest over what focus needs); a
-  camera that
-  refuses an exposure stops it at once, in the camera's words, as any
-  device that fails inside the focus step does (the focuser, the mount),
-  and the telescope is parked as at any other stop. A known cost: when
-  the exposure is held at the camera's minimum, a planet that clips there
-  stops shrinking above the size the autofocus takes over at, and the
-  approach spends its eight donut frames before handing over; the focus
-  is found all the same, a few frames later.
+  listed star up now that is fainter by the magnitudes the exposure is
+  short (2.5 log10 of the camera's shortest over what focus needs).
 * **The end of the travel.** If the disk still shrinks at an end of the
-  focuser's travel, the focus is beyond it: first light says which end,
-  and to add (or remove) a spacer or extension.
-* **No focuser.** Without `--yes`, first light walks you through it: a
-  frame, a line saying what the star did and how to turn the knob (as a
-  multiple of your last turn), until it is in focus; `--yes` answers no
-  walk-through (it needs a person), so with `--yes` and no focuser there is
-  no focus step.
+  focuser's travel, the focus is beyond it: it says which end, and to add
+  (or remove) a spacer or extension.
+* **No focuser.** There is no focus step: focus by hand first (on a bright
+  star, until it is smallest), then run first light.
 * **A focuser that moves by steps.** A relative focuser (ASCOM `Absolute`
   false) takes a move as a number of steps, not a position: first light
-  does not drive it (not supported yet), says so, and focus is by hand as
-  with no focuser.
+  does not drive it, says so, and focus is by hand as with no focuser.
+* **A failed focus** (no light, the focus beyond the travel, a device
+  error) stops first light in its words, and the telescope parks.
 
 Measured on the simulated focuser and sky (a 512-pixel chip, f/6.5, a
 47 % obstruction, 2" seeing; the tolerance is docs/autofocus.md's, a
-quarter of the seeing: 43.9 steps):
+quarter of the seeing: 43.9 steps), by Guven Gurkan's first version:
 
 | start (steps from focus) | frames | end (steps from focus) |
 |---|---|---|
@@ -207,13 +240,10 @@ quarter of the seeing: 43.9 steps):
 | 60000 (the disk 1.3 times the chip), the star centred | 12-13 + 9 | +7.8, -8.5 |
 | 60000, the star 150 px from the centre | 25-26 + 9 | +7.8 |
 | the star 230 px from the centre (26 px from the edge) | - | stops: point at it again |
-| the walk-through, a hand exact / 5 % / 15 % off | 7-9 | within 11 / 24 (one 44) / 41 (two 55, 143) |
 
 A disk of an obstructed telescope has a dark centre: one more than about
 three chips across (the chip's diagonal over the obstruction) leaves a
-chip at its centre unlit, and first light says it sees no light. A
-person's hand is the floor of the walk-through: the more exact the turns,
-the closer the focus.
+chip at its centre unlit, and no light is seen.
 
 ## The catalog
 
@@ -248,7 +278,7 @@ sky, served on loopback as plugged-in Alpaca devices (with discovery):
 
 ```sh
 python -m robofast.testing.sky_device --discovery-port 32227 &
-python -m robofast --no-enclosure --address 127.0.0.1 \
+robofast first-light --no-enclosure --address 127.0.0.1 \
     --plugin robofast.testing.sky_device:register --catalog synthetic
 ```
 

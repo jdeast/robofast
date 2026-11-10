@@ -20,11 +20,11 @@ With a telescope and camera plugged into this computer (ASCOM Alpaca):
 
 ```
 pip install .        # this repository, or a wheel built from it: robofast is not on PyPI yet
-python -m robofast --no-enclosure
+robofast first-light --no-enclosure    # or, under an enclosure: --supervisor URL
 ```
 
-finds them, reads their plate scale and the telescope's site, writes the
-config, calibrates the pointing's zero points from three plate solves and
+finds them, reads their plate scale and the telescope's site, checks the
+Sun is down, writes the config, focuses, calibrates the pointing's zero points from three plate solves and
 takes one plate-solved light frame:
 [docs/first_light.md](docs/first_light.md).
 

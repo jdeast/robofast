@@ -1,5 +1,6 @@
-"""``python -m robofast``: first light (:mod:`robofast.first_light`)."""
+"""``python -m robofast``: the subcommands (:mod:`robofast.cli`); with none,
+the help."""
 
-from robofast.first_light import main
+from robofast.cli import main
 
 main()

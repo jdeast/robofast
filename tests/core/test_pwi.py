@@ -512,6 +512,82 @@ async def test_limit_watch_keeps_a_pwi2_slew_that_starts_late(make):
     await tel.aclose()
 
 
+def _pwi2_get(sim: PWISim, query: str) -> None:
+    """A command sent straight to the simulated PWI2 (not through robofast)."""
+    with socket.create_connection(("127.0.0.1", sim.port), timeout=T) as c:
+        c.sendall(f"GET /?{query} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n".encode())
+        while c.recv(65536):
+            pass
+
+
+async def test_limit_watch_leaves_pwi2s_own_home_after_a_power_cycle(make, caplog):
+    """MINERVA T2, 2026-11-09: after a controller power cycle PWI2's
+    encoders read ~0 deg until homed. A findhome sent to PWI2 directly (not
+    through the server) searched downward from 0-18 deg; the limit watch read
+    that as below min_alt 21 and sent stop, aborting every altitude home.
+    Unhomed, or while PWI finds home, the alt/az are not sky positions: the
+    watch stands aside, says so once, and resumes when the mount is homed."""
+    caplog.set_level("INFO", logger="robofast.devices.pwi_server")
+    sim, server = make(
+        "pwi2",
+        sim_kw={"slew_rate": 3.0, "home_search": 4.0, "home_alt": 45.85},
+        min_alt=21.0,
+        max_alt=83.0,
+    )
+    mount = server.mount
+    await asyncio.sleep(0.3)  # the watch runs against a homed mount
+    assert mount.watch_suspended is None
+    with sim.model.lock:
+        sim.model.power_cycle()
+    await until(lambda: _async(mount.watch_suspended is not None), what="watch suspended")
+    assert "encoders_have_been_set" in mount.watch_suspended
+    tel = await device(server)
+    st = json.loads(await tel.call("Action", "Status", "", timeout=T))
+    assert st["watch_suspended"] == mount.watch_suspended and st["homed"] is False
+    # The operator connects, enables and homes in PWI2 itself.
+    _pwi2_get(sim, "device=mount&cmd=connect")
+    _pwi2_get(sim, "device=mount&cmd=enable")
+    # robofast's own moves stay refused while unhomed.
+    with pytest.raises(InvalidOperationException, match="not homed"):
+        await tel.put("SlewToAltAzAsync", Altitude=40.0, Azimuth=100.0, timeout=T)
+    _pwi2_get(sim, "device=mount&cmd=findhome")
+    await until(lambda: _async(sim.model.alt < -1.0), timeout=3, what="home search under way")
+    await until(lambda: _async(sim.model.homed), timeout=8, what="PWI2 home done")
+    assert abs(sim.model.alt - 45.85) < 1e-6
+    assert mount.watch_stops == 0
+    assert not [c for c in sim.model.commands if c.endswith(":stop")]
+    await until(lambda: _async(mount.watch_suspended is None), what="watch resumed")
+    st = json.loads(await tel.call("Action", "Status", "", timeout=T))
+    assert st["watch_suspended"] is None and st["homed"] is True
+    logs = [r.getMessage() for r in caplog.records]
+    assert sum(m.startswith("limit watch suspended") for m in logs) == 1
+    assert sum(m.startswith("limit watch resumed") for m in logs) == 1
+    assert not [m for m in logs if m.startswith("LIMIT")]
+    # Homed again: the watch stops a mount going below the limit, as ever.
+    with sim.model.lock:
+        sim.model.slew_rate = 15.0
+        sim.model.goto_altaz(5.0, 90.0)
+    await until(lambda: _async(mount.watch_stops >= 1), timeout=8, what="watch stop")
+    await until(lambda: _async(not sim.model.state()["slewing"]), timeout=3, what="stopped")
+    assert sim.model.state()["alt"] > 21.0
+    await tel.aclose()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_limit_watch_stands_aside_while_unhomed(make, backend):
+    """Unhomed (PWI2 encoders not set; PWI4 not homed by its flag, or with no
+    flag and no robofast home record) the watch stops nothing, whatever moves
+    the mount; the same move of a homed mount is stopped (the tests above)."""
+    sim, server = make(backend, sim_kw={"slew_rate": 5.0, "alt": 24.0, "homed": False})
+    mount = server.mount
+    await until(lambda: _async(mount.watch_suspended is not None), what="watch suspended")
+    with sim.model.lock:
+        sim.model.goto_altaz(5.0, 90.0)  # something else drives it low
+    await until(lambda: _async(not sim.model.state()["slewing"]), timeout=8, what="move done")
+    assert abs(sim.model.state()["alt"] - 5.0) < 0.01
+    assert mount.watch_stops == 0
+
+
 async def test_pwi2_slew_ends_on_target_although_moving_sticks(make):
     """MINERVA T1, 2026-11-07 23:16:52: after a PWI2 restart its mount
     ``moving`` stuck True; a slew that had arrived (tracking on the target)

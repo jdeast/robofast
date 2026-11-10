@@ -38,7 +38,13 @@ The model, from the legacy driver's use of PWI (``docs/pwi.md``):
   and sets "homed" (after at least ``home_time`` s); PWI4's
   ``/mount/findhome?axis=0|1`` (4.1.7 beta 3+) homes one axis. PWI4 reports
   ``mount.axisN.is_homed`` only with ``report_homed`` (PWI4 4.1.4 did not);
-  PWI2 reports ``encoders_have_been_set``.
+  PWI2 reports ``encoders_have_been_set``. With ``home_search`` (deg, 0 by
+  default) a home of an **unhomed** altitude axis first drives the reported
+  altitude down that far at ``slew_rate`` (the search for the home sensor, in
+  the arbitrary frame the encoders power up in), then the encoders are set
+  and the reported position jumps to the home: as MINERVA T2's PWI2 after a
+  controller power cycle (2026-11-09: from ~0-18 deg, downward at ~2-3 deg/s,
+  then 45.85 deg).
 * PWI4's own altitude limit (``pwi_min_alt``, off by default): a goto
   below it is accepted, the mount stops at the limit and then reports
   slewing *and* tracking until stopped -- what PWI4 4.1.6 does on a CDK700.
@@ -143,6 +149,7 @@ class CDK700Model:
         model_file: str = "",
         stuck_moving: bool = False,
         altaz_tracks: bool = False,
+        home_search: float = 0.0,
     ) -> None:
         self.lat, self.lon = latitude, longitude
         #: PWI2: ``mount.moving`` stuck True (MINERVA T1 after a PWI2
@@ -154,6 +161,10 @@ class CDK700Model:
         self.altaz_tracks = altaz_tracks
         self.slew_rate = slew_rate
         self.home_time = home_time
+        #: An unhomed altitude axis's home first searches this far down (deg).
+        self.home_search = home_search
+        #: A home search is under way: the axes it homes (encoders set at its end).
+        self._searching: tuple[int, ...] = ()
         self.m3_time = m3_time
         self.lock = threading.RLock()
         self.connected = ready
@@ -271,6 +282,15 @@ class CDK700Model:
                     if stuck:
                         # At PWI's limit: still "slewing", and "tracking", forever.
                         self.tracking = True
+                    elif self._searching:
+                        # The home sensor found: the encoders are set, and
+                        # the reported position is the home's.
+                        axes, self._searching = self._searching, ()
+                        self.alt = float(self.home_pos[0])
+                        if 0 in axes:
+                            self.mech = float(self.home_pos[1])
+                        self.altaz, self.mech_target = (self.alt, self.az), self.mech
+                        self.slewing = False
                     else:
                         self.slewing = False
             elif self.tracking:
@@ -303,6 +323,7 @@ class CDK700Model:
         self.stop()
 
     def stop(self) -> None:
+        self._searching = ()
         self.homing_until = 0.0
         self.homing_axes = ()
         self.slewing = False
@@ -323,6 +344,11 @@ class CDK700Model:
             self.radec, self.altaz, self.slewing = None, (alt, az), True
             # The home is a mechanical position (no wrap choice).
             self.mech_target = float(self.home_pos[1]) if 0 in axes else self.mech
+            if self.home_search > 0 and 1 in axes and not self.axes_homed[1]:
+                # Search for the home sensor first (in the unhomed frame).
+                self.altaz = (self.alt - self.home_search, self.az)
+                self.mech_target = self.mech
+                self._searching = axes
             self.homing_axes = axes
             self.homing_until = time.monotonic() + self.home_time
             if self.altaz_tracks:

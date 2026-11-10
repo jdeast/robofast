@@ -189,7 +189,9 @@ python -m robofast.testing.rehearsal --out /tmp/rehearsal \
   verified simulator and none with `--hardware`: nothing it starts can
   reach a real enclosure, PAC or PDU. The hardware gate is unchanged: the
   real device servers are yours, and the rehearsal only talks Alpaca to
-  them.
+  them -- including a PDU server you started with `--hardware` for a
+  `--recovery` policy's `powercycle` rung, which **switches a real
+  outlet** (below).
 * **The mount guard** (`robofast/testing/mount_guard.py`): the
   supervisor and the sequencer reach each real mount only through it.
   Reads pass. It forwards `SlewToCoordinatesAsync` only within 21..83 deg
@@ -203,7 +205,8 @@ python -m robofast.testing.rehearsal --out /tmp/rehearsal \
   guard's flag only once the real mount has answered its own. The camera
   is used directly.
 * **`--recovery NAME=FILE`** (opt-in, per real telescope): the JSON is a
-  sequencer `recovery` entry (docs/recovery.md; no `powercycle`), e.g.
+  sequencer `recovery` entry (docs/recovery.md; MINERVA's:
+  `sites/minerva/remote/t1_recovery.example.json`, `t2_...`), e.g.
   `{"telescope": {"steps": ["reconnect", "restart", "home"], "restart":
   {"command": [...]}}}` with the site's PWI restart hook. In the night it
   is that telescope's recovery ladder in the sequencer, as in production
@@ -211,7 +214,14 @@ python -m robofast.testing.rehearsal --out /tmp/rehearsal \
   homed if PWI says it is not; the PWI server reloads the port's pointing
   model with `pointing_models`). At the preflight a failing telescope gets
   the ladder once, then is read again, and is dropped (a WARNING, a
-  problem in the checks) if it still fails.
+  problem in the checks) if it still fails. A `powercycle` rung (JDE
+  2026-11-10: MINERVA's `panel` and `inst` outlets) power-cycles a real
+  outlet through the PDU server the policy names, under every guard of the
+  ladder (parked -- here the guard's park --, the camera idle and warm
+  enough, one cycle a night per device); a mount's cycle is followed by
+  `MountConnect`, `MotorsEnable` and `FindHome` through the guard
+  (docs/recovery.md, "Power-cycling the mount" and "Running the PDU
+  servers").
 * **Cooling from the site config** (`--site-config FILE`, default
   `sites/minerva/aqawan1.json`, the enclosure config production runs on):
   each real telescope's `cooling` entry there keeps its real camera cooled

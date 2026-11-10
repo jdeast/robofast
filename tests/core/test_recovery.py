@@ -457,9 +457,10 @@ def test_requires_pwi_stop_validation():
         DevicePolicy.from_dict({**PWI_CYCLE, "powercycle": {**pc, "pwi_start": None}})
     with pytest.raises(ValueError, match="requires_parked"):
         DevicePolicy.from_dict({**PWI_CYCLE, "requires_parked": False})
-    with pytest.raises(ValueError, match="for a camera"):
-        RecoveryLadder.from_config("t1", {"telescope": PWI_CYCLE})
-    RecoveryLadder.from_config("t1", {"camera": PWI_CYCLE, "guider": PWI_CYCLE})
+    # The telescope's own (panel) cycle stops and starts PWI too (legacy).
+    RecoveryLadder.from_config(
+        "t1", {"telescope": PWI_CYCLE, "camera": PWI_CYCLE, "guider": PWI_CYCLE}
+    )
 
 
 # -- the guider ------------------------------------------------------------------------------

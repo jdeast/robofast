@@ -48,7 +48,7 @@ the site network; prefer the hop.
 | 7101 / 7102 | T1 / T2 PWI2 HTTP (44444) | `t1_pwi2.json`, `t2_pwi2.json` | in use by the legacy system today |
 | 7141 / 7142 | T1 / T2 PWI4 HTTP (8220, the PC's loopback: second hop, above) | `t1_pwi4.json`, `t2_pwi4.json` | T1: PWI4 4.1.6 installed; T2: not installed |
 | 7151 / 7152 | T1 / T2 ASCOM Remote (Alpaca: cameras, the PC's loopback 11111) | `aqawan1.json` cameras | installed (6.7.1, 32-bit server): camera 0 = science camera, 1 = ZWO; T2 filterwheel 0 |
-| 7162 | T2 PDU through `scripts/snmp_relay.py` on the gateway (below) | `t2_pdu.json` | relay: start it for the session |
+| 7161 / 7162 | T1 / T2 PDU through `scripts/snmp_relay.py` on the gateway (below) | `t1_pdu.json`, `t2_pdu.json` | relay: start it for the session |
 
 Check what is forwarded before starting anything: `ss -ltn | grep ':71'`.
 

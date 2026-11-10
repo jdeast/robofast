@@ -221,9 +221,12 @@ What robofast does:
 * **Nothing homes implicitly**: not starting, not connecting, not enabling,
   not before a slew. The server's `FindHome` (Alpaca, and the `FindHome`
   Action) is refused (NotImplemented, `CanFindHome` false) unless the config
-  says `"allow_find_home": true`; the MINERVA configs say false.
+  says `"allow_find_home": true`. Of the MINERVA configs, T1's and T2's
+  PWI2 configs say true (T1 verified 2026-11-09, T2 2026-11-10: homing is
+  part of recovery); the PWI4 configs say false.
   The recovery ladder's `home` rung (docs/recovery.md) is a client of that
-  `FindHome`: with `allow_find_home` false it is skipped as unavailable.
+  `FindHome`: with `allow_find_home` false it is skipped as unavailable,
+  and a power cycle of the mount's own outlet cannot count as a recovery.
 * The engineering path is `robofast-pwi-jog home --axis 0|1|both`: it asks
   first, prints the position while it runs, and sends stop on Ctrl-C, after
   `home_timeout` s, or (for one axis) if the other axis moves more than

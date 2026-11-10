@@ -1,0 +1,33 @@
+{
+  "_note": [
+    "robofast PDU server (Alpaca Switch) for the MINERVA T1 APC rack PDU (AP7900), through an SSH tunnel: docs/recovery.md, docs/remote.md.",
+    "SNMP is UDP and ssh -L carries TCP only, so the far end of the tunnel is scripts/snmp_relay.py on the site gateway, relaying to the PDU and nothing else; hence pdu.relay true.",
+    "Outlet names are the PDU's own (SNMP sPDUOutletCtlName), read 2026-11-02.",
+    "Only inst (the Andor camera) and panel (the mount electronics) may be switched or power-cycled (JDE 2026-11-10). Cycling panel drops the mount controller: PWI reconnects and the mount is homed again (the recovery ladder's telescope powercycle rung).",
+    "The telcom PC, the heater, the fiber box, the network switch and the monitor can never be switched from here.",
+    "credentials: {\"read\": ..., \"write\": ...} SNMP communities, chmod 600, outside every repository.",
+    "allow_hardware is true, but nothing talks to the real PDU without --hardware on the command line as well (robofast/hwgate.py)."
+  ],
+  "name": "pdu-t1",
+  "listen": "127.0.0.1:11131",
+  "pdu": {
+    "host": "127.0.0.1",
+    "port": 7161,
+    "relay": true,
+    "timeout": 3.0,
+    "retries": 2
+  },
+  "credentials": "~/.config/robofast/pdu-t1.credentials.json",
+  "allow_hardware": true,
+  "outlets": [
+    {"outlet": 1, "name": "T1", "description": "T1 telescope control PC", "writable": false},
+    {"outlet": 2, "name": "panel", "description": "T1 mount panel (the mount controller)", "writable": true, "cycle": true},
+    {"outlet": 3, "name": "inst", "description": "T1 instruments: the Andor camera", "writable": true, "cycle": true},
+    {"outlet": 4, "name": "A1 South Heater", "writable": false},
+    {"outlet": 5, "name": "fiber box", "writable": false},
+    {"outlet": 6, "name": "switch", "description": "network switch", "writable": false},
+    {"outlet": 7, "name": "empty7", "writable": false},
+    {"outlet": 8, "name": "monitor", "writable": false}
+  ],
+  "min_cycle_interval": 600
+}

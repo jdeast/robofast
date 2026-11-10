@@ -23,6 +23,7 @@ import logging
 import os
 import stat
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -174,6 +175,10 @@ class APCPDUSim:
     #: Answer reads but drop every SET unanswered, as an APC does when its
     #: write community is locked out (:meth:`APCPDU.check_write`).
     drop_sets: bool = False
+    #: Called with (outlet, value) after each outlet SET it accepts: a test
+    #: wires what an outlet powers (e.g. a reboot of a mount's outlet power-
+    #: cycles a simulated mount controller).
+    on_set: Callable[[int, int], None] | None = None
 
     def __post_init__(self) -> None:
         self._state = [_Outlet(n) for n in self.outlets]
@@ -269,6 +274,8 @@ class APCPDUSim:
                     o.on, o.back_on = False, time.monotonic() + self.reboot_delay
                 else:
                     o.on, o.back_on = value == ON, None
+                if self.on_set is not None:
+                    self.on_set(n, int(value))
                 return value
             return ON if self.is_on(n) else OFF
         raise LookupError(oid)

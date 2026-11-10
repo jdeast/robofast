@@ -3601,6 +3601,7 @@ class Sequencer:
         filter: str | None,
         extra: dict[str, Any] | None = None,
         exposer: Any = None,
+        sky_beside: Any = None,
     ) -> Autofocus:
         setup, fg = unit.autofocus, state.focusers.get(unit.name)
         if setup is None or fg is None:
@@ -3627,6 +3628,7 @@ class Sequencer:
             values=values,
             event=lambda what, **kw: self._event(what, gen=state.gen, **kw),
             clock=self.clock,
+            sky_beside=sky_beside,
         )
 
     async def _read_altitude(self, unit: TelescopeUnit, tel: Grant) -> None:
@@ -3736,7 +3738,22 @@ class Sequencer:
             data = image.data if isinstance(image, ImageArray) else np.asarray(image)
             return fits_order(data)
 
-        af = self._focus_runner(state, unit, cam, obs.port, obs.filter, extra, expose)
+        async def sky_beside(t1: float, t2: float) -> tuple[np.ndarray, np.ndarray]:
+            # The coarse mode's reference (robofast.autofocus): two frames
+            # 2 deg away in declination, then back on the target.
+            ra_h, dec = obs.ra_hours, obs.dec_deg
+            if ra_h is None or dec is None:
+                ra_h = float(await tel.get("RightAscension"))
+                dec = float(await tel.get("Declination"))
+            await self._goto(state, unit, tel, ra_h, dec + (2.0 if dec < 80.0 else -2.0))
+            try:
+                return await expose(t1), await expose(t2)
+            finally:
+                await self._goto(state, unit, tel, ra_h, dec)
+
+        af = self._focus_runner(
+            state, unit, cam, obs.port, obs.filter, extra, expose, sky_beside=sky_beside
+        )
         unit.focus_restore = float(await fg.get("Position"))
         result = await (af.calibrate() if calibrate else af.run())
         # The run left the focuser at its new focus, or back where it started.

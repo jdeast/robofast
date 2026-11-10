@@ -1,5 +1,6 @@
-"""Focus from far out of focus (robofast.first_focus) on the simulated
-focuser and star field: one bright star, a field of fainter ones."""
+"""The autofocus's coarse mode (robofast.autofocus_coarse): from far out of
+focus on the simulated focuser and star field (one bright star, a field of
+fainter ones), alone and as the fine mode's fallback."""
 
 from __future__ import annotations
 
@@ -10,7 +11,7 @@ import re
 import numpy as np
 import pytest
 
-from robofast.first_focus import FocusError, Level, approach, sweep_settings, walk_through
+from robofast.autofocus_coarse import FocusError, Level, approach, sweep_settings
 from robofast.testing.focus_sim import FocusScene
 from robofast.testing.starfield import Star
 
@@ -108,45 +109,6 @@ async def test_a_star_at_the_chips_edge_says_point_at_it_again():
         await _approach(_scene(off_px=300.0, faint=False), 40000.0)
 
 
-async def test_the_walk_through_brings_a_person_to_focus():
-    """A person who does what each line says (4000 steps a knob turn)."""
-    sc = _scene(faint=False)
-    turn_steps = 4000.0
-    state = {"x": TRUE + 10000.0, "last": 0.0}
-    lines: list[str] = []
-
-    async def expose(t: float) -> np.ndarray:
-        return sc.render(state["x"], t, (0, 0, 512, 512), 1)
-
-    async def ask(prompt: str) -> str:
-        adv, last = lines[-1], state["last"]
-        if "stop here" in adv:
-            return "q"
-        if "quarter turn, either way" in adv:
-            turn = 0.25 * turn_steps
-        elif m := re.search(r"turn (the same way|back), ([0-9.]+) times your last turn", adv):
-            turn = float(m.group(2)) * last * (1 if m.group(1) == "the same way" else -1)
-        elif m := re.search(r"turn a quarter turn, (the same way|back)", adv):
-            sign = 1 if m.group(1) == "the same way" else -1
-            turn = 0.25 * turn_steps * (1 if last >= 0 else -1) * sign
-        elif "turn back, half your last turn" in adv:
-            turn = -0.5 * last
-        elif "the same way, as far as your last turn" in adv:
-            turn = last
-        else:
-            turn = turn_steps * (1.0 if last >= 0 else -1.0)  # no light: a full turn
-        state["x"] += turn
-        state["last"] = turn
-        return ""
-
-    await walk_through(
-        expose, ask, dark=_dark(sc), fwhm_px=2.0, exptime=T, saturation=65535.0,
-        say=lines.append, max_frames=30,
-    )  # fmt: skip
-    assert "stop here" in lines[-1], lines[-3:]
-    assert abs(state["x"] - TRUE) < tolerance(2.0), state["x"] - TRUE
-
-
 def test_a_shortened_frame_is_compared_with_the_dark_at_its_own_exposure():
     """The camera's bias does not shrink with the exposure; the sky does. A
     frame shortened 16x (a bright star near focus) still reads its light, at
@@ -207,7 +169,7 @@ def test_the_sweep_is_shortened_only_when_its_stars_all_clip():
     """At the handover, one frame at the sweep's exposure: stars measured
     unclipped keep it; only clipped ones, and it is the approach's last
     exposure times (FWHM / donut)^2 (the star gathers into the seeing's disk)."""
-    from robofast.first_focus import Approach
+    from robofast.autofocus_coarse import Approach
     from robofast.testing.starfield import Detector, SimOptics, render
 
     opt = SimOptics(pixel_scale=1.0, pixel_size=13.5, f_ratio=6.5, obstruction=0.47)
@@ -222,47 +184,6 @@ def test_the_sweep_is_shortened_only_when_its_stars_all_clip():
     alone = sweep_settings(frame(3e9), 1.0, a, fwhm_px=2.0, saturation=60000.0)
     assert alone["exptime"] == pytest.approx(0.000625 * (2.0 / 8.0) ** 2), alone
     assert alone["min_stars"] == 1
-
-
-async def test_the_kind_refuses_a_focuser_that_moves_by_steps_before_anything_moves():
-    """first_focus in any plan: a relative focuser (Absolute false) is
-    refused before a slew, an exposure or a move."""
-    from types import SimpleNamespace
-
-    from robofast.first_focus import run_first_focus
-    from robofast.sequencer import ObservationFailed
-
-    done: list[str] = []
-
-    class Focuser:
-        async def get(self, name):
-            done.append(f"get {name}")
-            return {"Absolute": False}.get(name, 0)
-
-        async def call(self, name, *args):
-            done.append(f"call {name}")
-
-    class Camera:
-        async def call(self, name, *args):
-            done.append(f"camera {name}")
-            raise AssertionError("exposed")
-
-        get = call
-
-    async def goto(*args):
-        done.append("slew")
-
-    seq = SimpleNamespace(_goto=goto, _event=lambda *a, **k: None)
-    r = SimpleNamespace(
-        sequencer=seq, state=SimpleNamespace(focusers={"t1": Focuser()}),
-        unit=SimpleNamespace(name="t1"), tel=None, cam=Camera(),
-        obs=SimpleNamespace(
-            autofocus={"fwhm_px": 2.0, "saturation": 65535.0}, ra_hours=1.0, dec_deg=10.0
-        ),
-    )  # fmt: skip
-    with pytest.raises(ObservationFailed, match="moves by steps"):
-        await run_first_focus(r)
-    assert done == ["get Absolute"], done
 
 
 async def test_a_camera_minimum_exposure_is_never_asked_below():
@@ -291,73 +212,31 @@ async def test_a_camera_minimum_exposure_is_never_asked_below():
 
 
 def test_a_planet_too_bright_for_the_shortest_exposure_says_so():
-    from robofast.first_focus import Approach
+    from robofast.autofocus_coarse import Approach
     from robofast.testing.starfield import Detector, SimOptics, render
 
     opt = SimOptics(pixel_scale=1.0, pixel_size=13.5, f_ratio=6.5, obstruction=0.47)
     img = render([Star(128.0, 128.0, 3e9)], opt, Detector(shape=(256, 256)), seeing=2.0,
                  exposure=1.0).image  # fmt: skip
     a = Approach(0.0, 0.01, [], exptime=0.1, donut=8.0)
-    from robofast.first_focus import TooBright, too_bright_line
+    from robofast.autofocus_coarse import TooBright
 
     with pytest.raises(TooBright, match="shortest exposure") as exc:
         sweep_settings(img, 1.0, a, fwhm_px=2.0, saturation=60000.0, exposure_min=0.1)
-    # The stop says what to run next, naming a fainter star up now.
-    line = too_bright_line(exc.value, {"mag": -2.5, "stars_up": [["Vega", 0.03], ["Mirfak", 1.79]]})
-    # 0.1 s / 0.0063 s is 3.0 mag: fainter than -2.5 + 3.0 = +0.5, so Mirfak, not Vega.
-    assert "--focus-on Mirfak" in line, line
-    assert "--focus-on NAME" in too_bright_line(exc.value, {"mag": -2.5, "stars_up": []})
-
-
-async def test_a_camera_error_in_the_focus_step_stops_it_in_the_cameras_words():
-    from types import SimpleNamespace
-
-    from robofast.first_focus import run_first_focus
-    from robofast.owner import DeviceError
-    from robofast.sequencer import ObservationFailed
-
-    events: list[tuple[str, dict]] = []
-
-    class Focuser:
-        async def get(self, name):
-            return {"Absolute": True}.get(name, 0)
-
-        async def call(self, name, *args):
-            pass
-
-    class Camera:
-        async def call(self, name, *args):
-            raise DeviceError("InvalidValue: Duration 0.01 below ExposureMin 0.1")
-
-        get = call
-
-    async def goto(*args):
-        pass
-
-    seq = SimpleNamespace(_goto=goto, _event=lambda kind, **k: events.append((kind, k)))
-    r = SimpleNamespace(
-        sequencer=seq, state=SimpleNamespace(focusers={"t1": Focuser()}),
-        unit=SimpleNamespace(name="t1"), tel=None, cam=Camera(),
-        obs=SimpleNamespace(
-            autofocus={"fwhm_px": 2.0, "saturation": 65535.0}, ra_hours=1.0, dec_deg=10.0
-        ),
-    )  # fmt: skip
-    with pytest.raises(ObservationFailed, match=r"ExposureMin 0\.1"):
-        await run_first_focus(r)
-    assert [k for k, _ in events] == ["first_focus_failed"], events
+    assert exc.value.need == pytest.approx(0.1 * (2.0 / 8.0) ** 2)
 
 
 def test_a_target_is_chosen_by_name_and_refused_if_unknown_or_low():
     from datetime import UTC, datetime
 
-    from robofast.first_focus import bright_target, targets_up
+    from robofast.autofocus_coarse import bright_target, targets_up
 
     site, when = (42.38, -71.13, 0.0), datetime(2026, 11, 7, 3, 0, 0, tzinfo=UTC)
     up = targets_up(site, when)
     assert up and bright_target(site, when).name == up[0].name
     other = up[-1]
     assert bright_target(site, when, other.name.lower()).name == other.name
-    with pytest.raises(FocusError, match=r"Nostar.*not one first light knows"):
+    with pytest.raises(FocusError, match=r"Nostar.*not one robofast knows"):
         bright_target(site, when, "Nostar")
     with pytest.raises(FocusError, match=r"Canopus.*below"):
         bright_target(site, when, "Canopus")
@@ -366,9 +245,150 @@ def test_a_target_is_chosen_by_name_and_refused_if_unknown_or_low():
 def test_a_too_bright_target_names_a_fainter_star_by_its_rule():
     """The brightest listed star up now at least as many magnitudes fainter
     as the exposure is short: 2.5 log10(minimum / needed)."""
-    from robofast.first_focus import fainter_star
+    from robofast.autofocus_coarse import fainter_star
 
     up = [("Vega", 0.03), ("Deneb", 1.25), ("Mirfak", 1.79)]
     # Jupiter (-2.5) needs 0.01 s on a camera whose shortest is 0.1 s: 2.5 mag fainter.
     assert fainter_star(up, -2.5, need=0.01, shortest=0.1) == ("Vega", 0.03)
     assert fainter_star(up, -2.5, need=0.001, shortest=0.1) is None  # 5 mag: none listed
+
+
+# -- the coarse mode in robofast.autofocus: alone, and as the fine mode's fallback ---------
+
+
+def _beside(sc: FocusScene):
+    """The sky beside the target: the scene without its stars."""
+    empty = dataclasses.replace(sc, stars=[])
+
+    async def sky_beside(t1: float, t2: float) -> tuple[np.ndarray, np.ndarray]:
+        return (
+            empty.render(sc.true_focus, t1, (0, 0, 512, 512), 1),
+            empty.render(sc.true_focus, t2, (0, 0, 512, 512), 1),
+        )
+
+    return sky_beside
+
+
+def _coarse_config(**kw):
+    base = dict(
+        exptime=1.0, coarse_exptime=T, coarse_step=2000.0, max_seeing=2.0, saturation=65535.0
+    )
+    base.update(kw)
+    return config(**base)
+
+
+@pytest.mark.parametrize("offset", [40000.0, -20000.0])
+async def test_the_coarse_mode_reaches_focus_from_far_out(offset):
+    sc = _scene()
+    rig = Rig(sc, position=TRUE + offset, max_step=120000)
+    af = rig.autofocus(_coarse_config(mode="coarse"), sky_beside=_beside(sc))
+    res = await af.run()
+    rig.close()
+    assert res.success, res.message
+    assert res.used == "coarse" and res.method == "coarse"
+    assert abs(res.focus - TRUE) < tolerance(2.0), res.focus - TRUE
+    assert abs(rig.focuser.optical - TRUE) < tolerance(2.0)
+    lines = res.details["coarse"]["lines"]
+    assert lines and all(ln.startswith("focus: ") for ln in lines)
+    assert [w for w, _ in af.events].count("autofocus_coarse_step") == len(lines)
+
+
+@pytest.mark.parametrize("method", ["vcurve", "donut", "sweep"])
+async def test_a_failed_fine_focus_falls_back_to_the_coarse_mode(method):
+    """The fine mode, started 40000 steps out (the stars cover the chip),
+    cannot give a focus; the coarse mode takes it from the same start."""
+    sc = _scene()
+    rig = Rig(sc, position=TRUE + 40000.0, max_step=120000)
+    # (fallback false: the fine mode's own sweep fallback is not this test's)
+    cfg = _coarse_config(method=method, fallback=False)
+    af = rig.autofocus(cfg, sky_beside=_beside(sc))
+    res = await af.run()
+    rig.close()
+    assert res.success, res.message
+    assert res.used == "coarse" and res.method == method
+    assert res.fallbacks and res.fallbacks[-1].startswith("fine (")
+    assert ("autofocus_fallback", "coarse") in [(w, d.get("to")) for w, d in af.events]
+    assert abs(res.focus - TRUE) < tolerance(2.0), res.focus - TRUE
+
+
+@pytest.mark.parametrize("why", ["disabled", "no reference"])
+async def test_without_the_fallback_a_failed_fine_focus_fails_back_at_its_start(why):
+    sc = _scene()
+    start = TRUE + 40000.0
+    rig = Rig(sc, position=start, max_step=120000)
+    if why == "disabled":
+        af = rig.autofocus(_coarse_config(coarse_fallback=False), sky_beside=_beside(sc))
+    else:
+        af = rig.autofocus(_coarse_config())
+    res = await af.run()
+    rig.close()
+    assert not res.success
+    assert "autofocus_coarse_step" not in [w for w, _ in af.events]
+    assert rig.focuser.Position == start
+
+
+async def test_the_coarse_mode_refuses_a_focuser_that_moves_by_steps_before_moving():
+    sc = _scene()
+    start = TRUE + 40000.0
+    rig = Rig(sc, position=start, max_step=120000)
+    rig.focuser.Absolute = False
+    beside: list[float] = []
+
+    async def sky_beside(t1, t2):
+        beside.append(t1)
+        return await _beside(sc)(t1, t2)
+
+    res = await rig.autofocus(_coarse_config(mode="coarse"), sky_beside=sky_beside).run()
+    rig.close()
+    assert not res.success and "moves by steps" in res.message
+    assert not beside and not res.points and rig.focuser.Position == start
+
+
+async def test_a_coarse_focus_with_no_light_fails_back_at_its_start():
+    """The bright star off the chip and no field: the whole travel is
+    searched, nothing is found, and the focuser goes back where it was."""
+    sc = _scene(off_px=700.0, faint=False)
+    start = TRUE + 40000.0
+    rig = Rig(sc, position=start, max_step=120000)
+    res = await rig.autofocus(_coarse_config(mode="coarse"), sky_beside=_beside(sc)).run()
+    rig.close()
+    assert not res.success and "no light at any focus position" in res.message
+    assert rig.focuser.Position == start
+
+
+async def test_a_camera_error_in_the_coarse_mode_is_the_cameras():
+    """Device errors propagate (the sequencer treats them as the
+    telescope's), in the coarse mode as in the fine."""
+    from robofast.owner import DeviceError
+
+    sc = _scene()
+    rig = Rig(sc, position=TRUE + 40000.0, max_step=120000)
+
+    async def sky_beside(t1, t2):
+        raise DeviceError("t1.camera: InvalidValue: Duration below ExposureMin")
+
+    with pytest.raises(DeviceError, match="ExposureMin"):
+        await rig.autofocus(_coarse_config(mode="coarse"), sky_beside=sky_beside).run()
+    rig.close()
+
+
+def test_a_mode_is_checked_at_startup():
+    with pytest.raises(ValueError, match=r"autofocus\.mode"):
+        config(mode="rough").validate()
+    with pytest.raises(ValueError, match="coarse_step"):
+        config(coarse_step=0).validate()
+
+
+def test_a_target_near_the_sun_is_passed_over_or_refused_by_name():
+    from datetime import UTC, datetime
+
+    from robofast.autofocus_coarse import bright_target, targets_up
+
+    site, when = (42.38, -71.13, 0.0), datetime(2026, 11, 7, 3, 0, 0, tzinfo=UTC)
+    every = targets_up(site, when)
+    assert every and all(0 <= t.sun <= 180 for t in every)
+    nearest = min(every, key=lambda t: t.sun)
+    kept = targets_up(site, when, min_sun_separation=nearest.sun + 0.1)
+    assert nearest.name not in [t.name for t in kept]
+    with pytest.raises(FocusError, match=rf"{nearest.name}.*from the Sun"):
+        bright_target(site, when, nearest.name, min_sun_separation=nearest.sun + 0.1)

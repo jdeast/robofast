@@ -103,6 +103,9 @@ plan:
  "pointing": {"min_points": 3, "terms": ["IH", "ID"]}}
 ```
 
+Fixed `terms` must be the mount's TPOINT names (equatorial or alt-az),
+no more of them than `min_points`; otherwise the run is refused
+(`unsupported`, not retried) before the telescope moves.
 Its cross-validated rms is not defined (fewer points than folds). A full
 run (`min_points` 12) replaces it once the sky is clear for long enough.
 

@@ -3220,6 +3220,22 @@ class Sequencer:
         unknown = set(run) - set(POINTING_RUN_DEFAULTS)
         if unknown:
             raise ObservationFailed(f"pointing run: unknown settings {sorted(unknown)}")
+        if run["terms"] is not None:
+            # Checked before the telescope moves, not after the run's points.
+            from robofast.pointing import ALTAZ_TERMS, EQUATORIAL_TERMS
+
+            known = ALTAZ_TERMS if pc.mount == "altaz" else EQUATORIAL_TERMS
+            terms = run["terms"]
+            # A config error: never retried (a static plan re-queues a failure).
+            if isinstance(terms, str) or not terms or any(t not in known for t in terms):
+                raise Unsupported(
+                    f"pointing run: terms {terms!r} must be a list of {pc.mount}"
+                    f" TPOINT terms ({', '.join(known)})"
+                )
+            if run["min_points"] < len(terms):
+                raise Unsupported(
+                    f"pointing run: min_points {run['min_points']} cannot carry {len(terms)} terms"
+                )
         await self._vendor_model_off(state, unit, tel)
         lst0 = float(await tel.get("SiderealTime")) * 15.0
         avoid = []

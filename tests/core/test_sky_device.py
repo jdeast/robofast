@@ -44,3 +44,19 @@ def test_a_held_sky_does_not_move(tmp_path):
         assert live.mount.SiderealTime != first[1]  # the control: a live sky moves
     finally:
         held.stop(), live.stop()
+
+
+@pytest.mark.parametrize("focuser", [True, False])
+def test_a_focuser_is_served_off_focus_or_not_at_all(tmp_path, focuser):
+    d = SkyDevice(
+        catalog={"cache_dir": str(tmp_path)},
+        focus_error=3000,
+        focuser=focuser,
+        discovery_port=None,
+    ).start()
+    try:
+        types = {x.type for x in configured_devices(d.address)}
+    finally:
+        d.stop()
+    assert ("Focuser" in types) is focuser
+    assert d.focuser.Position == 23000  # true focus is 20000

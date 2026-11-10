@@ -3,6 +3,7 @@
 Focusing a telescope by *computing* the focus from star sizes measured on
 one known side of it, rather than by searching for the smallest star.
 `robofast/autofocus.py` (the methods and the runner),
+`robofast/autofocus_coarse.py` (the coarse mode),
 `robofast/starmeasure.py` (star sizes), `robofast/focusfit.py`
 (the fits), `robofast/autofocus_plan.py` (when to focus), and the
 sequencer's `kind="autofocus"` observations (design.md section 3.4).
@@ -130,6 +131,55 @@ of it. If the smallest star is at the sweep's edge, the sweep is re-centred
 there once (`sweep_recentre`). Otherwise the run fails. The **fit's** focus
 is always used: it is never replaced by a model value or by the best single
 point.
+
+### Coarse mode (`mode: "coarse"`; also the fallback): from far out of focus
+
+The methods above are the **fine** mode: they start from a focus they can
+see. A telescope plugged in for the first time, or one whose focus was
+lost, can be so far out that a star's image covers the chip and nothing is
+measured. The **coarse** mode (`robofast/autofocus_coarse.py`, first
+proposed by Guven Gurkan, PR #132) starts there, on a bright planet or star
+(or a field):
+
+1. **The reference.** Two frames of the sky beside the target (the
+   sequencer offsets the telescope 2 deg in declination, then returns),
+   at the coarse exposure and a quarter of it: the sky and the camera's
+   bias, which the frames' light is measured against.
+2. **Light.** A frame at the start, then a step either way (`coarse_step`,
+   default the focuser's travel / 64), the step doubled until one way is
+   lit: the frame's level above the reference, or a measured donut. The
+   whole travel unlit stops it ("no light at any focus position").
+3. **Climb.** Steps the way the level rises (the defocused disk shrinking
+   onto the chip), reversing at half the step when it falls, until one
+   whole donut is measured. Still rising at an end of the travel: the
+   focus is beyond it, and it says which spacer to add or remove.
+4. **Donut.** Two frames a known step apart give the donut's diameter per
+   step *as measured* (so neither the focuser's units nor how far it moves
+   the focal plane are assumed), and where it reaches zero; it moves
+   there, stopping short on its side, until the donut is under 8 seeing
+   FWHM (`max_seeing`).
+5. **Sweep.** The fine sweep from there, sized by the measured slope (it
+   sets `optics.focal_plane_factor` for the run), at an exposure from one
+   frame at the handover: a planet alone, whose every point would clip,
+   gets `exptime x (FWHM / donut)^2` and `min_stars` 1.
+
+Every frame stays within the camera's `ExposureMin`; a frame that clips is
+taken again shorter (but not for a hot pixel, which a shorter exposure does
+not change). A focuser that moves by steps (`Absolute` false) is refused
+before anything moves. Each step is one line (timeline event
+`autofocus_coarse_step`; the run's `details.coarse.lines`).
+
+**As the fallback.** When the fine mode cannot give a focus (no stars, a
+failed fit), the coarse mode is run from the same start
+(`coarse_fallback`, default true; event `autofocus_fallback` with
+`to: "coarse"`), and the result's `used` is `coarse`. It costs the two
+reference frames and the approach's frames, and fails back at the start
+like any run. Device errors are not caught: they are the telescope's.
+Without the sequencer's reference (an `Autofocus` built with no
+`sky_beside`) there is no coarse mode and no fallback.
+
+`robofast.autofocus_coarse.bright_target` names a planet or bright star up
+(above 30 deg) to focus on, optionally at least a given angle from the Sun.
 
 ### Expected exposure counts
 
@@ -299,6 +349,10 @@ model, like any, only predicts where an autofocus starts.
 
   A failed autofocus is not retried for `retry_after` (30 min). The
   telescope observes on at its old focus meanwhile.
+* **The coarse fallback.** The sequencer gives every run the coarse
+  mode's reference (two frames 2 deg away in declination, then back on
+  the target), so a fine run that finds no focus tries the coarse mode
+  before it fails (`coarse_fallback: false` to skip it).
 * **Failure is not an error.** An autofocus that finds no focus is
   reported `failed`, with no backoff or park, and the telescope observes
   on. A focuser *device* error is the telescope's error, as usual.
@@ -315,7 +369,8 @@ model, like any, only predicts where an autofocus starts.
   * The focus frames are saved with `IMAGETYP = 'FOCUS'`, and `FOCPOS`
     comes from the focuser.
   * Timeline events: `autofocus_start`, `autofocus_point`,
-    `autofocus_wrong_side`, `autofocus_fallback` and `autofocus_done`.
+    `autofocus_wrong_side`, `autofocus_fallback`, `autofocus_coarse_step` and
+    `autofocus_done`.
   * The plan record gets an `autofocus` entry when the plan keeps one.
   * The store keeps a history of the last 200 runs.
 
@@ -349,6 +404,10 @@ with `-` for any):
 | `min_stars` | 3 | fewest measured stars per frame |
 | `measure` | {} | `MeasureConfig` fields (`saturation`, `region`, ...) |
 | `verify` | false | one more exposure at the new focus |
+| `mode` | `fine` | `fine` (`method`) or `coarse` (from far out of focus) |
+| `coarse_fallback` | true | run the coarse mode when the fine mode fails |
+| `coarse_exptime`, `coarse_step` | `exptime`, travel / 64 | the coarse mode's first exposure and step |
+| `saturation` | camera's `MaxADU` | full scale, for the coarse mode's clipping |
 
 Also in the entry: `model` (above), `store` (the JSON file, relative to
 the config file) and `overrides`.

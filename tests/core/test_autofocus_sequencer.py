@@ -125,6 +125,42 @@ async def test_a_failed_autofocus_is_not_the_telescopes_fault(make_rig):
     assert rig.focuser.Position == TRUE_FOCUS + 200
     assert inner.history == [("t1", "field", "complete", 2)]
     assert rig.sequencer.registry.get("t1.autofocus.success").value is False
+    # The coarse fallback was tried (clouds: no light either) and failed back.
+    assert [e.detail.get("to") for e in rig.timeline.events("autofocus_fallback")] == ["coarse"]
+    assert "coarse" in res.message
+
+
+async def test_a_lost_focus_is_found_by_the_coarse_fallback(make_rig):
+    """The focuser 9000 steps out (90 px donuts): the fine run cannot give
+    a focus, the coarse mode does, from the reference 2 deg away."""
+    af = Observation("focus", ra_hours=1.0, dec_deg=10.0, kind="autofocus")
+    plan = StaticPlan([], ["t1"])
+    plan.queues["t1"].append(af)
+    rig, unit = focus_rig(make_rig, plan, start=TRUE_FOCUS + 9000)
+    unit.autofocus.base.update(method="sweep", sweep_recentre=0, max_seeing=2.0)
+    await run_to_end(rig)
+    [res] = unit.autofocus_results
+    assert res.success, res.message
+    assert res.used == "coarse" and res.fallbacks
+    assert abs(rig.focuser.optical - TRUE_FOCUS) < tolerance(2.0)
+    decs = [dec for _, dec in rig.tel.slews]
+    assert any(abs(d - 12.0) < 1e-6 for d in decs), decs  # the sky beside
+    assert abs(decs[-1] - 10.0) < 1e-6  # back on the target
+    assert [h[1:3] for h in plan.history] == [("focus", "complete")]
+
+
+async def test_a_coarse_autofocus_observation(make_rig):
+    af = Observation(
+        "focus", ra_hours=1.0, dec_deg=10.0, kind="autofocus",
+        autofocus={"mode": "coarse", "max_seeing": 2.0},
+    )  # fmt: skip
+    plan = StaticPlan([], ["t1"])
+    plan.queues["t1"].append(af)
+    rig, unit = focus_rig(make_rig, plan, start=TRUE_FOCUS - 9000)
+    await run_to_end(rig)
+    [res] = unit.autofocus_results
+    assert res.success and res.method == "coarse" and not res.fallbacks, res.message
+    assert abs(rig.focuser.optical - TRUE_FOCUS) < tolerance(2.0)
 
 
 async def test_an_autofocus_cut_short_is_undone_before_the_next_observation(make_rig):

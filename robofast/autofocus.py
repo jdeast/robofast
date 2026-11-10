@@ -32,6 +32,15 @@ sizes measured on one known side of it, instead of searched for:
   positions through focus, a robust weighted fit (hyperbola, or the
   legacy parabola with its bugs fixed), and the **fit's** focus is used.
 
+These are the **fine** mode. The **coarse** mode (``mode="coarse"``,
+:mod:`robofast.autofocus_coarse`) starts where no star can be measured
+(a new telescope, a lost focus): it follows the light of a bright object's
+defocused disk, then its donut, to near focus, then runs the sweep. It is
+also the fine mode's automatic fallback (``coarse_fallback``): when the
+fine mode cannot give a focus, the coarse mode is run from the same start.
+It needs frames of the sky beside the target (``sky_beside``: the
+sequencer offsets the telescope) as the reference of the frames' light.
+
 Every focuser move ends travelling *from the configured side* (toward
 ``-side``), overshooting by ``backlash`` steps first when it would
 otherwise arrive from the other side, so mechanical backlash never shifts
@@ -67,7 +76,7 @@ import math
 import os
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -90,6 +99,7 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "METHODS",
+    "MODES",
     "Autofocus",
     "AutofocusConfig",
     "AutofocusFailed",
@@ -106,6 +116,8 @@ __all__ = [
 ]
 
 METHODS = ("vcurve", "donut", "sweep")
+#: The fine mode (METHODS) starts near focus; the coarse one from far out.
+MODES = ("fine", "coarse")
 #: HFD of a seeing-limited star over its FWHM (Moffat, beta ~ 4.8).
 HFD_PER_FWHM = 1.2
 
@@ -247,6 +259,18 @@ class AutofocusConfig:
     measure: dict[str, Any] = field(default_factory=dict)
     #: Take one more exposure at the final focus and report its FWHM/HFD.
     verify: bool = False
+    #: "fine" (``method``) or "coarse" (from far out of focus; module doc).
+    mode: str = "fine"
+    #: When the fine mode cannot give a focus, run the coarse mode from the
+    #: same start (only where the runner has ``sky_beside``).
+    coarse_fallback: bool = True
+    #: The coarse mode's first exposure (s; None: ``exptime``), shortened
+    #: as the light gathers, never below the camera's ExposureMin.
+    coarse_exptime: float | None = None
+    #: The coarse mode's first focuser step (None: the travel / 64).
+    coarse_step: float | None = None
+    #: The camera's full scale (ADU; None: its MaxADU, else 65535).
+    saturation: float | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> AutofocusConfig:
@@ -278,6 +302,12 @@ class AutofocusConfig:
             raise ValueError("autofocus.vcurve_model must be 'linear' or 'hyperbola'")
         if self.sweep_fit not in ("hyperbola", "parabola"):
             raise ValueError("autofocus.sweep_fit must be 'hyperbola' or 'parabola'")
+        if self.mode not in MODES:
+            raise ValueError(f"autofocus.mode {self.mode!r}: expected one of {MODES}")
+        for name in ("coarse_exptime", "coarse_step", "saturation"):
+            v = getattr(self, name)
+            if v is not None and v <= 0:
+                raise ValueError(f"autofocus.{name} must be > 0")
         if self.sweep_points < 5 or self.calibration_points < 7:
             raise ValueError("autofocus: sweep_points >= 5 and calibration_points >= 7")
         o = self.optics
@@ -605,6 +635,8 @@ def publish_result(registry: Any, telescope: str, result: AutofocusResult) -> No
 # -- exposures -------------------------------------------------------------------------
 
 Exposer = Callable[[float], Awaitable[np.ndarray]]
+#: ``sky_beside(t1, t2)``: two frames of the sky beside the target.
+SkyBeside = Callable[[float, float], Awaitable[tuple[np.ndarray, np.ndarray]]]
 
 
 def camera_exposer(
@@ -639,7 +671,9 @@ class Autofocus:
     :func:`camera_exposer` on ``camera``. ``store`` keeps calibrations and
     the model's zero point under ``key``; ``model`` predicts the start from
     ``values()`` (registry value names -> values). ``event`` is called as
-    ``event(what, **detail)`` for the timeline.
+    ``event(what, **detail)`` for the timeline. ``sky_beside(t1, t2)``
+    returns two frames (``t1`` and ``t2`` s) of the sky beside the target,
+    the coarse mode's reference; without it there is no coarse mode.
     """
 
     def __init__(
@@ -656,6 +690,7 @@ class Autofocus:
         values: Callable[[], dict[str, float | None]] | None = None,
         event: Callable[..., None] | None = None,
         clock: Callable[[], datetime] | None = None,
+        sky_beside: SkyBeside | None = None,
     ) -> None:
         if exposer is None and camera is None:
             raise ValueError("give a camera grant or an exposer")
@@ -684,6 +719,9 @@ class Autofocus:
         self._approached: float | None = None  # last position reached from `side`
         self._result: AutofocusResult | None = None
         self._binning = 1
+        self.sky_beside = sky_beside
+        #: Where the expected star size is smallest, if not the run's start.
+        self._centre: float | None = None
 
     # -- public -------------------------------------------------------------------
 
@@ -706,12 +744,16 @@ class Autofocus:
         return near, far
 
     async def run(
-        self, method: str | None = None, *, start: float | None = None
+        self, method: str | None = None, *, start: float | None = None, mode: str | None = None
     ) -> AutofocusResult:
-        """Focus: ``method`` (default: the config's). Returns the result,
-        with the focuser at the new focus (or back at the start, on failure)."""
-        method = method or self.config.method
-        if method not in METHODS:
+        """Focus: ``method`` (default: the config's) in ``mode`` (default:
+        the config's; "coarse" ends in the sweep). Returns the result, with
+        the focuser at the new focus (or back at the start, on failure)."""
+        mode = mode or self.config.mode
+        if mode not in MODES:
+            raise ValueError(f"autofocus mode {mode!r}")
+        method = "coarse" if mode == "coarse" else method or self.config.method
+        if mode == "fine" and method not in METHODS:
             raise ValueError(f"autofocus method {method!r}")
         return await self._run(method, start, calibrate=False)
 
@@ -747,13 +789,23 @@ class Autofocus:
                 if calibrate:
                     focus, err = await self._calibrate(start)
                     res.used = "calibrate"
-                elif method == "vcurve":
-                    focus, err = await self._vcurve_with_fallback(start)
-                elif method == "donut":
-                    focus, err = await self._donut_with_fallback(start)
+                elif method == "coarse":
+                    focus, err = await self._coarse(start)
                 else:
-                    focus, err = await self._sweep(start)
-                    res.used = res.used or "sweep"
+                    try:
+                        focus, err = await self._fine(method, start)
+                    except AutofocusFailed as exc:
+                        if not (cfg.coarse_fallback and self.sky_beside is not None):
+                            raise
+                        res.fallbacks.append(f"fine ({res.used or method}) failed: {exc}")
+                        self._event(
+                            "autofocus_fallback",
+                            telescope=self.telescope,
+                            reason=str(exc),
+                            to="coarse",
+                        )
+                        log.warning("%s: fine focus failed (%s); coarse", self.telescope, exc)
+                        focus, err = await self._coarse(start)
             except AutofocusFailed as exc:
                 res.success = False
                 res.message = str(exc)
@@ -791,6 +843,138 @@ class Autofocus:
         return res
 
     # -- methods -------------------------------------------------------------------
+
+    async def _fine(self, method: str, start: float) -> tuple[float, float]:
+        res = self._result
+        assert res is not None
+        if method == "vcurve":
+            return await self._vcurve_with_fallback(start)
+        if method == "donut":
+            return await self._donut_with_fallback(start)
+        focus, err = await self._sweep(start)
+        res.used = res.used or "sweep"
+        return focus, err
+
+    async def _coarse(self, start: float) -> tuple[float, float]:
+        """The coarse mode (module doc; :mod:`robofast.autofocus_coarse`):
+        the approach from ``start``, then the sweep from where it ended,
+        sized by the donut's measured slope."""
+        from robofast.autofocus_coarse import FocusError, Level, approach, sweep_settings
+
+        cfg = self.config
+        res = self._result
+        assert res is not None
+        res.used = "coarse"
+        if self.sky_beside is None:
+            raise AutofocusFailed("coarse: no reference (the sky beside the target)")
+        try:
+            # Before anything moves: a focuser that moves by steps would
+            # take a position as that many steps.
+            if await self.focuser.get("Absolute") is False:
+                raise AutofocusFailed(
+                    "coarse: the focuser moves by steps, not to positions (Absolute false)"
+                )
+        except DeviceError:
+            pass  # not reported: an absolute focuser (ASCOM's default)
+        lo, hi = await self._bounds()
+        if not math.isfinite(hi):
+            raise AutofocusFailed("coarse: the focuser's travel is unknown (set max_position)")
+        saturation, exposure_min = await self._camera_limits()
+        t = max(cfg.coarse_exptime or cfg.exptime, exposure_min)
+        t2 = t / 4.0 if t / 4.0 >= exposure_min else 4.0 * t
+        beside, beside2 = await self.sky_beside(t, t2)
+        res.exposures += 2
+        dark = Level.of(beside, beside2, t, t2)
+        b = self._binning
+        fwhm_px = cfg.max_seeing / (cfg.optics.pixel_scale * b)
+        lines: list[str] = []
+
+        async def expose(exptime: float) -> np.ndarray:
+            res.exposures += 1
+            return await self.exposer(exptime)
+
+        def say(line: str) -> None:
+            lines.append(line)
+            log.info("%s: %s", self.telescope, line)
+            self._event("autofocus_coarse_step", telescope=self.telescope, line=line)
+
+        try:
+            a = await approach(
+                expose,
+                self.move,
+                start=start,
+                limits=(lo, hi),
+                dark=dark,
+                fwhm_px=fwhm_px,
+                step=cfg.coarse_step or max(1.0, (hi - lo) / 64.0),
+                exptime=t,
+                saturation=saturation,
+                say=say,
+                exposure_min=exposure_min,
+            )
+            # One frame at the handover: the sweep's exposure (a planet
+            # alone clips at the field's exposure at every point).
+            sweep = sweep_settings(
+                await expose(cfg.exptime),
+                cfg.exptime,
+                a,
+                fwhm_px=fwhm_px,
+                saturation=0.9 * saturation,
+                exposure_min=exposure_min,
+            )
+        except FocusError as exc:
+            res.details["coarse"] = {"lines": lines}
+            raise AutofocusFailed(f"coarse: {exc}") from exc
+        res.details["coarse"] = {
+            "lines": lines,
+            "handover": a.position,
+            "slope": a.slope,
+            **sweep,
+        }
+        optics = cfg.optics
+        if a.slope:
+            # The donut's measured diameter per step (binned px) gives the
+            # focal plane's motion per step; the sweep is sized from it.
+            per_um = abs(optics.um_per_step) / (optics.f_ratio * optics.pixel_size)
+            factor = a.slope * b / per_um
+            optics = replace(optics, focal_plane_factor=factor)
+        measure_cfg = {"saturation": 0.9 * saturation, **cfg.measure}
+        self.config = replace(
+            cfg,
+            optics=optics,
+            exptime=sweep["exptime"],
+            min_stars=sweep.get("min_stars", cfg.min_stars),
+            measure=measure_cfg,
+            max_start_error=0.0,
+            near_offset=None,
+            far_offset=None,
+            sweep_half_width=None,
+        )
+        self._centre = a.position
+        try:
+            focus, err = await self._sweep(a.position)
+        finally:
+            self.config, self._centre = cfg, None
+        res.used = "coarse"
+        return focus, err
+
+    async def _camera_limits(self) -> tuple[float, float]:
+        """(full scale, ADU; shortest exposure, s): the config's saturation
+        or the camera's MaxADU (else 65535), and its ExposureMin (else 0)."""
+        cfg = self.config
+        saturation, emin = cfg.saturation, 0.0
+        cam = self.camera
+        if cam is not None:
+            if saturation is None:
+                try:
+                    saturation = float(await cam.get("MaxADU"))
+                except DeviceError:
+                    pass
+            try:
+                emin = float(await cam.get("ExposureMin"))
+            except DeviceError:
+                pass
+        return float(saturation or 65535.0), emin
 
     def _slope(self, side: int) -> float:
         cal = self.calibration
@@ -1083,6 +1267,8 @@ class Autofocus:
     def _expected_hfd(self, position: float) -> float:
         res = self._result
         centre = res.start if res is not None and res.start is not None else position
+        if self._centre is not None:
+            centre = self._centre  # the coarse mode's handover
         geo = self._slope(self.config.side) * abs(position - centre)
         seeing = self.config.optics.seeing_hfd(min(self.config.max_seeing, 2.0))
         return math.hypot(geo, seeing)

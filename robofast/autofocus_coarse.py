@@ -1,13 +1,17 @@
-"""Focus from far out: a bright object's light, then its donut, then the
-autofocus (docs/first_light.md, "Focus").
+"""The autofocus's coarse mode: from far out of focus, a bright object's
+light, then its donut, then the fine sweep (docs/autofocus.md, "Coarse
+mode"). Run through :class:`robofast.autofocus.Autofocus` (``mode="coarse"``,
+or automatically when the fine mode fails: ``coarse_fallback``); this module
+has the measurement. First proposed by Guven Gurkan (PR #132).
 
-A telescope plugged in for the first time can be so far from focus that a
-star's image covers the chip: no star is found, and the autofocus
-(:mod:`robofast.autofocus`), which starts from a focus it can see, has
-nothing to measure. Far from focus a star is the image of the pupil, of
-diameter ``D = |dz| / N``, and its light is spread over that disk: so the
-signal is the frame's level over a dark of the same exposure, and it rises
-as the disk shrinks onto the chip. :func:`approach`:
+A telescope plugged in for the first time, or one whose focus was lost, can
+be so far from focus that a star's image covers the chip: no star is found,
+and the fine mode (V-curve, donut, sweep), which starts from a focus it can
+see, has nothing to measure. Far from focus a star is the image of the
+pupil, of diameter ``D = |dz| / N``, and its light is spread over that
+disk: so the signal is the frame's level over the sky beside the target at
+the same exposure, and it rises as the disk shrinks onto the chip.
+:func:`approach`:
 
 1. **light**: the level at the start, then a step either way, the step
    doubled until either way is lit (the whole travel unlit: no light);
@@ -19,14 +23,12 @@ as the disk shrinks onto the chip. :func:`approach`:
    step as measured (the focuser's units and how far it moves the focal
    plane are not assumed), and the focus where the diameter reaches zero;
    it moves there, again until the donut is small, and hands over to the
-   autofocus's sweep (:meth:`robofast.autofocus.Autofocus.run`, ``"sweep"``),
-   which fits the curve itself: the measured slope sizes the sweep, and a
-   few per cent of error in it (the seeing, near focus) does not bias the
-   focus as it would the two-point V-curve's.
+   fine mode's sweep, which fits the curve itself: the measured slope sizes
+   the sweep, and a few per cent of error in it (the seeing, near focus)
+   does not bias the focus as it would the two-point V-curve's.
 
-The person's version (:func:`walk_through`) is the same measurement with a
-focus knob: the frames are taken in a loop and each line says what the
-star did and which way to turn. Every step is one line of named numbers.
+Every step is one line of named numbers. :func:`bright_target` names a
+bright planet or star to focus on from a site at a time.
 """
 
 from __future__ import annotations
@@ -298,7 +300,8 @@ async def approach(
     while not here.lit:
         up = await at(here.position + s, "light")
         down = await at(here.position - s, "light")
-        best = max((up, down), key=lambda t: t.level)
+        # A measured donut wins (a star field: its level hardly changes).
+        best = max((up, down), key=lambda t: (t.donut is not None, t.level))
         if best.lit:
             here = best
             break
@@ -368,137 +371,7 @@ def _beyond(upper: bool, where: float) -> FocusError:
     )
 
 
-#: Far from focus (the donut larger than this many FWHM) the donut's size
-#: is a straight line of the knob's turn; nearer, the star's HFD is used.
-LINEAR_FWHM = 4.0
-#: The sweep by hand: points at these fractions of its half-width W either
-#: side of the estimated focus (W: the donut at 6 FWHM, as the autofocus's
-#: near offset), then a turn to the hyperbola's minimum (robofast.focusfit).
-SWEEP = (1.0, 0.5, 0.0, -0.5, -1.0)
-
-
-async def walk_through(
-    expose: Callable[[float], Awaitable[np.ndarray]],
-    ask: Callable[[str], Awaitable[str]],
-    *,
-    dark: Level,
-    fwhm_px: float,
-    exptime: float,
-    saturation: float,
-    say: Callable[[str], None] = print,
-    max_frames: int = 60,
-    exposure_min: float = 0.0,
-) -> list[Step]:
-    """The person turns the focus knob; each frame says what the star did
-    and what to do next (module doc). ``ask(prompt)`` returns their answer:
-    empty to take the next frame, ``q`` to stop. Every turn asked for is a
-    multiple of their last, so the knob is followed in units of their first
-    quarter turn. Far from focus the donut's size per unit says where the
-    focus is; there, the person is taken through five points around it and
-    then to the minimum of the star sizes' fitted curve (the autofocus's
-    sweep, by hand)."""
-    from robofast.focusfit import FitError, fit_hyperbola
-
-    log: list[Step] = []
-    exposure = _Exposure(expose, exptime, saturation, dark, exposure_min)
-    knob, last = 0.0, 0.0  # in units of the first quarter turn
-    per_unit: float | None = None
-    prev: Step | None = None
-    plan: list[float] = []  # knob positions still to visit (the sweep)
-    points: list[tuple[float, float]] = []  # (knob, HFD) on the sweep
-    final = False
-    for _ in range(max_frames):
-        img, level = await exposure.frame()
-        z = _sizes(img, fwhm_px)
-        donut, hfd = z.donut, z.hfd
-        s = Step("knob", knob, level, donut, "", *exposure.shown(img, z))
-        far = donut is not None and donut > LINEAR_FWHM * fwhm_px
-        if far and prev is not None and prev.donut is not None and last:
-            if prev.donut > LINEAR_FWHM * fwhm_px and prev.donut != donut:
-                per_unit = abs(prev.donut - donut) / abs(last)
-        turn: float | None
-        if final:
-            turn, s.note = (
-                None,
-                (f"in focus: the star is {hfd or 0:.1f} px across (HFD); stop here"),
-            )
-        elif plan or points:
-            if hfd is not None:
-                points.append((knob, hfd))
-            if plan:
-                target = plan.pop(0)
-                turn, s.note = target - knob, _relative(target - knob, last, "the next point")
-            else:
-                try:
-                    fit = fit_hyperbola([p[0] for p in points], [p[1] for p in points])
-                    turn = fit.x0 - knob
-                    s.note = _relative(turn, last, "the smallest star (the fitted curve's minimum)")
-                    final = True
-                except FitError:
-                    best = min(points, key=lambda p: p[1])
-                    turn, final = best[0] - knob, True
-                    s.note = _relative(turn, last, "the smallest star seen")
-        elif far and per_unit and prev is not None and prev.donut is not None:
-            shrank = donut < prev.donut
-            way = (1.0 if last > 0 else -1.0) * (1.0 if shrank else -1.0)
-            focus = knob + way * donut / per_unit
-            w = 6.0 * fwhm_px / per_unit
-            said = (
-                f"{'shrinking' if shrank else 'growing'} (donut {prev.donut:.1f} to"
-                f" {donut:.1f} px): "
-            )
-            if abs(focus - knob) > 2.5 * w:
-                # Far yet: a hand's error on a long turn is large, so stop
-                # short on this side, by more than a hand's error (a quarter
-                # of the way), and measure again from there.
-                short = max(1.5 * w, 0.25 * abs(focus - knob))
-                turn = focus - way * short - knob
-                s.note = said + _relative(turn, last, "just short of focus (measured again there)")
-            else:
-                plan = [focus + f * w for f in SWEEP]
-                turn = plan.pop(0) - knob
-                s.note = said + _relative(turn, last, "the first of five points near focus")
-        else:
-            turn, s.note = _start(prev, s, last)
-        log.append(s)
-        say(s.line())
-        if turn is None:
-            return log
-        answer = (await ask("turn the knob as it says, then Enter (q: stop) ")).strip().lower()
-        if answer.startswith("q"):
-            return log
-        knob, last, prev = knob + turn, turn, s
-    say(f"focus: stopped after {max_frames} frames without reaching focus")
-    return log
-
-
-def _relative(turn: float, last: float, what: str) -> str:
-    """A turn said as a multiple of the last one (its sign: the same way or back)."""
-    k = abs(turn) / abs(last) if last else abs(turn)
-    way = "the same way" if turn * last > 0 else "back"
-    return f"turn {way}, {k:.2f} times your last turn, to {what}"
-
-
-def _start(prev: Step | None, now: Step, last: float) -> tuple[float, str]:
-    """Before the donut's size per turn is known: find light, then a donut."""
-    if not now.lit:
-        way = 1.0 if last >= 0 else -1.0
-        return 4.0 * way, (
-            "no light yet: turn the knob one full turn, the same way as before"
-            " (the first time: either way)"
-        )
-    if prev is None or not last:
-        return 1.0, "turn the knob a quarter turn, either way"
-    if now.donut is None or prev.donut is None:  # follow the level
-        if _rises(now, prev):
-            return last, "brighter: turn the same way, as far as your last turn"
-        return -last / 2.0, "fainter: turn back, half your last turn"
-    # A donut, but not yet two far ones: a quarter turn more, the way it shrinks.
-    way = 1.0 if (now.donut < prev.donut) == (last > 0) else -1.0
-    return way * 1.0, "turn a quarter turn, " + ("the same way" if way * last > 0 else "back")
-
-
-#: The planets first light may focus on, brightest first (typical V mag).
+#: The planets to focus on from far out, brightest first (typical V mag).
 PLANETS = (("Venus", -4.0), ("Jupiter", -2.5), ("Mars", 0.0), ("Saturn", 0.7))
 #: Then the brightest stars (name, RA deg, Dec deg J2000, V mag).
 BRIGHT_STARS = (
@@ -530,12 +403,17 @@ class Target:
     dec: float
     mag: float
     alt: float
+    #: Its angle from the Sun (deg).
+    sun: float = 180.0
 
 
-def targets_up(site: tuple[float, float, float], when) -> list[Target]:
+def targets_up(
+    site: tuple[float, float, float], when, min_sun_separation: float = 0.0
+) -> list[Target]:
     """Every listed planet and star above :data:`MIN_ALT` from ``site`` at
-    ``when``, the planets first, each list brightest first."""
-    return [t for t in _targets(site, when) if t.alt >= MIN_ALT]
+    ``when`` and at least ``min_sun_separation`` deg from the Sun, the
+    planets first, each list brightest first."""
+    return [t for t in _targets(site, when) if t.alt >= MIN_ALT and t.sun >= min_sun_separation]
 
 
 def _targets(site: tuple[float, float, float], when) -> list[Target]:
@@ -551,36 +429,52 @@ def _targets(site: tuple[float, float, float], when) -> list[Target]:
     frame = AltAz(obstime=t, location=loc)
     out: list[Target] = []
     with solar_system_ephemeris.set("builtin"):
+        sun = get_body("sun", t, loc)
         for name, mag in PLANETS:
             c = get_body(name.lower(), t, loc)
             alt = float(c.transform_to(frame).alt.deg)
-            out.append(Target(name, float(c.ra.deg), float(c.dec.deg), mag, alt))
+            sep = float(c.separation(sun).deg)
+            out.append(Target(name, float(c.ra.deg), float(c.dec.deg), mag, alt, sep))
     for name, ra, dec, mag in BRIGHT_STARS:
-        alt = float(SkyCoord(ra * u.deg, dec * u.deg).transform_to(frame).alt.deg)
-        out.append(Target(name, ra, dec, mag, alt))
+        c = SkyCoord(ra * u.deg, dec * u.deg)
+        alt = float(c.transform_to(frame).alt.deg)
+        sep = float(c.separation(SkyCoord(sun.ra, sun.dec)).deg)
+        out.append(Target(name, ra, dec, mag, alt, sep))
     return out
 
 
-def bright_target(site: tuple[float, float, float], when, name: str | None = None) -> Target | None:
+def bright_target(
+    site: tuple[float, float, float],
+    when,
+    name: str | None = None,
+    *,
+    min_sun_separation: float = 0.0,
+) -> Target | None:
     """What to focus on now from ``site``: the brightest planet above
-    :data:`MIN_ALT`, else the brightest star above it (the Moon is not used:
-    on a small chip it is a disk with no edge in the frame); None: nothing.
-    With ``name`` (--focus-on), that planet or star, or :class:`FocusError`
-    if it is not listed or is below :data:`MIN_ALT`."""
+    :data:`MIN_ALT`, else the brightest star above it, either at least
+    ``min_sun_separation`` deg from the Sun (the Moon is not used: on a
+    small chip it is a disk with no edge in the frame); None: nothing.
+    With ``name``, that planet or star, or :class:`FocusError` if it is not
+    listed, is below :data:`MIN_ALT` or is too near the Sun."""
     if name is None:
-        up = targets_up(site, when)
+        up = targets_up(site, when, min_sun_separation)
         return up[0] if up else None
     every = {t.name.lower(): t for t in _targets(site, when)}
     t = every.get(name.strip().lower())
     if t is None:
         raise FocusError(
-            f"--focus-on {name}: not one first light knows; these are:"
+            f"focus target {name}: not one robofast knows; these are:"
             f" {', '.join(n for n, _ in PLANETS)}, {', '.join(s[0] for s in BRIGHT_STARS)}"
         )
     if t.alt < MIN_ALT:
         raise FocusError(
-            f"--focus-on {t.name}: at {t.alt:.0f} deg it is below {MIN_ALT:.0f} deg now;"
+            f"focus target {t.name}: at {t.alt:.0f} deg it is below {MIN_ALT:.0f} deg now;"
             " choose one higher"
+        )
+    if t.sun < min_sun_separation:
+        raise FocusError(
+            f"focus target {t.name}: {t.sun:.0f} deg from the Sun, nearer than"
+            f" {min_sun_separation:g} deg; choose another"
         )
     return t
 
@@ -594,40 +488,6 @@ def fainter_star(
     fainter = mag + 2.5 * math.log10(shortest / need)
     ok = sorted((s for s in up if s[1] >= fainter), key=lambda s: s[1])
     return ok[0] if ok else None
-
-
-# -- the observation kind: first light's focus step, in the sequencer --------------
-
-
-async def _ask(prompt: str) -> str:
-    import asyncio
-
-    return await asyncio.to_thread(input, prompt)
-
-
-#: A device's role in the owner's name (``t1.focuser``), in plain words.
-_ROLES = {"focuser": "the focuser", "telescope": "the mount", "camera": "the camera"}
-
-
-def device_words(exc: Exception | str) -> str:
-    """A device's error, its device first in plain words ("the focuser: ...")."""
-    import re
-
-    text = str(exc)
-    m = re.search(r"\b(focuser|telescope|camera)\b", text.split(": ", 1)[0])
-    return f"{_ROLES[m.group(1)]}: {text}" if m else text
-
-
-def too_bright_line(exc: TooBright, opts: dict) -> str:
-    """The stop for a target too bright for the camera: what to run next,
-    with a fainter star up now by :func:`fainter_star`'s rule, if one is."""
-    star = fainter_star(
-        [(str(n), float(m)) for n, m in opts.get("stars_up", [])], float(opts.get("mag", 0.0)),
-        need=exc.need, shortest=exc.shortest,
-    )  # fmt: skip
-    if star is None:
-        return f"{exc}: run again with --focus-on NAME, a fainter star up now (docs/first_light.md)"
-    return f"{exc}: run again with --focus-on {star[0]} (V {star[1]:g}, up now)"
 
 
 def sweep_settings(
@@ -653,154 +513,3 @@ def sweep_settings(
     if t < exposure_min:
         raise TooBright(t, exposure_min)
     return {"exptime": t, "min_stars": 1}
-
-
-def _optics(opts: dict, slope: float | None):
-    """The autofocus's optics from what the devices reported (``opts``), its
-    focal-plane factor from the donut's measured slope (px per step)."""
-    from robofast.autofocus import FocusOptics
-
-    o = FocusOptics(
-        f_ratio=float(opts["f_ratio"]),
-        pixel_size=float(opts["pixel_size"]),
-        pixel_scale=float(opts["plate_scale"]),
-        obstruction=float(opts.get("obstruction", 0.0)),
-        um_per_step=float(opts.get("um_per_step", 1.0)),
-    )
-    if slope:
-        o.focal_plane_factor = slope / o.donut_slope
-    return o
-
-
-class FirstFocus:
-    """First light's focus step (``kind="first_focus"``): on the bright
-    target, from far out of focus to focus (module doc): the sky beside it
-    for the level's reference, :func:`approach` then the autofocus's sweep
-    with a focuser, :func:`walk_through` without one. Settings in the
-    observation's ``autofocus`` entry: the optics (``f_ratio``,
-    ``pixel_size``, ``plate_scale``, ``obstruction``, ``um_per_step``),
-    ``fwhm_px``, ``saturation``, ``exptime`` (the bright frames), ``sweep_exptime``."""
-
-    name = "first_focus"
-    request_types: tuple[str, ...] = ()
-    light = True
-    fields = ("autofocus",)
-    stage = "on_target"
-    spectrograph = False
-    fiber = False
-    shutter = False
-    always_guided = False
-
-
-def _kind():
-    from robofast.kinds import ObservationKind
-
-    class _FirstFocus(FirstFocus, ObservationKind):
-        async def run(self, r) -> None:
-            await run_first_focus(r)
-
-    return _FirstFocus()
-
-
-def register() -> None:
-    """Register the ``first_focus`` kind (a plug-in entry, docs/plugins.md)."""
-    from robofast.kinds import OBSERVATION_KINDS
-
-    if "first_focus" not in OBSERVATION_KINDS:
-        OBSERVATION_KINDS.register("first_focus", _kind())
-
-
-async def run_first_focus(r) -> None:
-    import asyncio
-
-    from robofast.autofocus import Autofocus, AutofocusConfig, camera_exposer
-    from robofast.owner import DeviceError
-    from robofast.sequencer import ObservationFailed
-
-    seq, state, unit, tel, cam, obs = r.sequencer, r.state, r.unit, r.tel, r.cam, r.obs
-    opts = dict(obs.autofocus or {})
-    exptime = float(opts.get("exptime", 0.01))
-    fwhm_px = float(opts["fwhm_px"])
-    saturation = float(opts["saturation"])
-    exposure_min = float(opts.get("exposure_min") or 0.0)
-    expose = camera_exposer(cam, readout_margin=30.0, poll=0.05)
-
-    def say(line: str) -> None:
-        print(line, flush=True)
-        seq._event("first_focus_step", telescope=unit.name, line=line)
-
-    try:
-        fg = state.focusers.get(unit.name)
-        # Before anything moves: a focuser that moves by steps would take a
-        # position as that many steps.
-        if fg is not None and await fg.get("Absolute") is not True:
-            raise FocusError(
-                "the focuser moves by steps, not to positions (Absolute false): not supported"
-                " yet; focus by hand"
-            )
-        # The level's reference: the sky beside the target (a camera with no
-        # shutter cannot take a dark), at the exposure and at a quarter of it
-        # (what a shortened frame keeps: the bias).
-        ra_h, dec = float(obs.ra_hours), float(obs.dec_deg)
-        await seq._goto(state, unit, tel, ra_h, dec + (2.0 if dec < 80 else -2.0))
-        # (four times it, where a quarter is below the camera's shortest).
-        other_t = exptime / 4.0 if exptime / 4.0 >= exposure_min else 4.0 * exptime
-        dark = Level.of(await expose(exptime), await expose(other_t), exptime, other_t)
-        await seq._goto(state, unit, tel, ra_h, dec)
-        if fg is None:
-            if not opts.get("walk_through"):
-                raise FocusError(
-                    "no focuser, and nobody to turn the knob (--yes): focus by hand first"
-                )
-            await walk_through(
-                expose, _ask, dark=dark, fwhm_px=fwhm_px, exptime=exptime,
-                saturation=saturation, say=say, exposure_min=exposure_min,
-            )  # fmt: skip
-            seq._event("first_focus_done", telescope=unit.name, method="walk_through")
-            return
-        lo, hi = 0.0, float(await fg.get("MaxStep"))
-
-        async def move(x: float) -> None:
-            await fg.call("Move", round(x))
-            while await fg.get("IsMoving"):
-                await asyncio.sleep(0.05)
-
-        start = float(await fg.get("Position"))
-        step = max(1.0, (hi - lo) / 64.0)
-        a = await approach(
-            expose, move, start=start, limits=(lo, hi), dark=dark, fwhm_px=fwhm_px,
-            step=step, exptime=exptime, saturation=saturation, say=say,
-            exposure_min=exposure_min,
-        )  # fmt: skip
-        # One frame at the handover: the sweep's exposure (a planet alone
-        # clips at the field's exposure at every point).
-        sweep_t = float(opts.get("sweep_exptime", 1.0))
-        sweep = sweep_settings(
-            await expose(sweep_t), sweep_t, a, fwhm_px=fwhm_px, saturation=0.9 * saturation,
-            exposure_min=exposure_min,
-        )  # fmt: skip
-        cfg = AutofocusConfig(
-            optics=_optics(opts, a.slope),
-            method="sweep",
-            **sweep,
-            max_start_error=0.0,
-            measure={"saturation": 0.9 * saturation},
-            min_position=lo,
-            max_position=hi,
-        )
-        res = await Autofocus(unit.name, cfg, fg, cam).run("sweep", start=a.position)
-        if not res.success:
-            raise FocusError(f"the sweep did not find focus: {res.message}")
-        say(f"focus: done at position {res.focus:.0f} (+-{res.focus_err or 0:.0f} steps)")
-        seq._event("first_focus_done", telescope=unit.name, focus=res.focus, method="sweep")
-    except DeviceError as exc:  # any device inside the step: stop now, in its words
-        why = device_words(exc)
-        seq._event("first_focus_failed", telescope=unit.name, error=why)
-        raise ObservationFailed(f"focus: {why}") from exc
-    except TooBright as exc:
-        why = too_bright_line(exc, opts)
-        seq._event("first_focus_failed", telescope=unit.name, error=why)
-        raise ObservationFailed(f"focus: {why}") from exc
-    except FocusError as exc:
-        seq._event("first_focus_failed", telescope=unit.name, error=str(exc))
-        raise ObservationFailed(f"focus: {exc}") from exc

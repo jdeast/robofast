@@ -50,6 +50,9 @@ The model, from the legacy driver's use of PWI (``docs/pwi.md``):
   slewing *and* tracking until stopped -- what PWI4 4.1.6 does on a CDK700.
 * :meth:`CDK700Model.power_cycle`: the controller loses power (disconnected,
   disabled, not homed, both axes reading 0 deg, as a CDK700's encoders do);
+  :meth:`CDK700Model.drop_controller`: the controller stops answering PWI
+  (MINERVA T2, 2026-11-09): disconnected and disabled, and ``connect`` is
+  ignored -- also after a PWI restart -- until the next power cycle;
   :meth:`CDK700Model.pwi_restart`: PWI itself restarts (disconnected,
   disabled, not homed, ``Default_Mount_Model.PXP`` loaded; ``--restarted``
   starts a simulator in that state).
@@ -169,6 +172,9 @@ class CDK700Model:
         self.lock = threading.RLock()
         self.connected = ready
         self.enabled = [ready, ready]
+        #: The controller dropped (:meth:`drop_controller`): PWI cannot
+        #: connect to it until :meth:`power_cycle`.
+        self.controller_down = False
         self.axes_homed = [homed, homed]
         self.report_homed = report_homed
         self.home_pos = (home_alt, home_az)
@@ -308,6 +314,9 @@ class CDK700Model:
         return False
 
     def connect(self) -> None:
+        if self.controller_down:
+            self.ignored.append("connect")
+            return
         self.connected = True
 
     def enable(self, axis: int | None = None) -> None:
@@ -387,9 +396,20 @@ class CDK700Model:
             if self.slewing and (self.altaz is None or self.altaz_tracks):
                 self.slewing = False
 
+    def drop_controller(self) -> None:
+        """The mount controller stops answering PWI (module doc): PWI reports
+        it disconnected and cannot connect to it, nor home it, until the
+        controller is power-cycled."""
+        self.stop()
+        self.controller_down = True
+        self.connected = False
+        self.enabled = [False, False]
+        self.axes_homed = [False, False]
+
     def power_cycle(self) -> None:
         """The mount controller loses power and comes back."""
         self.stop()
+        self.controller_down = False
         self.connected = False
         self.enabled = [False, False]
         self.axes_homed = [False, False]

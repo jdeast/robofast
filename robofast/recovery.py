@@ -30,6 +30,15 @@ rungs to climb, in order:
    starts PWI (also when the cycle failed), and brings the mount back
    (reconnect, ``MountConnect``/``MotorsEnable``, ``home`` if the server
    allows it). It needs ``requires_parked``.
+   The **telescope's own** outlet (MINERVA's ``panel``: the mount
+   controller) cuts the mount: the controller comes back disconnected,
+   disabled and with its encoders lost. The telescope's ``powercycle`` rung
+   therefore (after ``pwi_start``, with ``requires_pwi_stop``: legacy
+   stopped PWI before cycling the panel and started it after) reconnects,
+   reconnects PWI to the mount (``MountConnect``, ``MotorsEnable``) and
+   **homes** it, and on a PWI server counts only once the mount is homed:
+   powercycle, then home, whatever the order of ``steps``. A server that
+   may not home (``allow_find_home`` false) fails the rung.
 
 The ``guider`` is a device too (the guider service of
 :mod:`robofast.guider.service` and its camera, the FAU camera on MINERVA):
@@ -139,8 +148,9 @@ class DevicePolicy:
     #: device's outlet, and the server's power-cycle action: default
     #: ``"PowerCycle"``, robofast's PDU server's). ``"requires_pwi_stop":
     #: true`` with ``"pwi_stop"`` and ``"pwi_start"`` hooks (as ``restart``):
-    #: the device shares power/USB with the mount, so PWI is stopped before
-    #: the cycle and started after (module doc).
+    #: the device shares power/USB with the mount, or (the telescope's
+    #: policy) is the mount, so PWI is stopped before the cycle and started
+    #: after (module doc).
     powercycle: dict[str, Any] | None = None
     step_timeout: float = 180.0
     verify_timeout: float = 60.0
@@ -324,8 +334,6 @@ class RecoveryLadder:
             only = [s for s in pol.steps if s in TELESCOPE_RUNGS]
             if only and kind != "telescope":
                 raise ValueError(f"recovery.{kind}: {only} is a telescope step")
-            if kind == "telescope" and (pol.powercycle or {}).get("requires_pwi_stop"):
-                raise ValueError("recovery.telescope: requires_pwi_stop is for a camera's cycle")
         self.telescope = telescope
         self.policies = policies
         self.alarm = alarm or (lambda text: None)
@@ -412,10 +420,16 @@ class RecoveryLadder:
             rung = pol.steps[i]
             self.level[kind] = i + 1
             bound = pol.home_timeout if rung == "home" else pol.step_timeout
+            if rung == "powercycle" and kind == "telescope":
+                # The cycle, its boot, and the home after it (module doc).
+                bound += pol.home_timeout
             try:
                 async with asyncio.timeout(bound + pol.verify_timeout):
                     await self._rung(rung, kind, pol, reconnect, probe, others, call, mount)
-                    await self._verify(kind, pol, reconnect, probe, call)
+                    # A mount whose own power was cut counts only once homed.
+                    await self._verify(
+                        kind, pol, reconnect, probe, call, homed=rung == "powercycle"
+                    )
             except Skipped as exc:
                 why = str(exc)
                 tried.append((rung, f"skipped: {why}"))
@@ -440,7 +454,11 @@ class RecoveryLadder:
         self.alarm(f"{who}: recovery ladder exhausted ({', '.join(pol.steps)}): escalating")
         return res
 
-    async def _verify(self, kind: str, pol: DevicePolicy, reconnect, probe, call=None) -> None:
+    async def _verify(
+        self, kind: str, pol: DevicePolicy, reconnect, probe, call=None, *, homed: bool = False
+    ) -> None:
+        """``homed``: a PWI telescope must be homed even when its steps do
+        not include ``home`` (after its own power cycle)."""
         deadline = self.clock() + pol.verify_timeout
         last: Exception | None = None
         while True:
@@ -449,7 +467,7 @@ class RecoveryLadder:
                 if kind == "guider" and isinstance(value, dict) and value.get("state") == "failed":
                     raise RuntimeError(f"the guider is failed: {value.get('reason')}")
                 if kind == "telescope":
-                    await self._usable(probe, call, need_homed="home" in pol.steps)
+                    await self._usable(probe, call, need_homed=homed or "home" in pol.steps)
                 return
             except NotUsable:
                 raise
@@ -536,6 +554,15 @@ class RecoveryLadder:
         if await probe("CanFindHome") is False:
             raise Skipped("FindHome is not allowed by the server (CanFindHome false)")
         await self._mount_up(kind, probe, call)
+        # A mount PWI cannot drive (its controller dropped: MINERVA T2,
+        # 2026-11-09) cannot home: fail before unparking it, so it still
+        # reads parked for the power cycle that may come next.
+        pwi = (await self._status(probe, call) or {}).get("pwi") or {}
+        if pwi.get("connected") is False:
+            raise RuntimeError("cannot home: PWI is not connected to the mount")
+        off = [a for a in ("az", "alt") if pwi.get(f"{a}_enabled") is False]
+        if off:
+            raise RuntimeError(f"cannot home: the {' and '.join(off)} axis is disabled")
         parked = bool(await probe("AtPark"))
         if parked:
             await call("Unpark")
@@ -591,21 +618,45 @@ class RecoveryLadder:
             self.event("recovery_powercycle", device=kind, switch=int(pc["switch"]))
             await self.sleep(float(pc.get("boot_time", 60.0)))
         finally:
-            if pwi:
+            if pwi and kind == "telescope":
+                await self._pwi_start(kind, pc, pol)
+            elif pwi:
                 await self._pwi_back(kind, pc, pol, mount)
         await _reconnect(reconnect)
+        if kind == "telescope":
+            await self._mount_after_cycle(probe, call)
 
-    async def _pwi_back(
-        self, kind: str, pc: dict[str, Any], pol: DevicePolicy, mount: MountAccess | None
-    ) -> None:
-        """After a power cycle that stopped PWI: start it, then bring the
-        mount back (reconnect, MountConnect/MotorsEnable, home if allowed).
-        The mount's own state is the telescope's: problems are alarmed, and
-        the telescope's next command (and its ladder) deals with them."""
+    async def _mount_after_cycle(self, probe, call) -> None:
+        """The telescope's own outlet was cycled (module doc): the controller
+        lost power and its encoders. On a PWI server: MountConnect,
+        MotorsEnable and home; a home the server does not allow fails the
+        rung (the mount cannot observe unhomed). Another telescope only has
+        to answer."""
+        if await self._status(probe, call) is None:
+            return
+        await self._mount_up("telescope", probe, call)
+        try:
+            await self._home("telescope", probe, call)
+        except Skipped as exc:
+            if "reports itself homed" in str(exc):
+                return
+            raise RuntimeError(f"power-cycled, but the mount cannot be homed: {exc}") from None
+
+    async def _pwi_start(self, kind: str, pc: dict[str, Any], pol: DevicePolicy) -> None:
         out = await self.hook(pc["pwi_start"], pol.step_timeout)
         self.event("recovery_pwi_start", device=kind, output=out[-200:])
         if pc["pwi_start"].get("settle"):
             await self.sleep(float(pc["pwi_start"]["settle"]))
+
+    async def _pwi_back(
+        self, kind: str, pc: dict[str, Any], pol: DevicePolicy, mount: MountAccess | None
+    ) -> None:
+        """After a power cycle of another device that stopped PWI: start it,
+        then bring the mount back (reconnect, MountConnect/MotorsEnable,
+        home if allowed). The mount's own state is the telescope's: problems
+        are alarmed, and the telescope's next command (and its ladder) deals
+        with them."""
+        await self._pwi_start(kind, pc, pol)
         if mount is None:
             self.alarm(f"{self.telescope} {kind}: PWI restarted; the mount was not reinitialized")
             return

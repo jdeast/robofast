@@ -35,7 +35,9 @@ at the real FAU's geometry (docs/demo.md).
   telescope given explicitly and without ``--i-know-the-enclosure-is-closed``.
   It starts nothing that talks to a real enclosure, PAC or PDU (every
   device server it starts runs without ``--hardware`` on a verified
-  simulator: :mod:`robofast.hwgate`). robofast reaches each real mount
+  simulator: :mod:`robofast.hwgate`); only a ``--recovery`` policy's
+  ``powercycle`` rung reaches a real PDU, through a server the operator
+  started (below). robofast reaches each real mount
   only through a :class:`~robofast.testing.mount_guard.MountGuard`:
   reads pass, slews outside the altitude limits are refused, robofast's
   ``Park`` becomes "stop tracking, stay where you are" and every other
@@ -58,8 +60,16 @@ at the real FAU's geometry (docs/demo.md).
   **dropped** (a WARNING, and a problem in the evaluation) and the night
   goes on with the others. The rehearsal refuses only when a telescope
   without a recovery policy fails, or when no real telescope is left. A
-  policy may not power-cycle (``powercycle``): the rehearsal never
-  switches a PDU.
+  policy's ``powercycle`` rung (JDE 2026-11-10) **switches a real outlet**:
+  it asks the PDU server named in the policy (``powercycle.pdu``, started
+  by the operator with ``--hardware``; the rehearsal starts no PDU
+  server) to power-cycle that outlet, under the ladder's guards
+  (``requires_parked``: here the guard's park, "stopped where it is";
+  the camera idle and, with ``camera_warm_above``, warm; at most
+  ``max_powercycles`` a night, ``min_interval`` apart; the PDU server's
+  own ``cycle`` outlets and ``min_cycle_interval``). A cycle of the
+  mount's own outlet is followed by ``MountConnect``, ``MotorsEnable`` and
+  ``FindHome`` through the guard (docs/recovery.md).
 * **Cooling** comes from the site's enclosure config, the file production
   runs on (``--site-config``, default ``sites/minerva/aqawan1.json``): each
   real camera's own ``cooling`` entry there (``telescopes.<name>.camera.cooling``;
@@ -103,7 +113,7 @@ from robofast.dispatch import dispatch_from_config
 from robofast.owner import DeviceOwner
 from robofast.plan import Idle, Observation
 from robofast.plan_record import read_record
-from robofast.recovery import RecoveryLadder
+from robofast.recovery import MountAccess, RecoveryLadder
 from robofast.request_model import Status
 from robofast.sequencer import Sequencer
 from robofast.testing.alpaca_server import FakeAlpacaServer
@@ -268,9 +278,12 @@ class RehearsalSettings:
             ladder = RecoveryLadder.from_config(name, policy)
             for kind, pol in ladder.policies.items():
                 if "powercycle" in pol.steps:
-                    raise ValueError(
-                        f"--recovery {name}: {kind} lists powercycle; the rehearsal never"
-                        " switches a PDU"
+                    log.warning(
+                        "--recovery %s: %s may power-cycle PDU switch %s at %s (a real outlet)",
+                        name,
+                        kind,
+                        (pol.powercycle or {}).get("switch"),
+                        (pol.powercycle or {}).get("pdu"),
                     )
                 if pol.escalation.agent is not None:
                     raise ValueError(
@@ -995,39 +1008,87 @@ class Rehearsal(SimulatedNight):
                     }
                 )
                 continue
-            guard: MountGuard | None = None
-            if kind == "telescope":
-                guard = MountGuard(
-                    {name: {"telescope": real.telescope}},
-                    limits=(MIN_ALT, MAX_ALT),
-                    site=(MINERVA.latitude, MINERVA.longitude),
-                    clock=self.clock,
-                    recovery={name},
-                ).start()
-                address, number = guard.address, 0
-            else:
-                ep = getattr(real, kind)
-                address, number = ep.address, ep.number
-            owner = DeviceOwner(
-                f"{name}.{kind}",
-                lambda a=address, k=kind, n=number: AlpacaDevice(a, k, n),
+            # The mount always through a guard of its own (never a real
+            # Park): the ladder's telescope, or what a power cycle's guards
+            # and a PWI restart read and reinitialize.
+            guard = MountGuard(
+                {name: {"telescope": real.telescope}},
+                limits=(MIN_ALT, MAX_ALT),
+                site=(MINERVA.latitude, MINERVA.longitude),
+                clock=self.clock,
+                recovery={name},
+            ).start()
+            tel_owner = DeviceOwner(
+                f"{name}.telescope",
+                lambda a=guard.address: AlpacaDevice(a, "telescope", 0),
                 tl,
                 default_timeout=30.0,
             )
-            grant = owner.grant(f"{name}-preflight-recovery")
+            tel = tel_owner.grant(f"{name}-preflight-recovery")
+            if kind == "telescope":
+                owner, grant = tel_owner, tel
+            else:
+                ep = getattr(real, kind)
+                owner = DeviceOwner(
+                    f"{name}.{kind}",
+                    lambda a=ep.address, k=kind, n=ep.number: AlpacaDevice(a, k, n),
+                    tl,
+                    default_timeout=30.0,
+                )
+                grant = owner.grant(f"{name}-preflight-recovery")
+            cam_owner: DeviceOwner | None = None
+            cam = grant if kind == "camera" else None
+            if cam is None:
+                cam_owner = DeviceOwner(
+                    f"{name}.camera",
+                    lambda a=real.camera.address, n=real.camera.number: AlpacaDevice(
+                        a, "camera", n
+                    ),
+                    tl,
+                    default_timeout=30.0,
+                )
+                cam = cam_owner.grant(f"{name}-preflight-recovery")
+
+            async def others(device: str, member: str, tel=tel, cam=cam) -> Any:
+                # Reads only, for the power cycle's guards.
+                if device == "telescope":
+                    return await tel.get(member)
+                if device == "camera":
+                    return await cam.get(member)
+                return None
+
+            if "powercycle" in ladder.policies[kind].steps:
+                # As the sequencer does before its ladder: the telescope made
+                # safe -- here the guard's park, stopped where it is -- so
+                # the power cycle's requires_parked can hold.
+                try:
+                    await tel.call("Park")
+                except Exception as exc:  # a mount that does not answer
+                    log.warning("%s: preflight park (the guard's stop) failed: %s", name, exc)
             try:
                 res = await ladder.recover(
                     kind,
                     reconnect=lambda o_=owner: o_.reconnect("recovery"),
                     probe=lambda m, g=grant: g.get(m),
+                    others=others,
                     call=lambda m, *a, g=grant: g.call(m, *a),
+                    mount=None
+                    if kind == "telescope"
+                    else MountAccess(
+                        reconnect=lambda o_=tel_owner: o_.reconnect("recovery"),
+                        probe=lambda m, g=tel: g.get(m),
+                        call=lambda m, *a, g=tel: g.call(m, *a),
+                    ),
                 )
             finally:
                 owner.reconnect("preflight recovery done")
-                if guard is not None:
-                    guard.stop()
-                    o.recovery_commands += [dict(x) for x in guard.recovery_commands]
-                    o.refused += [dict(x) for x in guard.refused]
+                if owner is not tel_owner:
+                    tel_owner.reconnect("preflight recovery done")
+                if cam_owner is not None:
+                    cam_owner.reconnect("preflight recovery done")
+                guard.stop()
+                o.recovery_commands += [dict(x) for x in guard.recovery_commands]
+                o.refused += [dict(x) for x in guard.refused]
             o.preflight_recovery.append(
                 {
                     "telescope": name,

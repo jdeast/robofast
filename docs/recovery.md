@@ -30,7 +30,9 @@ Per device (`telescope`, `camera`, `focuser`, `rotator`, `filterwheel`,
    Switch server (below), `boot_time` s, reconnect. A PDU server whose
    action is named differently: `powercycle.action`. A device that
    shares its power and USB with the mount says so (`requires_pwi_stop`,
-   below).
+   below). On the **telescope**, the outlet is the mount's own (MINERVA's
+   `panel`): see "Power-cycling the mount" below -- the rung reconnects
+   PWI to the mount and homes it, and counts only once it is homed.
 
 On a telescope served by robofast's PWI server, `reconnect` and `restart`
 also reconnect PWI to the mount: `Action("MountConnect")` if `Status` says
@@ -139,8 +141,50 @@ back as the telescope's ladder would (reconnect, `MountConnect`,
 `MotorsEnable`, `home` if the PWI server allows it), and reconnects the
 camera. A mount that does not come back is alarmed
 (`recovery_mount_after_cycle`) and left to the telescope's own ladder at
-its next command. Not allowed on the `telescope` policy itself (its PWI
-restart is its `restart` rung).
+its next command. On the `telescope` policy itself it is the panel
+cycle's PWI stop and start (next section).
+
+## Power-cycling the mount
+
+A power cycle of the telescope's own outlet (MINERVA's `panel`: the
+mount controller, and on T2 the Apogee filter wheel too) cuts the mount.
+The controller comes back disconnected, with its motors disabled and its
+encoders lost (both axes read about 0 deg until a home). The telescope's
+`powercycle` rung therefore, after the guards (parked, the camera idle,
+the rate limits):
+
+1. with `requires_pwi_stop` (legacy stopped PWI before cycling the panel
+   and started it after: MINERVA T1 and T2), runs `pwi_stop`;
+2. power-cycles the outlet and waits `boot_time`;
+3. runs `pwi_start` (also when the cycle failed);
+4. reconnects, `Action("MountConnect")`, `Action("MotorsEnable")`;
+5. **homes** the mount (as the `home` rung: `FindHome`, until it stops);
+6. counts as recovered only when `Status` shows the mount connected,
+   enabled **and homed** -- whether or not `steps` lists `home`. A PWI
+   server that may not home (`allow_find_home` false) fails the rung: an
+   unhomed mount cannot observe.
+
+So the order is always powercycle, then home, even in the usual ladder
+`["reconnect", "restart", "home", "powercycle"]` (whose `home` rung, before
+the cycle, fails at once on a mount PWI cannot drive -- "cannot home: PWI is
+not connected to the mount" -- without unparking it, so the cycle's
+`requires_parked` still holds). Its bound is `step_timeout` (the hooks and
+`boot_time`) plus `home_timeout` plus `verify_timeout`.
+
+The PWI server must not let its altitude limit watch stop the home of an
+unhomed mount (its encoders read 0 deg, "below the horizon"): that is the
+server's job (docs/pwi.md).
+
+A camera's rung on its own outlet (MINERVA's `inst`) is the camera alone:
+no `requires_pwi_stop`, the mount is not touched.
+
+**MINERVA.** `sites/minerva/remote/t1_recovery.example.json` and
+`t2_recovery.example.json`: telescope `reconnect`, `restart`, `home`,
+`powercycle` (panel, switch 1 of `t1_pdu.json`/`t2_pdu.json`, with
+`requires_pwi_stop`); camera `reconnect`, `powercycle` (inst, switch 2,
+`camera_warm_above` -5 C). Their hooks are the site deployment's.
+`tests/core/test_powercycle_recovery.py` replays T2's 2026-11-09 failure
+(the mount controller dropped off the network) on simulators.
 
 ## Escalation: an agent, then a person
 
@@ -311,8 +355,7 @@ restarts a PWI2 simulator process.
 
 `python -m robofast.testing.rehearsal --recovery t1=t1-recovery.json`
 (one per real telescope; the JSON is a `recovery` entry as above, a
-`guider` policy included, without `powercycle`: the rehearsal never
-switches a PDU) gives the night's
+`guider` policy included) gives the night's
 sequencer that ladder, exactly as in production; the rehearsal's mount
 guard forwards to that telescope what the ladder sends (`Action("Status")`,
 `MountConnect`, `MotorsEnable`, `FindHome`) and still never a real `Park`
@@ -322,6 +365,47 @@ failing, it is **dropped** (a WARNING; a problem in the evaluation and the
 summary) and the night goes on with the other telescopes. The rehearsal
 refuses when a telescope without a recovery policy fails, or when no real
 telescope is left.
+
+**A `powercycle` rung switches a real outlet** (JDE 2026-11-10: MINERVA
+T1's and T2's `panel` and `inst`). The rehearsal starts no PDU server:
+the policy's `powercycle.pdu` is a PDU server the operator started with
+`--hardware` (next section), and without one the rung fails (connection
+refused) and the ladder escalates. Every guard holds: `requires_parked`
+(in the rehearsal "parked" is the mount guard's park: robofast's `Park`
+stopped the real mount where it is, tracking off -- it is not at its
+park position; at the preflight the guard's park is sent before a ladder
+that can power-cycle), the camera idle, `camera_warm_above`,
+`max_powercycles`, `min_interval`, and the PDU server's own `cycle`
+outlets and `min_cycle_interval`. After a mount cycle the guard forwards
+`MountConnect`, `MotorsEnable` and `FindHome` (recorded in the summary's
+"recovery commands to real mounts"). The rehearsal logs a warning for
+every policy that may power-cycle.
+
+### Running the PDU servers
+
+One PDU server per telescope, each behind an SNMP relay and a tunnel
+(docs/remote.md; `sites/minerva/remote/t1_pdu.json`, `t2_pdu.json`):
+
+```
+# on the site gateway (user processes; each relays to one PDU and nothing else)
+python snmp_relay.py --listen 127.0.0.1:7236 --target <T1 pdu address>:161
+python snmp_relay.py --listen 127.0.0.1:7237 --target <T2 pdu address>:161
+# here: the tunnels (local 7161 -> T1's relay, 7162 -> T2's)
+ssh -N -L 7161:127.0.0.1:7236 -L 7162:127.0.0.1:7237 <gateway>
+# read first: every outlet, and a write that switches nothing
+robofast-pdu-server --config sites/minerva/remote/t1_pdu.json --hardware --check-write 3
+robofast-pdu-server --config sites/minerva/remote/t2_pdu.json --hardware --check-write 3
+# then the servers (Alpaca on 127.0.0.1:11131 and :11132), for the night
+robofast-pdu-server --config sites/minerva/remote/t1_pdu.json --hardware
+robofast-pdu-server --config sites/minerva/remote/t2_pdu.json --hardware
+```
+
+The SNMP communities are in `~/.config/robofast/pdu-t1.credentials.json`
+and `pdu-t2.credentials.json` (mode 600). Only `panel` and `inst` can be
+switched or cycled; the PCs, heaters, network and everything else are
+read-only. A recovery policy's `powercycle.pdu` names the server
+(`127.0.0.1:11131` for T1, `:11132` for T2) and its `switch` the outlet by
+its place in the config (`1` panel, `2` inst).
 
 ## The PDU server
 
@@ -394,4 +478,11 @@ PDU); `tests/core/test_recovery.py` (each rung, escalation and
 exhaustion, the power-cycle guards, step bounds, a cycle through the real
 server and simulator, `requires_pwi_stop`, the guider's ladder on a
 simulated guider service, and the sequencer recovering one telescope or
-giving up on it while the other observes on).
+giving up on it while the other observes on);
+`tests/core/test_powercycle_recovery.py` (a PWI2 simulator whose mount
+controller drops, as T2's did on 2026-11-09: reconnect, restart and home
+fail, the `panel` cycle through the PDU server on its simulator with
+`t2_pdu.json`'s outlets brings the controller back, PWI reconnects and
+homes, recovered; the guards still refuse an unparked mount; a wedged
+camera recovered by its `inst` cycle without touching the mount; the
+MINERVA example policies; the rehearsal accepting a `powercycle` policy).

@@ -1,0 +1,73 @@
+{
+  "_note": [
+    "MINERVA T2's recovery ladder (docs/recovery.md): the sequencer's telescopes.t2.recovery entry, or a rehearsal's --recovery t2=FILE (robofast.testing.rehearsal).",
+    "powercycle SWITCHES A REAL OUTLET (JDE 2026-11-10: panel and inst) through the PDU server of t2_pdu.json on 127.0.0.1:11132, which the operator starts with --hardware (docs/recovery.md, 'Running the PDU servers'). Switch ids are that config's outlets in order: 1 = panel (the mount controller), 2 = inst (the Apogee camera).",
+    "telescope: reconnect, restart (PWI), home, then powercycle(panel). Cycling panel cuts the mount controller (encoders lost): PWI is stopped first and started after (legacy's constraint; requires_pwi_stop), then robofast reconnects PWI to the mount (MountConnect, MotorsEnable) and homes it; the rung counts only once the mount is homed (the PWI server needs allow_find_home).",
+    "camera: reconnect, then powercycle(inst): the camera alone (the Apogee camera). Its cooler is set again on the reconnect (the site config's cooling entry). A camera that still answers colder than camera_warm_above is not cut off; one that does not answer is.",
+    "Guards on every cycle: the telescope parked (requires_parked), the camera idle, at most one cycle a night per device (max_powercycles) and min_interval s apart, plus the PDU server's own cycle outlets and min_cycle_interval.",
+    "The hooks (/usr/local/bin/minerva-pwi T VERB: restart, stop or start PWI on the telescope's PC through the site gateway; exit 0 only once PWI answers, for restart and start) are the site deployment's, outside this repository (docs/recovery.md, 'The restart hook').",
+    "T2's panel also powers the Apogee filter wheel: after a panel cycle the wheel re-initializes, and its next command reconnects it (give the filterwheel its own reconnect policy in production).",
+    "restart and pwi_start start PWI2 through T2's scheduled 'Start PWI' task: until that task is enabled, a restart cannot bring PWI back (drop restart from the steps, and cycle panel only with someone ready to start PWI2 by hand)."
+  ],
+  "telescope": {
+    "steps": [
+      "reconnect",
+      "restart",
+      "home",
+      "powercycle"
+    ],
+    "restart": {
+      "command": [
+        "/usr/local/bin/minerva-pwi",
+        "t2",
+        "restart"
+      ],
+      "settle": 10
+    },
+    "powercycle": {
+      "pdu": "127.0.0.1:11132",
+      "switch": 1,
+      "boot_time": 30,
+      "requires_pwi_stop": true,
+      "pwi_stop": {
+        "command": [
+          "/usr/local/bin/minerva-pwi",
+          "t2",
+          "stop"
+        ]
+      },
+      "pwi_start": {
+        "command": [
+          "/usr/local/bin/minerva-pwi",
+          "t2",
+          "start"
+        ],
+        "settle": 10
+      }
+    },
+    "step_timeout": 240,
+    "verify_timeout": 60,
+    "home_timeout": 300,
+    "requires_parked": true,
+    "requires_camera_idle": true,
+    "max_powercycles": 1,
+    "min_interval": 1800
+  },
+  "camera": {
+    "steps": [
+      "reconnect",
+      "powercycle"
+    ],
+    "powercycle": {
+      "pdu": "127.0.0.1:11132",
+      "switch": 2,
+      "boot_time": 60
+    },
+    "step_timeout": 180,
+    "verify_timeout": 60,
+    "requires_parked": true,
+    "camera_warm_above": -5,
+    "max_powercycles": 1,
+    "min_interval": 1800
+  }
+}

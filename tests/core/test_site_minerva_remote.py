@@ -120,9 +120,13 @@ def test_pwi_configs_are_refused_without_hardware(name, port):
 
     d = _json(name)
     assert d["pwi"]["host"] == "127.0.0.1" and d["pwi"]["port"] == port
-    # Only T1 under PWI2 may be homed by robofast (verified 2026-11-09, docs/pwi.md);
-    # the others home only by hand.
-    assert d["allow_find_home"] is (name == "t1_pwi2.json")
+    # T1 and T2 under PWI2 may be homed by robofast (verified 2026-11-09 and
+    # 2026-11-10: homing is part of recovery, docs/pwi.md), and then refuse
+    # unhomed moves; the PWI4 configs home only by hand.
+    pwi2 = name in ("t1_pwi2.json", "t2_pwi2.json")
+    assert d["allow_find_home"] is pwi2
+    if pwi2:
+        assert d["allow_unhomed_moves"] is False
     with FakeTunnel() as tunnel:
         d["pwi"] = {**d["pwi"], "port": tunnel.port}
         d["listen"] = "127.0.0.1:0"

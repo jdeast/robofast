@@ -574,8 +574,9 @@ def test_recovery_options(tmp_path):
             }
         )
     )
-    with pytest.raises(RehearsalRefused, match="never switches a PDU"):
-        settings_from_args(args(recovery=[f"t1={f}"]))
+    # A powercycle rung is allowed (JDE 2026-11-10): it switches a real outlet.
+    s = settings_from_args(args(recovery=[f"t1={f}"]))
+    assert s.recovery["t1"]["telescope"]["steps"] == ["powercycle"]
     f.write_text(
         json.dumps(
             {

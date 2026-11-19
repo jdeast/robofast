@@ -54,24 +54,29 @@ class FakeDevice:
         #: Times :meth:`restart` was called.
         self.restarts = 0
 
-    async def _gate(self, member: str | None = None) -> None:
+    async def _gate(self) -> None:
         while self._hung.is_set():
             await asyncio.sleep(0.01)
         if self._failure is not None:
             raise FakeDeviceError(self._failure)
+
+    def _check_connected(self, member: str) -> None:
         if self.strict_connected and member != "Connected" and not self.Connected:
             raise NotConnectedException(f"{member}: not connected")
 
     async def get(self, member: str, *, timeout: float | None = None) -> Any:
-        await self._gate(member)
+        await self._gate()
+        self._check_connected(member)
         return getattr(self, member)
 
     async def set(self, member: str, value: Any, *, timeout: float | None = None) -> None:
-        await self._gate(member)
+        await self._gate()
+        self._check_connected(member)
         setattr(self, member, value)
 
     async def call(self, member: str, *args: Any, timeout: float | None = None) -> Any:
-        await self._gate(member)
+        await self._gate()
+        self._check_connected(member)
         return getattr(self, member)(*args)
 
     def restart(self) -> None:
@@ -389,7 +394,7 @@ class FakeCamera(FakeDevice):
 
     async def connect(self, *, timeout: float | None = None) -> None:
         """As :meth:`robofast.alpaca_client.AlpacaDevice.connect`."""
-        await self._gate("Connected")
+        await self._gate()
         if not self.Connected:
             self.Connected = True
 

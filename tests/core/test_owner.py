@@ -158,3 +158,42 @@ async def test_cancelled_caller_does_not_reorder_commands():
     assert dev.calls == [1, 2]
     assert tl.commands(outcome="cancelled")
     owner.close()
+
+
+async def test_not_connected_reconnects_and_retries_once():
+    """Night 2026-11-09/10: T2's PWI server, restarted mid-night, starts with
+    Connected false and answers NotConnected (0x407); the owner connects it
+    again (and runs on_connect, as for any fresh connection) and the command
+    goes through."""
+    tl = Timeline()
+    tel = FakeTelescope()
+    hooked: list[bool] = []
+
+    async def on_connect(driver, timeout):
+        hooked.append(driver.Connected)
+
+    owner = DeviceOwner("t2.telescope", lambda: tel, tl, on_connect=on_connect)
+    g = owner.grant("safety")
+    assert await g.get("AtPark") is True
+    assert hooked == [True]  # the first connection
+    tel.restart()
+    assert await g.get("AtPark") is True
+    assert tel.Connected
+    assert hooked == [True, True]
+    assert [e.detail["member"] for e in tl.events("reconnected")] == ["AtPark"]
+    assert await g.get("AtPark") is True  # connected: no reconnect
+    assert len(tl.events("reconnected")) == 1
+
+    # Once only: a device that is still not connected after Connected = True
+    # is an error, not a loop; nor is a NotConnected from Connected itself.
+    class Stubborn(FakeTelescope):
+        async def set(self, member, value, *, timeout=None):
+            if member != "Connected":
+                await super().set(member, value, timeout=timeout)
+
+    stub = Stubborn()
+    stub.restart()
+    owner2 = DeviceOwner("stub", lambda: stub, tl)
+    with pytest.raises(DeviceError, match="not connected"):
+        await owner2.grant("safety").get("AtPark")
+    assert [e.detail["member"] for e in tl.events("reconnected", source="stub")] == ["AtPark"]

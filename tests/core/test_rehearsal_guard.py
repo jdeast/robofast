@@ -94,6 +94,33 @@ def test_the_guard_parks_by_stopping_tracking(mount, guard):
     assert [e[2] for e in guard.events] == ["park", "unpark"]
 
 
+async def test_a_restarted_mount_server_is_connected_again(mount, guard):
+    """Night 2026-11-09/10: T2's PWI server restarted mid-night (Connected
+    false). The supervisor's AtPark read through the guard, and the guard's
+    own park, connect it again instead of failing with NotConnected for the
+    rest of the night (which held every lease: T1 sat idle)."""
+    from robofast.alpaca_client import AlpacaDevice
+    from robofast.owner import DeviceOwner
+    from robofast.timeline import Timeline
+
+    m, _, _ = mount
+    tl = Timeline()
+    owner = DeviceOwner("t2.telescope", lambda: AlpacaDevice(guard.address, "telescope", 0), tl)
+    g = owner.grant("safety")
+    assert put(guard, "telescope/0/park")["ErrorNumber"] == 0
+    assert await g.get("AtPark") is True
+    m.restart()
+    assert get(guard, "telescope/0/atpark")["ErrorNumber"] == 0x407
+    assert await g.get("AtPark") is True  # reconnected, through the guard
+    assert m.Connected
+    assert [e.detail["member"] for e in tl.events("reconnected")] == ["AtPark"]
+    m.Tracking = True
+    m.restart()
+    assert put(guard, "telescope/0/park")["ErrorNumber"] == 0  # the guard's own requests
+    assert m.Connected and not m.Tracking
+    owner.close()
+
+
 def test_the_guard_refuses_slews_outside_the_limits(mount, guard):
     m, _, _ = mount
     lst = lst_hours(NIGHT, MINERVA.longitude)

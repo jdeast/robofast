@@ -6,6 +6,16 @@ device, climbs its **recovery ladder** (`robofast/recovery.py`) before
 the usual backoff. It replaces legacy `cdk700.recover()`, `killPWI` /
 `restartPWI` and `powercycle`, which were called ad hoc.
 
+A device server that was **restarted** under a running robofast (it comes
+back with `Connected` false and answers every request with NotConnected,
+0x407) needs no rung: every `DeviceOwner` connects it again on the
+NotConnected (`Connected` = true, then its `on_connect` hook, as for any
+fresh connection) and sends the command once more, within the command's
+timeout; so does the rehearsal's mount guard for its own requests. Before
+this (night 2026-11-09/10) T2's restarted PWI server answered the
+supervisor's `AtPark` with NotConnected for the rest of the night, and the
+park-before-open check refused every lease: T1 sat idle.
+
 ## The ladder
 
 Per device (`telescope`, `camera`, `focuser`, `rotator`, `filterwheel`,

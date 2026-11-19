@@ -119,6 +119,10 @@ class _Handler(BaseHTTPRequestHandler):
             return
         names = {n.lower(): n for n in dir(device) if not n.startswith("_")}
         name = names.get(parts[4])
+        if getattr(device, "strict_connected", False) and name != "Connected":
+            if not device.Connected:  # restarted (robofast.testing.fakes)
+                self._send(200, _alpaca(ctid=ctid, err=0x407, msg=f"{parts[4]}: not connected"))
+                return
         if name is None:
             self._send(200, _alpaca(ctid=ctid, err=NOT_IMPLEMENTED, msg=f"{parts[4]}"))
             return

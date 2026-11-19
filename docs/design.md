@@ -163,6 +163,8 @@ A `DeviceOwner` is the only path to one device (`robofast/owner.py`).
   wire, so a cancelled task cannot send anything after it was fenced off.
 - Every command has a timeout; a timeout or device error is an exception,
   never a sentinel value.
+- A device answering NotConnected (0x407: its server restarted) is
+  connected again and the command sent once more (docs/recovery.md).
 - Some members are **privileged**: only the safety supervisor's grant may
   call `OpenShutter`/`CloseShutter`.
 - Every command and outcome is recorded in a timeline, which the tests

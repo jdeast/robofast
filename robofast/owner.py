@@ -16,7 +16,14 @@ A :class:`DeviceOwner` is the only path to one physical device. It:
   device afresh (the first command, after a timeout discarded the driver,
   after :meth:`DeviceOwner.reconnect`): what a device must have set again
   whenever it is (re)connected -- a camera's cooler (robofast/cooling.py)
-  -- is set there, and only there.
+  -- is set there, and only there;
+* treats an Alpaca ``NotConnected`` (0x407) as a restarted device server
+  (a server starts with ``Connected`` false): it connects the device again
+  (``Connected`` = True, then ``on_connect``, as for any fresh connection)
+  and sends the command once more, within the command's timeout. Night
+  2026-11-09/10: T2's PWI server, restarted mid-night, answered every
+  ``AtPark`` with NotConnected, so the park-before-open check refused every
+  lease and T1 sat idle for the rest of the night.
 
 Components never hold the device object itself, only a :class:`Grant`.
 Revoking a grant is how a cancelled task is fenced off: any command it still
@@ -47,6 +54,10 @@ from typing import Any
 from robofast.timeline import Timeline
 
 log = logging.getLogger(__name__)
+
+
+#: The Alpaca ``NotConnected`` error number (module doc).
+NOT_CONNECTED = 0x407
 
 
 class DeviceError(Exception):
@@ -125,6 +136,14 @@ class Grant:
     def __repr__(self) -> str:
         state = f"revoked:{self.revoke_reason}" if self.revoked else "live"
         return f"<Grant {self.holder} on {self.owner.name} {state}>"
+
+
+async def _send_op(driver: Any, op: str, member: str, args: tuple, timeout: float) -> Any:
+    if op == "get":
+        return await driver.get(member, timeout=timeout)
+    if op == "set":
+        return await driver.set(member, args[0], timeout=timeout)
+    return await driver.call(member, *args, timeout=timeout)
 
 
 # Background driver shutdowns, referenced until they finish.
@@ -271,13 +290,25 @@ class DeviceOwner:
                 t0 = loop.time()
                 await self._connected(driver, timeout)
                 deadline += loop.time() - t0  # the hook's time is not the command's
-            async with asyncio.timeout_at(deadline):
-                if op == "get":
-                    result = await driver.get(member, timeout=timeout)
-                elif op == "set":
-                    result = await driver.set(member, args[0], timeout=timeout)
-                else:
-                    result = await driver.call(member, *args, timeout=timeout)
+            try:
+                async with asyncio.timeout_at(deadline):
+                    result = await _send_op(driver, op, member, args, timeout)
+            except DeviceError as exc:
+                if getattr(exc, "number", None) != NOT_CONNECTED or member == "Connected":
+                    raise
+                # A restarted device server (module doc): connect again, as a
+                # fresh connection, and send the command once more.
+                log.warning("%s: %s: not connected; connecting again", self.name, member)
+                self.timeline.event(
+                    self.name, "reconnected", member=member, generation=self._generation
+                )
+                async with asyncio.timeout_at(deadline):
+                    await driver.set("Connected", True, timeout=timeout)
+                t0 = loop.time()
+                await self._connected(driver, timeout)
+                deadline += loop.time() - t0
+                async with asyncio.timeout_at(deadline):
+                    result = await _send_op(driver, op, member, args, timeout)
         except (TimeoutError, DeviceTimeout):
             self.timeline.command(grant.holder, self.name, member, "timeout", timeout=timeout)
             self._discard_driver(f"{member} exceeded {timeout} s")

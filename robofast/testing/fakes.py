@@ -8,7 +8,11 @@ with ``time.monotonic()``. Each has fault injection:
 * ``hang()`` / ``unhang()`` -- every command through the protocol waits until
   released (a device that stops answering);
 * ``fail(msg)`` / ``unfail()`` -- every command raises (a device that has
-  disappeared or errors).
+  disappeared or errors);
+* ``restart()`` -- its device server restarted: ``Connected`` is false, and
+  from then on, as on an Alpaca server, every member but ``Connected``
+  raises :class:`~robofast.alpaca_client.NotConnectedException` (0x407)
+  while it is (night 2026-11-09/10, T2's PWI server).
 
 Tests read ground truth by touching the members directly, bypassing the gate.
 
@@ -27,6 +31,7 @@ from typing import Any
 
 import numpy as np
 
+from robofast.alpaca_client import NotConnectedException
 from robofast.imagebytes import ImageArray
 
 
@@ -43,6 +48,11 @@ class FakeDevice:
         self._hung = threading.Event()
         self._failure: str | None = None
         self.Connected = True
+        #: Members but ``Connected`` raise NotConnected while it is false
+        #: (set by :meth:`restart`; module doc).
+        self.strict_connected = False
+        #: Times :meth:`restart` was called.
+        self.restarts = 0
 
     async def _gate(self) -> None:
         while self._hung.is_set():
@@ -50,17 +60,30 @@ class FakeDevice:
         if self._failure is not None:
             raise FakeDeviceError(self._failure)
 
+    def _check_connected(self, member: str) -> None:
+        if self.strict_connected and member != "Connected" and not self.Connected:
+            raise NotConnectedException(f"{member}: not connected")
+
     async def get(self, member: str, *, timeout: float | None = None) -> Any:
         await self._gate()
+        self._check_connected(member)
         return getattr(self, member)
 
     async def set(self, member: str, value: Any, *, timeout: float | None = None) -> None:
         await self._gate()
+        self._check_connected(member)
         setattr(self, member, value)
 
     async def call(self, member: str, *args: Any, timeout: float | None = None) -> Any:
         await self._gate()
+        self._check_connected(member)
         return getattr(self, member)(*args)
+
+    def restart(self) -> None:
+        """Its device server restarted (module doc)."""
+        self.restarts += 1
+        self.strict_connected = True
+        self.Connected = False
 
     def hang(self) -> None:
         self._hung.set()

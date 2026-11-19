@@ -7,9 +7,10 @@ a 20 min reopen hold, a 60 s lease, a 60 s staleness limit, a 5 min error
 backoff), a 45 s shutter and 30-40 s slews and parks. Random faults are thrown
 at it, seeded: unsafe weather, a sensor flickering at its threshold, a frozen
 feed, a SafetyMonitor that fails or hangs, cameras and mounts that fail or
-hang; the weather turning unsafe moments after a reopen hold ran out
-(``reopen_race``, half the nights); and targets of opportunity dropped into
-the scheduler's drop box and rung (robofast.doorbell) at random moments.
+hang or whose device server restarts (``Connected`` false); the weather
+turning unsafe moments after a reopen hold ran out (``reopen_race``, half
+the nights); and targets of opportunity dropped into the scheduler's drop
+box and rung (robofast.doorbell) at random moments.
 Faults of one kind on one device may overlap (the device is faulted while
 any is active).
 
@@ -102,6 +103,7 @@ TRAVEL = 45.0  # shutter travel, s
 KINDS = (
     "unsafe", "unsafe", "unsafe", "freeze", "sm_fail", "sm_hang",
     "cam_fail", "cam_hang", "tel_fail", "tel_hang", "flicker", "too", "too",
+    "cam_restart", "tel_restart",
 )  # fmt: skip
 SEEDS = range(
     int(os.environ.get("FAULT_SEED", "0")),
@@ -216,7 +218,10 @@ async def test_a_night_of_faults(make_rig, tmp_path, seed):
             rig.sm.hang() if on else rig.sm.unhang()
         elif kind[:3] in ("cam", "tel"):
             dev = (rig.cams if kind.startswith("cam") else rig.tels)[i]
-            if kind.endswith("fail"):
+            if kind.endswith("restart"):
+                if on:
+                    dev.restart()  # its server restarted: Connected false
+            elif kind.endswith("fail"):
                 dev.fail(f"{kind} {i}") if on else dev.unfail()
             else:
                 dev.hang() if on else dev.unhang()
@@ -321,3 +326,77 @@ async def test_a_night_of_faults(make_rig, tmp_path, seed):
         if not started and tel in working:
             viol.append(f"I5: {gid} (rung at {rung - t0:.0f}s, {tel}) never started")
     assert not viol, f"seed {seed}: " + "; ".join(viol)
+
+
+@pytest.mark.parametrize("t2_gave_up", [False, True], ids=["t2_observing", "t2_gave_up"])
+async def test_a_device_server_restarts_mid_night(make_rig, t2_gave_up):
+    """Night 2026-11-09/10 (robofast e3e9cdc): T2's PWI server was restarted
+    mid-night and came back with Connected false, so every AtPark read of T2
+    by the supervisor's park-before-open check answered NotConnected (0x407),
+    for good. At the next lease the check refused it ("cannot confirm parked:
+    t2"), and every lease after: T1 sat idle for the rest of the night with
+    nothing wrong with it, and parking T2 by hand did not release it.
+
+    Here, at the shipped timings, with ``park_before_close`` (MINERVA's): T2's
+    telescope server restarts 2 h in (``t2_gave_up``: after T2 gave up for
+    the night, and T2 is then parked by hand, as on the night), the weather
+    closes the enclosure an hour later, and once it reopens T1 (and T2, if
+    it still observes) must observe again. Without the reconnect on
+    NotConnected (robofast/owner.py) no lease is ever granted again."""
+    plan = make(
+        [
+            group(
+                "a", telescopes=["t1"], exptime=300.0, count=3, cadence={"min_interval": 0},
+                max_attempts=10**6,
+            ),
+            group(
+                "b", telescopes=["t2"], exptime=300.0, count=3, cadence={"min_interval": 0},
+                max_attempts=10**6,
+            ),
+        ]
+    )  # fmt: skip
+    rig = make_rig(
+        safety={**SHIPPED_SAFETY, "park_before_close": True},
+        seq=SHIPPED_SEQ,
+        command_timeout=5.0,
+        telescopes=2,
+        plan=plan,
+    )
+    rig.dome._travel = TRAVEL
+    for tel in rig.tels:
+        tel._slew_time, tel._park_time = 30.0, 40.0
+    t1cam, t2tel, t2cam = rig.cams[0], rig.tels[1], rig.cams[1]
+    t2 = rig.sequencer.units["t2"]
+    serve = asyncio.create_task(plan.serve())
+    await rig.start()
+    t0 = time.monotonic()
+    try:
+        if t2_gave_up:
+            await asyncio.sleep(1800.0)
+            t2tel.fail("PWI2 closed")  # T2 errors until it gives up
+            async with asyncio.timeout(3600.0):
+                while not t2.gave_up:
+                    await asyncio.sleep(1.0)
+            t2tel.unfail()
+        await asyncio.sleep(t0 + 2 * 3600.0 - time.monotonic())
+        assert rig.dome_open() and t1cam.exposures_started > 0
+        t2tel.restart()  # the server restarted: Connected false
+        if t2_gave_up:
+            t2tel._parked, t2tel._tracking = True, False  # parked by hand
+        await asyncio.sleep(3600.0)
+        rig.weather.set_safe(False)
+        await asyncio.sleep(600.0)
+        assert rig.dome_closed()
+        rig.weather.set_safe(True)
+        t_safe = time.monotonic()
+        n1, n2 = t1cam.exposures_started, t2cam.exposures_started
+        await asyncio.sleep(SHIPPED_SAFETY["reopen_hold"] + 3600.0)
+    finally:
+        serve.cancel()
+    after = f"{time.monotonic() - t_safe:.0f} s after the weather cleared"
+    assert rig.dome_open(), f"enclosure not reopened {after} (lease refused?)"
+    assert t1cam.exposures_started > n1, f"T1 held: no exposure {after}"
+    assert t2tel.Connected
+    if not t2_gave_up:
+        assert not t2.gave_up
+        assert t2cam.exposures_started > n2, f"T2: no exposure {after}"

@@ -63,6 +63,7 @@ log = logging.getLogger(__name__)
 INVALID_VALUE = 0x401
 INVALID_OPERATION = 0x40B
 INVALID_WHILE_PARKED = 0x408
+NOT_CONNECTED = 0x407
 
 #: Commands (lower case) forwarded to the real device, by device type.
 FORWARDED = {
@@ -151,6 +152,13 @@ def _alpaca_error(data: bytes) -> bool:
         return bool(json.loads(data).get("ErrorNumber"))
     except (ValueError, AttributeError):
         return True
+
+
+def _error_number(r: httpx.Response) -> int | None:
+    try:
+        return int(r.json().get("ErrorNumber") or 0)
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 def _alpaca(value: Any = None, *, ctid: int = 0, err: int = 0, msg: str = "") -> dict[str, Any]:
@@ -385,15 +393,35 @@ class MountGuard(ThreadingHTTPServer):
             return 500, "text/plain", f"rehearsal mount guard: {route.name}: {exc!r}".encode()
         return r.status_code, r.headers.get("Content-Type", "application/json"), r.content
 
-    def _put(self, route: _Route, member: str, **values: Any) -> str | None:
-        """A command to the real device; the error text, or None."""
+    def _own(self, verb: str, route: _Route, member: str, **values: Any) -> httpx.Response:
+        """One of the guard's own requests to the real device. Always
+        ClientID 1: a robofast device server keeps Connected per client (the
+        preflight connected this one). NotConnected (0x407: the device
+        server restarted, night 2026-11-09/10): connect again, ask once more."""
+        url = f"{route.upstream}/{member}"
         form = {
             "ClientID": "1",
             "ClientTransactionID": "0",
             **{k: str(v) for k, v in values.items()},
         }
+        for again in (True, False):
+            if verb == "PUT":
+                r = self._client().put(url, data=form)
+            else:
+                r = self._client().get(url, params=form)
+            if not (again and r.status_code == 200 and _error_number(r) == NOT_CONNECTED):
+                return r
+            log.warning("%s: %s: not connected; connecting again", route.name, member)
+            self._client().put(
+                f"{route.upstream}/connected",
+                data={"ClientID": "1", "ClientTransactionID": "0", "Connected": "True"},
+            )
+        return r
+
+    def _put(self, route: _Route, member: str, **values: Any) -> str | None:
+        """A command to the real device; the error text, or None."""
         try:
-            r = self._client().put(f"{route.upstream}/{member}", data=form)
+            r = self._own("PUT", route, member, **values)
         except httpx.HTTPError as exc:
             return repr(exc)
         if r.status_code != 200:
@@ -405,11 +433,7 @@ class MountGuard(ThreadingHTTPServer):
         return None if not d.get("ErrorNumber") else str(d.get("ErrorMessage"))
 
     def _get(self, route: _Route, member: str) -> Any:
-        # The same ClientID as the guard's commands: a robofast device server
-        # keeps Connected per client (the preflight connected this one).
-        r = self._client().get(
-            f"{route.upstream}/{member}", params={"ClientID": "1", "ClientTransactionID": "0"}
-        )
+        r = self._own("GET", route, member)
         r.raise_for_status()
         d = r.json()
         if d.get("ErrorNumber"):

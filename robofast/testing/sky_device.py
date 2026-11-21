@@ -156,6 +156,7 @@ class SkyDevice:
         #: The focuser starts ``focus_error`` steps from the true focus (20000).
         self.focuser = SimFocuser(position=round(20000 + focus_error), max_step=120000)
         self.camera = StarfieldCamera(self.focuser, scene)
+        self.camera.render_early = True  # real time: render during the exposure
         self.camera.PixelSizeX = self.camera.PixelSizeY = pixel_size
         self.server = FakeAlpacaServer(
             # Without ``focuser`` the camera keeps it (it sets the sharpness)

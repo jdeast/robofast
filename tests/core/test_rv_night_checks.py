@@ -33,3 +33,21 @@ def test_each_telescope_aborts_before_it_parks():
 def test_a_telescope_parked_before_its_abort_is_a_violation():
     o = cleanup((1.0, "t1.telescope", "Park"), (2.0, "t1.camera", "AbortExposure"))
     assert safety_violations(o) == ["night cleanup #2: an abort after a park (t1)"]
+
+
+async def test_the_simulated_night_keeps_its_emergency_log_in_its_own_directory(tmp_path):
+    """2026-11-21, the MINERVA gateway (robofast installed, /var/log/robofast
+    root:robofast 0750): every e2e night read the example config's production
+    emergency log, could not read it, assumed a latched emergency close, and
+    never opened the simulated roof (6 e2e tests failed, 900 s timeouts)."""
+    from robofast.emergency import EmergencyConfig, EmergencyGate
+    from robofast.testing.rv_night import SimulatedNight
+
+    night = SimulatedNight(tmp_path)
+    try:
+        night._start_aqawan()
+        cfg = EmergencyConfig.from_dict(night.aqawan.config.emergency_close)
+        assert cfg.log == str(tmp_path / "aqawan1-emergency.jsonl")
+        assert EmergencyGate(cfg).latched is None
+    finally:
+        await night.close()

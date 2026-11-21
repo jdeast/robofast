@@ -4420,6 +4420,8 @@ class Sequencer:
             record = {
                 "version": 1,
                 "kind": result.get("kind"),
+                # A test frame (rehearsal / dry run): not data (docs/data.md).
+                **({"test": True} if result.get("test") else {}),
                 "file": result.get("file"),
                 "object": result.get("object"),
                 "observation": obs.name,

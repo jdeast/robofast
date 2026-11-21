@@ -239,6 +239,7 @@ class SpectrumRecorder:
             "sidecar": str(rel),
             "file": raw,
             "kind": record.get("kind"),
+            **({"test": True} if record.get("test") else {}),
             "object": record.get("object"),
             "telescopes": record.get("telescopes"),
             "start_utc": record.get("start_utc"),

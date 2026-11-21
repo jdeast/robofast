@@ -70,6 +70,23 @@ devices). They are only read, for the headers.
   `observation`, `frame`, `seq`, the request ids, `shape`, `bytes` and
   `written`.
 
+### Test frames
+
+A rehearsal or dry run is not a science night, and its frames must never be
+mistaken for data (JDE 2026-11-19: dry-run KiwiSpec frames with real object
+names and `IMAGETYP` science were extracted by the legacy pipeline). With
+`"test_frames": true` in `images`, every frame is named
+`n<YYYYMMDD>.<telescope>.<object>.test.<seq:04d>.fits` and written with
+`IMAGETYP = 'test'`, its real type (`LIGHT`, `DARK`, ...) in `TESTTYP`; the
+index line says `"imagetyp": "test"` and `"test_of"`. The KiwiSpec service
+does the same for raw spectra with `test_frames` in its config or
+`--test-frames` (`<night>.<object>.test.<index>.fits`, the name the
+spectrograph PC saves under, so the legacy extraction, which skips names
+containing `test`, leaves it alone; docs/kiwispec.md); the sidecars say
+`"test": true`. `robofast.testing.rehearsal` always writes test frames, and
+refuses an external KiwiSpec service (`--kiwispec`) that does not report
+`test_frames` in `GET /status`.
+
 **Writing never overwrites and is atomic.** A frame is written under a
 temporary name in its directory, fsynced, then hard-linked to its final
 name. The link fails if that name already exists; the writer then takes the

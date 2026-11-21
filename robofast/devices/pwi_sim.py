@@ -162,6 +162,10 @@ class CDK700Model:
         #: on tracking off (MINERVA T1, 2026-11-08: the rehearsal's end
         #: action sent tracking off mid-slew and the mount stopped short).
         self.altaz_tracks = altaz_tracks
+        #: PWI reports tracking on only this long (s) after ``tracking on``
+        #: (MINERVA T2, night 2026-11-09: still off 6 s after it).
+        self.tracking_report_lag = 0.0
+        self._tracking_on_at = -1e9
         self.slew_rate = slew_rate
         self.home_time = home_time
         #: An unhomed altitude axis's home first searches this far down (deg).
@@ -384,11 +388,18 @@ class CDK700Model:
         self.radec = ((ra + ra_arcsec / 3600.0 / 15.0) % 24.0, dec + dec_arcsec / 3600.0)
         self.slewing = True
 
+    def tracking_reported(self) -> bool:
+        """Tracking as PWI reports it (``tracking_report_lag``)."""
+        return self.tracking and (
+            time.monotonic() - self._tracking_on_at >= self.tracking_report_lag
+        )
+
     def set_tracking(self, on: bool) -> None:
         if on and not self._can_move("tracking_on"):
             return
         self.tracking = on
         if on:
+            self._tracking_on_at = time.monotonic()
             self.radec = self.radec_now()
             self.altaz = None
         else:
@@ -501,7 +512,7 @@ def pwi4_status(m: CDK700Model) -> str:
         ("mount.azimuth_degs", repr(m.az)),
         ("mount.altitude_degs", repr(m.alt)),
         ("mount.is_slewing", _b4(moving)),
-        ("mount.is_tracking", _b4(m.tracking)),
+        ("mount.is_tracking", _b4(m.tracking_reported())),
         ("mount.axis0.is_enabled", _b4(m.enabled[0])),
         *(
             [
@@ -687,7 +698,7 @@ def pwi2_status(m: CDK700Model) -> str:
         + el("connected", _b2(m.connected))
         + el("on_target", _b2(on_target))
         + el("moving", _b2(moving))
-        + el("tracking", _b2(m.tracking))
+        + el("tracking", _b2(m.tracking_reported()))
         + el("ra", _sexa(ra, hours=True, places=3))
         + el("dec", _sexa(dec, hours=False, places=2))
         + el("ra_target", _sexa(t_ra, hours=True, places=3))

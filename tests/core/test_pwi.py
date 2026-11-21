@@ -826,6 +826,50 @@ async def test_offset_and_pulse_guide(make, backend):
     await tel.aclose()
 
 
+async def visible(tel) -> tuple[float, float]:
+    """An RA/Dec an hour east of the meridian at Dec 20: inside the limits."""
+    lst = await tel.get("SiderealTime", timeout=T)
+    return (lst - 1.0) % 24, 20.0
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_a_slew_waits_for_pwi_to_report_tracking(make, backend):
+    """Night 2026-11-09: T2's PWI2 still read tracking off 6 s after
+    ``tracking on`` and the slew was refused; the server now re-reads."""
+    sim, server = make(backend)
+    sim.model.tracking_report_lag = 1.5
+    tel = await device(server)
+    await tel.set("Tracking", True, timeout=T)
+    assert not sim.model.tracking_reported()
+    t0 = time.monotonic()
+    await tel.call("SlewToCoordinatesAsync", *(await visible(tel)), timeout=T)
+    assert time.monotonic() - t0 >= 1.0 and sim.model.tracking_reported()
+    await tel.call("Action", "Offset", '{"north": 1}', timeout=T)
+    await tel.aclose()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_tracking_that_never_comes_is_refused_after_the_settle(make, backend):
+    sim, server = make(backend, tracking_settle=0.6)
+    sim.model.tracking_report_lag = 60.0
+    tel = await device(server)
+    await tel.set("Tracking", True, timeout=T)
+    with pytest.raises(InvalidOperationException, match="after tracking on"):
+        await tel.call("SlewToCoordinatesAsync", *(await visible(tel)), timeout=T)
+    await tel.aclose()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_tracking_never_asked_is_refused_at_once(make, backend):
+    _sim, server = make(backend)
+    tel = await device(server)
+    t0 = time.monotonic()
+    with pytest.raises(InvalidOperationException, match="tracking is off"):
+        await tel.call("SlewToCoordinatesAsync", *(await visible(tel)), timeout=T)
+    assert time.monotonic() - t0 < 1.0
+    await tel.aclose()
+
+
 async def test_hung_pwi_is_bounded(make):
     sim, server = make("pwi4")
     tel = await device(server)

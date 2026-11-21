@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from robofast.testing.rv_night import SEQUENCER, NightSettings, Outcome, safety_violations
+from robofast.testing.rv_night import (
+    SEQUENCER,
+    NightSettings,
+    Outcome,
+    console_park_problems,
+    safety_violations,
+)
 from robofast.timeline import Entry, Timeline
 
 
@@ -33,3 +39,44 @@ def test_each_telescope_aborts_before_it_parks():
 def test_a_telescope_parked_before_its_abort_is_a_violation():
     o = cleanup((1.0, "t1.telescope", "Park"), (2.0, "t1.camera", "AbortExposure"))
     assert safety_violations(o) == ["night cleanup #2: an abort after a park (t1)"]
+
+
+def console_park(*mount_events: tuple[float, str, str]) -> Outcome:
+    """The console parks t2 at t 5 (requested) to 6 (parked), with these
+    ``(t, telescope, what)`` mount events."""
+    tl = Timeline()
+    tl._add(Entry(5.0, "event", SEQUENCER, None, "park_requested", "", {"telescope": "t2"}))
+    tl._add(
+        Entry(
+            6.0,
+            "event",
+            SEQUENCER,
+            None,
+            "operator_parked",
+            "",
+            {"telescope": "t2", "parked": True},
+        )
+    )
+    o = Outcome(out=Path("."), settings=NightSettings(), timelines={"night": tl})
+    o.mount_events.extend(mount_events)
+    return o
+
+
+def test_the_console_park_parks_t2():
+    assert console_park_problems(console_park((1.0, "t2", "slew"), (5.5, "t2", "park"))) == []
+
+
+def test_t2_already_parked_needs_no_park_command():
+    # test_rv_night "never parked" (master CI): T2's error path had parked it
+    # and it was idle, unmoved, when the console asked; the sequencer then
+    # sends no Park (it is AtPark), and the check failed.
+    o = console_park((1.0, "t2", "slew"), (2.0, "t2", "park"))
+    assert console_park_problems(o) == []
+
+
+def test_t2_moved_and_not_parked_again_is_caught():
+    o = console_park((1.0, "t2", "park"), (5.2, "t2", "unpark"), (5.3, "t2", "slew"))
+    assert console_park_problems(o) == ["t2's mount never parked for the console"]
+    assert console_park_problems(console_park((1.0, "t2", "slew"))) == [
+        "t2's mount never parked for the console"
+    ]

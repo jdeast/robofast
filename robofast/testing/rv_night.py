@@ -1331,7 +1331,15 @@ def console_park_problems(o: Outcome) -> list[str]:
         e[1] == "t1" and e[2] == "park" and t0 <= e[0] <= t1 + 1.0 for e in o.mount_events
     ):
         bad.append("t1 parked when the console parked t2")
-    if not any(e[1] == "t2" and e[2] == "park" and t0 <= e[0] <= t1 + 0.5 for e in o.mount_events):
+    t2 = [e for e in o.mount_events if e[1] == "t2" and e[2] in ("park", "unpark", "slew")]
+    parked_now = any(e[2] == "park" and t0 <= e[0] <= t1 + 0.5 for e in t2)
+    # Already parked when the console asked (its error path parked it and it
+    # was idle, unmoved, since: the sequencer then sends no Park), and not
+    # moved in the meantime: parked all along.
+    before = [e for e in t2 if e[0] < t0]
+    moved = any(e[2] != "park" and t0 <= e[0] <= t1 + 0.5 for e in t2)
+    parked_all_along = bool(before) and before[-1][2] == "park" and not moved
+    if not (parked_now or parked_all_along):
         bad.append("t2's mount never parked for the console")
     return bad
 

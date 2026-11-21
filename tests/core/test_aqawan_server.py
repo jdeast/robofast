@@ -560,7 +560,12 @@ def test_server_refuses_a_non_loopback_pac(tmp_path):
 
 
 async def test_heartbeat_stop_closes(make_rig):
-    hb = 1.0
+    # The pinger's heartbeats go HTTP -> server -> PAC every 0.2 s; under a
+    # loaded CI runner (xdist, slow cores) one round trip took over the 1 s
+    # timeout this test used, the PAC closed while it was still pinging, and
+    # a later check failed (master CI flake). 3 s leaves room; the timing is
+    # measured from the PAC's own deadline, not from when the pinger stopped.
+    hb = 3.0
     rig = make_rig({"heartbeat_timeout": hb})
     dome = rig.dome()
     await dome.call("Action", "Heartbeat", "")
@@ -576,10 +581,15 @@ async def test_heartbeat_stop_closes(make_rig):
     await until_status(dome, OPEN, 5)
     pinger_stop.set()
     await task
-    t0 = time.monotonic()
-    await wait_until(rig.sim.closed, hb + 2 * TRAVEL + 1.0, what="PAC closes itself")
+    assert rig.sim.watchdog_trips == 0, "the PAC timed out while the heartbeats were coming"
+    deadline = rig.sim._hb_deadline  # the last heartbeat + hb (the sim's monotonic clock)
+    assert deadline is not None
+    await wait_until(
+        rig.sim.closed, deadline - time.monotonic() + 2 * TRAVEL + 2.0, what="PAC closes itself"
+    )
     assert rig.sim.watchdog_trips == 1
-    assert time.monotonic() - t0 >= 2 * TRAVEL  # it closed by itself, after the timeout
+    # It closed by itself, after the timeout: both shutters' travel after the deadline.
+    assert time.monotonic() >= deadline + 2 * TRAVEL - 0.05
     assert await dome.get("ShutterStatus") == CLOSED
     with pytest.raises(DriverException, match="Heartbeat timer expired"):
         await dome.call("OpenShutter")

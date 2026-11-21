@@ -1210,6 +1210,9 @@ class Sequencer:
             if u.recovery is not None:
                 u.recovery.alarm = lambda text, u=u: self.alarm(u.name, text)
                 u.recovery.event = lambda what, u=u, **kw: self._event(what, telescope=u.name, **kw)
+            if u.guider is not None and hasattr(u.guider, "on_alarm"):
+                # The guider's forwarded alarms (offset_high: docs/guider.md).
+                u.guider.on_alarm = lambda text, u=u: self.alarm(u.name, text)
             if u.cooling is not None:
                 u.cooling.alarm = lambda text, u=u: self.alarm(u.name, text)
                 u.cooling.event = lambda what, u=u, **kw: self._event(what, telescope=u.name, **kw)

@@ -51,7 +51,13 @@ flux-weighted midpoint. Behind a beamsplitter (MINERVA's FAU) this is the
 light reaching the fiber's position, not the light coupled into it: a
 relative flux.
 
+**Guide log** (``guide_log``; :mod:`robofast.guider.guide_log`): every
+guide frame's star position, setpoint, fiber position, star flux and
+fiber counts go into :attr:`Guider.log_frames`, which the service writes
+to a per-telescope file at the guide rate.
+
 Alarms: ``star_lost``, ``tiptilt_limit``, ``residual_high``,
+``offset_high`` (the star held off its setpoint: ``offset_alarm``),
 ``acquisition_failed``, ``not_converging``, ``device_error``; repeated
 alarms within ``alarm_repeat`` seconds are counted, not duplicated.
 """
@@ -137,6 +143,16 @@ class GuideConfig:
     residual_alarm: float = 1.5
     limit_alarm: float = 0.95
     alarm_repeat: float = 60.0
+    #: ``offset_high`` alarm (arcsec; needs ``plate_scale``; None: off): the
+    #: star's mean offset from the setpoint, averaged over
+    #: ``offset_alarm_window`` seconds of guide frames, stays above
+    #: ``offset_alarm`` for ``offset_alarm_time`` seconds. A systematic
+    #: offset costs RVs (2016-2020 MINERVA: T2 held stars 7-11" off its
+    #: set point for months, T1/T2 a median 1.7" off after the legacy
+    #: header stall), unlike the residual rms, which sees only jitter.
+    offset_alarm: float | None = 1.5
+    offset_alarm_time: float = 30.0
+    offset_alarm_window: float = 10.0
     publish_interval: float = 1.0
     #: Arcsec per pixel, for telemetry in arcsec (optional).
     plate_scale: float | None = None
@@ -150,6 +166,10 @@ class GuideConfig:
     fiber_flux: bool = False
     fiber_aperture: float | None = None
     fiber_annulus: tuple[float, float] | None = None
+    #: Keep every guide frame's row for the guide log (star and fiber
+    #: positions, star flux, fiber counts: :attr:`Guider.log_frames`);
+    #: turned on by the service's ``guide_log`` (robofast.guider.guide_log).
+    guide_log: bool = False
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> GuideConfig:
@@ -170,6 +190,10 @@ class GuideConfig:
             raise ValueError("exposure times out of range")
         if not 8 <= c.roi_size <= 4096:
             raise ValueError("roi_size out of range")
+        if c.offset_alarm is not None and c.offset_alarm <= 0:
+            raise ValueError("offset_alarm must be positive (or null: off)")
+        if c.offset_alarm_time < 0 or c.offset_alarm_window <= 0:
+            raise ValueError("offset_alarm_time >= 0 and offset_alarm_window > 0")
         if c.fiber_annulus is not None:
             c.fiber_annulus = (float(c.fiber_annulus[0]), float(c.fiber_annulus[1]))
             if not 0 < c.fiber_annulus[0] < c.fiber_annulus[1]:
@@ -197,6 +221,30 @@ class FrameRecord:
     processing: float = math.nan
     #: Background-subtracted counts inside the fiber's footprint (fiber_flux).
     fiber_counts: float = math.nan
+
+
+@dataclass
+class GuideLogRow:
+    """One guide frame for the guide log (robofast.guider.guide_log):
+    where the star was, where it was held (the setpoint) and where the
+    fiber is, in guide-camera pixels, and its light. Times are the
+    guider's clock (the log converts them to Unix time)."""
+
+    t_start: float
+    t_end: float
+    valid: bool
+    star_x: float
+    star_y: float
+    setpoint_x: float
+    setpoint_y: float
+    fiber_x: float
+    fiber_y: float
+    #: The star's background-subtracted counts in the centroid aperture
+    #: (FAU photometry) and its FWHM (pixels).
+    flux: float
+    fwhm: float
+    #: Counts inside the fiber's footprint (NaN without ``fiber_flux``).
+    fiber_counts: float
 
 
 def fiber_counts(
@@ -272,6 +320,15 @@ class Guider:
         self.records: deque[FrameRecord] = deque(maxlen=max(config.window, 10))
         #: Fiber flux not yet reported: (t_start, t_end, counts), clock time.
         self.flux_frames: deque[tuple[float, float, float]] = deque(maxlen=20000)
+        #: Guide-log rows not yet written (``guide_log``): one per guide
+        #: frame, clock time (:class:`GuideLogRow`).
+        self.log_frames: deque[GuideLogRow] = deque(maxlen=20000)
+        #: The ``offset_high`` watch: recent (t, ex, ey) of valid guide
+        #: frames, the mean offset over ``offset_alarm_window`` (arcsec;
+        #: NaN until known) and since when it has been above the alarm.
+        self._offsets: deque[tuple[float, float, float]] = deque()
+        self.offset_arcsec = math.nan
+        self._offset_high_since: float | None = None
         self.alarms: deque[Alarm] = deque(maxlen=50)
         self.last: Measurement | None = None
         self.frames = 0
@@ -332,6 +389,9 @@ class Guider:
 
     def set_target(self, x: float, y: float) -> None:
         """Move the target (setpoint) without resetting the controller."""
+        prev = self.config.target
+        if prev is None or math.hypot(x - prev[0], y - prev[1]) > 1.0:
+            self._reset_offset_watch()  # a new setpoint, not offset guiding's small updates
         self.config.target = (float(x), float(y))
         self.controller.set_target(x, y)
         self._centroider = self._make_centroider()
@@ -671,6 +731,7 @@ class Guider:
         self.controller.reset()
         self.controller.set_target(*c.target)
         self._roi = ROI.centred(c.target[0], c.target[1], c.roi_size, self.camera.sensor)
+        self._reset_offset_watch()  # each (re)acquisition starts the watch afresh
         self._set_state("guiding")
         guess: tuple[float, float] = (star.x, star.y)
         bad = 0
@@ -748,6 +809,26 @@ class Guider:
             if got is not None:
                 counts = got
                 self.flux_frames.append((frame.t_start, frame.t_end, max(0.0, got)))
+        if self.config.guide_log:
+            fx, fy = fib if fib is not None else (math.nan, math.nan)
+            self.log_frames.append(
+                GuideLogRow(
+                    frame.t_start,
+                    frame.t_end,
+                    valid,
+                    m.x,
+                    m.y,
+                    tgt[0],
+                    tgt[1],
+                    float(fx),
+                    float(fy),
+                    m.flux,
+                    m.fwhm,
+                    counts,
+                )
+            )
+        if valid:
+            self._watch_offset(frame.t_end, m.x - tgt[0], m.y - tgt[1])
         self.records.append(
             FrameRecord(
                 frame.t_end,
@@ -767,6 +848,42 @@ class Guider:
                 counts,
             )
         )
+
+    def _reset_offset_watch(self) -> None:
+        self._offsets.clear()
+        self.offset_arcsec = math.nan
+        self._offset_high_since = None
+
+    def _watch_offset(self, t: float, ex: float, ey: float) -> None:
+        """The ``offset_high`` watch (GuideConfig.offset_alarm): the mean
+        offset over the last ``offset_alarm_window`` seconds of valid
+        guide frames, alarmed once it has stayed above the threshold for
+        ``offset_alarm_time`` seconds."""
+        c = self.config
+        if not (math.isfinite(ex) and math.isfinite(ey)):
+            return
+        q = self._offsets
+        q.append((t, ex, ey))
+        while q and t - q[0][0] > c.offset_alarm_window:
+            q.popleft()
+        if not c.plate_scale:
+            return
+        mx = sum(e[1] for e in q) / len(q)
+        my = sum(e[2] for e in q) / len(q)
+        self.offset_arcsec = math.hypot(mx, my) * c.plate_scale
+        if c.offset_alarm is None or self.offset_arcsec <= c.offset_alarm:
+            self._offset_high_since = None
+            return
+        if self._offset_high_since is None:
+            self._offset_high_since = t
+        if t - self._offset_high_since >= c.offset_alarm_time:
+            self.alarm(
+                "offset_high",
+                f"star {self.offset_arcsec:.2f} arcsec from the setpoint"
+                f" for {t - self._offset_high_since:.0f} s (alarm at {c.offset_alarm} arcsec)",
+                offset_arcsec=round(self.offset_arcsec, 3),
+                offset_pixels=[round(mx, 3), round(my, 3)],
+            )
 
     # -- telemetry --------------------------------------------------------------------
 
@@ -813,6 +930,8 @@ class Guider:
         ps = self.config.plate_scale
         if ps:
             out["residual_rms_arcsec"] = rms * ps
+            if math.isfinite(self.offset_arcsec):
+                out["offset_arcsec"] = self.offset_arcsec
             if self.last is not None and math.isfinite(self.last.fwhm):
                 out["fwhm_arcsec"] = out["fwhm"] * ps
             # The live seeing (docs/seeing.md): a whole star's FWHM; on the
@@ -921,6 +1040,7 @@ VALUES: dict[str, tuple[str, str, str]] = {
     "guide_rate": ("GUIDRATE", "Hz", "Guide loop rate"),
     "guide_latency": ("GUIDLAT", "s", "Guide latency, exposure end to command (median)"),
     "guide_exptime": ("GUIDEXP", "s", "Guide exposure time"),
+    "guide_offset_arcsec": ("GUIDOFFA", "arcsec", "Mean guide star offset from its setpoint"),
     "fiber_x": ("XSCIFIB", "pix", "X pixel of the science fiber (guide camera)"),
     "fiber_y": ("YSCIFIB", "pix", "Y pixel of the science fiber (guide camera)"),
     "tiptilt_a": ("TTPOSA", "", "Tip/tilt position, axis A"),
@@ -971,6 +1091,7 @@ def publish_values(
             ("guide_seeing", "seeing_arcsec"),
             ("guide_rate", "loop_rate"),
             ("guide_latency", "latency_median"),
+            ("guide_offset_arcsec", "offset_arcsec"),
         ):
             v = summary.get(key)
             if isinstance(v, (int, float)) and math.isfinite(v):

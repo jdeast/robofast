@@ -23,7 +23,8 @@ from typing import Any
 import numpy as np
 
 from robofast.allsky import calibrate, clouds, imageio, skycal, stars
-from robofast.allsky.cameras import MODELS_DIR, CameraSpec
+from robofast.allsky.calibrate import _site
+from robofast.allsky.cameras import CameraSpec
 from robofast.allsky.frames import Frame, load_frame
 from robofast.allsky.model import CameraModel
 
@@ -41,10 +42,10 @@ class NightFrame:
     eph: stars.Ephemeris | None = field(default=None, repr=False)
 
 
-def with_ephemeris(items: Sequence[tuple[Path, datetime]]) -> list[NightFrame]:
+def with_ephemeris(items: Sequence[tuple[Path, datetime]], site: stars.Site) -> list[NightFrame]:
     out = []
     for p, t in items:
-        e = stars.ephemeris(t)
+        e = stars.ephemeris(t, site)
         out.append(NightFrame(Path(p), t, e.sun_alt, e.moon_alt, e))
     return out
 
@@ -65,7 +66,7 @@ def calibrate_night(
     spec: CameraSpec,
     *,
     start: CameraModel | None = None,
-    out_dir: Path = MODELS_DIR,
+    out_dir: Path,
     name: str | None = None,
     n_static: int = 40,
     n_candidates: int = 24,
@@ -79,7 +80,7 @@ def calibrate_night(
     ``<name>.json`` / ``<name>.static.png`` (``name`` defaults to the camera)."""
     name = name or spec.name
     report: dict[str, Any] = {"camera": spec.name, "n_frames": len(items)}
-    nights = with_ephemeris(list(items))
+    nights = with_ephemeris(list(items), _site(spec))
     dark = [n for n in nights if n.sun_alt < -15]
     report["n_dark"] = len(dark)
     if len(dark) < 10:
@@ -119,9 +120,13 @@ def calibrate_night(
     }
     progress(f"refine: {report['refine']}")
     # 3. Clear-sky calibration.
-    model.sky = dict(model.sky or {}, static_mask=str((out_dir / f"{name}.static.png").resolve()))
+    model.sky = dict(model.sky or {}, static_mask=f"{name}.static.png")
+    model.source_dir = str(out_dir.resolve())
     sky_frames = [_load(n, spec.name) for n in _spread(dark, n_sky)]
-    sky, srep = skycal.calibrate_sky(sky_frames, spec, model, static_name=model.sky["static_mask"])
+    sky, srep = skycal.calibrate_sky(
+        sky_frames, spec, model, static_name=str(out_dir / f"{name}.static.png")
+    )
+    sky["static_mask"] = f"{name}.static.png"
     model.sky = sky
     report["sky"] = srep
     # 4. Twilight, if the night was clear enough to trust its twilight.
@@ -144,18 +149,21 @@ def calibrate_sky_only(
     spec: CameraSpec,
     model: CameraModel,
     *,
-    out_dir: Path = MODELS_DIR,
+    out_dir: Path,
     name: str | None = None,
     n_sky: int = 60,
 ) -> tuple[CameraModel, dict[str, Any]]:
     """Redo only the clear-sky calibration of ``model`` (geometry and static
     mask kept) from another night's frames."""
     name = name or spec.name
-    dark = [n for n in with_ephemeris(list(items)) if n.sun_alt < -15]
+    dark = [n for n in with_ephemeris(list(items), _site(spec)) if n.sun_alt < -15]
     frames = [_load(n, spec.name) for n in _spread(dark, n_sky)]
-    sky, rep = skycal.calibrate_sky(
-        frames, spec, model, static_name=(model.sky or {}).get("static_mask")
-    )
+    sm = (model.sky or {}).get("static_mask")
+    if sm and not Path(sm).is_absolute() and model.source_dir:
+        sm = str(Path(model.source_dir) / sm)
+    sky, rep = skycal.calibrate_sky(frames, spec, model, static_name=sm)
+    if sm:
+        sky["static_mask"] = Path(sm).name if Path(sm).parent == out_dir.resolve() else sm
     model.sky = sky
     model.save(out_dir / f"{name}.json")
     return model, rep
@@ -172,7 +180,7 @@ def analyze_night(
     """A cloud map for every frame taken with the Sun below ``max_sun_alt``."""
     out = []
     for p, t in items:
-        eph = stars.ephemeris(t)
+        eph = stars.ephemeris(t, _site(spec))
         if eph.sun_alt > max_sun_alt:
             continue
         try:

@@ -6,10 +6,11 @@ camera's clear fractions and the cloud sensors' readings nearest in time.
 ``... report X.jsonl ... --out-dir D`` draws a time-series PNG per night
 and prints the confusion table of camera versus sensor.
 
-Sensor classes follow the archive's selection: MEarth (legacy scale,
-sky minus ambient, deg C) at or below -38 is clear, above -28 cloudy, in
-between "between"; 39.0, 0, 999 and -999.9 are no reading, 998 is rain
-(cloudy).
+The log's keys are the caller's (``--sensor`` decides; ``--log-keys``
+are recorded too): they are a site's (docs/allsky.md). Sensor classes,
+for a sky-minus-ambient cloud sensor in deg C: at or below ``CLEAR_MAX``
+(-38) clear, above ``CLOUDY_MIN`` (-28) cloudy, in between "between";
+39.0, 0, 999 and -999.9 are no reading, 998 is rain (cloudy).
 """
 
 from __future__ import annotations
@@ -79,13 +80,15 @@ def run_night(
     step: int = 4,
     max_sun_alt: float = -12.0,
     log_path: Path | None = None,
+    log_keys: tuple[str, ...] = (),
 ) -> Iterable[dict[str, Any]]:
+    from robofast.allsky.calibrate import _site
+
     paths = archive.frame_paths(night_dir)
     times = archive.frame_times(paths)
-    lp = log_path or (night_dir / "site_mtHopkins.log")
-    log = archive.read_site_log(lp) if lp.is_file() else {}
+    log = archive.read_site_log(log_path, log_keys) if log_path and log_path.is_file() else {}
     for p, t in list(zip(paths, times, strict=True))[::step]:
-        eph = stars.ephemeris(t)
+        eph = stars.ephemeris(t, _site(spec))
         if eph.sun_alt > max_sun_alt:
             continue
         try:
@@ -111,9 +114,8 @@ def run_night(
             "n_stars": int(cmap.table["v"].size),
             "n_det": int(cmap.table["det"].sum()),
         }
-        for k in ("MearthCloud", "HATCloud", "MINERVACloud", "AuroraCloud", "outsideHumidity"):
-            if k in log:
-                rec[k] = _nearest(log[k], t)
+        for k, series in log.items():
+            rec[k] = _nearest(series, t)
         yield rec
 
 
@@ -121,19 +123,17 @@ def _r(v: float | None) -> float | None:
     return None if v is None or math.isnan(v) else round(float(v), 4)
 
 
-SENSORS = ("MearthCloud", "HATCloud", "MINERVACloud", "AuroraCloud", "outsideHumidity")
-
-
-def attach_sensors(recs: list[dict[str, Any]], log_path: str | Path) -> list[dict[str, Any]]:
-    """(Re)fill each record's sensor readings from a site log."""
-    log = archive.read_site_log(log_path)
+def attach_sensors(
+    recs: list[dict[str, Any]], log_path: str | Path, keys: tuple[str, ...] | list[str]
+) -> list[dict[str, Any]]:
+    """(Re)fill each record's readings of ``keys`` from a site log."""
+    log = archive.read_site_log(log_path, keys)
     for r in recs:
         if "error" in r:
             continue
         t = datetime.fromisoformat(r["time"])
-        for k in SENSORS:
-            if k in log:
-                r[k] = _nearest(log[k], t)
+        for k, series in log.items():
+            r[k] = _nearest(series, t)
     return recs
 
 
@@ -144,8 +144,8 @@ def load(path: str | Path) -> list[dict[str, Any]]:
 
 def confusion(
     recs: list[dict[str, Any]],
+    sensor: str,
     key: str = "clear",
-    sensor: str = "MearthCloud",
     sun_range: tuple[float, float] = (-90.0, -18.0),
     min_coverage: float = 0.3,
 ) -> Counter:
@@ -198,7 +198,7 @@ def scores(c: Counter) -> dict[str, float]:
     }
 
 
-def plot_night(recs: list[dict[str, Any]], path: str, title: str) -> None:
+def plot_night(recs: list[dict[str, Any]], path: str, title: str, sensor: str) -> None:
     from robofast.allsky import render
 
     ok = [r for r in recs if "error" not in r]
@@ -209,10 +209,7 @@ def plot_night(recs: list[dict[str, Any]], path: str, title: str) -> None:
     clear = np.array([np.nan if r["clear"] is None else r["clear"] for r in ok])
     z45 = np.array([np.nan if r["zenith45"] is None else r["zenith45"] for r in ok])
     me = np.array(
-        [
-            np.nan if sensor_class(r.get("MearthCloud")) == "none" else min(r["MearthCloud"], 10)
-            for r in ok
-        ]
+        [np.nan if sensor_class(r.get(sensor)) == "none" else min(r[sensor], 10) for r in ok]
     )
     bands = []
     for r, hh in zip(ok, h, strict=True):
@@ -226,7 +223,7 @@ def plot_night(recs: list[dict[str, Any]], path: str, title: str) -> None:
             (h, clear, (0, 150, 0), "camera whole sky"),
             (h, z45, (120, 200, 120), "camera zenith 45"),
         ],
-        y2=[(h, me, (30, 60, 220), "MEarth (right, deg C)")],
+        y2=[(h, me, (30, 60, 220), f"{sensor} (right, deg C)")],
         ylim=(0.0, 1.0),
         y2lim=(-60.0, 10.0),
         title=title,
@@ -244,15 +241,23 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--model", required=True)
     p.add_argument("--step", type=int, default=4)
     p.add_argument("--out", required=True)
+    p.add_argument("--log", help="the night's site log")
+    p.add_argument("--log-keys", default="", help="comma-separated log keys to record")
+    p.add_argument("--models", help="models directory (default $ROBOFAST_ALLSKY_MODELS)")
     p = sub.add_parser("report")
     p.add_argument("jsonl", nargs="+")
     p.add_argument("--out-dir", required=True)
+    p.add_argument("--sensor", required=True, help="the log key to compare with")
     a = ap.parse_args(argv)
     if a.cmd == "run":
-        spec = cameras.camera_spec(a.camera)
+        spec = cameras.camera_spec(a.camera, a.models)
         model = CameraModel.load(a.model)
+        keys = tuple(k for k in a.log_keys.split(",") if k)
+        log = Path(a.log) if a.log else None
         with open(a.out, "w") as fh:
-            for rec in run_night(Path(a.night_dir), spec, model, step=a.step):
+            for rec in run_night(
+                Path(a.night_dir), spec, model, step=a.step, log_path=log, log_keys=keys
+            ):
                 fh.write(json.dumps(rec) + "\n")
                 fh.flush()
         return 0
@@ -262,8 +267,8 @@ def main(argv: list[str] | None = None) -> int:
     for j in a.jsonl:
         recs = load(j)
         name = Path(j).stem
-        plot_night(recs, str(out / f"{name}.png"), name)
-        c = confusion(recs)
+        plot_night(recs, str(out / f"{name}.png"), name, a.sensor)
+        c = confusion(recs, a.sensor)
         total += c
         print(name, json.dumps(scores(c)))
     print(format_confusion(total))

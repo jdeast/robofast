@@ -10,6 +10,7 @@ interval: 60      # s between passes (the ridge camera publishes once a minute)
 max_age: 180      # s: pool the two cameras when their frames are this close
 stale: 600        # s: a camera whose newest frame is older is left out
 trend_frames: 10
+models: allsky    # cameras.yaml and the fitted models, beside this file
 fetch: false
 cameras:
   mmto:

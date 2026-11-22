@@ -42,6 +42,8 @@ ARCSEC_PER_RAD = 206264.806
 #: Every file and the test that loads it (a new file must be added here).
 COVERED = {
     "README.md",
+    "allsky",
+    "allsky_watch.yaml",
     "aqawan1.json",
     "remote",
     "autofocus.example.json",
@@ -78,10 +80,31 @@ def test_every_site_file_is_covered():
     assert {p.name for p in SITE.iterdir()} == COVERED
 
 
+def test_allsky_cameras_models_and_watcher_load():
+    """sites/minerva/allsky: the cameras, each fitted model and its static
+    mask; allsky_watch.yaml through the watcher's loader."""
+    from robofast.allsky import cameras, watch
+    from robofast.allsky.model import CameraModel
+
+    specs = cameras.load_cameras(SITE / "allsky")
+    assert set(specs) == {"mmto", "ridge", "mmto-png"}
+    for spec in specs.values():
+        lat, lon, _ = spec.site
+        assert 31.6 < lat < 31.7 and -110.9 < lon < -110.8
+    for path in sorted((SITE / "allsky").glob("*.json")):
+        m = CameraModel.load(path)
+        assert m.camera in specs, path.name
+        assert (SITE / "allsky" / m.sky["static_mask"]).is_file(), path.name
+        assert m.meta["fit"]["median_px"] < 0.6, path.name
+    cfg = watch.load_config(SITE / "allsky_watch.yaml")
+    assert cfg.models == (SITE / "allsky").resolve()
+    assert set(cfg.cameras) == {"mmto", "ridge"} and cfg.fetch is False
+
+
 def test_no_addresses_or_credentials():
     """Only loopback placeholders; no LAN addresses, hostnames of site
     devices, or credentials (the weather pages' public URLs excepted)."""
-    for path in (p for p in SITE.rglob("*") if p.is_file()):
+    for path in (p for p in SITE.rglob("*") if p.is_file() and p.suffix != ".png"):
         name = path.relative_to(SITE)
         text = path.read_text()
         for ip in re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", text):

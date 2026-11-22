@@ -16,11 +16,15 @@ them.
 | `ridge` | SAO all-sky on the FLWO ridge | `http://linmax.sao.arizona.edu/weather/sky/last_sky.jpg`: 1040x1040 grey JPEG once a minute, sunset to sunrise; a mast from the southern horizon to the centre, city glow at the horizon |
 | `mmto-png` | the MMTO camera before its upgrade (2016-2023 archives) | 640x480 PNG, 256-frame stacks, gain and stamps burned in |
 
-`robofast/allsky/cameras.py` holds each camera's starting guess
-(centre, horizon radius, orientation) and the pixels that are never sky
-(text, the mast). The fitted model is a JSON file per camera,
-`robofast/allsky/models/<camera>.json` (override the directory with
-`$ROBOFAST_ALLSKY_MODELS`).
+The cameras are site data (docs/design.md 3.10), in a **models
+directory**: MINERVA's is `sites/minerva/allsky/`. Its `cameras.yaml`
+says where each camera stands (latitude, longitude, elevation), where its
+frames come from, a starting guess at its geometry (centre, horizon
+radius, orientation) and the pixels that are never sky (text, the mast,
+the overlay); beside it, the fitted model of each camera
+(`<camera>.json`) and its static mask (`<camera>.static.png`). Commands
+take `--models DIR` (or `$ROBOFAST_ALLSKY_MODELS`); the watcher's config
+names it (`models:`, relative to the config file).
 
 ## Dependencies
 
@@ -169,10 +173,10 @@ redo the clear-sky part from a few hours of dark frames (the geometry and
 masks stay):
 
 ```
-python -m robofast.allsky calibrate ~/allsky/mmto/<UTdate>/*.jpg --camera mmto \
-    --start robofast/allsky/models/mmto.json --sky-only --step 2 --out-dir robofast/allsky/models
-python -m robofast.allsky calibrate ~/allsky/ridge/<UTdate>/*.jpg --camera ridge \
-    --start robofast/allsky/models/ridge.json --sky-only --out-dir robofast/allsky/models
+python -m robofast.allsky --models sites/minerva/allsky calibrate ~/allsky/mmto/<UTdate>/*.jpg --camera mmto \
+    --start sites/minerva/allsky/mmto.json --sky-only --step 2 --out-dir sites/minerva/allsky
+python -m robofast.allsky --models sites/minerva/allsky calibrate ~/allsky/ridge/<UTdate>/*.jpg --camera ridge \
+    --start sites/minerva/allsky/ridge.json --sky-only --out-dir sites/minerva/allsky
 ```
 
 After a camera is bumped (`check` reports an offset), refit the geometry
@@ -197,13 +201,14 @@ entry in each JSON names its PNG relative to the models directory.
 
 ```
 python -m robofast.allsky fetch-catalog
-python -m robofast.allsky calibrate ~/allsky/mmto/20261122/*.jpg --step 4
-python -m robofast.allsky check  ~/allsky/mmto/20261122/mmto_20261122T060000Z.jpg
-python -m robofast.allsky analyze ~/allsky/mmto/20261122/mmto_20261122T060000Z.jpg \
+python -m robofast.allsky --models sites/minerva/allsky calibrate ~/allsky/mmto/20261122/*.jpg --step 4
+python -m robofast.allsky --models sites/minerva/allsky check  ~/allsky/mmto/20261122/mmto_20261122T060000Z.jpg
+python -m robofast.allsky --models sites/minerva/allsky analyze ~/allsky/mmto/20261122/mmto_20261122T060000Z.jpg \
     [~/allsky/ridge/20261122/ridge_20261122T060012Z.jpg] [--at 60,180,10]
 python -m robofast.allsky watch --config sites/minerva/allsky_watch.yaml [--once]
-python -m robofast.allsky.validate run NIGHT_DIR --camera mmto-png --model M.json --out N.jsonl
-python -m robofast.allsky.validate report *.jsonl --out-dir plots/
+python -m robofast.allsky.validate run NIGHT_DIR --camera mmto-png --model M.json \
+    --models sites/minerva/allsky --log LOG --log-keys KEY1,KEY2 --out N.jsonl
+python -m robofast.allsky.validate report *.jsonl --sensor KEY1 --out-dir plots/
 ```
 
 `analyze` writes `<frame>.cloud.png` (the frame with detected stars green

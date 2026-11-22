@@ -1,28 +1,44 @@
-"""The all-sky cameras on Mt Hopkins: where their images come from, a
-starting guess at their geometry, and the parts of the image that are not
-sky (burned-in text, the mast).
+"""The all-sky cameras: where their frames come from, where they stand, a
+starting guess at their geometry, and the pixels that are never sky.
 
-The guesses only seed :func:`robofast.allsky.calibrate.solve`, which finds
-the real centre, rotation and distortion from the stars; the fitted model
-is a JSON file (:mod:`robofast.allsky.model`), by default
-``robofast/allsky/models/<camera>.json``.
+The cameras are site data (docs/design.md 3.10): a ``cameras.yaml`` in the
+**models directory**, beside the fitted models (``<camera>.json``) and
+their static masks. The directory is ``$ROBOFAST_ALLSKY_MODELS``, or the
+one a command or the watcher's config names; MINERVA's is
+``sites/minerva/allsky/``. The guesses only seed
+:func:`robofast.allsky.calibrate.solve`, which finds the real centre,
+rotation and distortion from the stars.
 
-Masks are in pixels of the camera's native frame: rectangles
-``(x0, y0, x1, y1)`` (inclusive-exclusive) and thick segments
-``(xa, ya, xb, yb, half_width)``.
+Masks are in pixels of the camera's native frame: ``rects``
+``(x0, y0, x1, y1)`` (inclusive-exclusive), thick ``segments``
+``(xa, ya, xb, yb, half_width)`` and ``rings`` ``(cx, cy, radius, half_width)``.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
-__all__ = ["CAMERAS", "CameraSpec", "camera_spec"]
+__all__ = ["CAMERAS", "CameraSpec", "camera_spec", "load_cameras", "models_dir"]
 
-MODELS_DIR = Path(__file__).parent / "models"
+#: Environment variable naming the models directory.
+MODELS_ENV = "ROBOFAST_ALLSKY_MODELS"
 _MASKS: dict[tuple, np.ndarray] = {}
+
+
+def models_dir(given: str | Path | None = None) -> Path:
+    """``given``, else ``$ROBOFAST_ALLSKY_MODELS``; an error names both."""
+    d = given or os.environ.get(MODELS_ENV)
+    if not d:
+        raise FileNotFoundError(
+            f"no all-sky models directory: pass one or set ${MODELS_ENV} "
+            "(a site's: sites/<site>/allsky)"
+        )
+    return Path(d).expanduser()
 
 
 @dataclass(frozen=True)
@@ -56,9 +72,26 @@ class CameraSpec:
     label_box: tuple[int, int, int, int] | None = None
     label_vmax: float = 1.5
     notes: tuple[str, ...] = field(default_factory=tuple)
+    #: Where the camera stands: (latitude deg N, longitude deg E, elevation m).
+    site: tuple[float, float, float] | None = None
 
-    def model_path(self) -> Path:
-        return MODELS_DIR / f"{self.name}.json"
+    @classmethod
+    def from_dict(cls, name: str, d: dict[str, Any]) -> CameraSpec:
+        known = set(cls.__dataclass_fields__) - {"name"}
+        extra = set(d) - known
+        if extra:
+            raise ValueError(f"camera {name}: unknown keys {sorted(extra)}")
+        kw: dict[str, Any] = dict(d)
+        for key in ("rects", "segments", "rings"):
+            kw[key] = tuple(tuple(v) for v in d.get(key) or ())
+        for key in ("radial", "label_box", "site"):
+            if d.get(key) is not None:
+                kw[key] = tuple(d[key])
+        kw["notes"] = tuple(d.get("notes") or ())
+        spec = cls(name=name, **kw)
+        if spec.site is None or len(spec.site) != 3:
+            raise ValueError(f"camera {name}: site must be [latitude, longitude, elevation]")
+        return spec
 
     def fixed_mask(self, shape: tuple[int, int] | None = None) -> np.ndarray:
         """True where the image is never sky (text, mast), from the spec."""
@@ -86,93 +119,28 @@ class CameraSpec:
         return m
 
 
-CAMERAS: dict[str, CameraSpec] = {
-    "ridge": CameraSpec(
-        name="ridge",
-        title="SAO ridge all-sky (FLWO ridge)",
-        url="http://linmax.sao.arizona.edu/weather/sky/last_sky.jpg",
-        width=1040,
-        height=1040,
-        x0=522.0,
-        y0=505.0,
-        horizon_px=500.0,
-        rects=((470, 0, 640, 32), (0, 995, 440, 1040)),
-        # The mast, from the southern horizon toward the centre (2026; in the
-        # 2023 frames it crossed the lower right: (612, 650) to (805, 915)).
-        segments=((556.0, 650.0, 628.0, 1000.0, 10.0),),
-        cadence_s=60.0,
-        notes=(
-            "1040x1040 grey JPEG converted from FITS at the source;",
-            "one a minute, sunset to sunrise.",
-            "Text: 'North' at the top, the time and 'East' at the bottom left.",
-        ),
-    ),
-    "mmto": CameraSpec(
-        name="mmto",
-        title="MMT Observatory all-sky (summit)",
-        url="https://skycam.mmto.arizona.edu/skycam/latest_image.jpg",
-        width=1422,
-        height=1411,
-        # The overlay's own altitude rings: centre (710, 705), 7.33 px/deg.
-        x0=710.0,
-        y0=705.0,
-        horizon_px=660.0,
-        rects=(
-            (0, 0, 110, 34),  # Sun altitude box
-            (0, 1340, 70, 1372),  # frame counter
-            (0, 1376, 280, 1411),  # local time
-            (1255, 1336, 1422, 1372),  # temperature / humidity
-            (1160, 1374, 1422, 1411),  # f/ gain exposure
-            (680, 10, 740, 70),  # N
-            (680, 1342, 740, 1402),  # S
-            (14, 676, 74, 736),  # E
-            (1346, 676, 1406, 736),  # W
-            (686, 680, 790, 730),  # MMT crosshair and label
-        ),
-        # The overlay: altitude rings every 10 deg (7.33 px/deg), the N-S and
-        # E-W lines through the centre, the ring labels along the SE radius.
-        segments=(
-            (710.0, 40.0, 710.0, 1372.0, 2.0),
-            (44.0, 705.0, 1376.0, 705.0, 2.0),
-            (650.0, 735.0, 285.0, 1125.0, 16.0),
-        ),
-        rings=tuple((710.0, 705.0, 73.3 * k, 2.0) for k in range(1, 10)),
-        cadence_s=34.0,
-        colour_labels=True,
-        label_box=(10, 110, 14, 14),
-        label_vmax=1.6,
-        notes=(
-            "1422x1411 colour JPEG with an overlay: altitude rings every 10 deg, N-S and E-W",
-            "lines, and labelled bright stars, planets, Moon and Sun (masked per frame by colour",
-            "and by the static-feature mask).",
-        ),
-    ),
-    "mmto-png": CameraSpec(
-        name="mmto-png",
-        title="MMT Observatory all-sky, 2016-2023 (640x480 PNG stacks)",
-        url="http://skycam.mmto.arizona.edu/skycam/latest_image.png",
-        width=640,
-        height=480,
-        x0=322.0,
-        y0=248.0,
-        horizon_px=262.0,
-        rects=(
-            (0, 0, 150, 62),  # time, gain, frames
-            (460, 0, 640, 50),  # logo
-            (0, 462, 150, 480),  # IDL time stamp
-            (300, 0, 332, 26),  # N
-            (300, 456, 332, 480),  # S
-            (58, 226, 86, 252),  # E
-            (535, 226, 565, 252),  # W
-            (300, 232, 332, 264),  # centre marker
-        ),
-        cadence_s=34.0,
-        notes=("256-frame stacks, gain and stamps burned in.",),
-    ),
-}
+#: Camera specs loaded so far, by name (:func:`load_cameras` fills it).
+CAMERAS: dict[str, CameraSpec] = {}
 
 
-def camera_spec(name: str) -> CameraSpec:
+def load_cameras(directory: str | Path | None = None) -> dict[str, CameraSpec]:
+    """The cameras of a models directory's ``cameras.yaml``; also registers
+    them in :data:`CAMERAS`."""
+    import yaml
+
+    path = models_dir(directory) / "cameras.yaml"
+    raw = yaml.safe_load(path.read_text())
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: the top level must be a mapping of cameras")
+    specs = {name: CameraSpec.from_dict(name, d or {}) for name, d in raw.items()}
+    CAMERAS.update(specs)
+    return specs
+
+
+def camera_spec(name: str, directory: str | Path | None = None) -> CameraSpec:
+    """A camera by name: from :data:`CAMERAS`, else the models directory."""
+    if name not in CAMERAS:
+        load_cameras(directory)
     try:
         return CAMERAS[name]
     except KeyError:

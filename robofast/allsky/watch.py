@@ -23,7 +23,8 @@ Config (YAML)::
     trend_frames: 10
     fetch: false          # true: download from the cameras' urls
     fetch_dir: ~/allsky   # where downloads go (fetch: true only)
-    models: null          # directory of <camera>.json (default: the package's)
+    models: allsky        # cameras.yaml and <camera>.json (relative: to this file;
+                          # default $ROBOFAST_ALLSKY_MODELS)
     cameras:
       mmto: {dir: ~/allsky/mmto}
       ridge: {dir: ~/allsky/ridge, url: "http://linmax.sao.arizona.edu/weather/sky/last_sky.jpg"}
@@ -79,30 +80,37 @@ class WatchConfig:
     models: Path | None = None
 
     @classmethod
-    def parse(cls, raw: dict[str, Any]) -> WatchConfig:
+    def parse(cls, raw: dict[str, Any], base: Path | None = None) -> WatchConfig:
+        """``base``: the directory relative paths are relative to (the
+        config file's)."""
         extra = set(raw) - _KEYS
         if extra:
             raise ValueError(f"unknown watch config keys: {sorted(extra)}")
         if not raw.get("cameras"):
             raise ValueError("watch config: no cameras")
+
+        def path(key: str) -> Path | None:
+            v = raw.get(key)
+            if v is None:
+                return None
+            p = Path(v).expanduser()
+            return p if p.is_absolute() or base is None else base / p
+
+        models = cameras.models_dir(path("models"))
         cams = {}
         for name, spec in raw["cameras"].items():
             spec = dict(spec or {})
             bad = set(spec) - _CAMERA_KEYS
             if bad:
                 raise ValueError(f"camera {name}: unknown keys {sorted(bad)}")
-            cameras.camera_spec(name)  # a known camera
+            cameras.camera_spec(name, models)  # a known camera
             if "dir" in spec:
                 spec["dir"] = Path(spec["dir"]).expanduser()
             cams[name] = spec
 
-        def path(key: str) -> Path | None:
-            v = raw.get(key)
-            return None if v is None else Path(v).expanduser()
-
         cfg = cls(output=path("output") or Path("latest.json"), cameras=cams)
         cfg.history = path("history")
-        cfg.models = path("models")
+        cfg.models = models
         if raw.get("fetch_dir"):
             cfg.fetch_dir = Path(raw["fetch_dir"]).expanduser()
         for key in ("interval", "max_age", "stale"):
@@ -125,7 +133,7 @@ def load_config(path: str | Path) -> WatchConfig:
     raw = yaml.safe_load(Path(path).read_text())
     if not isinstance(raw, dict):
         raise ValueError(f"{path}: the top level must be a mapping")
-    return WatchConfig.parse(raw)
+    return WatchConfig.parse(raw, base=Path(path).resolve().parent)
 
 
 def latest_frame(root: Path, camera: str) -> Path | None:
@@ -190,7 +198,7 @@ class Watcher:
 
     def model(self, camera: str) -> CameraModel:
         if camera not in self.models:
-            d = self.cfg.models or cameras.MODELS_DIR
+            d = cameras.models_dir(self.cfg.models)
             self.models[camera] = CameraModel.load(d / f"{camera}.json")
         return self.models[camera]
 
@@ -229,7 +237,9 @@ class Watcher:
                     meas = cached[1]
                 else:
                     f = frames.load_frame(p, cam)
-                    _, meas = clouds.analyze(f, cameras.camera_spec(cam), self.model(cam))
+                    _, meas = clouds.analyze(
+                        f, cameras.camera_spec(cam, self.cfg.models), self.model(cam)
+                    )
                     meas.bg = None  # keep memory down between passes
                     meas.valid = None
                     meas.frame.grey = None

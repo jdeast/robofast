@@ -8,12 +8,18 @@ import json
 import math
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from robofast.allsky import clouds, image
 from robofast.allsky.model import CameraModel, fit
+
+#: The tests' site (any will do): latitude, longitude, elevation.
+SITE = (32.0, -111.0, 2500.0)
+#: The shipped MINERVA camera definitions and models.
+MODELS = Path(__file__).resolve().parents[2] / "sites" / "minerva" / "allsky"
 
 # -- the camera model ---------------------------------------------------------------
 
@@ -325,7 +331,7 @@ def fake_sky(monkeypatch):
     monkeypatch.setattr(st, "bright_stars", lambda path=None, vmax=6.5: cat[cat["v"] <= vmax])
     eph = st.Ephemeris(sun_alt=-40.0, sun_az=0.0, moon_alt=-30.0, moon_az=0.0, moon_illum=0.5,
                        planets={})  # fmt: skip
-    monkeypatch.setattr(st, "ephemeris", lambda when, site=st.SITE: eph)
+    monkeypatch.setattr(st, "ephemeris", lambda when, site: eph)
     return cat, eph
 
 
@@ -333,7 +339,7 @@ def _render(model, cat, when, cloud=None, seed=0):
     from robofast.allsky import stars as st
 
     rng = np.random.default_rng(seed)
-    alt, az = st.star_altaz(cat, when)
+    alt, az = st.star_altaz(cat, when, SITE)
     up = alt > 5
     x, y = model.to_pixel(alt[up], az[up])
     amp = 120 * 10 ** (-0.4 * (cat["v"][up] - 1.0))
@@ -358,7 +364,7 @@ def test_synthetic_frame_solve_and_cloud_map(fake_sky):
 
     cat, _ = fake_sky
     spec = cameras.CameraSpec(name="synth", title="", url="", width=400, height=400,
-                              x0=200.0, y0=200.0, horizon_px=185.0)  # fmt: skip
+                              x0=200.0, y0=200.0, horizon_px=185.0, site=SITE)  # fmt: skip
     truth = CameraModel(camera="synth", width=400, height=400, x0=203.0, y0=196.0, rot=37.0,
                         f1=185.0 / (math.pi / 2), f2=-3.0, f3=-2.0)  # fmt: skip
     when = datetime(2026, 11, 22, 6, tzinfo=UTC)
@@ -412,12 +418,12 @@ def test_validation_classes_and_confusion():
         {"sun_alt": -15, "clear": 0.10, "coverage": 0.8, "MearthCloud": -45.0},  # twilight
         {"time": "x", "error": "corrupt"},
     ]
-    c = validate.confusion(recs)
+    c = validate.confusion(recs, "MearthCloud")
     assert c[("clear", "clear")] == 1 and c[("cloudy", "cloudy")] == 1
     s = validate.scores(c)
     assert s["decided"] == 3 and s["agreement"] == pytest.approx(2 / 3, abs=1e-3)
     assert s["camera_clear_when_sensor_cloudy"] == pytest.approx(0.5)
-    assert validate.confusion(recs, sun_range=(-18, -12))[("clear", "cloudy")] == 1
+    assert validate.confusion(recs, "MearthCloud", sun_range=(-18, -12))[("clear", "cloudy")] == 1
 
 
 def test_site_log_parsing_both_formats(tmp_path):
@@ -430,7 +436,7 @@ def test_site_log_parsing_both_formats(tmp_path):
         "2016-11-02T23:03:54.639 [env.py:227 - getWeather()] DEBUG: T4: Requesting URL: x\n"
         "2016-11-02T23:04:00 [env.py:298 - oktoopen()] INFO: Not OK to open: MearthCloud=-1.0\n"
     )
-    log = archive.read_site_log(p)
+    log = archive.read_site_log(p, ("MearthCloud",))
     assert log["MearthCloud"][1].tolist() == [-21.0, -51.3]
     t = datetime(2016, 11, 2, 23, 5, tzinfo=UTC)
     assert archive.series_at(log["MearthCloud"], t) == -51.3
@@ -486,9 +492,10 @@ def test_clear_patches_picks_patches_where_bright_stars_all_show():
 # -- the shadow watcher ----------------------------------------------------------------
 
 
-def test_watch_config_reads_a_directory_unless_fetch_is_opted_in(tmp_path):
+def test_watch_config_reads_a_directory_unless_fetch_is_opted_in(tmp_path, monkeypatch):
     from robofast.allsky import watch
 
+    monkeypatch.setenv("ROBOFAST_ALLSKY_MODELS", str(MODELS))
     cfg = watch.WatchConfig.parse(
         {"output": str(tmp_path / "latest.json"), "cameras": {"mmto": {"dir": str(tmp_path)}}}
     )
@@ -521,7 +528,7 @@ def test_watch_step_writes_latest_json_from_the_newest_frames(fake_sky, tmp_path
 
     cat, _ = fake_sky
     spec = cameras.CameraSpec(name="synth", title="", url="", width=400, height=400,
-                              x0=200.0, y0=200.0, horizon_px=185.0)  # fmt: skip
+                              x0=200.0, y0=200.0, horizon_px=185.0, site=SITE)  # fmt: skip
     monkeypatch.setitem(cameras.CAMERAS, "synth", spec)
     model = CameraModel(camera="synth", width=400, height=400, x0=200.0, y0=200.0,
                         f1=185.0 / (math.pi / 2))  # fmt: skip

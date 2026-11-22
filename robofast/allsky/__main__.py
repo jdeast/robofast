@@ -11,8 +11,8 @@ Commands::
 
 Frames named ``<camera>_<YYYYMMDDTHHMMSS>Z.jpg`` (the live fetcher's
 names) need no ``--camera``/``--time``. Models are read from
-``$ROBOFAST_ALLSKY_MODELS`` (a directory of ``<camera>.json``) or the
-package's ``models/``.
+``--models`` or ``$ROBOFAST_ALLSKY_MODELS``: a site's directory with
+``cameras.yaml`` and ``<camera>.json`` (``sites/<site>/allsky``).
 """
 
 from __future__ import annotations
@@ -28,10 +28,11 @@ from pathlib import Path
 from robofast.allsky import cameras, clouds, frames, render, stars
 from robofast.allsky.model import CameraModel
 
+_MODELS: str | None = None  # --models
+
 
 def models_dir() -> Path:
-    env = os.environ.get("ROBOFAST_ALLSKY_MODELS")
-    return Path(env) if env else cameras.MODELS_DIR
+    return cameras.models_dir(_MODELS)
 
 
 def load_model(camera: str, path: str | None) -> CameraModel:
@@ -57,15 +58,15 @@ def _frame(path: str, camera: str | None, when: str | None) -> frames.Frame:
 
 def cmd_analyze(a: argparse.Namespace) -> int:
     f = _frame(a.frame, a.camera, a.time)
-    spec = cameras.camera_spec(f.camera)
+    spec = cameras.camera_spec(f.camera, _MODELS)
     model = load_model(f.camera, a.model)
-    eph = stars.ephemeris(f.time)
+    eph = stars.ephemeris(f.time, spec.site)
     cmap, meas = clouds.analyze(f, spec, model, eph=eph)
     items = [(meas, model)]
     if a.frame2:
         f2 = _frame(a.frame2, None, None)
         m2 = load_model(f2.camera, None)
-        _, meas2 = clouds.analyze(f2, cameras.camera_spec(f2.camera), m2)
+        _, meas2 = clouds.analyze(f2, cameras.camera_spec(f2.camera, _MODELS), m2)
         items.append((meas2, m2))
         cmap = clouds.combine(items, max_age_s=a.max_age)
     out = Path(a.out_dir or Path(a.frame).parent)
@@ -100,7 +101,7 @@ def cmd_check(a: argparse.Namespace) -> int:
     from robofast.allsky.clouds import static_mask
 
     f = _frame(a.frame, a.camera, a.time)
-    spec = cameras.camera_spec(f.camera)
+    spec = cameras.camera_spec(f.camera, _MODELS)
     model = load_model(f.camera, a.model)
     res = cal.check(f, spec, model, mask=static_mask(model, f.shape))
     print(json.dumps(res.as_dict()))
@@ -128,13 +129,13 @@ def cmd_calibrate(a: argparse.Namespace) -> int:
         if start is None:
             raise SystemExit("--sky-only needs --start MODEL")
         _model, rep = pipeline.calibrate_sky_only(
-            items[:: a.step], cameras.camera_spec(cam), start, out_dir=out, name=a.name
+            items[:: a.step], cameras.camera_spec(cam, _MODELS), start, out_dir=out, name=a.name
         )
         print(json.dumps({k: v for k, v in rep.items() if k != "clear_frames"}, indent=1))
         return 0
     _model, rep = pipeline.calibrate_night(
         items[:: a.step],
-        cameras.camera_spec(cam),
+        cameras.camera_spec(cam, _MODELS),
         start=start,
         out_dir=out,
         name=a.name,
@@ -150,7 +151,7 @@ def cmd_series(a: argparse.Namespace) -> int:
 
     items = _items(a.frames, a.camera)[:: a.step]
     cam = a.camera or frames.camera_from_name(a.frames[0])
-    spec = cameras.camera_spec(cam)
+    spec = cameras.camera_spec(cam, _MODELS)
     model = load_model(cam, a.model)
     maps = pipeline.analyze_night(items, spec, model)
     with open(a.out, "w") as fh:
@@ -187,6 +188,10 @@ def main(argv: list[str] | None = None) -> int:
         prog="python -m robofast.allsky",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument(
+        "--models",
+        help="models directory: cameras.yaml, <camera>.json (or $ROBOFAST_ALLSKY_MODELS)",
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("analyze", help="cloud map of one frame")
@@ -236,6 +241,8 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("fetch-catalog", help="download the Bright Star Catalogue")
     p.set_defaults(fn=cmd_fetch)
     a = ap.parse_args(argv)
+    global _MODELS
+    _MODELS = a.models
     logging.basicConfig(level=logging.INFO if a.cmd == "watch" else logging.WARNING)
     return int(a.fn(a))
 

@@ -353,11 +353,12 @@ def static_mask(model: CameraModel, shape: tuple[int, int]) -> np.ndarray | None
     if not name:
         return None
     from robofast.allsky import imageio
-    from robofast.allsky.cameras import MODELS_DIR
 
-    p = Path(name)
+    p = Path(name).expanduser()
     if not p.is_absolute():
-        p = MODELS_DIR / p
+        if model.source_dir is None:
+            return None
+        p = Path(model.source_dir) / p
     if not p.is_file():
         return None
     key = (str(p), p.stat().st_mtime)
@@ -411,7 +412,10 @@ def measure(
     settings: dict[str, Any] | None = None,
 ) -> Measurement:
     s = settings or _settings(model)
-    eph = eph or stars.ephemeris(frame.time)
+    from robofast.allsky.calibrate import _site
+
+    site = _site(spec)
+    eph = eph or stars.ephemeris(frame.time, site)
     h, w = frame.shape
     valid = sky_valid(frame, spec, model, min_alt=MIN_ALT - 5)
     sm = static_mask(model, (h, w))
@@ -426,7 +430,7 @@ def measure(
         near = _sep(alt_px, az_px, eph.moon_alt, eph.moon_az) < r_moon
         valid &= ~np.repeat(np.repeat(near, 4, 0), 4, 1)[:h, :w]
     cat = stars.bright_stars(vmax=vmax or min(6.5, s["m0"] + 1.5))
-    alt, az = stars.star_altaz(cat, frame.time)
+    alt, az = stars.star_altaz(cat, frame.time, site)
     up = alt > MIN_ALT
     cat, alt, az = cat[up], alt[up], az[up]
     for _name, (pa, pz) in eph.planets.items():

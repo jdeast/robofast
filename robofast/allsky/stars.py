@@ -26,7 +26,6 @@ import numpy as np
 
 __all__ = [
     "BSC5_URL",
-    "SITE",
     "Ephemeris",
     "bright_stars",
     "ephemeris",
@@ -38,8 +37,9 @@ __all__ = [
 
 #: Public copy of the catalogue (Harvard TDC mirror of NASA ADC V/50).
 BSC5_URL = "http://tdc-www.harvard.edu/catalogs/bsc5.dat.gz"
-#: Mt Hopkins (latitude deg N, longitude deg E, elevation m).
-SITE = (31.6803, -110.8781, 2600.0)
+#: A site: (latitude deg N, longitude deg E, elevation m); a camera's
+#: comes from its spec (:attr:`robofast.allsky.cameras.CameraSpec.site`).
+Site = tuple[float, float, float]
 
 STAR_DTYPE = np.dtype(
     [("hr", "<i4"), ("ra", "<f8"), ("dec", "<f8"), ("pmra", "<f4"), ("pmdec", "<f4"), ("v", "<f4")]
@@ -148,9 +148,7 @@ def _as_utc(when: datetime) -> datetime:
     return when.replace(tzinfo=UTC) if when.tzinfo is None else when.astimezone(UTC)
 
 
-def star_altaz(
-    stars: np.ndarray, when: datetime, site: tuple[float, float, float] = SITE
-) -> tuple[np.ndarray, np.ndarray]:
+def star_altaz(stars: np.ndarray, when: datetime, site: Site) -> tuple[np.ndarray, np.ndarray]:
     """Apparent (refracted) altitude and azimuth (deg, azimuth east of
     north) of ``stars`` at ``when``."""
     from astropy import units as u
@@ -186,7 +184,7 @@ class Ephemeris:
     planets: dict[str, tuple[float, float]]
 
 
-def ephemeris(when: datetime, site: tuple[float, float, float] = SITE) -> Ephemeris:
+def ephemeris(when: datetime, site: Site) -> Ephemeris:
     from astropy import units as u
     from astropy.coordinates import AltAz, EarthLocation, get_body
     from astropy.time import Time

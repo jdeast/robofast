@@ -85,10 +85,6 @@ robofast-pwi-jog = "robofast.devices.pwi_jog:main"
 [tool.setuptools.packages.find]
 include = ["robofast*"]
 
-[tool.setuptools.package-data]
-# The all-sky cameras' fitted models and static masks (docs/allsky.md).
-"robofast.allsky" = ["models/*.json", "models/*.png"]
-
 [dependency-groups]
 # pyyaml: site configs (sites/*/weather.yaml) are YAML so every limit can
 # carry a comment saying where it came from (design.md 3.10).

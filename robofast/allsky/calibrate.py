@@ -28,6 +28,12 @@ from robofast.allsky.model import CameraModel, FitResult, fit
 __all__ = ["Check", "check", "guess_model", "match", "refine", "sky_valid", "solve"]
 
 
+def _site(spec: CameraSpec) -> stars.Site:
+    if spec.site is None:
+        raise ValueError(f"camera {spec.name}: no site (latitude, longitude, elevation)")
+    return spec.site
+
+
 def guess_model(spec: CameraSpec) -> CameraModel:
     f1, f2, f3 = spec.radial or (spec.horizon_px / (math.pi / 2), 0.0, 0.0)
     return CameraModel(
@@ -97,10 +103,10 @@ def detect(frame: Frame, valid: np.ndarray, threshold: float = 4.0) -> Detection
 
 
 def _catalogue(
-    frame: Frame, vmax: float, min_alt: float
+    frame: Frame, vmax: float, min_alt: float, site: stars.Site
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     cat = stars.bright_stars(vmax=vmax)
-    alt, az = stars.star_altaz(cat, frame.time)
+    alt, az = stars.star_altaz(cat, frame.time, site)
     up = alt > min_alt
     return cat[up], alt[up], az[up]
 
@@ -212,7 +218,7 @@ def solve(
     det = detect(frame, valid, 5.0)
     o = np.argsort(-det.snr)[:n_peaks]
     bright = Detections(det.x[o], det.y[o], det.snr[o], det.bg)
-    cat, alt, az = _catalogue(frame, vmax_search, min_alt)
+    cat, alt, az = _catalogue(frame, vmax_search, min_alt, _site(spec))
     tol = max(6.0, model.f1 * math.radians(1.0))
     step = max(0.25, math.degrees(tol / (0.6 * model.f1 * math.pi / 2)) / 2)
     rots = np.arange(search_rot[0], search_rot[1], step)
@@ -236,7 +242,7 @@ def solve(
     )
     # Refine with all detections and fainter stars, shrinking the radius.
     det = detect(frame, valid, 4.0)
-    cat, alt, az = _catalogue(frame, vmax_fit, min_alt)
+    cat, alt, az = _catalogue(frame, vmax_fit, min_alt, _site(spec))
     plan = [
         (tol, ("x0", "y0", "rot", "f1"), vmax_search),
         (tol * 0.7, ("x0", "y0", "rot", "f1", "f2"), vmax_search + 0.5),
@@ -277,7 +283,7 @@ def matches_for(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     valid = sky_valid(frame, spec, model, min_alt=2.0, mask=mask)
     det = detect(frame, valid, 4.0)
-    _cat, alt, az = _catalogue(frame, vmax, min_alt)
+    _cat, alt, az = _catalogue(frame, vmax, min_alt, _site(spec))
     idx, _ = match(model, alt, az, det, tol)
     ok = idx >= 0
     return alt[ok], az[ok], det.x[idx[ok]], det.y[idx[ok]]
@@ -331,7 +337,7 @@ def check(
     ``ok=False`` with reason 'too few stars' (not evidence of a bump)."""
     valid = sky_valid(frame, spec, model, min_alt=2.0, mask=mask)
     det = detect(frame, valid, 5.0)
-    _cat, alt, az = _catalogue(frame, vmax, min_alt)
+    _cat, alt, az = _catalogue(frame, vmax, min_alt, _site(spec))
     px, py = model.to_pixel(alt, az)
     inside = valid[
         np.clip(np.rint(py).astype(int), 0, frame.shape[0] - 1),

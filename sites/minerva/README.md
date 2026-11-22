@@ -19,6 +19,8 @@ only in `instruments.json`, with `"enabled": false`.
 | `target_sheet.example.json` | the target-list Sheet reader (`catalogs.minerva_sheet.SheetConfig`; docs/minerva_sheet.md); placeholders for the key path and sheet keys |
 | `throughput.example.json` | the throughput monitor (`throughput.ThroughputConfig`; docs/throughput.md) |
 | `weather.yaml` | `weather_bridge` |
+| `allsky/` | the all-sky cameras (docs/allsky.md): `cameras.yaml` (where each stands, its frames' URL, the geometry guess and fixed masks), the fitted models `<camera>.json` and static masks `<camera>.static.png` (`robofast.allsky.cameras`, `CameraModel`) |
+| `allsky_watch.yaml` | the cloud-map watcher (`robofast.allsky.watch`), which writes the `latest.json` the bridge's shadow `allsky` source reads |
 | `instruments.json` | reference catalog: every legacy value, including those no module reads yet |
 | `remote/` | off-site engineering through an SSH tunnel (docs/remote.md): `aqawan1.json` (enclosure, engineering mode), `aqawan1_shadow.json` (read-only Aqawan server), `aqawan1_control.json`, and the telescopes' PWI server configs (docs/pwi.md). Every file there says `allow_hardware: true` and is refused without `--hardware`. |
 

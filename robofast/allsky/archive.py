@@ -50,17 +50,7 @@ def frame_times(paths: list[Path], lag_s: float = 15.0) -> list[datetime]:
 
 
 def read_site_log(
-    path: str | Path,
-    keys: tuple[str, ...] = (
-        "MearthCloud",
-        "HATCloud",
-        "MINERVACloud",
-        "AuroraCloud",
-        "sunAltitude",
-        "outsideHumidity",
-        "outsideTemp",
-        "outsideDewPt",
-    ),
+    path: str | Path, keys: tuple[str, ...] | list[str]
 ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """{key: (times as POSIX seconds, values)} for numeric ``keys``."""
     want = set(keys)

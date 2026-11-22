@@ -59,6 +59,9 @@ class CameraModel:
     #: The clear-sky calibration (:mod:`robofast.allsky.skycal`): limiting
     #: magnitude model, clear-sky noise and background, static-mask file.
     sky: dict[str, Any] = field(default_factory=dict)
+    #: The directory the model was loaded from (relative files in ``sky``,
+    #: the static mask, are found there); not saved.
+    source_dir: str | None = field(default=None, compare=False, repr=False)
 
     # -- geometry -----------------------------------------------------------------
 
@@ -141,6 +144,7 @@ class CameraModel:
 
     def to_json(self) -> dict[str, Any]:
         d = asdict(self)
+        d.pop("source_dir")
         d["model"] = "robofast.allsky.CameraModel/1"
         return d
 
@@ -149,12 +153,14 @@ class CameraModel:
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> CameraModel:
-        d = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        d = {k: v for k, v in d.items() if k in cls.__dataclass_fields__ and k != "source_dir"}
         return cls(**d)
 
     @classmethod
     def load(cls, path: str | Path) -> CameraModel:
-        return cls.from_json(json.loads(Path(path).read_text()))
+        m = cls.from_json(json.loads(Path(path).read_text()))
+        m.source_dir = str(Path(path).resolve().parent)
+        return m
 
     def params(self) -> np.ndarray:
         return np.array([getattr(self, k) for k in FREE], dtype=float)

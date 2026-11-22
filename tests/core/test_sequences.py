@@ -343,6 +343,45 @@ async def test_cancelled_mid_sequence_the_lamps_go_off_and_the_stage_out(servers
     assert any(c.parked for c in rig.sequencer.cleanups) or rig.parked()
 
 
+async def test_a_second_cancel_during_the_lamp_off_still_moves_the_stage_out(servers, make_rig):
+    """CI 2026-11-22 (master 2746b0d, 3.14): the sequencer cancelled mid
+    exposure; a second cancel (a TaskGroup passing the first on a loop step
+    later) landed while the cleanup switched the lamp off, before the task
+    for the cleanup steps existed, so the calibration stage stayed in. Here
+    the lamp-off is held and the second cancel sent while it waits."""
+    slow = _with(lambda d: d["steps"][2]["expose"].update(exptime=2.0, n=5))
+    plan = StaticPlan([{"name": "thar", "kind": "sequence", "sequence": "tres_thar"}], ["t1"])
+    rig, lamps, stage = tres_rig(make_rig, servers, plan, {"tres_thar": slow})
+    seq = rig.sequencer
+    entered, release = asyncio.Event(), asyncio.Event()
+    lamp_off, cleanup = seq._sequence_lamp_off, seq._sequence_cleanup
+    running: list[asyncio.Task] = []  # the task running the sequence
+
+    async def held(r, lamp, sid):
+        entered.set()
+        await release.wait()
+        await lamp_off(r, lamp, sid)
+
+    async def watched(r, **kw):
+        running.append(asyncio.current_task())
+        await cleanup(r, **kw)
+
+    seq._sequence_lamp_off, seq._sequence_cleanup = held, watched
+    await rig.start()
+    await wait_until(lambda: rig.cams[0].exposures_started >= 1, 30.0, what="exposing")
+    assert stage_at(stage, 25.0)
+    main = rig.tasks[-1]
+    main.cancel()
+    await asyncio.wait_for(entered.wait(), 10)
+    running[0].cancel()  # the second cancel, while the lamp is being switched off
+    await asyncio.sleep(0.05)
+    release.set()
+    await asyncio.wait([main], timeout=20)
+    await wait_until(lambda: stage_at(stage, 0.0), 30.0, what="stage out")
+    assert lamps.sim.lit() == [3, 5]
+    assert _events(rig, "sequence_cleanup_done")[0].detail["ok"] is True
+
+
 async def test_a_failure_mid_sequence_still_cleans_up(servers, make_rig):
     slow = _with(lambda d: d["steps"][2]["expose"].update(exptime=0.5, n=4))
     plan = StaticPlan([{"name": "thar", "kind": "sequence", "sequence": "tres_thar"}], ["t1"])

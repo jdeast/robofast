@@ -673,9 +673,11 @@ def make_requests(
     note: Callable[[str], None] | None = None,
 ) -> list[dict[str, Any]]:
     """The rehearsal's request groups (module doc) from ``observable``'s
-    targets. Spectra are allotted over time (:func:`allot`); any span with
-    nothing observable is reported (``note``, else a warning) before the
-    night starts."""
+    targets. The default (whole-night) count of spectra is allotted over time
+    (:func:`allot`), and any span with nothing observable is reported
+    (``note``, else a warning) before the night starts; an explicit
+    ``spectra`` count takes the targets best first, each request open across
+    all of its target's windows."""
     if not targets:
         raise RehearsalRefused(
             f"nothing in the catalog is within {MIN_ALT + ALT_MARGIN}..{MAX_ALT - ALT_MARGIN} deg"
@@ -705,7 +707,23 @@ def make_requests(
         }
 
     groups = []
-    slots, gaps = allot(rv, bstars, start, end, n)
+    if s.spectra is None:
+        # The whole night (the default count): allotted over time (allot).
+        slots, gaps = allot(rv, bstars, start, end, n)
+    else:
+        # An explicit, usually short list (a test, a demo): the targets best
+        # first (up now, then longest up), each request open across all of
+        # its target's windows, so the list is done as soon as it can be
+        # (PR #156: slotting 3 spectra over a 9 h fast-clock night left the
+        # later ones closed for most of the test).
+        slots, gaps, j = [], [], 0
+        for k in range(n):
+            if k == 0 and bstars:
+                t, is_b = bstars[0], True
+            else:
+                t, is_b = rv[j % len(rv)], False
+                j += 1
+            slots.append((start, end, t, is_b))
     if gaps:
         spans = ", ".join(f"{a:%H:%M}-{b:%H:%M}" for a, b in gaps)
         msg = (
@@ -721,7 +739,7 @@ def make_requests(
             role, iodine = "template (iodine out)", False
         else:
             role, iodine = "RV standard", True
-        hold_end = min(end, t0 + REQUEST_HOLD)
+        hold_end = min(end, t0 + REQUEST_HOLD) if s.spectra is None else end
         spans_k = [
             {"start": max(a, t0).isoformat(), "end": min(b, hold_end).isoformat()}
             for a, b in t["windows"]

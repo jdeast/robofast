@@ -421,7 +421,7 @@ def check_kiwispec(url: str, timeout: float = 10.0) -> dict[str, Any]:
         raise RehearsalRefused(
             f"--kiwispec {url}: the service does not write test frames (/status test_frames"
             f" {st.get('test_frames')!r}); a rehearsal's spectra must be marked as tests:"
-            " start it with --test-frames (docs/data.md, \"Test frames\")"
+            ' start it with --test-frames (docs/data.md, "Test frames")'
         )
     return st
 

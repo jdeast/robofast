@@ -1859,7 +1859,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument(
         "--test-frames",
         action="store_true",
-        help="every frame is a test frame (a rehearsal or dry run): IMAGETYP test, .test in the name",
+        help=(
+            "every frame is a test frame (a rehearsal or dry run): IMAGETYP test, .test in the name"
+        ),
     )
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args(argv)

@@ -138,6 +138,22 @@ async def test_mget_selects_the_database_and_sends_nothing_else():
     assert feed.commands == [["SELECT", "7"], ["MGET", "a", "b"], ["SELECT", "8"], ["MGET", "a"]]
 
 
+async def test_the_feed_keeps_a_bounded_command_log(monkeypatch):
+    """Night 2026-11-21: the rehearsal's Redis feed answered ~10 commands a
+    second all night and kept every one (the top steady grower in a
+    real-time tracemalloc run). It keeps the latest COMMANDS_KEPT."""
+    from robofast.testing import redis_feed
+
+    monkeypatch.setattr(redis_feed, "COMMANDS_KEPT", 50)
+    feed = RedisFeedState({7: {"a": "1"}})
+    with RedisFeed(feed) as server:
+        host, port = server.server_address[:2]
+        for i in range(120):  # 240 commands (SELECT + MGET each)
+            assert await resp.mget(host, port, 7, ["a", f"k{i}"], timeout=2) == [b"1", None]
+    assert len(feed.commands) <= 2 * 50
+    assert feed.commands[-1] == ["MGET", "a", "k119"]  # the latest are kept
+
+
 async def test_mget_is_bounded_by_its_timeout():
     feed = RedisFeedState({7: {"a": "1"}})
     feed.delay = 5

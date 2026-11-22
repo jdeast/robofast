@@ -11,8 +11,10 @@ real-time rehearsal does over hours.
 :class:`MemWatch` starts :mod:`tracemalloc` (one frame per allocation: low
 overhead) and every ``every`` seconds appends to ``path`` the process's RSS
 and the ``top`` source lines whose allocations grew most since the first
-report. Opt-in (``rehearsal --memwatch SECONDS``): tracing costs memory and
-time.
+report; then (glibc) it calls ``malloc_trim(0)`` and logs how much RSS that
+released: a large release means freed memory the allocator kept
+(fragmentation), not live objects. Opt-in for every simulated night with
+``ROBOFAST_MEMWATCH=SECONDS``: tracing costs memory and time.
 """
 
 from __future__ import annotations
@@ -36,12 +38,16 @@ def _rss_mb() -> float | None:
 
 
 class MemWatch:
-    def __init__(self, path: str | Path, every: float = 600.0, top: int = 15) -> None:
+    def __init__(
+        self, path: str | Path, every: float = 600.0, top: int = 15, trim: bool = True
+    ) -> None:
         if every <= 0:
             raise ValueError("every must be > 0")
         self.path = Path(path)
         self.every = every
         self.top = top
+        #: After each report, malloc_trim(0) and log the RSS it released.
+        self.trim = trim
         self.reports = 0
 
     def report(self, base: tracemalloc.Snapshot) -> None:
@@ -63,9 +69,31 @@ class MemWatch:
                 f"{st.size_diff / 1e6:+9.2f} MB {st.count_diff:+9d} blocks"
                 f"  {frame.filename}:{frame.lineno}"
             )
+        released = self._trim()
+        if released is not None:
+            lines.append(f"   malloc_trim(0): RSS {released:+.0f} MB (freed memory glibc had kept)")
         with open(self.path, "a") as f:
             f.write("\n".join(lines) + "\n")
         self.reports += 1
+
+    def _trim(self) -> float | None:
+        """glibc only: return freed heap memory to the system and say how much
+        RSS that released. A large release means the growth is memory freed
+        but kept by the allocator (fragmentation), not live objects."""
+        if not self.trim:
+            return None
+        try:
+            import ctypes
+
+            libc = ctypes.CDLL("libc.so.6")
+        except OSError:
+            return None
+        before = _rss_mb()
+        libc.malloc_trim(0)
+        after = _rss_mb()
+        if before is None or after is None:
+            return None
+        return after - before
 
     async def run(self) -> None:
         started = not tracemalloc.is_tracing()

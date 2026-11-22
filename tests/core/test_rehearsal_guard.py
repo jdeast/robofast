@@ -28,7 +28,10 @@ from robofast.testing.rehearsal import (
     parse_duration,
     preflight,
     settings_from_args,
+    slew_problems,
 )
+from robofast.testing.rv_night import SEQUENCER
+from robofast.timeline import Entry, Timeline
 
 NIGHT = datetime(2026, 11, 10, 4, 0, tzinfo=UTC)
 
@@ -479,3 +482,31 @@ def test_imaging_requests_wait_for_the_azimuth_window():
                     tgt["ra"] / 15, tgt["dec"], lst_hours(when, MINERVA.longitude), MINERVA.latitude
                 )
                 assert 117 <= az <= 264, (g["id"], edge, az)
+
+
+def test_a_slew_cut_short_by_a_cancel_is_not_a_hung_slew() -> None:
+    """night1121, 03:27 UTC: both mounts started a slew 0.6 s before an
+    unsafe cancel; the cleanup aborted them, so they never reported an end,
+    and the verdict called them hung. A cancel before the telescope's next
+    slew excuses it; a slew with no cancel or error after it still counts."""
+    tl = Timeline()
+    t = tl.t0
+    slews = [
+        {"telescope": "t1", "alt": 45.0, "t": t + 1, "utc": "a", "seconds": 20.0},
+        {"telescope": "t1", "alt": 45.0, "t": t + 30, "utc": "cut"},
+        {"telescope": "t1", "alt": 45.0, "t": t + 60, "utc": "hung"},
+        {"telescope": "t2", "alt": 45.0, "t": t + 70, "utc": "hung-t2"},
+    ]
+    assert slew_problems(slews, tl) == [
+        "t1: a slew never reported its end (cut)",
+        "t1: a slew never reported its end (hung)",
+        "t2: a slew never reported its end (hung-t2)",
+    ]
+    tl._add(Entry(t + 31, "event", SEQUENCER, None, "cancel_requested", "", {"reason": "unsafe"}))
+    assert slew_problems(slews, tl) == [
+        "t1: a slew never reported its end (hung)",
+        "t2: a slew never reported its end (hung-t2)",
+    ]
+    # Out of the altitude limits is still reported, cancel or not.
+    low = [{"telescope": "t1", "alt": MIN_ALT - 1, "t": t + 30, "utc": "low", "seconds": 5.0}]
+    assert slew_problems(low, tl) == [f"t1: slew to altitude {MIN_ALT - 1:.1f}"]

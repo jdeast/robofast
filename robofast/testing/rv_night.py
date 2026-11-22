@@ -83,6 +83,7 @@ from robofast.sun import now_utc
 from robofast.testing.alpaca_server import FakeAlpacaServer
 from robofast.testing.fakes import FakeTelescope
 from robofast.testing.focus_sim import FocusScene, SimFocuser, StarfieldCamera
+from robofast.testing.mem_watch import MemWatch
 from robofast.testing.processes import ROOT, Service, SupervisorProcess
 from robofast.testing.redis_feed import RedisFeed, RedisFeedState
 from robofast.testing.starfield import Detector, SimOptics, random_stars
@@ -269,6 +270,7 @@ class SimulatedNight:
     async def start(self) -> None:
         self.outcome.t_start = time.monotonic()
         await self._stack.__aenter__()
+        self._start_mem_watch()
         self._start_weather()
         self._start_aqawan()
         self._start_telescopes()
@@ -276,6 +278,23 @@ class SimulatedNight:
         self._start_guiders()
         self._start_supervisor()
         await self._wait_ready()
+
+    def _start_mem_watch(self) -> None:
+        """Opt-in (``ROBOFAST_MEMWATCH=SECONDS``): every SECONDS, this process's
+        top memory growth sites to ``memwatch.txt`` (MemWatch; night
+        2026-11-21: the rehearsal grew 0.4-1.1 GB/h in its main heap)."""
+        every = os.environ.get("ROBOFAST_MEMWATCH")
+        if not every:
+            return
+        self.mem_watch = MemWatch(self.out / "memwatch.txt", every=float(every))
+        task = asyncio.get_running_loop().create_task(self.mem_watch.run(), name="mem-watch")
+
+        async def stop() -> None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        self._stack.push_async_callback(stop)
 
     def _start_weather(self) -> None:
         import yaml
@@ -1340,7 +1359,15 @@ def console_park_problems(o: Outcome) -> list[str]:
         e[1] == "t1" and e[2] == "park" and t0 <= e[0] <= t1 + 1.0 for e in o.mount_events
     ):
         bad.append("t1 parked when the console parked t2")
-    if not any(e[1] == "t2" and e[2] == "park" and t0 <= e[0] <= t1 + 0.5 for e in o.mount_events):
+    t2 = [e for e in o.mount_events if e[1] == "t2" and e[2] in ("park", "unpark", "slew")]
+    parked_now = any(e[2] == "park" and t0 <= e[0] <= t1 + 0.5 for e in t2)
+    # Already parked when the console asked (its error path parked it and it
+    # was idle, unmoved, since: the sequencer then sends no Park), and not
+    # moved in the meantime: parked all along.
+    before = [e for e in t2 if e[0] < t0]
+    moved = any(e[2] != "park" and t0 <= e[0] <= t1 + 0.5 for e in t2)
+    parked_all_along = bool(before) and before[-1][2] == "park" and not moved
+    if not (parked_now or parked_all_along):
         bad.append("t2's mount never parked for the console")
     return bad
 

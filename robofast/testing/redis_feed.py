@@ -73,6 +73,8 @@ GOOD_REDIS: dict[str, str] = {
     "boltwood": "-30.0",
 }
 TIMESTAMP_KEYS = ("time", "boltwood_time", "mbolt_time")
+#: How many received commands a feed keeps (RedisFeedState.commands).
+COMMANDS_KEPT = 10_000
 _MJD_UNIX = 40587.0
 
 
@@ -93,7 +95,9 @@ class RedisFeedState:
         self.delay = 0.0
         #: Close the connection without answering.
         self.drop = False
-        #: Every command received, as a list of str.
+        #: The commands received, each a list of str: the latest
+        #: :data:`COMMANDS_KEPT` (a feed serving a whole rehearsal night
+        #: answered ~10 commands a second, every one kept: night 2026-11-21).
         self.commands: list[list[str]] = []
         #: Accept ``SET`` (else it is answered with an error, like any
         #: other command this fake does not know).
@@ -147,6 +151,8 @@ class _Handler(socketserver.StreamRequestHandler):
                 return
             with feed.lock:
                 feed.commands.append(args)
+                if len(feed.commands) > 2 * COMMANDS_KEPT:  # amortized trim
+                    del feed.commands[:-COMMANDS_KEPT]
             if feed.delay:
                 time.sleep(feed.delay)
             if feed.drop:

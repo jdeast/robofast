@@ -12,6 +12,7 @@ import time
 
 import pytest
 
+from robofast.owner import GrantRevoked
 from robofast.plan import CallablePlan, Observation, StaticPlan
 from robofast.sequencer import SlewDenied
 from robofast.testing.checks import (
@@ -146,9 +147,14 @@ async def test_stale_grants_refused_on_every_telescope(make_rig, monkeypatch):
     original = seq._observe
 
     async def stale(state, unit, tel, cam, obs, taken):
+        # The cancel reaches a telescope's task as CancelledError, or -- when
+        # the task runs once between the fence and the TaskGroup passing the
+        # cancel on (sequencer._cancel_observe revokes, then cancels the
+        # generation's task) -- as GrantRevoked on its next command. A stale
+        # client tries again either way (CI flake: one telescope missing).
         try:
             await original(state, unit, tel, cam, obs, taken)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GrantRevoked):
             try:
                 await tel.call("SlewToCoordinatesAsync", 1.0, 1.0)
             finally:

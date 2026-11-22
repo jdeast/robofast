@@ -927,3 +927,13 @@ def test_si_temperatures_are_tenths_of_a_kelvin():
 def test_ccd_temperature_settings_are_checked(sim, over, error):
     with pytest.raises(ValueError, match=error):
         service_config(sim, **over)
+
+
+async def test_the_simulators_expmeter_log_is_bounded(sim):
+    """Night 2026-11-21: the simulated KiwiSpec PC runs inside the rehearsal
+    all night; its exposure-meter readings are kept bounded."""
+    cap = sim.expmeter_readings.maxlen
+    assert cap is not None and cap <= 10_000
+    for i in range(cap + 500):
+        sim.expmeter_readings.append((float(i), 1.0))
+    assert len(sim.expmeter_readings) == cap and sim.expmeter_readings[-1][0] == cap + 499

@@ -35,6 +35,7 @@ async def test_the_report_names_the_line_that_grows(tmp_path):
     assert "RSS" in last[0] or "traced" in last[0]
     assert "test_mem_watch.py" in last[1]  # the top grower: the cache above
     assert float(last[1].split()[0]) >= 2.0  # MB (allocations after the baseline)
+    assert "malloc_trim(0): RSS" in text  # glibc (Linux CI, the gateway)
 
 
 def test_every_must_be_positive(tmp_path):

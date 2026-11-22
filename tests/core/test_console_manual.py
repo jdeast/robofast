@@ -148,7 +148,10 @@ async def test_manual_control_end_to_end_and_weather_preempts_it(make_rig, tmp_p
         t_take = rig.timeline.first_event("manual_start").t
         st = (await clients["alice"].get("/console/api/status")).json()["enclosures"]["aqawan1"]
         assert st["telescopes"]["t1"]["manual"]["operator"] == "alice"
-        assert rig.exposing(1)  # t2 observes on
+        # t2 observes on. (Its 0.3 s exposures are back to back but not
+        # contiguous -- readout, download, the next start -- so one look at
+        # the camera can land between two: a master CI flake. Wait for one.)
+        await wait_until(lambda: rig.exposing(1), 5, what="t2 exposing")
 
         # Slew, refused outside the limits; offset; expose; focus (no focuser here).
         r = await manual(op="slew", **down)

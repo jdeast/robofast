@@ -195,6 +195,7 @@ from the same plan entry) but never write it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import math
@@ -421,6 +422,11 @@ class DispatchScheduler:
         if not allow_iers_download:
             sky.offline_iers()
         self.site = site
+        # The first sidereal-time and precession computation loads astropy's
+        # time tables (~0.7 s on a slow host): here, not inside the first
+        # decision, which runs on the event loop.
+        with contextlib.suppress(Exception):
+            sky.altitudes(site, [0.0], [0.0], [[datetime.now(UTC)]])
         self.limits = dict(telescopes)
         #: Each instrument name the telescopes list -> its type
         #: (:mod:`robofast.instruments`): ``instruments`` declares
@@ -1434,7 +1440,7 @@ class DispatchScheduler:
         if not light:
             return
         seps = sky.moon_separation(
-            sky_now.moon,
+            sky_now,
             [c.target.ra_hours for c, _, _ in light],
             [c.target.dec_deg for c, _, _ in light],
         )

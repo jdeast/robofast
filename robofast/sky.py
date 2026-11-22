@@ -1,9 +1,21 @@
 """Positions on the sky for the scheduler, from astropy.
 
-Everything is vectorized over targets: :func:`altitudes` takes arrays of
-coordinates and an array of times and does one coordinate transform, so a
-dispatch decision over a few hundred configurations costs tens of
-milliseconds, not seconds.
+Everything is vectorized over targets and none of it runs an astropy
+coordinate transform per target: the dispatch scheduler calls these on its
+event loop, for every candidate, and a slow decision holds the loop (and the
+GIL) -- lease renewals, guider polls and heartbeats wait. On the MINERVA
+gateway (night 2026-11-21) a re-evaluation of ~220 requests held the GIL for
+about 3 s, one astropy transform per candidate in :func:`moon_separation`.
+
+* :func:`altitudes` rotates the J2000 directions to the true equator and
+  equinox of date with one bias-precession-nutation matrix and takes the
+  apparent sidereal time at one reference instant, advancing it at the
+  sidereal rate; the rest is numpy. Against astropy's AltAz it differs by
+  annual aberration (up to 20 arcsec) and polar motion, far below what the
+  altitude limits need.
+* :func:`moon_separation` is plain spherical trigonometry against the Moon's
+  topocentric (GCRS) RA/Dec, read once per :class:`SkyNow`: GCRS axes are
+  ICRS-aligned, so for a star the two directions differ only by aberration.
 
 Altitudes are geometric (no refraction): the limits they are compared with
 (20 deg and up) are far from the horizon, where refraction is a few arcmin.
@@ -82,6 +94,11 @@ class SkyNow:
     def sun_rising(self) -> bool:
         return self.sun_alt_later > self.sun_alt
 
+    @cached_property
+    def moon_radec(self) -> tuple[float, float]:
+        """The Moon's topocentric RA and Dec (deg), read once."""
+        return float(self.moon.ra.deg), float(self.moon.dec.deg)
+
 
 def sky_now(site: Site, when: datetime) -> SkyNow:
     t = Time([when, when + timedelta(minutes=10)])
@@ -106,27 +123,66 @@ def altitudes(
     """Altitude (deg) of target ``i`` at each of ``times[i]``; shape
     ``(len(ra_hours), len(times[0]))``. Each row of ``times`` has the same
     length."""
-    ra = np.asarray(ra_hours, dtype=float)[:, None] * 15.0
-    dec = np.asarray(dec_deg, dtype=float)[:, None]
-    t = Time(np.asarray(times, dtype=object))
-    coords = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
-    frame = AltAz(obstime=t, location=site.location)
-    return np.asarray(coords.transform_to(frame).alt.deg)
+    import erfa
+
+    ra = np.radians(np.asarray(ra_hours, dtype=float) * 15.0)
+    dec = np.radians(np.asarray(dec_deg, dtype=float))
+    rows = [list(r) for r in times]
+    if len(rows) != len(ra) or len(ra) != len(dec):
+        raise ValueError("ra_hours, dec_deg and times must have one entry per target")
+    ref = next((t for r in rows for t in r), None)
+    if ref is None:
+        return np.zeros((len(rows), len(rows[0]) if rows else 0))
+    # Hours of each time after the reference instant.
+    dt = np.array([[(t - ref).total_seconds() / 3600.0 for t in r] for r in rows], dtype=float)
+    t_ref = Time(ref)
+    tt = t_ref.tt
+    # J2000 (ICRS) -> true equator and equinox of date; one matrix for the
+    # whole evaluation (it changes by ~0.1 arcsec in an hour).
+    rbpn = erfa.pnm06a(tt.jd1, tt.jd2)
+    v = np.stack([np.cos(dec) * np.cos(ra), np.cos(dec) * np.sin(ra), np.sin(dec)])
+    x, y, z = rbpn @ v
+    ra_app = np.arctan2(y, x)
+    dec_app = np.arcsin(np.clip(z, -1.0, 1.0))
+    # Apparent sidereal time at the site, advanced at the sidereal rate.
+    lst0 = t_ref.sidereal_time("apparent", longitude=site.longitude * u.deg).hour
+    lst = np.radians((lst0 + dt / SIDEREAL) * 15.0)
+    ha = lst - ra_app[:, None]
+    phi = math.radians(site.latitude)
+    sin_alt = math.sin(phi) * np.sin(dec_app)[:, None] + math.cos(phi) * np.cos(dec_app)[
+        :, None
+    ] * np.cos(ha)
+    return np.degrees(np.arcsin(np.clip(sin_alt, -1.0, 1.0)))
 
 
 def moon_separation(
-    moon: SkyCoord, ra_hours: Sequence[float], dec_deg: Sequence[float]
+    moon: SkyNow | SkyCoord | tuple[float, float],
+    ra_hours: Sequence[float],
+    dec_deg: Sequence[float],
 ) -> np.ndarray:
     """Angular distance (deg) from the Moon to each target (as seen from the
-    site; the Moon's parallax matters, so this uses its topocentric place)."""
-    coords = SkyCoord(
-        ra=np.asarray(ra_hours, dtype=float) * 15.0 * u.deg,
-        dec=np.asarray(dec_deg, dtype=float) * u.deg,
-        frame="icrs",
+    site; the Moon's parallax matters, so this uses its topocentric place).
+    ``moon`` is a :class:`SkyNow` (its RA/Dec read once), the Moon's GCRS
+    SkyCoord, or its (RA, Dec) in degrees. Plain spherical trigonometry: GCRS
+    axes are ICRS-aligned, so a star's ICRS direction differs from its GCRS
+    one only by aberration (20 arcsec), which a Moon-avoidance limit ignores."""
+    if isinstance(moon, SkyNow):
+        m_ra, m_dec = moon.moon_radec
+    elif isinstance(moon, SkyCoord):
+        m_ra, m_dec = float(moon.ra.deg), float(moon.dec.deg)
+    else:
+        m_ra, m_dec = moon
+    ra = np.radians(np.asarray(ra_hours, dtype=float) * 15.0)
+    dec = np.radians(np.asarray(dec_deg, dtype=float))
+    m_ra, m_dec = math.radians(m_ra), math.radians(m_dec)
+    # Vincenty's formula: accurate at every separation.
+    d_ra = ra - m_ra
+    num = np.hypot(
+        np.cos(dec) * np.sin(d_ra),
+        math.cos(m_dec) * np.sin(dec) - math.sin(m_dec) * np.cos(dec) * np.cos(d_ra),
     )
-    # Compare in the Moon's (GCRS) frame; for a star at infinity GCRS and
-    # ICRS directions differ only by aberration (20 arcsec).
-    return np.asarray(moon.separation(coords.transform_to(moon.frame)).deg)
+    den = math.sin(m_dec) * np.sin(dec) + math.cos(m_dec) * np.cos(dec) * np.cos(d_ra)
+    return np.degrees(np.arctan2(num, den))
 
 
 def hour_angle(lst_hours: float, ra_hours: float) -> float:

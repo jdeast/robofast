@@ -1,0 +1,20 @@
+# The all-sky cloud-map watcher (docs/allsky.md):
+#   python -m robofast.allsky watch --config sites/minerva/allsky_watch.yaml
+# It reads the frames the site fetcher saves (~/allsky/<camera>/<UTdate>/)
+# and writes latest.json for the weather bridge's shadow `allsky` source.
+# fetch: false -- this host already has a fetcher; set true (with each
+# camera's url) only where nothing else downloads the frames.
+output: ~/allsky/shadow/latest.json
+history: ~/allsky/shadow/history.jsonl
+interval: 60      # s between passes (the ridge camera publishes once a minute)
+max_age: 180      # s: pool the two cameras when their frames are this close
+stale: 600        # s: a camera whose newest frame is older is left out
+trend_frames: 10
+fetch: false
+cameras:
+  mmto:
+    dir: ~/allsky/mmto
+    url: https://skycam.mmto.arizona.edu/skycam/latest_image.jpg
+  ridge:
+    dir: ~/allsky/ridge
+    url: http://linmax.sao.arizona.edu/weather/sky/last_sky.jpg

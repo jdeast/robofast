@@ -21,6 +21,7 @@ exposure started; it honours ``BinX``/``BinY`` and the subframe.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -189,12 +190,42 @@ class StarfieldCamera(FakeCamera):
         self._duration = 0.0
         #: Optical focuser position of every exposure (ground truth).
         self.exposed_at: list[float] = []
+        #: Render each frame from StartExposure on a worker thread, with
+        #: ImageReady waiting for it (a real-time Alpaca sky: SkyDevice), so
+        #: the render does not count against the client's download timeout.
+        #: Off (render at the download): the virtual-time rigs, whose
+        #: exposures end in simulated milliseconds.
+        self.render_early = False
+        self._render: concurrent.futures.Future | None = None
 
     def StartExposure(self, duration: float, light: bool) -> None:
         super().StartExposure(duration, light)
         self._optical_at_start = self.focuser.optical
         self._duration = float(duration)
         self.exposed_at.append(self._optical_at_start)
+        self._render = None
+        if not self.render_early:
+            return
+        # The frame is rendered while it "exposes and reads out", on a worker
+        # thread, and ImageReady waits for it -- as a real camera reads out
+        # before ImageReady. Rendered at the download, a far-out-of-focus
+        # frame on a slow host took longer than the download timeout (e2e
+        # first light on the MINERVA gateway, 2026-11-21:
+        # "t1.camera.ImageArray did not complete within 37 s").
+        b = int(self.BinX)
+        roi = (int(self.StartX) * b, int(self.StartY) * b, int(self.NumX) * b, int(self.NumY) * b)
+        args = (self._optical_at_start, self._duration, roi, b)
+        self._render = self._renderer().submit(self.scene.render, *args)
+
+    def _renderer(self) -> concurrent.futures.ThreadPoolExecutor:
+        if getattr(self, "_pool", None) is None:
+            self._pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="starfield")
+        return self._pool
+
+    @property
+    def ImageReady(self) -> bool:
+        render = self._render
+        return super().ImageReady and (render is None or render.done())
 
     async def get(self, member: str, *, timeout: float | None = None) -> Any:
         if member != "ImageArray":
@@ -202,10 +233,8 @@ class StarfieldCamera(FakeCamera):
         if self.download_time:
             await asyncio.sleep(self.download_time)
         await self._gate()
-        # Rendered off the event loop, as a real camera's download never
-        # blocks it: a sky frame takes ~0.3 s of CPU, more on a loaded CI
-        # runner, and a blocked loop starves the supervisor's weather reads
-        # (a short stale_after then revokes the lease mid-run).
+        # Off the event loop, as a real camera's download never blocks it
+        # (a blocked loop starves the supervisor's weather reads).
         return await asyncio.to_thread(lambda: self.ImageArray)
 
     @property
@@ -215,8 +244,17 @@ class StarfieldCamera(FakeCamera):
         if not self._ready:
             raise FakeDeviceError("no image available")
         self.downloads += 1
-        b = int(self.BinX)
-        roi = (int(self.StartX) * b, int(self.StartY) * b, int(self.NumX) * b, int(self.NumY) * b)
-        img = self.scene.render(self._optical_at_start, self._duration, roi, b)
+        render = self._render
+        if render is None:  # rendered now, at the download
+            b = int(self.BinX)
+            roi = (
+                int(self.StartX) * b,
+                int(self.StartY) * b,
+                int(self.NumX) * b,
+                int(self.NumY) * b,
+            )
+            img = self.scene.render(self._optical_at_start, self._duration, roi, b)
+        else:
+            img = render.result()
         data = np.ascontiguousarray(img.T.astype("<i4"))  # ASCOM order: [x, y]
         return ImageArray(data, 2, "imagebytes", data.nbytes + 44)

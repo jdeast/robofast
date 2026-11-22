@@ -80,3 +80,21 @@ def test_t2_moved_and_not_parked_again_is_caught():
     assert console_park_problems(console_park((1.0, "t2", "slew"))) == [
         "t2's mount never parked for the console"
     ]
+
+
+async def test_the_simulated_night_keeps_its_emergency_log_in_its_own_directory(tmp_path):
+    """2026-11-21, the MINERVA gateway (robofast installed, /var/log/robofast
+    root:robofast 0750): every e2e night read the example config's production
+    emergency log, could not read it, assumed a latched emergency close, and
+    never opened the simulated roof (6 e2e tests failed, 900 s timeouts)."""
+    from robofast.emergency import EmergencyConfig, EmergencyGate
+    from robofast.testing.rv_night import SimulatedNight
+
+    night = SimulatedNight(tmp_path)
+    try:
+        night._start_aqawan()
+        cfg = EmergencyConfig.from_dict(night.aqawan.config.emergency_close)
+        assert cfg.log == str(tmp_path / "aqawan1-emergency.jsonl")
+        assert EmergencyGate(cfg).latched is None
+    finally:
+        await night.close()

@@ -347,6 +347,15 @@ class SimulatedNight:
         self.aqawan_sim.start()
         self._stack.callback(self.aqawan_sim.stop)
         base = json.loads((ROOT / "deploy" / "aqawan.example.json").read_text())
+        # The example's emergency log is the production path
+        # (/var/log/robofast/...): on a host with robofast installed it is
+        # there but unreadable to this user, the gate then assumes a latched
+        # emergency close, and the simulated roof never opens. The night's
+        # own log, in its output directory.
+        base["emergency_close"] = {
+            **base["emergency_close"],
+            "log": str(self.out / "aqawan1-emergency.jsonl"),
+        }
         base.update(
             listen="127.0.0.1:0",
             pac={

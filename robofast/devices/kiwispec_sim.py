@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import contextlib
 import ipaddress
 import json
@@ -234,7 +235,11 @@ class KiwiSpecSim:
         self.expmeter_logging = c.expmeter_enabled
         self.expmeter_total: float | None = 0.0 if c.expmeter_enabled else None
         self.expmeter_tripped = False
-        self.expmeter_readings: list[tuple[float, float]] = []
+        #: The latest exposure-meter readings (time, counts): bounded, as the
+        #: simulator runs all night inside the rehearsal (night 2026-11-21).
+        self.expmeter_readings: collections.deque[tuple[float, float]] = collections.deque(
+            maxlen=10_000
+        )
         self._expmeter_t = now
         # files
         self.file_name = ""

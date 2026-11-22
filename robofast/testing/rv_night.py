@@ -83,6 +83,7 @@ from robofast.sun import now_utc
 from robofast.testing.alpaca_server import FakeAlpacaServer
 from robofast.testing.fakes import FakeTelescope
 from robofast.testing.focus_sim import FocusScene, SimFocuser, StarfieldCamera
+from robofast.testing.mem_watch import MemWatch
 from robofast.testing.processes import ROOT, Service, SupervisorProcess
 from robofast.testing.redis_feed import RedisFeed, RedisFeedState
 from robofast.testing.starfield import Detector, SimOptics, random_stars
@@ -269,6 +270,7 @@ class SimulatedNight:
     async def start(self) -> None:
         self.outcome.t_start = time.monotonic()
         await self._stack.__aenter__()
+        self._start_mem_watch()
         self._start_weather()
         self._start_aqawan()
         self._start_telescopes()
@@ -276,6 +278,23 @@ class SimulatedNight:
         self._start_guiders()
         self._start_supervisor()
         await self._wait_ready()
+
+    def _start_mem_watch(self) -> None:
+        """Opt-in (``ROBOFAST_MEMWATCH=SECONDS``): every SECONDS, this process's
+        top memory growth sites to ``memwatch.txt`` (MemWatch; night
+        2026-11-21: the rehearsal grew 0.4-1.1 GB/h in its main heap)."""
+        every = os.environ.get("ROBOFAST_MEMWATCH")
+        if not every:
+            return
+        self.mem_watch = MemWatch(self.out / "memwatch.txt", every=float(every))
+        task = asyncio.get_running_loop().create_task(self.mem_watch.run(), name="mem-watch")
+
+        async def stop() -> None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        self._stack.push_async_callback(stop)
 
     def _start_weather(self) -> None:
         import yaml
@@ -347,6 +366,15 @@ class SimulatedNight:
         self.aqawan_sim.start()
         self._stack.callback(self.aqawan_sim.stop)
         base = json.loads((ROOT / "deploy" / "aqawan.example.json").read_text())
+        # The example's emergency log is the production path
+        # (/var/log/robofast/...): on a host with robofast installed it is
+        # there but unreadable to this user, the gate then assumes a latched
+        # emergency close, and the simulated roof never opens. The night's
+        # own log, in its output directory.
+        base["emergency_close"] = {
+            **base["emergency_close"],
+            "log": str(self.out / "aqawan1-emergency.jsonl"),
+        }
         base.update(
             listen="127.0.0.1:0",
             pac={

@@ -449,6 +449,74 @@ class RedisSource(WeatherSource):
         )
 
 
+# -- the all-sky cloud map (shadow only) ----------------------------------------------
+
+
+class AllskySource(WeatherSource):
+    """The all-sky cameras' cloud map: the ``latest.json`` written by
+    ``python -m robofast.allsky watch`` (docs/allsky.md).
+
+    **Shadow only**: the bridge logs its status with every evaluation and
+    never lets it into the safe/unsafe/unknown decision (``parse_config``
+    forces ``shadow: true``). Option: ``path`` (the file). Fields:
+    ``clear`` (whole-sky clear fraction, 0-1), ``zenith60_clear``,
+    ``coverage`` (fraction of the sky's cells known), ``trend_per_hour``
+    (whole-sky slope) and ``frame_age`` (s, the oldest frame used). The
+    reading's time is the newest frame's.
+    """
+
+    _OPTIONS = frozenset({"path"})
+
+    def __init__(self, config: SourceConfig) -> None:
+        super().__init__(config)
+        extra = set(config.options) - self._OPTIONS
+        if extra:
+            raise ValueError(f"source {config.name}: unknown options {sorted(extra)}")
+        if not config.options.get("path"):
+            raise ValueError(f"source {config.name}: needs a path (the watcher's latest.json)")
+        self.path = os.path.expanduser(str(config.options["path"]))
+
+    async def fetch(self, now: datetime) -> Reading:
+        import asyncio
+        import json
+
+        try:
+            text = await asyncio.to_thread(self._read)
+            doc = json.loads(text)
+        except (OSError, ValueError) as exc:
+            raise SourceError(f"{self.path}: {exc}") from exc
+        return self.parse(doc)
+
+    def _read(self) -> str:
+        with open(self.path) as f:
+            return f.read()
+
+    def parse(self, doc: Mapping[str, Any]) -> Reading:
+        if not isinstance(doc, Mapping) or not doc.get("time"):
+            raise SourceError(f"{self.path}: no cloud map (no time)")
+        when = datetime.fromisoformat(str(doc["time"]))
+        if when.tzinfo is None:
+            raise SourceError(f"{self.path}: time without a zone")
+
+        def num(v: Any) -> float | None:
+            return None if v is None else float(v)
+
+        ages = [f["age_s"] for f in doc.get("frames", []) if f.get("used")]
+        trend = (doc.get("trend") or {}).get("whole_sky") or {}
+        values = {
+            "clear": num(doc.get("whole_sky_clear")),
+            "zenith60_clear": num(doc.get("zenith60_clear")),
+            "coverage": num(doc.get("coverage")),
+            "trend_per_hour": num(trend.get("slope_per_hour")),
+            "frame_age": num(max(ages)) if ages else None,
+        }
+        notes = tuple(str(e) for e in doc.get("errors", []))
+        return Reading(self.name, when.astimezone(UTC), values, notes=notes)
+
+    def fields(self) -> set[str]:
+        return {"clear", "zenith60_clear", "coverage", "trend_per_hour", "frame_age"}
+
+
 #: Source type name -> factory(config, site, **kw) -> WeatherSource. A site
 #: adapter registers its own from a plug-in (docs/plugins.md; MINERVA's:
 #: :mod:`robofast.sites.minerva`, listed in its weather config's
@@ -465,3 +533,6 @@ SOURCE_TYPES.register(
     ),
 )
 SOURCE_TYPES.register("redis", lambda cfg, site, **kw: RedisSource(cfg))
+SOURCE_TYPES.register("allsky", lambda cfg, site, **kw: AllskySource(cfg))
+#: Source types that may only ever run in shadow (logged, never decide).
+SHADOW_ONLY_TYPES = frozenset({"allsky"})

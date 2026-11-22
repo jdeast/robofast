@@ -254,6 +254,20 @@ sources:
     required: false
     stale_after: 600  # legacy rejected data older than 10 min
 
+  allsky:
+    # The all-sky cameras' cloud map (docs/allsky.md): the latest.json the
+    # watcher writes (python -m robofast.allsky watch --config
+    # sites/minerva/allsky_watch.yaml). SHADOW ONLY, whatever is set here:
+    # logged with every evaluation and in --json, never in IsSafe.
+    # Enable once the watcher runs on this host.
+    enabled: false
+    type: allsky
+    path: ~/allsky/shadow/latest.json
+    stale_after: 600
+    # Judged against these and logged as "would" verdicts, never enforced.
+    limits:
+      clear: {open: [0.7, null], close: [0.3, null]}
+
 # ASCOM ObservingConditions members -> source field, in the field's unit
 # (converted to ASCOM units: degC, %, m/s, hPa, mm/h, deg).
 conditions:

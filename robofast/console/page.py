@@ -501,7 +501,8 @@ function render(doc) {
       if (b.rain_until) parts.push(h("p", {class: "warn"}, "rain hold until " + b.rain_until));
       for (const [sn, s] of Object.entries(b.sources || {})) {
         parts.push(h("div", {class: "card"}, h("strong", {}, sn), " ",
-          badge(fmt(s.state), s.state === "safe" ? "ok" : s.state === "unsafe" ? "bad" : "warn"),
+          s.shadow ? h("span", {class: "dim"}, "(shadow: logged, not in the verdict) ") : null,
+          badge(fmt(s.state), s.shadow ? "warn" : s.state === "safe" ? "ok" : s.state === "unsafe" ? "bad" : "warn"),
           h("span", {class: "dim"}, " age " + fmt(s.age, 0) + " s"),
           kv(Object.entries(s.values || {}).map(([k, v]) => [k, fmt(v)])),
           (s.reasons || []).length ? h("p", {class: "dim"}, s.reasons.join("; ")) : null));

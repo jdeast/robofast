@@ -61,6 +61,7 @@ from robofast.weather_eval import (
 from robofast.weather_server import WeatherServer, WeatherState
 from robofast.weather_sources import (
     ASCOM_UNITS,
+    SHADOW_ONLY_TYPES,
     SOURCE_TYPES,
     UNITS,
     Reading,
@@ -85,6 +86,7 @@ _SOURCE_KEYS = {
     "rain_rates",
     "enforce_rain",
     "dynamic_limits",
+    "shadow",
 }
 _TOP_KEYS = {
     "plugins",
@@ -172,10 +174,17 @@ def parse_config(raw: dict[str, Any]) -> BridgeConfig:
             raise ValueError(
                 f"source {name}: type {known.get('type')!r} is not one of {sorted(SOURCE_TYPES)}"
             )
+        shadow = known.get("shadow", known["type"] in SHADOW_ONLY_TYPES)
+        if not isinstance(shadow, bool):
+            raise ValueError(f"source {name}: shadow must be true or false")
+        if known["type"] in SHADOW_ONLY_TYPES and not shadow:
+            raise ValueError(f"source {name}: type {known['type']} may only run in shadow")
+        if shadow and known.get("required", False):
+            raise ValueError(f"source {name}: a shadow source cannot be required")
         scfg = SourceConfig(
             name=name,
             type=known["type"],
-            required=bool(known.get("required", True)),
+            required=False if shadow else bool(known.get("required", True)),
             stale_after=float(known.get("stale_after", 300.0)),
             timeout=float(known.get("timeout", 10.0)),
             url=known.get("url"),
@@ -214,6 +223,7 @@ def parse_config(raw: dict[str, Any]) -> BridgeConfig:
                     rain_rates=rain_rates,
                     enforce_rain=enforce_rain,
                     dynamic_limits={f: d for f, d in dynamic.items() if d is not None},
+                    shadow=shadow,
                 ),
             )
         )
@@ -226,6 +236,8 @@ def parse_config(raw: dict[str, Any]) -> BridgeConfig:
         src, fld, unit = spec["source"], spec["field"], spec["unit"]
         if src not in by_name:
             raise ValueError(f"conditions.{member}: no enabled source {src!r}")
+        if by_name[src][1].shadow:
+            raise ValueError(f"conditions.{member}: source {src!r} is shadow-only")
         if unit not in UNITS or UNITS[unit][0] != ASCOM_UNITS[member]:
             raise ValueError(
                 f"conditions.{member}: unit {unit!r} does not convert to {ASCOM_UNITS[member]}"
@@ -244,7 +256,7 @@ def parse_config(raw: dict[str, Any]) -> BridgeConfig:
             setattr(cfg, key, float(raw[key]))
     if "listen" in raw:
         cfg.listen = str(raw["listen"])
-    if not any(spec.required and not spec.live for _, spec in sources):
+    if not any(spec.required and not spec.live and not spec.shadow for _, spec in sources):
         raise ValueError("at least one required weather source (not just the Sun) is needed")
     if cfg.server_stale_after <= cfg.evaluate_interval:
         raise ValueError("server_stale_after must exceed evaluate_interval")

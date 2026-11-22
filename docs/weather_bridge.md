@@ -142,6 +142,15 @@ systemd user unit; it never writes to Redis or anything at the site.
   anything (it is listed in the reasons as `(advisory)`), but one that
   answers with a value outside its limits does. A config needs at least one
   required source besides the Sun.
+- **Shadow sources** (`shadow: true`; the `allsky` type is always shadow)
+  are fetched and judged like the others, and their status is in every
+  evaluation (`sources`, marked `"shadow": true`, the log line, `--json`),
+  but they take no part in the combiner: not their state, reasons or rain.
+  A shadow source cannot be required, cannot feed ObservingConditions, and
+  does not count as the required source a config needs. The `allsky` type
+  reads the all-sky cloud map's `latest.json` (`path`; docs/allsky.md) and
+  gives `clear`, `zenith60_clear`, `coverage`, `trend_per_hour` and
+  `frame_age`.
 - **Reasons** (which limit tripped, which source is stale, what would close
   if rain were enforced, ...) are in the status JSON: `GET /weather/status`
   on the Alpaca server, and `Action("WeatherStatus")` on the SafetyMonitor.

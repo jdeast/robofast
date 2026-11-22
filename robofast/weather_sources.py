@@ -298,6 +298,10 @@ class RedisField:
     to: str | None = None
     #: Values meaning "sensor down" (unknown).
     missing_values: tuple[float, ...] = ()
+    #: Values meaning "raining": the field is unknown *and* the reading says
+    #: rain (``Reading.rain``, under the source's ``enforce_rain``; MINERVA:
+    #: the MEarth cloud sensor's 998).
+    rain_values: tuple[float, ...] = ()
 
 
 class RedisSource(WeatherSource):
@@ -307,11 +311,14 @@ class RedisSource(WeatherSource):
     (:mod:`robofast.resp`) sends only SELECT and MGET. Options:
 
     ``fields``
-        ``{field: {key, time?, unit?, to?, missing_values?}}``: the explicit
+        ``{field: {key, time?, unit?, to?, missing_values?, rain_values?}}``: the explicit
         key -> field mapping. ``time`` names the key holding this value's
         measurement time (default ``time_key``); ``unit``/``to`` convert
         (``{unit: km/h, to: mph}`` keeps the limits in mph whatever the
-        server turns out to send); a value in ``missing_values`` is unknown.
+        server turns out to send); a value in ``missing_values`` is unknown;
+        one in ``rain_values`` is unknown and says rain (``Reading.rain``,
+        enforced only with the source's ``enforce_rain``), so it never fails
+        the field's own limits.
     ``time_key``
         The key with the reading's main measurement time (required; if it is
         absent or unreadable the fetch fails). Its staleness bound is the
@@ -375,6 +382,7 @@ class RedisSource(WeatherSource):
                 unit=unit,
                 to=to,
                 missing_values=tuple(float(v) for v in spec.pop("missing_values", [])),
+                rain_values=tuple(float(v) for v in spec.pop("rain_values", [])),
             )
             if spec:
                 raise ValueError(f"{what}: unknown {sorted(spec)}")
@@ -419,6 +427,7 @@ class RedisSource(WeatherSource):
         field_times: dict[str, datetime] = {}
         field_stale: dict[str, float] = {}
         notes: list[str] = []
+        rain = False
         for name, f in self.mapping.items():
             values[name] = None
             if f.time != self.time_key:
@@ -435,6 +444,9 @@ class RedisSource(WeatherSource):
             v = _number(value)
             if v is None:
                 notes.append(f"{name}: {f.key}={value!r} is not a number")
+            elif v in f.rain_values:
+                notes.append(f"{name}: rain sentinel {v:g}")
+                rain = True
             elif v in f.missing_values:
                 notes.append(f"{name}: sensor-down value {v:g}")
             else:
@@ -443,6 +455,7 @@ class RedisSource(WeatherSource):
             self.name,
             when,
             values,
+            rain=rain,
             notes=tuple(notes),
             field_times=field_times,
             field_stale_after=field_stale,

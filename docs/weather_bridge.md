@@ -188,9 +188,10 @@ logic and a write API for two read commands; the small reader is easier to
 bound (every call is under `timeout`; replies are size-capped) and to fake
 in tests.
 
-Options: `fields` (`{field: {key, time?, unit?, to?, missing_values?}}`, the
-explicit key -> field mapping; `unit`/`to` convert, e.g. `{unit: km/h, to:
-mph}`), `time_key` (the reading's main timestamp key; unreadable = fetch
+Options: `fields` (`{field: {key, time?, unit?, to?, missing_values?,
+rain_values?}}`, the explicit key -> field mapping; `unit`/`to` convert, e.g.
+`{unit: km/h, to: mph}`; a value in `missing_values` is unknown, one in
+`rain_values` is unknown and says rain, under the source's `enforce_rain`), `time_key` (the reading's main timestamp key; unreadable = fetch
 failed), `timestamps` (`{key: stale_after}` for other timestamp keys a field
 names as its `time`), `time_format` (default `%Y-%m-%d %H:%M:%S`) and
 `utc_offset_hours`.
@@ -256,35 +257,45 @@ ridge page at the same moment, so it is the same WXT510 station):
 | humidity | `humidity` | % | |
 | dewpoint | `dew` | degC | |
 | pressure | `pressure` | inHg | 22.69 = ridge `barometer` |
-| wind, wind_gust | `wind`, `wind_gust` | **km/h (unverified)** -> mph | see below |
+| wind, wind_gust | `wind`, `wind_gust` | km/h -> mph | see below |
 | wind_direction | `wind_direction` | deg | |
 | rain_wxt | `rain_current` | mm, cumulative | = ridge `wxt510Rain` |
 | rain_total | `rain` | cumulative | = ridge `totalRain` |
 | rain_intensity | `rain_intensity` | mm/h | rain rate; served as RainRate |
 | hail_intensity | `hail_intensity` | | rain rate (shadow) |
 | rain_duration, hail, hail_duration | same | cumulative | logged only |
-| mearth | `m_bolt` (time `mbolt_time`) | degC | the MEarth cloud sensor (confirmed, JDE 2026-10-31); limits as the MEarth cloud column |
-| aurora | `aurora` | degC | the Aurora sensor (confirmed, JDE 2026-10-31); limits as the Aurora cloud column; `a_sky` equalled it |
+| mearth | `m_bolt` (time `mbolt_time`) | degC | the MEarth cloud sensor (confirmed, JDE 2026-10-31); limit from `sky_limit`; -999.9 down, 998 rain |
+| aurora | `aurora` | degC | the Aurora sensor (confirmed, JDE 2026-10-31); limits as the Aurora cloud column; -999.9 down; `a_sky` equalled it |
 | boltwood | `boltwood` (time `boltwood_time`) | degC | read -0.0 (= "sensor down"); which sensor is unknown: logged only |
-| sky_limit | `sky_limit` | degC | the FLWO observers' MEarth limit; dynamic limit, off |
+| sky_limit | `sky_limit` | degC | the FLWO observers' MEarth limit; dynamic limit, on |
 
-**Wind units are not established.** At the capture Redis said wind 11.3,
-gust 38.4 while the ridge page said 7.21 and 20.38 mph. 11.3 km/h = 7.02
-mph fits the mean wind (gusts depend on the averaging window), and the
-MEarth station that shares these WXT keys reported km/h in legacy
-`getWeatherMearth`, so the config reads km/h and converts to mph (the
-legacy limits' unit). If the server really sends mph, Redis wind reads 1.6x
-low; the ridge page's mph limits still close the roof while it answers.
-Settle it in shadow mode, then fix `unit:` in the config (the limits stay
-in mph).
+**Wind units: km/h.** Converted to mph, Redis `wind`/`wind_gust` match the
+ridge page's windSpeed/windGustSpeed (median ratio 1.00 over 17,572 minutes
+of the 2026-10-31..11-14 shadow run).
+
+**Cloud sensor sentinels.** As on the cloud page, -999.9 is "sensor down"
+for MEarth and Aurora (MEarth read it from 2026-11-03 ~22 UTC; before this
+it failed the sky limit instead of falling back to Aurora), and MEarth's
+998 is its rain flag: a `rain_values` sentinel, shadow-only with the
+source's `enforce_rain: false` (JDE 2026-10-31), never a sky value.
+
+**The static cloud limits are uncalibrated on the Redis scale.** In the
+shadow run the best nights read about -24 (MEarth) and -19 (Aurora), so the
+legacy -40 / -32 are never reached. MEarth's static limit is only the
+fallback when `sky_limit` is missing; calibrate both against the cloud page
+side by side once its credentials exist.
 
 **sky_limit.** Legacy `domeControl.py` fetched the FLWO 48" observers'
 `me_sky_limit` (`getskylimit.sh`, ssh to flwo48) every 30 min, defaulting
 to -38, and `oktoopen` applied it to the MEarth sensor only: close limit =
-sky_limit, open limit = sky_limit - 2. Redis's `sky_limit` (-35.0 at
-capture) is most likely that setting. The config carries this as a dynamic
-limit on `mearth`, `enabled: false` (JDE: off by default), with a sanity
-range of [-50, -25].
+sky_limit, open limit = sky_limit - 2. Redis's `sky_limit` is that
+setting. The config carries this as a dynamic limit on `mearth`, **enabled**
+(JDE 2026-11-21, after the weather-shadow run: with it off the static -40
+applied and the bridge never opened), read from Redis; legacy's ssh to
+flwo48 is not ported. The observers set it from 0 ("don't block on cloud")
+to -70/-75 ("don't open"), so its `range` [-100, 10] is only a garbage
+guard. It applies to MEarth only, as legacy's did; Aurora keeps its static
+limits.
 
 The limits in `sites/minerva/weather.yaml` are ported from legacy
 `minerva_library/env.py` (MinervaCollaboration/minerva-control). Units the

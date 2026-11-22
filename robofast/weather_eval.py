@@ -33,6 +33,11 @@ time frozen at startup):
 The combiner: unsafe if any source is unsafe (advisory ones included) or rain
 is being held; unknown -- which is unsafe -- if a required source is unknown
 or every fetched (non-live) source is; safe otherwise.
+
+A **shadow** source (``SourceSpec.shadow``; the all-sky cloud map) is judged
+like any other and its status is in every :class:`Evaluation` (``sources``,
+marked ``shadow``, and ``line()``), but it takes no part in the combiner:
+not its state, not its reasons, not its rain.
 """
 
 from __future__ import annotations
@@ -222,8 +227,12 @@ class SourceSpec:
     enforce_rain: bool = True
     #: field -> a limit side taken from another field (see DynamicLimit).
     dynamic_limits: dict[str, DynamicLimit] = field(default_factory=dict)
+    #: Logged with every evaluation, never part of the verdict.
+    shadow: bool = False
 
     def __post_init__(self) -> None:
+        if self.shadow and self.required:
+            raise ValueError(f"source {self.name}: a shadow source cannot be required")
         unlimited = [f for f in self.dynamic_limits if f not in self.limits]
         if unlimited:
             raise ValueError(f"source {self.name}: dynamic limits without static ones: {unlimited}")
@@ -255,10 +264,13 @@ class SourceStatus:
     notes: list[str] = field(default_factory=list)
     #: Fields measured at their own time (else ``time`` applies).
     field_times: dict[str, datetime] = field(default_factory=dict)
+    #: Logged only: not part of the verdict.
+    shadow: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "state": self.state,
+            "shadow": self.shadow,
             "required": self.required,
             "reasons": self.reasons,
             "age": None if self.age is None else round(self.age, 1),
@@ -308,7 +320,8 @@ class Evaluation:
             vals = " ".join(
                 f"{k}={'NA' if v is None else f'{v:.6g}'}" for k, v in sorted(s.values.items())
             )
-            parts.append(f"{s.name}[{s.state},age={age}]: {vals}".rstrip())
+            tag = ",shadow" if s.shadow else ""
+            parts.append(f"{s.name}[{s.state}{tag},age={age}]: {vals}".rstrip())
         return f"{head} reasons=[{why}] | " + " | ".join(parts)
 
 
@@ -338,10 +351,14 @@ class Evaluator:
     def evaluate(self, now: datetime, readings: Mapping[str, Reading | str | None]) -> Evaluation:
         """``readings[name]`` is the latest Reading, an error message, or None."""
         use_open = not self.was_safe
-        statuses = {
+        every = {
             name: self._source(spec, readings.get(name), now, use_open)
             for name, spec in self.specs.items()
         }
+        for name, st in every.items():
+            st.shadow = self.specs[name].shadow
+        # Shadow sources are reported, never judged with the rest.
+        statuses = {n: st for n, st in every.items() if not st.shadow}
         reasons: list[str] = []
         for s in statuses.values():
             tag = "" if s.required else " (advisory)"
@@ -372,7 +389,7 @@ class Evaluator:
             reasons.append("no sources configured")
         self.was_safe = state == SAFE
         return Evaluation(
-            now, state, "open" if use_open else "close", reasons, statuses, rain_until, would_close
+            now, state, "open" if use_open else "close", reasons, every, rain_until, would_close
         )
 
     @property
@@ -393,6 +410,8 @@ class Evaluator:
     # -- one source -------------------------------------------------------------
 
     def _rain(self, spec: SourceSpec, when: datetime, why: str) -> None:
+        if spec.shadow:
+            return  # never held, never reported as rain
         last = self.rain.get(spec.enforce_rain)
         if last is None or when >= last[0]:
             self.rain[spec.enforce_rain] = (when, why)

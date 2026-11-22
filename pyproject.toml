@@ -42,6 +42,8 @@ sheets = ["gspread>=6", "google-auth>=2"]
 serial = ["pyserial>=3.5"]
 # Keep in step with the `alerts` dependency group below.
 alerts = ["gcn-kafka>=0.3"]
+# Keep in step with the `allsky` dependency group below.
+allsky = ["pillow>=10"]
 
 [project.urls]
 Homepage = "https://github.com/jdeast/robofast"
@@ -107,8 +109,14 @@ serial = ["pyserial>=3.5"]
 # docs/alerts.md), on the host that runs it only. An optional import; the
 # tests use NASA's example notices.
 alerts = ["gcn-kafka>=0.3"]
+# Reading and drawing all-sky camera frames (robofast/allsky,
+# docs/allsky.md), on the host that runs the cloud maps. A lazy import:
+# importing robofast never needs it.
+allsky = ["pillow>=10"]
 test = [
     {include-group = "core"},
+    # The all-sky cloud-map tests read and draw images.
+    {include-group = "allsky"},
     # The serial-URL path, against simulators on loopback.
     "pyserial>=3.5",
     "pytest>=8",

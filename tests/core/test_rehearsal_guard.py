@@ -387,6 +387,75 @@ def test_the_plan_is_what_is_up():
     assert day and len(day) < len(observable(catalog(), noon, noon + timedelta(hours=1)))
 
 
+def test_the_rehearsal_has_an_observable_request_all_night_in_a_southern_window():
+    """Night 2026-11-21 (night1121): ~390 spectrum requests were handed out
+    cyclically over the RV targets, ~50 each whatever their windows; the
+    targets up early spent theirs, and from 06:41 UTC all 357 left were
+    "outside their windows": the night idled with the roof closed. With the
+    T2 azimuth window 117-264 and a 13 h night from 01:20 UTC on 2026-11-22,
+    there must be an observable request at every 10 min step from dusk to
+    dawn, and each target's request count must follow its window length."""
+    import numpy as np
+
+    from robofast.testing.rehearsal import _az_intersection, morning_twilight
+
+    start = datetime(2026, 11, 22, 1, 20, tzinfo=UTC)
+    ep = Endpoint("127.0.0.1", 1, 0)
+    s = RehearsalSettings(
+        real={"t2": RealTelescope(ep, Endpoint("127.0.0.1", 2, 0), ep, None)},
+        az_windows={"t2": (117.0, 264.0)},
+        duration=13 * 3600.0,
+    )
+    end = min(start + timedelta(seconds=s.duration), morning_twilight(start))
+    targets = observable(catalog(), start, end, az_window=_az_intersection(s))
+    notes: list[str] = []
+    groups = make_requests(s, start, end, targets, note=notes.append)
+    assert notes == [], notes  # no span without an observable target
+    spectra = [g for g in groups if g["id"].startswith("REH")]
+    windows = [
+        (datetime.fromisoformat(w["start"]), datetime.fromisoformat(w["end"]), g)
+        for g in spectra
+        for w in g["requests"][0]["windows"]
+    ]
+    t = start + timedelta(minutes=5)
+    while t < end - timedelta(minutes=5):
+        assert any(a <= t <= b for a, b, _ in windows), f"no request open at {t:%H:%M} UTC"
+        t += timedelta(minutes=10)
+    # Every request's target is up (limits and window) throughout its window.
+    by_name = {x["name"]: x for x in targets}
+    for a, b, g in windows:
+        name = g["requests"][0]["configurations"][0]["target"]["name"]
+        assert any(w0 <= a and b <= w1 for w0, w1 in by_name[name]["windows"]), g["id"]
+    # Counts follow window length.
+    count: dict[str, int] = {}
+    for g in spectra:
+        name = g["requests"][0]["configurations"][0]["target"]["name"]
+        count[name] = count.get(name, 0) + 1
+    names = sorted(count)
+    length = [sum((b - a).total_seconds() for a, b in by_name[n]["windows"]) for n in names]
+    # Not exactly proportional: a target that is alone in the window for a
+    # while takes every slot there (0.78 measured; the cyclic allotment that
+    # idled night1121 gave ~50 each whatever their windows).
+    assert np.corrcoef(length, [count[n] for n in names])[0, 1] > 0.7
+    assert max(count.values()) < 0.25 * len(spectra)  # no target dominates
+    # And taken one spectrum every 2 min (the earliest-open first, as a
+    # scheduler ahead of the slots would), they last the night: master's
+    # cyclic allotment ran dry from about 08:14 in this model.
+    per_request = [
+        [(datetime.fromisoformat(w["start"]), datetime.fromisoformat(w["end"])) for w in ws]
+        for ws in (g["requests"][0]["windows"] for g in spectra)
+    ]
+    left, idle, t = list(range(len(spectra))), [], start
+    while t < end:
+        ready = [i for i in left if any(a <= t <= b for a, b in per_request[i])]
+        if ready:
+            left.remove(ready[0])
+        else:
+            idle.append(t)
+        t += timedelta(minutes=2)
+    assert len(idle) <= 3, [f"{x:%H:%M}" for x in idle[:10]]
+
+
 def test_imaging_requests_wait_for_the_azimuth_window():
     # The second T2 rehearsal: HD 50692 was picked for the second half (it is in
     # the window at the middle) but is still rising below az 117 at the start.

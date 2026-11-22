@@ -96,6 +96,7 @@ import math
 import re
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -164,6 +165,15 @@ EXTRA_BSTARS = [
     ("HD 160762", 264.8662, 46.0063),  # iota Her
     ("HD 196867", 309.9096, 15.9119),  # alpha Del
     ("HD 214923", 340.3654, 10.8314),  # zeta Peg
+    # Low-to-mid declination, spread in RA: a southern azimuth window (e.g.
+    # T2's 117-264) has one up at every sidereal time (night 2026-11-21).
+    ("HD 886", 3.3090, 15.1836),  # gamma Peg
+    ("HD 35468", 81.2828, 6.3497),  # gamma Ori (Bellatrix)
+    ("HD 87901", 152.0930, 11.9672),  # alpha Leo (Regulus)
+    ("HD 106625", 183.9516, -17.5419),  # gamma Crv
+    ("HD 116658", 201.2983, -11.1613),  # alpha Vir (Spica)
+    ("HD 155125", 257.5945, -15.7249),  # eta Oph
+    ("HD 177724", 286.3525, 13.8635),  # zeta Aql
 ]
 EXTRA_RV = [
     ("HD 3651", 9.8408, 21.2506),
@@ -172,6 +182,21 @@ EXTRA_RV = [
     ("HD 50692", 103.8279, 25.3756),
     ("HD 75732", 133.1492, 28.3308),
     ("HD 84737", 147.1475, 46.0211),
+    # Low-to-mid declination, spread in RA (see EXTRA_BSTARS).
+    ("HD 693", 2.8163, -15.4681),
+    ("HD 10700", 26.0170, -15.9375),  # tau Cet
+    ("HD 22049", 53.2327, -9.4583),  # eps Eri
+    ("HD 38858", 87.1454, -4.0947),
+    ("HD 69830", 124.5996, -12.6323),
+    ("HD 84117", 145.5600, -23.9156),
+    ("HD 102870", 177.6738, 1.7647),  # beta Vir
+    ("HD 115617", 199.6013, -18.3111),  # 61 Vir
+    ("HD 140538", 236.0076, 2.5153),
+    ("HD 146233", 243.9053, -8.3694),  # 18 Sco
+    ("HD 164922", 270.6288, 26.3131),
+    ("HD 182572", 291.2425, 11.9444),
+    ("HD 190406", 301.0258, 17.0703),  # 15 Sge
+    ("HD 206860", 326.1304, 14.7719),  # HN Peg
 ]
 
 
@@ -498,9 +523,9 @@ def observable(
     """``targets`` with ``"up"`` (seconds within the limits, with margin, from
     ``start`` to ``end``) and ``"up_now"`` and ``"alt_now"``; those never up
     are left out. Best first: up now, then longest up. With ``az_window``
-    ``(lo, hi)`` a target also counts as up only inside that azimuth range,
-    and ``"windows"`` lists the ``(start, end)`` spans it is up (trimmed by
-    one ``step`` at each edge, so a slew commanded inside one stays inside)."""
+    ``(lo, hi)`` a target also counts as up only inside that azimuth range.
+    ``"windows"`` lists the ``(start, end)`` spans it is up (trimmed at the
+    end, so a slew commanded inside one stays inside)."""
     from astropy import units as u
     from astropy.coordinates import AltAz, SkyCoord, get_body
     from astropy.time import Time
@@ -538,23 +563,22 @@ def observable(
                 "up_now": bool(row[0]),
                 "alt_now": float(a[0]),
             }
-            if az_window is not None:
-                spans, k = [], 0
-                while k < n:
-                    if row[k]:
-                        j = k
-                        while j + 1 < n and row[j + 1]:
-                            j += 1
-                        lo, hi = times[k], times[j]
-                        if j < n - 1:  # it leaves after times[j]: stop starting well before
-                            hi -= timedelta(seconds=min(300.0, step / 2))
-                        spans.append((lo, hi))
-                        k = j + 1
-                    else:
-                        k += 1
-                entry["windows"] = [(a0, b0) for a0, b0 in spans if b0 > a0]
-                if not entry["windows"]:
-                    continue
+            spans, k = [], 0
+            while k < n:
+                if row[k]:
+                    j = k
+                    while j + 1 < n and row[j + 1]:
+                        j += 1
+                    lo, hi = times[k], times[j]
+                    if j < n - 1:  # it leaves after times[j]: stop starting well before
+                        hi -= timedelta(seconds=min(300.0, step / 2))
+                    spans.append((lo, hi))
+                    k = j + 1
+                else:
+                    k += 1
+            entry["windows"] = [(a0, b0) for a0, b0 in spans if b0 > a0]
+            if not entry["windows"]:
+                continue
             out.append(entry)
     out.sort(key=lambda t: (not t["up_now"], -t["up"]))
     return out
@@ -589,10 +613,69 @@ def morning_twilight(start: datetime, limit: float = -12.0) -> datetime:
     return t
 
 
+#: How long a rehearsal spectrum request stays open after its slot starts
+#: (scheduler time): long enough that a scheduler running behind still finds
+#: it, short enough that it cannot be spent hours early.
+REQUEST_HOLD = timedelta(minutes=20)
+
+
+def allot(
+    rv: list[dict[str, Any]],
+    bstars: list[dict[str, Any]],
+    start: datetime,
+    end: datetime,
+    n: int,
+) -> tuple[list[tuple[datetime, datetime, dict[str, Any], bool]], list[tuple[datetime, datetime]]]:
+    """The ``n`` spectrum slots from ``start`` to ``end``, each given a target
+    observable at its middle (``observable``'s ``"windows"``): ``(slot start,
+    slot end, target, is a B star)``; and the spans no target covers.
+
+    Requests are allotted over time, not over targets (night 2026-11-21:
+    handed out cyclically, ~50 per RV target, the targets up early spent
+    theirs by 06:41 UTC and the night idled with the roof closed). Among the
+    targets up in a slot the one with the fewest requests per hour of its
+    windows so far is taken, so each target's count follows its window
+    length. The first slot takes a B star when one is up."""
+
+    def length(t: dict[str, Any]) -> float:
+        return sum((b - a).total_seconds() for a, b in t["windows"]) or 1.0
+
+    def up(t: dict[str, Any], when: datetime) -> bool:
+        return any(a <= when <= b for a, b in t["windows"])
+
+    used: dict[str, int] = {}
+    slots: list[tuple[datetime, datetime, dict[str, Any], bool]] = []
+    gaps: list[tuple[datetime, datetime]] = []
+    width = (end - start) / n
+    for k in range(n):
+        t0, t1 = start + width * k, start + width * (k + 1)
+        mid = t0 + width / 2
+        pool = [t for t in bstars if up(t, mid)] if k == 0 else []
+        is_b = bool(pool)
+        pool = pool or [t for t in rv if up(t, mid)] or [t for t in bstars if up(t, mid)]
+        if not pool:
+            if gaps and gaps[-1][1] == t0:
+                gaps[-1] = (gaps[-1][0], t1)
+            else:
+                gaps.append((t0, t1))
+            continue
+        t = min(pool, key=lambda x: (used.get(x["name"], 0) / length(x), -length(x), x["name"]))
+        used[t["name"]] = used.get(t["name"], 0) + 1
+        slots.append((t0, t1, t, is_b or t.get("bstar", False)))
+    return slots, gaps
+
+
 def make_requests(
-    s: RehearsalSettings, start: datetime, end: datetime, targets: list[dict[str, Any]]
+    s: RehearsalSettings,
+    start: datetime,
+    end: datetime,
+    targets: list[dict[str, Any]],
+    note: Callable[[str], None] | None = None,
 ) -> list[dict[str, Any]]:
-    """The rehearsal's request groups (module doc) from ``observable``'s targets."""
+    """The rehearsal's request groups (module doc) from ``observable``'s
+    targets. Spectra are allotted over time (:func:`allot`); any span with
+    nothing observable is reported (``note``, else a warning) before the
+    night starts."""
     if not targets:
         raise RehearsalRefused(
             f"nothing in the catalog is within {MIN_ALT + ALT_MARGIN}..{MAX_ALT - ALT_MARGIN} deg"
@@ -622,15 +705,28 @@ def make_requests(
         }
 
     groups = []
-    j = 0  # the next RV standard
-    for k in range(n):
-        if k == 0 and bstars:
-            t, role, iodine = bstars[0], "B star through iodine", True
+    slots, gaps = allot(rv, bstars, start, end, n)
+    if gaps:
+        spans = ", ".join(f"{a:%H:%M}-{b:%H:%M}" for a, b in gaps)
+        msg = (
+            f"no rehearsal target is observable (altitude limits"
+            f"{', the azimuth window' if _az_intersection(s) else ''}) during {spans} UTC:"
+            " the night idles then, with the enclosure closed"
+        )
+        (note or log.warning)(msg)
+    for k, (t0, _t1, t, is_b) in enumerate(slots):
+        if k == 0 and is_b:
+            role, iodine = "B star through iodine", True
         elif k == 2:
-            t, role, iodine = rv[0], "template (iodine out)", False
+            role, iodine = "template (iodine out)", False
         else:
-            t, role, iodine = rv[j % len(rv)], "RV standard", True
-            j += 1
+            role, iodine = "RV standard", True
+        hold_end = min(end, t0 + REQUEST_HOLD)
+        spans_k = [
+            {"start": max(a, t0).isoformat(), "end": min(b, hold_end).isoformat()}
+            for a, b in t["windows"]
+            if a < hold_end and b > t0
+        ]
         gid = f"REH{k + 1:02d}"
         ic = {
             "exposure_time": s.exptime,
@@ -647,7 +743,7 @@ def make_requests(
                     {
                         "id": f"{gid}-r",
                         "extra_params": {"telescopes": s.active},
-                        "windows": windows(t),
+                        "windows": spans_k,
                         "configurations": [
                             {
                                 "id": f"{gid}-spec",
@@ -1303,7 +1399,7 @@ class Rehearsal(SimulatedNight):
         entry = json.loads((SITES / "dispatch.example.json").read_text())
         entry.pop("_note", None)
         entry.update(
-            requests=make_requests(r, start, end, targets),
+            requests=make_requests(r, start, end, targets, note=self._note),
             state=str(self.out / "dispatch-state.json"),
             too_dropbox=str(self.out / "too-dropbox"),
             record={"dir": str(self.out / "plans")},

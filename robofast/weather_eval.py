@@ -347,6 +347,9 @@ class Evaluator:
         self._counters = {
             (s.name, f): RainCounter(rule) for s in sources for f, rule in s.rain.items()
         }
+        #: Each source's last good reading: a failed fetch is judged on it
+        #: until it is older than the source's stale_after (:meth:`_source`).
+        self._last_good: dict[str, Reading] = {}
 
     def evaluate(self, now: datetime, readings: Mapping[str, Reading | str | None]) -> Evaluation:
         """``readings[name]`` is the latest Reading, an error message, or None."""
@@ -426,17 +429,31 @@ class Evaluator:
             kw.setdefault("fresh", False)
             return SourceStatus(spec.name, spec.required, state, reasons, **kw)
 
+        failed: str | None = None
+        if isinstance(reading, str):
+            # One failed fetch (night 2026-11-21, 02:12:44 UTC: one Redis
+            # read timed out, the required source went UNKNOWN, and the roof
+            # closed and reopened) is not a reason to close: the last good
+            # reading is judged as before, and goes stale (UNKNOWN) at its
+            # own stale_after. The failure is a note.
+            failed = reading
+            reading = self._last_good.get(spec.name)
+            if reading is None:
+                return status(UNKNOWN, [f"fetch failed: {failed}"])
         if reading is None:
             return status(UNKNOWN, ["no reading yet"])
-        if isinstance(reading, str):
-            return status(UNKNOWN, [f"fetch failed: {reading}"])
+        if failed is None:
+            self._last_good[spec.name] = reading
         age = (now - reading.time).total_seconds()
         values: dict[str, float | None] = dict(reading.values)
         common = dict(age=age, time=reading.time, values=values, notes=list(reading.notes))
+        if failed is not None:
+            common["notes"].insert(0, f"fetch failed: {failed}; judging the last good reading")
         if age > spec.stale_after:
-            return status(
-                UNKNOWN, [f"stale: data {age:.0f} s old (limit {spec.stale_after:g} s)"], **common
-            )
+            why = f"stale: data {age:.0f} s old (limit {spec.stale_after:g} s)"
+            if failed is not None:
+                why += f"; fetch failed: {failed}"
+            return status(UNKNOWN, [why], **common)
         if age < -self.max_clock_skew:
             return status(UNKNOWN, [f"timestamp {-age:.0f} s in the future"], **common)
 

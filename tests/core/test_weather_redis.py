@@ -392,9 +392,15 @@ async def test_redis_failure_closes_even_with_good_pages(site, fault):
     t0 = asyncio.get_running_loop().time()
     ev = await site.poll(bridge, 10)
     assert asyncio.get_running_loop().time() - t0 < 2.5
+    # One failed read is not a close (night 2026-11-21, 02:12:44 UTC): the
+    # last good reading is judged until it is stale...
+    assert ev.safe, ev.reasons
+    assert ev.sources["redis"].notes[0].startswith("fetch failed:")
+    # ...and Redis down for longer than stale_after (300 s) closes.
+    ev = await site.poll(bridge, 300)
     assert ev.state == UNKNOWN and not ev.safe
-    assert ev.sources["redis"].reasons[0].startswith("fetch failed:")
-    assert ev.sources["redis"].values == {}
+    assert ev.sources["redis"].reasons[0].startswith("stale: data")
+    assert "fetch failed" in ev.sources["redis"].reasons[0]
     assert ev.sources["ridge"].state == SAFE and ev.sources["cloud"].state == SAFE
     if fault == "down":
         site.redis = RedisFeed(site.redis.feed).start()  # for close()
@@ -413,9 +419,11 @@ async def test_page_failures_do_not_close(site, fault):
     site.pages.errors[CLOUD_URL] = fault
     ev = await site.poll(bridge, 10)
     assert ev.state == SAFE
+    assert ev.sources["ridge"].notes[0].startswith("fetch failed:")  # last good reading
+    ev = await site.poll(bridge, 360)  # past both pages' stale_after
+    assert ev.state == SAFE
     assert ev.sources["ridge"].state == UNKNOWN and ev.sources["cloud"].state == UNKNOWN
-    assert ev.reasons[0].startswith("ridge (advisory): fetch failed:")
-    assert ev.sources["ridge"].values == {}  # still dropped at once
+    assert ev.reasons[0].startswith("ridge (advisory): stale: data")
 
 
 async def test_stale_pages_do_not_close_but_unsafe_pages_do(site):
@@ -702,3 +710,30 @@ def test_shadow_once_json_reports_would_close(raw, tmp_path, capsys):
     finally:
         redis.stop()
         feed.stop()
+
+
+async def test_a_failed_read_keeps_the_hysteresis_and_the_rain_hold(site):
+    """A Redis read that fails (night 2026-11-21) is judged on the last good
+    reading: the close limits still apply while safe, and rain seen in that
+    reading is held, not repeated or dropped."""
+    site.raw["sources"]["redis"]["timeout"] = 0.3
+    bridge = site.bridge()
+    assert (await site.poll(bridge)).safe
+    site.db["humidity"] = "77.0"  # above the open limit 75, below the close limit 80
+    assert (await site.poll(bridge, 10)).safe
+    site.db["rain_intensity"] = "0.6"  # shadow rain: would close
+    ev = await site.poll(bridge, 10)
+    assert ev.safe and ev.would_close
+    held = list(ev.would_close)
+    site.redis.feed.drop = True  # the next reads fail
+    ev = await site.poll(bridge, 10)
+    assert ev.safe, ev.reasons  # still judged on the close limits (77 < 80)
+    assert ev.would_close == held  # the same rain, held
+    assert ev.sources["redis"].notes[0].startswith("fetch failed:")
+    ev = await site.poll(bridge, 300)  # the last good reading is now stale
+    assert not ev.safe and ev.sources["redis"].reasons[0].startswith("stale: data")
+    assert ev.would_close  # the rain hold (3600 s) outlives the failure
+    site.redis.feed.drop = False
+    ev = await site.poll(bridge, 10)
+    # Unknown since the last verdict: the open limits apply again (77 > 75).
+    assert "redis: humidity=77 > 75 (open limit)" in ev.reasons

@@ -1214,3 +1214,25 @@ def test_python_m_robofast_prints_the_commands():
         [sys.executable, "-m", "robofast"], cwd=root, capture_output=True, text=True, timeout=60
     )
     assert r.returncode == 0 and "first-light" in r.stdout, r.stderr
+
+
+async def test_an_orphaned_lease_is_released_once_first_lights_sequencer_is_gone(make_rig):
+    """test_the_dawn_stops_first_light_and_parks timed out on the MINERVA
+    gateway (2026-11-21): the dawn came while the sequencer's grant was in
+    flight, the cancelled sequencer never released the lease, and first
+    light's stop waited out shutter_timeout + 3 polls (135 s) for it. The
+    orphan is now recovered as soon as it is revoked and the sky is closed."""
+    import time
+
+    from robofast.first_light import _release_after_sequencer
+
+    rig = make_rig()
+    await rig.start(sequencer=False)
+    sup = rig.supervisor
+    lease = await asyncio.wait_for(sup.request_open("first-light"), 5)  # never renewed
+    sup.operator_close("minerva", "first light over")
+    t0 = time.monotonic()
+    await _release_after_sequencer(sup, 60.0)
+    assert sup.outstanding() is None and lease.released.is_set()
+    assert time.monotonic() - t0 < 10.0
+    assert rig.timeline.events("lease_recovered")

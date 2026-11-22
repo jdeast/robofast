@@ -764,15 +764,37 @@ class _Local:
         self.sup.duty_off(self.operator, "first light over")
         # The sky "closes" through the supervisor's own loop (the lease is
         # gone; park_before_close has parked the telescope).
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + self.sup.config.shutter_timeout + 3 * self.sup.config.poll_interval
-        while loop.time() < deadline and self.sup.outstanding() is not None:
-            await asyncio.sleep(min(0.5, self.sup.config.poll_interval))
+        cfg = self.sup.config
+        await _release_after_sequencer(self.sup, cfg.shutter_timeout + 3 * cfg.poll_interval)
         self.task.cancel()
         with contextlib.suppress(BaseException):
             await self.task
         await self.server.stop()
         self.sky.stop()
+
+
+async def _release_after_sequencer(sup: Any, bound: float) -> None:
+    """Wait (up to ``bound`` s) until ``sup`` has no outstanding lease, once
+    first light's sequencer has ended (cancelled and awaited; its cleanup
+    parked the telescope). A lease it never released -- the dawn or a stop
+    arriving while its grant was in flight, so it never knew it held it --
+    is an orphan nothing else would release: recover it as soon as it is
+    revoked and the sky reads closed, rather than waiting out ``bound``
+    (test_the_dawn_stops_first_light_and_parks timed out at 120 s on the
+    MINERVA gateway: the wait was 135 s)."""
+    from robofast.safety import RecoveryRefused
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + bound
+    while loop.time() < deadline:
+        lease = sup.outstanding()
+        if lease is None:
+            return
+        if not lease.live and not lease.quarantined:
+            with contextlib.suppress(RecoveryRefused):
+                await sup.recover(lease.id, lease.holder)
+                continue
+        await asyncio.sleep(min(0.5, sup.config.poll_interval))
 
 
 def _outstanding(status: dict[str, Any]) -> dict[str, Any] | None:

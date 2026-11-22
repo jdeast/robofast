@@ -329,6 +329,13 @@ class PWIConfig:
     az_wrap_max: float | None = None
     #: Reads reuse a PWI reply this recent (s).
     status_max_age: float = 0.3
+    #: A slew or offset that finds tracking off within this long (s) of our
+    #: own ``tracking on`` re-reads PWI until it reports tracking, before
+    #: refusing (night 2026-11-09: MINERVA T2's PWI2 still read tracking
+    #: off 6 s after ``tracking on``, and the slew was refused). The wait is
+    #: inside the slew's request: at most ``request_timeout`` - 1 s.
+    tracking_settle: float = 8.0
+    tracking_poll: float = 0.5
     #: Bound on each Alpaca request (s).
     request_timeout: float = 10.0
     aperture_diameter: float | None = None
@@ -575,6 +582,8 @@ class PWIMount:
         #: Tracking off was asked during an alt/az slew of ours: sent once
         #: the mount is on the target (on PWI2 it halts a slew midway).
         self._untrack_on_arrival = False
+        #: When this server last sent ``tracking on`` (monotonic s; None: never).
+        self._tracking_on_sent: float | None = None
         #: Why the last slew failed (Slewing raises it until the next command).
         self.slew_error: str | None = None
         self.m3_resends = 0
@@ -1217,6 +1226,35 @@ class PWIMount:
             log.warning("UNHOMED MOVE (%s): mount %s; override in effect", what, state)
         return st
 
+    async def _tracking_ready(self, what: str) -> PWIStatus:
+        """:meth:`_ready`, and tracking on. Tracking off within
+        ``tracking_settle`` s of our own ``tracking on`` is PWI not yet
+        reporting it: re-read (fresh, every ``tracking_poll`` s) until it
+        does, then refuse."""
+        cfg = self.config
+        st = await self._ready(what)
+        sent = self._tracking_on_sent
+        if not st.tracking and sent is None:
+            raise AlpacaException(INVALID_OPERATION, f"{what}: tracking is off")
+        if st.tracking:
+            return st
+        assert sent is not None
+        settle = max(0.0, min(cfg.tracking_settle, cfg.request_timeout - 1.0))
+        deadline = sent + settle
+        while not st.tracking and time.monotonic() < deadline:
+            await asyncio.sleep(min(cfg.tracking_poll, max(0.0, deadline - time.monotonic())))
+            st = await self._ready(what)
+        if not st.tracking:
+            raise AlpacaException(
+                INVALID_OPERATION,
+                f"{what}: tracking is off ({time.monotonic() - sent:.1f} s after tracking on;"
+                f" PWI did not report it within {settle:.1f} s)",
+            )
+        log.info(
+            "%s: PWI reported tracking %.1f s after tracking on", what, time.monotonic() - sent
+        )
+        return st
+
     def _check_alt(self, alt: float, what: str) -> None:
         cfg = self.config
         if not cfg.min_alt <= alt <= cfg.max_alt:
@@ -1237,9 +1275,7 @@ class PWIMount:
         if not (0.0 <= ra < 24.0) or not (-90.0 <= dec <= 90.0):
             raise AlpacaException(INVALID_VALUE, f"RA {ra} h / Dec {dec} deg out of range")
         await self._not_parked("slew")
-        st = await self._ready("slew")
-        if not st.tracking:
-            raise AlpacaException(INVALID_OPERATION, "slew: tracking is off")
+        st = await self._tracking_ready("slew")
         if st.lst_hours is None:
             raise AlpacaException(DRIVER_ERROR, "slew: PWI reports no sidereal time")
         app = j2000_to_date(ra, dec)
@@ -1309,6 +1345,7 @@ class PWIMount:
             if not (await self.status(0)).tracking:
                 return
         await self._send(lambda: self.pwi.tracking(on), f"tracking {'on' if on else 'off'}")
+        self._tracking_on_sent = time.monotonic() if on else None
 
     async def park(self) -> None:
         if self.park_state == "parked" and await self.at_park():
@@ -1471,9 +1508,7 @@ class PWIMount:
         if abs(east) > cfg.max_offset or abs(north) > cfg.max_offset:
             raise AlpacaException(INVALID_VALUE, f'Offset exceeds max_offset {cfg.max_offset}"')
         await self._not_parked("Offset")
-        st = await self._ready("Offset")
-        if not st.tracking:
-            raise AlpacaException(INVALID_OPERATION, "Offset: tracking is off")
+        st = await self._tracking_ready("Offset")
         cosd = math.cos(math.radians(st.dec_deg))
         if cosd < 0.01:
             raise AlpacaException(INVALID_OPERATION, "Offset: too close to the pole")

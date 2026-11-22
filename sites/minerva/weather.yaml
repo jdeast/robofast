@@ -254,19 +254,40 @@ sources:
     required: false
     stale_after: 600  # legacy rejected data older than 10 min
 
-  allsky:
-    # The all-sky cameras' cloud map (docs/allsky.md): the latest.json the
-    # watcher writes (python -m robofast.allsky watch --config
-    # sites/minerva/allsky_watch.yaml). SHADOW ONLY, whatever is set here:
-    # logged with every evaluation and in --json, never in IsSafe.
-    # Enable once the watcher runs on this host.
-    enabled: false
-    type: allsky
-    path: ~/allsky/shadow/latest.json
-    stale_after: 600
-    # Judged against these and logged as "would" verdicts, never enforced.
-    limits:
-      clear: {open: [0.7, null], close: [0.3, null]}
+# The all-sky cameras (docs/allsky.md). Listing a camera here turns the
+# cloud map on (JDE 2026-11-22: run it, with several sources); remove them
+# all to turn it off. Each listed camera becomes its own weather source,
+# allsky_<camera>, and with two or more the pooled map is `allsky`. ALL ARE
+# SHADOW ONLY: logged with every evaluation, in --json and on the console's
+# weather card, never in IsSafe, never required, never ObservingConditions.
+# The watcher reads this same section and writes `output`:
+#   python -m robofast.allsky watch --config sites/minerva/weather.yaml
+# A third camera: its entry under `cameras`, plus its definition and fitted
+# model in `models` (cameras.yaml, <camera>.json).
+allsky:
+  cameras:
+    mmto:
+      dir: ~/allsky/mmto
+      url: https://skycam.mmto.arizona.edu/skycam/latest_image.jpg
+    ridge:
+      dir: ~/allsky/ridge
+      url: http://linmax.sao.arizona.edu/weather/sky/last_sky.jpg
+  # The watcher. fetch: false -- this site's fetcher already saves the
+  # frames under each camera's dir (<dir>/<UTdate>/<camera>_<UTC>Z.jpg); set
+  # true only where nothing else downloads them (the urls are then used).
+  output: ~/allsky/shadow/latest.json
+  history: ~/allsky/shadow/history.jsonl
+  interval: 60      # s between passes (the ridge camera publishes once a minute)
+  max_age: 180      # s: pool the cameras when their frames are this close
+  stale: 600        # s: a camera whose newest frame is older is left out
+  trend_frames: 10
+  models: allsky    # cameras.yaml and the fitted models, beside this file
+  fetch: false
+  # The bridge's shadow sources: judged against these and logged as "would"
+  # verdicts, never enforced.
+  stale_after: 600
+  limits:
+    clear: {open: [0.7, null], close: [0.3, null]}
 
 # ASCOM ObservingConditions members -> source field, in the field's unit
 # (converted to ASCOM units: degC, %, m/s, hPa, mm/h, deg).

@@ -458,14 +458,18 @@ class AllskySource(WeatherSource):
 
     **Shadow only**: the bridge logs its status with every evaluation and
     never lets it into the safe/unsafe/unknown decision (``parse_config``
-    forces ``shadow: true``). Option: ``path`` (the file). Fields:
-    ``clear`` (whole-sky clear fraction, 0-1), ``zenith60_clear``,
-    ``coverage`` (fraction of the sky's cells known), ``trend_per_hour``
-    (whole-sky slope) and ``frame_age`` (s, the oldest frame used). The
-    reading's time is the newest frame's.
+    forces ``shadow: true``). Options: ``path`` (the file) and ``camera``
+    (one camera's own map, from the file's ``per_camera``; without it, the
+    pooled map). Fields: ``clear`` (whole-sky clear fraction, 0-1),
+    ``zenith60_clear``, ``coverage`` (fraction of the sky's cells known),
+    ``trend_per_hour`` (whole-sky slope) and ``frame_age`` (s; pooled: the
+    oldest frame used). The reading's time is the (newest) frame's.
+
+    A site lists its cameras in the weather config's ``allsky`` section,
+    which makes these sources (:mod:`robofast.allsky.config`).
     """
 
-    _OPTIONS = frozenset({"path"})
+    _OPTIONS = frozenset({"path", "camera"})
 
     def __init__(self, config: SourceConfig) -> None:
         super().__init__(config)
@@ -475,6 +479,8 @@ class AllskySource(WeatherSource):
         if not config.options.get("path"):
             raise ValueError(f"source {config.name}: needs a path (the watcher's latest.json)")
         self.path = os.path.expanduser(str(config.options["path"]))
+        cam = config.options.get("camera")
+        self.camera = None if cam is None else str(cam)
 
     async def fetch(self, now: datetime) -> Reading:
         import asyncio
@@ -492,7 +498,11 @@ class AllskySource(WeatherSource):
             return f.read()
 
     def parse(self, doc: Mapping[str, Any]) -> Reading:
-        if not isinstance(doc, Mapping) or not doc.get("time"):
+        if not isinstance(doc, Mapping):
+            raise SourceError(f"{self.path}: not a cloud map")
+        if self.camera is not None:
+            return self._parse_camera(doc)
+        if not doc.get("time"):
             raise SourceError(f"{self.path}: no cloud map (no time)")
         when = datetime.fromisoformat(str(doc["time"]))
         if when.tzinfo is None:
@@ -512,6 +522,36 @@ class AllskySource(WeatherSource):
         }
         notes = tuple(str(e) for e in doc.get("errors", []))
         return Reading(self.name, when.astimezone(UTC), values, notes=notes)
+
+    def _parse_camera(self, doc: Mapping[str, Any]) -> Reading:
+        per = doc.get("per_camera")
+        cam = per.get(self.camera) if isinstance(per, Mapping) else None
+        if not isinstance(cam, Mapping):
+            raise SourceError(f"{self.path}: no map for camera {self.camera}")
+        if not cam.get("time"):
+            if cam.get("error"):
+                why = str(cam["error"])
+            elif cam.get("frame") is None:
+                why = "no frame"
+            else:
+                why = f"frame {cam.get('frame')} {cam.get('age_s')} s old, not analysed"
+            raise SourceError(f"{self.camera}: {why}")
+        when = datetime.fromisoformat(str(cam["time"]))
+        if when.tzinfo is None:
+            raise SourceError(f"{self.path}: {self.camera} time without a zone")
+
+        def num(v: Any) -> float | None:
+            return None if v is None else float(v)
+
+        trend = (cam.get("trend") or {}).get("whole_sky") or {}
+        values = {
+            "clear": num(cam.get("whole_sky_clear")),
+            "zenith60_clear": num(cam.get("zenith60_clear")),
+            "coverage": num(cam.get("coverage")),
+            "trend_per_hour": num(trend.get("slope_per_hour")),
+            "frame_age": num(cam.get("age_s")),
+        }
+        return Reading(self.name, when.astimezone(UTC), values)
 
     def fields(self) -> set[str]:
         return {"clear", "zenith60_clear", "coverage", "trend_per_hour", "frame_age"}

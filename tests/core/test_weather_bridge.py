@@ -79,8 +79,10 @@ PAGE_CONDITIONS = {
 
 
 def pages_only(data: dict) -> dict:
-    """The shipped config with only the SAO pages, required and enforcing rain."""
+    """The shipped config with only the SAO pages, required and enforcing rain
+    (and no all-sky cameras: test_weather_allsky_shadow adds its own)."""
     data["sources"]["redis"]["enabled"] = False
+    data.pop("allsky", None)
     for name in ("ridge", "cloud"):
         data["sources"][name]["required"] = True
         data["sources"][name]["enforce_rain"] = True

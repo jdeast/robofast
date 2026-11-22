@@ -8,12 +8,22 @@ bridge's ``allsky`` source reads that file in *shadow* mode: logged with
 every evaluation, never part of the safe/unsafe decision
 (docs/allsky.md, docs/weather_bridge.md).
 
+Which cameras: the ``allsky`` section of the site's weather config
+(:mod:`robofast.allsky.config`), so ``--config`` is normally the weather
+config itself; a file holding just that section's keys works too. No camera
+listed: the watcher has nothing to do and exits.
+
+Besides the pooled map, ``latest.json`` carries each camera's own map
+under ``per_camera`` (its time, clear fractions, coverage, trend, frame and
+age, or why there is none), which the bridge's per-camera shadow sources
+read.
+
 Frames come from a directory laid out like the site fetcher's,
 ``<dir>/<UTdate>/<camera>_<YYYYMMDDTHHMMSS>Z.<ext>``, or, only when the
 config says ``fetch: true``, from each camera's ``url`` (saved under that
 same layout in ``fetch_dir``, named by the server's Last-Modified).
 
-Config (YAML)::
+Config (YAML; the weather config's ``allsky:`` section)::
 
     output: ~/allsky/shadow/latest.json
     history: ~/allsky/shadow/history.jsonl   # optional: the trend's memory
@@ -28,6 +38,8 @@ Config (YAML)::
     cameras:
       mmto: {dir: ~/allsky/mmto}
       ridge: {dir: ~/allsky/ridge, url: "http://linmax.sao.arizona.edu/weather/sky/last_sky.jpg"}
+    stale_after: 600      # the bridge's (ignored here)
+    limits: {clear: {open: [0.7, null], close: [0.3, null]}}   # the bridge's
 """
 
 from __future__ import annotations
@@ -45,25 +57,12 @@ from pathlib import Path
 from typing import Any
 
 from robofast.allsky import cameras, clouds, frames
+from robofast.allsky.config import check_section
 from robofast.allsky.model import CameraModel
 
 log = logging.getLogger(__name__)
 
 __all__ = ["WatchConfig", "Watcher", "latest_frame", "write_atomic"]
-
-_KEYS = {
-    "output",
-    "history",
-    "interval",
-    "max_age",
-    "stale",
-    "trend_frames",
-    "fetch",
-    "fetch_dir",
-    "models",
-    "cameras",
-}
-_CAMERA_KEYS = {"dir", "url"}
 
 
 @dataclass
@@ -83,11 +82,7 @@ class WatchConfig:
     def parse(cls, raw: dict[str, Any], base: Path | None = None) -> WatchConfig:
         """``base``: the directory relative paths are relative to (the
         config file's)."""
-        extra = set(raw) - _KEYS
-        if extra:
-            raise ValueError(f"unknown watch config keys: {sorted(extra)}")
-        if not raw.get("cameras"):
-            raise ValueError("watch config: no cameras")
+        raw = check_section(raw, "allsky")
 
         def path(key: str) -> Path | None:
             v = raw.get(key)
@@ -98,11 +93,8 @@ class WatchConfig:
 
         models = cameras.models_dir(path("models"))
         cams = {}
-        for name, spec in raw["cameras"].items():
+        for name, spec in (raw.get("cameras") or {}).items():
             spec = dict(spec or {})
-            bad = set(spec) - _CAMERA_KEYS
-            if bad:
-                raise ValueError(f"camera {name}: unknown keys {sorted(bad)}")
             cameras.camera_spec(name, models)  # a known camera
             if "dir" in spec:
                 spec["dir"] = Path(spec["dir"]).expanduser()
@@ -133,6 +125,8 @@ def load_config(path: str | Path) -> WatchConfig:
     raw = yaml.safe_load(Path(path).read_text())
     if not isinstance(raw, dict):
         raise ValueError(f"{path}: the top level must be a mapping")
+    if "sources" in raw or "allsky" in raw:  # a weather config: its allsky section
+        raw = raw.get("allsky") or {}
     return WatchConfig.parse(raw, base=Path(path).resolve().parent)
 
 
@@ -187,8 +181,10 @@ class Watcher:
     def __init__(self, cfg: WatchConfig) -> None:
         self.cfg = cfg
         self.models: dict[str, CameraModel] = {}
-        self._last: dict[str, tuple[Path, Any]] = {}
+        self._last: dict[str, tuple[Path, Any, dict[str, Any]]] = {}
         self.history: list[clouds.CloudMap] = []
+        #: Each camera's own recent maps (in memory: its trend).
+        self.cam_history: dict[str, list[clouds.CloudMap]] = {}
         if cfg.history and cfg.history.is_file():
             for line in cfg.history.read_text().splitlines()[-cfg.trend_frames :]:
                 try:
@@ -212,13 +208,35 @@ class Watcher:
         root = spec.get("dir") or self.cfg.fetch_dir / camera
         return latest_frame(Path(root), camera)
 
+    def _camera_map(self, cam: str, meas: Any) -> dict[str, Any]:
+        """One camera's own map (whole-sky numbers and trend), for ``per_camera``."""
+        cmap = clouds.combine([(meas, self.model(cam))], max_age_s=math.inf)
+        hist = self.cam_history.setdefault(cam, [])
+        if not hist or cmap.time > hist[-1].time:
+            hist.append(cmap)
+            del hist[: -self.cfg.trend_frames]
+        m = cmap.to_json()
+        z60 = cmap.clear_fraction(90.0, 0.0, 60.0)
+        trend = clouds.trend(hist, n=self.cfg.trend_frames).to_json()
+        return {
+            "time": m["time"],
+            "whole_sky_clear": m["whole_sky_clear"],
+            "zenith60_clear": None if math.isnan(z60) else round(z60, 4),
+            "coverage": m["coverage"],
+            "flags": m["flags"],
+            "trend": {"whole_sky": trend["whole_sky"]},
+        }
+
     def step(self, now: datetime | None = None) -> dict[str, Any]:
         """Analyse the newest frames and write ``latest.json``; returns it."""
         now = now or datetime.now(UTC)
         items = []
         frame_info = []
+        per_camera: dict[str, dict[str, Any]] = {}
         errors = []
         for cam in self.cfg.cameras:
+            entry: dict[str, Any] = {"frame": None, "age_s": None, "used": False, "time": None}
+            per_camera[cam] = entry
             try:
                 p = self.newest(cam)
                 if p is None:
@@ -230,11 +248,12 @@ class Watcher:
                 frame_info.append(
                     {"camera": cam, "frame": p.name, "age_s": round(age, 1), "used": used}
                 )
+                entry.update(frame=p.name, age_s=round(age, 1) if math.isfinite(age) else None)
                 if not used:
                     continue
                 cached = self._last.get(cam)
                 if cached and cached[0] == p:
-                    meas = cached[1]
+                    meas, own = cached[1], cached[2]
                 else:
                     f = frames.load_frame(p, cam)
                     _, meas = clouds.analyze(
@@ -244,14 +263,18 @@ class Watcher:
                     meas.valid = None
                     meas.frame.grey = None
                     meas.frame.rgb = None
-                    self._last[cam] = (p, meas)
+                    own = self._camera_map(cam, meas)
+                    self._last[cam] = (p, meas, own)
+                entry.update(own, used=True)
                 items.append((meas, self.model(cam)))
             except Exception as exc:
                 log.warning("%s: %s", cam, exc)
                 errors.append(f"{cam}: {type(exc).__name__}: {exc}")
+                entry.update(used=False, time=None, error=f"{type(exc).__name__}: {exc}")
         doc: dict[str, Any] = {
             "written": now.isoformat(),
             "frames": frame_info,
+            "per_camera": per_camera,
             "errors": errors,
         }
         if not items:
@@ -283,6 +306,9 @@ class Watcher:
         return doc
 
     def run(self, passes: int | None = None) -> None:
+        if not self.cfg.cameras:
+            log.info("no all-sky camera listed: nothing to watch")
+            return
         n = 0
         while passes is None or n < passes:
             t0 = time.monotonic()

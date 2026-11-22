@@ -44,6 +44,7 @@ def raw(tmp_path: Path) -> dict:
     data = load_config(CONFIG)
     data["sources"]["cloud"]["credentials_file"] = str(creds)
     data["sources"]["redis"]["timeout"] = 1.0
+    data["allsky"]["output"] = str(tmp_path / "latest.json")  # no watcher here
     return data
 
 

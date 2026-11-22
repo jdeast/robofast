@@ -135,6 +135,15 @@ systemd user unit; it never writes to Redis or anything at the site.
   first field with a valid value, as legacy chose its cloud sensor; none
   valid is unknown. The group's value is a derived field (`sky`), servable
   as SkyTemperature.
+- **A failed fetch** (a timeout, a refused connection, an HTTP error, a
+  reply that does not parse) is not by itself unknown: the source's last
+  good reading is judged as before, with `fetch failed: ...` as a note,
+  until that reading is older than the source's `stale_after`; then the
+  source is unknown ("stale ...; fetch failed: ..."). A failure before any
+  good reading is unknown at once. (Night 2026-11-21, 02:12:44 UTC: one
+  Redis read timed out, the required source went unknown at once, and the
+  roof closed and reopened.) The hysteresis and the rain hold are those of
+  that reading: re-judging it changes neither.
 - **Combiner.** Unsafe if any source (required or advisory) is unsafe, or
   enforced rain is being held; unknown (unsafe) if a required source is
   unknown or every fetched source is unknown; otherwise safe. So an

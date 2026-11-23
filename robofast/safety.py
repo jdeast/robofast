@@ -111,13 +111,14 @@ the safety monitor's verdict unsafe, the weather unknown, or an enclosure
 fault read from the fault channel): then it closes at once, as the robotic
 mode would (``park_before_close`` included), with a critical alarm and a
 ``shadow_intervened`` event, and goes back to watching once closed. Unknown
-weather counts as a risk (JDE 2026-11-23, "yes, safety first"): a failed or
-unreachable weather read, data older than ``stale_after``, or no successful
-read for ``stale_after``. A supervisor just started gets ``stale_after`` to
-make its first successful read before "no read yet" counts (failed reads
-inside that grace included), so a restart does not close what another
-system has open merely because it has not read anything yet. An unreadable
-fault channel and an expired duty are still not risks.
+weather counts as a risk (JDE 2026-11-23, "yes, safety first"): no
+successful weather read for ``stale_after`` (reads failing, the bridge
+unreachable), or data older than ``stale_after``. A single failed read
+after a good one is not: it waits out ``stale_after`` from the last good
+read. A supervisor just started counts the same ``stale_after`` from its
+start (the startup grace), so a restart does not close what another system
+has open merely because it has not read anything yet. An unreadable fault
+channel and an expired duty are still not risks.
 
 A switch never opens by itself: a mode that may open grants a lease only
 through :meth:`request_open`, with every check above. A switch to a mode
@@ -517,6 +518,9 @@ class SafetySupervisor:
         #: When :meth:`run` started: the start of the grace before "no
         #: weather read yet" counts as unknown weather (:meth:`active_risk`).
         self._started: float | None = None
+        #: The latest successful read's data were older than ``stale_after``
+        #: (why), else None; a failed read leaves it as it was.
+        self._stale_data: str | None = None
         self._dome = dome.grant(name, privileged=True)
         self._sm = safety_monitor.grant(name)
         self._oc = observing_conditions.grant(name) if observing_conditions else None
@@ -1141,12 +1145,14 @@ class SafetySupervisor:
                 age = await self._oc.call("TimeSinceLastUpdate", "", timeout=to)
         except DeviceError as exc:
             return False, f"weather read failed: {exc}", False
+        self._stale_data = None
         if is_safe is not True:
             self._unsafe_verdict = f"SafetyMonitor.IsSafe={is_safe!r}"
             return False, self._unsafe_verdict, True
         self._unsafe_verdict = None
         if age is not None and not (0 <= float(age) <= self.config.stale_after):
-            return False, f"weather data stale ({float(age):.1f} s old)", True
+            self._stale_data = f"weather data stale ({float(age):.1f} s old)"
+            return False, self._stale_data, True
         return True, "safe", True
 
     async def _weather_loop(self) -> None:
@@ -1409,21 +1415,26 @@ class SafetySupervisor:
         """Why the enforced weather verdict is unknown now, or None (known).
 
         Unknown (JDE 2026-11-23, "yes, safety first"): not safe without an
-        unsafe verdict, i.e. the last read failed, its data were older than
-        ``stale_after``, or no read succeeded for ``stale_after`` -- the
-        weather loop's reason says which. Before the first successful read
-        it is unknown only once ``stale_after`` has passed since
-        :meth:`run` started (the startup grace, failed reads included).
+        unsafe verdict, and either the latest successful read's data were
+        older than ``stale_after``, or no read has succeeded for
+        ``stale_after`` (reads failing, the bridge unreachable, the loop
+        stuck). One failed read after a good one is not unknown (JDE
+        2026-11-23: a transient failure must not close). Before the first
+        successful read the same bound counts from :meth:`run`'s start (the
+        startup grace).
         Only ``IsSafe`` and the feed's age count: a source the bridge does
         not enforce never moves either."""
         if self._safe:
             return None
+        bound = self.config.stale_after
+        if self._stale_data is not None:
+            return self._stale_data
+        since = self._last_good_read if self._last_good_read is not None else self._started
+        if since is None or now - since <= bound:
+            return None
         if self._last_good_read is None:
-            if self._started is None or now - self._started <= self.config.stale_after:
-                return None
-            if self._reason.startswith("startup"):
-                return f"no successful weather read in {self.config.stale_after:g} s since start"
-        return self._reason
+            return f"no successful weather read in {bound:g} s since start: {self._reason}"
+        return f"no successful weather read for > {bound:g} s: {self._reason}"
 
     async def _watch(self) -> None:
         """A ``watch`` mode: read the shutter, command nothing -- except

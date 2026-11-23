@@ -337,13 +337,33 @@ async def test_shadow_closes_on_a_stale_weather_feed(make_rig):
     assert rig.dome_closed() and not rig.timeline.events("open_commanded")
 
 
-async def test_shadow_closes_on_a_failed_weather_read(make_rig):
+async def test_shadow_closes_when_reads_keep_failing_for_the_staleness_bound(make_rig):
+    # JDE 2026-11-23: a failed read is unknown only once stale_after has
+    # passed since the last good read with none since -- then it closes.
     rig = await _shadow_open_and_safe(make_rig)
     rig.sm.fail("weather bridge down")
-    await wait_until(rig.dome_closed, 5, what="closed on a failed read")
+    await wait_until(lambda: rig.timeline.events("unsafe"), 3, what="the first failed read")
+    first_fail = rig.timeline.events("unsafe")[0]
+    assert "weather read failed" in first_fail.detail["reason"]
+    await asyncio.sleep(0.3)  # < stale_after since the last good read
+    assert rig.dome_open() and not rig.timeline.events("shadow_intervened")
+    await wait_until(rig.dome_closed, 5, what="closed after stale_after without a read")
     (ev,) = rig.timeline.events("shadow_intervened")
-    assert ev.detail["risk"].startswith("weather unknown (weather read failed")
+    assert ev.detail["risk"].startswith("weather unknown (no successful weather read for > 0.6 s")
     assert "weather bridge down" in ev.detail["risk"]
+    assert ev.t - first_fail.t >= 0.5  # the last good read was at most a poll before
+
+
+async def test_shadow_rides_out_a_transient_weather_read_failure(make_rig):
+    rig = await _shadow_open_and_safe(make_rig)
+    rig.sm.fail("one bad read")
+    await wait_until(lambda: rig.timeline.events("unsafe"), 3, what="the failed read")
+    await asyncio.sleep(0.2)
+    rig.sm.unfail()  # a good read again well inside stale_after
+    await asyncio.sleep(1.5)
+    assert rig.supervisor.safe and rig.dome_open()
+    assert not rig.timeline.events("shadow_intervened")
+    assert not rig.timeline.events("close_commanded")
 
 
 async def test_shadow_gives_a_restart_the_staleness_bound_to_read_then_closes(make_rig):
@@ -359,7 +379,9 @@ async def test_shadow_gives_a_restart_the_staleness_bound_to_read_then_closes(ma
     assert not rig.timeline.events("shadow_intervened")
     await wait_until(rig.dome_closed, 5, what="closed after the grace")
     (ev,) = rig.timeline.events("shadow_intervened")
-    assert ev.detail["risk"].startswith("weather unknown (weather read failed")
+    assert ev.detail["risk"].startswith(
+        "weather unknown (no successful weather read in 0.6 s since start: weather read failed"
+    )
     (start,) = rig.timeline.events("supervisor_start")
     assert ev.t - start.t >= 0.6
 

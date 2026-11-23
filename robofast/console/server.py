@@ -1008,6 +1008,15 @@ class Console:
                 return out
         out["supervisor"] = why
         # 3. The dome's own close-only channel (does not wait for parking).
+        #    Never past the park-before-close interlock (JDE 2026-11-23): it
+        #    cannot tell whether a telescope is in the roof's way.
+        if enc.park_interlock:
+            out["error"] = (
+                f"supervisor: {why}; no direct dome close: the park-before-close interlock"
+                " is on (park the telescopes, then close at the enclosure)"
+            )
+            self._emergency_event(enc, operator, reason, out)
+            return out
         if enc.emergency_fallback != "dome" or enc.emergency_token_file is None or not enc.dome_url:
             out["error"] = f"supervisor: {why}; no emergency channel to the dome configured"
             self._emergency_event(enc, operator, reason, out)

@@ -261,7 +261,13 @@ of them, or the one chosen in the dialog), in this order:
    channel**: `PUT /robofast/v1/emergency_close` on the dome server, with a
    bearer token (`robofast/emergency.py`). The dialog's *skip the
    supervisor* box goes straight to this step (for a supervisor that
-   answers but whose close does not happen).
+   answers but whose close does not happen). **Not on an enclosure with
+   the park-before-close interlock** (`safety.require_park_before_close`,
+   JDE 2026-11-23): this channel cannot tell whether a telescope is in the
+   roof's way, so the console never uses it there (its config must say
+   `"fallback": "none"`, or it is refused at start) and reports the close
+   as failed instead; someone parks the telescopes and closes at the
+   enclosure.
 
 Every emergency close is audited (the console's audit log, and on the dome
 server its own `emergency_close.log`) and raised as an alarm: `critical`

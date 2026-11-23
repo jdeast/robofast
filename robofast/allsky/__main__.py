@@ -166,6 +166,9 @@ def cmd_watch(a: argparse.Namespace) -> int:
     from robofast.allsky import watch
 
     cfg = watch.load_config(a.config)
+    if not cfg.cameras:
+        print(f"{a.config}: no all-sky camera listed; nothing to watch", file=sys.stderr)
+        return 0
     w = watch.Watcher(cfg)
     if a.once:
         doc = w.step()
@@ -234,7 +237,9 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_series)
     p = sub.add_parser("watch", help="loop: newest frames -> latest.json (shadow input)")
     p.add_argument(
-        "--config", required=True, help="watch config (YAML; see robofast/allsky/watch.py)"
+        "--config",
+        required=True,
+        help="the site weather config (its allsky section; see robofast/allsky/config.py)",
     )
     p.add_argument("--once", action="store_true", help="one pass, then exit")
     p.set_defaults(fn=cmd_watch)

@@ -107,13 +107,18 @@ reads the shutter and records what it would do (``shadow_would`` events,
 ``would_open`` in the status); a shutter found open then is a critical
 alarm, not a close -- unless the mode's ``intervene`` is set (``shadow``'s is) and
 an enforced close condition is active (:meth:`SafetySupervisor.active_risk`:
-the safety monitor's verdict unsafe, or an enclosure fault read from the
-fault channel): then it closes at once, as the robotic mode would
-(``park_before_close`` included), with a critical alarm and a
-``shadow_intervened`` event, and goes back to watching once closed. Not
-knowing (no weather read yet, a stale feed, an unreadable fault channel)
-is not an active risk: a restarted supervisor does not close what another
-system has open.
+the safety monitor's verdict unsafe, the weather unknown, or an enclosure
+fault read from the fault channel): then it closes at once, as the robotic
+mode would (``park_before_close`` included), with a critical alarm and a
+``shadow_intervened`` event, and goes back to watching once closed. Unknown
+weather counts as a risk (JDE 2026-11-23, "yes, safety first"): no
+successful weather read for ``stale_after`` (reads failing, the bridge
+unreachable), or data older than ``stale_after``. A single failed read
+after a good one is not: it waits out ``stale_after`` from the last good
+read. A supervisor just started counts the same ``stale_after`` from its
+start (the startup grace), so a restart does not close what another system
+has open merely because it has not read anything yet. An unreadable fault
+channel and an expired duty are still not risks.
 
 A switch never opens by itself: a mode that may open grants a lease only
 through :meth:`request_open`, with every check above. A switch to a mode
@@ -513,6 +518,12 @@ class SafetySupervisor:
         self._intervening: str | None = None
         #: The safety monitor's last successful verdict, if unsafe.
         self._unsafe_verdict: str | None = None
+        #: When :meth:`run` started: the start of the grace before "no
+        #: weather read yet" counts as unknown weather (:meth:`active_risk`).
+        self._started: float | None = None
+        #: The latest successful read's data were older than ``stale_after``
+        #: (why), else None; a failed read leaves it as it was.
+        self._stale_data: str | None = None
         self._dome = dome.grant(name, privileged=True)
         self._sm = safety_monitor.grant(name)
         self._oc = observing_conditions.grant(name) if observing_conditions else None
@@ -1138,12 +1149,14 @@ class SafetySupervisor:
                 age = await self._oc.call("TimeSinceLastUpdate", "", timeout=to)
         except DeviceError as exc:
             return False, f"weather read failed: {exc}", False
+        self._stale_data = None
         if is_safe is not True:
             self._unsafe_verdict = f"SafetyMonitor.IsSafe={is_safe!r}"
             return False, self._unsafe_verdict, True
         self._unsafe_verdict = None
         if age is not None and not (0 <= float(age) <= self.config.stale_after):
-            return False, f"weather data stale ({float(age):.1f} s old)", True
+            self._stale_data = f"weather data stale ({float(age):.1f} s old)"
+            return False, self._stale_data, True
         return True, "safe", True
 
     async def _weather_loop(self) -> None:
@@ -1387,23 +1400,52 @@ class SafetySupervisor:
             )
             log.info("%s: mode %s: would %s", self.name, self.mode, "open" if would else "close")
 
-    def active_risk(self) -> str | None:
+    def active_risk(self, now: float | None = None) -> str | None:
         """An enforced close condition active now, which a ``watch`` mode
         with ``intervene`` acts on (module doc): the safety monitor's
-        last successful verdict unsafe (a read failure keeps it), or a fault
-        read from the enclosure's fault channel. None: none known."""
+        last successful verdict unsafe (a read failure keeps it), a fault
+        read from the enclosure's fault channel, or the weather unknown
+        (:meth:`_weather_unknown`; JDE 2026-11-23). None: none."""
         if self._unsafe_verdict is not None:
             return f"weather unsafe ({self._unsafe_verdict})"
         if self._fault is not None and isinstance(self._fault_kind, tuple):
             return f"enclosure fault ({self._fault})"
+        unknown = self._weather_unknown(time.monotonic() if now is None else now)
+        if unknown is not None:
+            return f"weather unknown ({unknown})"
         return None
+
+    def _weather_unknown(self, now: float) -> str | None:
+        """Why the enforced weather verdict is unknown now, or None (known).
+
+        Unknown (JDE 2026-11-23, "yes, safety first"): not safe without an
+        unsafe verdict, and either the latest successful read's data were
+        older than ``stale_after``, or no read has succeeded for
+        ``stale_after`` (reads failing, the bridge unreachable, the loop
+        stuck). One failed read after a good one is not unknown (JDE
+        2026-11-23: a transient failure must not close). Before the first
+        successful read the same bound counts from :meth:`run`'s start (the
+        startup grace).
+        Only ``IsSafe`` and the feed's age count: a source the bridge does
+        not enforce never moves either."""
+        if self._safe:
+            return None
+        bound = self.config.stale_after
+        if self._stale_data is not None:
+            return self._stale_data
+        since = self._last_good_read if self._last_good_read is not None else self._started
+        if since is None or now - since <= bound:
+            return None
+        if self._last_good_read is None:
+            return f"no successful weather read in {bound:g} s since start: {self._reason}"
+        return f"no successful weather read for > {bound:g} s: {self._reason}"
 
     async def _watch(self) -> None:
         """A ``watch`` mode: read the shutter, command nothing -- except
         close on an active risk when the mode's ``intervene`` is set (module doc)."""
         self._opening_since = None
         status = await self._shutter_status()
-        risk = self.active_risk() if self.policy.intervene else None
+        risk = self.active_risk(time.monotonic()) if self.policy.intervene else None
         if risk is not None and status != Shutter.CLOSED:
             if self._intervening is None:
                 self._intervening = risk
@@ -1741,6 +1783,7 @@ class SafetySupervisor:
                 self.name,
             )
         self._stopping = False
+        self._started = time.monotonic()
         loops = [
             asyncio.create_task(self._weather_loop(), name=f"{self.name}-weather"),
             asyncio.create_task(self._enclosure_loop(), name=f"{self.name}-enclosure"),

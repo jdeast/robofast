@@ -275,9 +275,11 @@ prints.
 The PWI version (PWI4 `pwi4.version`; PWI2 reports none) is logged by the
 server at start and on any change, by the jog at its first read, and is in
 the `Status` Action's JSON. The telescope's `DriverInfo` starts with it
-(`PlaneWave PWI4 4.1.6; robofast pwi_server 0.1.0`), and the imaging
-pipeline writes `DriverInfo` into each light frame's header as `MNTSWVER`
-(docs/data.md).
+(`PlaneWave PWI4 4.1.6; robofast pwi_server 0.1.0`; PWI2:
+`PlaneWave PWI2 (reports no version); ...`), and the imaging pipeline
+writes `DriverInfo` into each light frame's header as `MNTSWVER`
+(docs/data.md), read at the frame's start and written undefined (`STALE`)
+like any registry value when that read is old or failed.
 
 ## Safety
 

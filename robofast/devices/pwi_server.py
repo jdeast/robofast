@@ -2042,7 +2042,10 @@ class PWIServer(ThreadingHTTPServer):
 
     def _common(self, device: str, member: str, client: int) -> Any:
         cfg = self.config
-        pwi_version = self.mount.version or "(version not read)"
+        # PWI2 has no version to report; PWI4 has none until its first status.
+        pwi_version = self.mount.version or (
+            "(reports no version)" if cfg.backend == "pwi2" else "(version not read)"
+        )
         return {
             "connected": self.connected(device, client),
             "connecting": False,

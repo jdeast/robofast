@@ -138,14 +138,14 @@ async def test_pages_down_do_not_close(site):
     await wait_until(
         lambda: (
             bridge.last is not None
-            and bridge.last.sources["ridge"].state == "unknown"
-            and bridge.last.sources["cloud"].state == "unknown"
+            and bridge.last.sources["ridge"].notes[:1] != []
+            and bridge.last.sources["ridge"].notes[0].startswith("fetch failed")
+            and bridge.last.sources["cloud"].notes[0].startswith("fetch failed")
         ),
         3,
-        what="both pages unknown",
+        what="both pages failing (their last good readings judged)",
     )
     assert state.is_safe()
-    assert any(r.startswith("ridge (advisory): fetch failed") for r in state.status["reasons"])
     pages.status = 200
     pages.ridge_age = 400
     await asyncio.sleep(0.5)

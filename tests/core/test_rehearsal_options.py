@@ -27,10 +27,12 @@ FIELD = (2.0965, 29.0904, 2.0)
 
 class _Recorder(BaseHTTPRequestHandler):
     seen: ClassVar[list[tuple[str, str]]] = []
+    #: GET /status's reply (None: an idle service writing test frames).
+    status: ClassVar[dict | None] = None
 
     def _reply(self) -> None:
         self.seen.append((self.command, self.path))
-        body = json.dumps({"state": "idle"}).encode()
+        body = json.dumps(self.status or {"state": "idle", "test_frames": True}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -107,6 +109,22 @@ def test_an_external_kiwispec_is_only_asked_its_status(fake_kiwispec):
     url, seen = fake_kiwispec
     assert reh.check_kiwispec(url)["state"] == "idle"
     assert seen == [("GET", "/status")]
+
+
+def test_an_external_kiwispec_without_test_frames_is_refused(fake_kiwispec):
+    """A rehearsal's real spectra must be test frames (docs/data.md)."""
+    url, _ = fake_kiwispec
+    _Recorder.status = {"state": "idle", "test_frames": False}
+    try:
+        with pytest.raises(reh.RehearsalRefused, match="--test-frames"):
+            reh.check_kiwispec(url)
+    finally:
+        _Recorder.status = None
+
+
+def test_the_rehearsal_writes_test_frames(tmp_path):
+    assert reh.Rehearsal.TEST_FRAMES is True
+    assert reh.SimulatedNight.TEST_FRAMES is False
 
 
 def test_an_external_kiwispec_that_does_not_answer_is_refused():

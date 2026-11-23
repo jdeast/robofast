@@ -273,7 +273,10 @@ def test_shipped_config_uses_db7_and_only_reads(raw):
     (src,) = [s for s in build_sources(cfg) if s.name == "redis"]
     assert isinstance(src, RedisSource) and src.db == 7
     spec = next(sp for s, sp in cfg.sources if s.name == "redis")
-    assert spec.required and not spec.enforce_rain and spec.dynamic_limits == {}
+    assert spec.required and not spec.enforce_rain
+    # The observers' sky limit on MEarth only (JDE 2026-11-21).
+    assert set(spec.dynamic_limits) == {"mearth"}
+    assert spec.dynamic_limits["mearth"].field == "sky_limit"
 
 
 # -- the shipped config end to end ------------------------------------------------
@@ -296,7 +299,8 @@ async def test_capture_evaluates_unsafe_for_humidity_and_cloud(raw):
         assert server.feed.commands == [["SELECT", "7"], ["MGET", *bridge.sources["redis"].keys]]
     assert ev.state == UNSAFE
     assert "redis: humidity=100 > 75 (open limit)" in ev.reasons
-    assert "redis: sky(mearth)=-1.3 > -40 (open limit)" in ev.reasons
+    # The observers' sky_limit -35 (dynamic_limits.mearth): open below -37.
+    assert "redis: sky(mearth)=-1.3 > -37 (open limit)" in ev.reasons
     assert ev.sources["redis"].age == pytest.approx(40)
     cond, times, _ = bridge.observing_conditions(ev)
     assert cond["pressure"] == pytest.approx(768.37, abs=0.01)
@@ -337,7 +341,8 @@ async def test_good_weather_is_safe(site):
         ("wind_gust", "57.0", "redis: wind_gust=35.4182 > 35 (open limit)"),
         ("humidity", "75.5", "redis: humidity=75.5 > 75 (open limit)"),
         ("temperature", "-20.5", "redis: temperature=-20.5 < -20 (open limit)"),
-        ("m_bolt", "-39.0", "redis: sky(mearth)=-39 > -40 (open limit)"),
+        # sky_limit -35: the open limit is sky_limit - 2.
+        ("m_bolt", "-36.0", "redis: sky(mearth)=-36 > -37 (open limit)"),
     ],
 )
 async def test_each_redis_limit_trips(site, key, value, reason):
@@ -388,9 +393,15 @@ async def test_redis_failure_closes_even_with_good_pages(site, fault):
     t0 = asyncio.get_running_loop().time()
     ev = await site.poll(bridge, 10)
     assert asyncio.get_running_loop().time() - t0 < 2.5
+    # One failed read is not a close (night 2026-11-21, 02:12:44 UTC): the
+    # last good reading is judged until it is stale...
+    assert ev.safe, ev.reasons
+    assert ev.sources["redis"].notes[0].startswith("fetch failed:")
+    # ...and Redis down for longer than stale_after (300 s) closes.
+    ev = await site.poll(bridge, 300)
     assert ev.state == UNKNOWN and not ev.safe
-    assert ev.sources["redis"].reasons[0].startswith("fetch failed:")
-    assert ev.sources["redis"].values == {}
+    assert ev.sources["redis"].reasons[0].startswith("stale: data")
+    assert "fetch failed" in ev.sources["redis"].reasons[0]
     assert ev.sources["ridge"].state == SAFE and ev.sources["cloud"].state == SAFE
     if fault == "down":
         site.redis = RedisFeed(site.redis.feed).start()  # for close()
@@ -409,9 +420,11 @@ async def test_page_failures_do_not_close(site, fault):
     site.pages.errors[CLOUD_URL] = fault
     ev = await site.poll(bridge, 10)
     assert ev.state == SAFE
+    assert ev.sources["ridge"].notes[0].startswith("fetch failed:")  # last good reading
+    ev = await site.poll(bridge, 360)  # past both pages' stale_after
+    assert ev.state == SAFE
     assert ev.sources["ridge"].state == UNKNOWN and ev.sources["cloud"].state == UNKNOWN
-    assert ev.reasons[0].startswith("ridge (advisory): fetch failed:")
-    assert ev.sources["ridge"].values == {}  # still dropped at once
+    assert ev.reasons[0].startswith("ridge (advisory): stale: data")
 
 
 async def test_stale_pages_do_not_close_but_unsafe_pages_do(site):
@@ -543,15 +556,20 @@ def test_enforce_rain_must_be_a_boolean(raw):
 # -- the dynamic (FLWO observers') sky limit -----------------------------------------
 
 
-async def test_dynamic_sky_limit_off_by_default(site):
+async def test_dynamic_sky_limit_off_uses_the_static_limit(site):
+    site.raw["sources"]["redis"]["dynamic_limits"]["mearth"]["enabled"] = False
     site.db["m_bolt"] = "-39.0"  # inside sky_limit - 2 = -37, outside the static -40
     ev = await site.poll(site.bridge())
     assert ev.state == UNSAFE
     assert "redis: sky(mearth)=-39 > -40 (open limit)" in ev.reasons
 
 
-async def test_dynamic_sky_limit_when_enabled(site):
-    site.raw["sources"]["redis"]["dynamic_limits"]["mearth"]["enabled"] = True
+async def test_dynamic_sky_limit_is_shipped_enabled(site):
+    """Weather-shadow report 2026-10-31..11-14 (JDE 2026-11-21): legacy
+    applied the observers' me_sky_limit to MEarth (open at sky_limit - 2,
+    close at sky_limit); robofast had it off, so the static -40 applied and
+    the bridge never opened. Now on, from Redis ``sky_limit``."""
+    assert site.raw["sources"]["redis"]["dynamic_limits"]["mearth"]["enabled"] is True
     bridge = site.bridge()
     site.db["m_bolt"] = "-39.0"
     ev = await site.poll(bridge)
@@ -564,13 +582,89 @@ async def test_dynamic_sky_limit_when_enabled(site):
     assert "redis: sky(mearth)=-34.5 > -35 (close limit)" in ev.reasons
     # A sky_limit outside its sanity range, or missing, falls back to static.
     site.db["m_bolt"] = "-39.0"
-    site.db["sky_limit"] = "10"
+    site.db["sky_limit"] = "20"
     ev = await site.poll(bridge, 10)
     assert "redis: sky(mearth)=-39 > -40 (open limit)" in ev.reasons
-    assert "mearth: sky_limit 10 outside [-50.0, -25.0]: static limits" in ev.sources["redis"].notes
+    assert "mearth: sky_limit 20 outside [-100.0, 10.0]: static limits" in ev.sources["redis"].notes
     del site.db["sky_limit"]
     ev = await site.poll(bridge, 10)
     assert "mearth: sky_limit missing: static limits" in ev.sources["redis"].notes
+
+
+async def test_dynamic_sky_limit_applies_to_mearth_only_with_hysteresis(site):
+    """The observers' limit is MEarth's: open below sky_limit - 2, then safe
+    until above sky_limit. Aurora keeps its static limits when it decides."""
+    bridge = site.bridge()
+    site.db["sky_limit"] = "-18.0"  # recorded 11-08..11-12
+    site.db["m_bolt"] = "-19.0"  # between -20 and -18: not yet open
+    ev = await site.poll(bridge)
+    assert "redis: sky(mearth)=-19 > -20 (open limit)" in ev.reasons
+    site.db["m_bolt"] = "-21.0"
+    site.db["aurora"] = "-10.0"  # would fail Aurora's -32: not consulted, MEarth decides
+    ev = await site.poll(bridge, 10)
+    assert ev.state == SAFE, ev.reasons
+    assert ev.sources["redis"].values["sky"] == -21.0
+    site.db["m_bolt"] = "-18.5"  # above the open limit, below the close: stays safe
+    assert (await site.poll(bridge, 10)).state == SAFE
+    site.db["m_bolt"] = "-17.5"
+    ev = await site.poll(bridge, 10)
+    assert "redis: sky(mearth)=-17.5 > -18 (close limit)" in ev.reasons
+    # MEarth down: Aurora decides on its own static limits, not sky_limit.
+    site.db["m_bolt"] = "-999.9"
+    site.db["aurora"] = "-25.0"  # would pass -20, fails Aurora's -32
+    ev = await site.poll(bridge, 10)
+    assert "redis: sky(aurora)=-25 > -32 (open limit)" in ev.reasons
+
+
+@pytest.mark.parametrize(
+    ("sky_limit", "m_bolt", "safe"),
+    [
+        ("-18.0", "-20.5", True),  # the live value 2026-11-21 (= rts2 me_sky_limit)
+        ("0.0", "-5.0", True),  # observers: "don't block on cloud"
+        ("-75.0", "-60.0", False),  # observers: "don't open"
+    ],
+)
+async def test_observers_sky_limits_are_all_taken(site, sky_limit, m_bolt, safe):
+    """Every value the observers set in the shadow run is applied, as legacy
+    applied it (the range is only a garbage guard)."""
+    site.db["sky_limit"], site.db["m_bolt"] = sky_limit, m_bolt
+    ev = await site.poll(site.bridge())
+    assert f"mearth: sky_limit={float(sky_limit):g}:" in " ".join(ev.sources["redis"].notes)
+    assert ev.safe is safe, ev.reasons
+
+
+async def test_mearth_down_value_falls_back_to_aurora(site):
+    """Weather-shadow report: from 2026-11-03 ~22 UTC Redis m_bolt read
+    -999.9 (MEarth down), which failed the sky limit ("sky(mearth)=-999.9 <
+    -999") instead of falling back to Aurora. -999.9 is now "sensor down"
+    for MEarth and Aurora, as on the cloud page."""
+    bridge = site.bridge()
+    site.db["m_bolt"] = "-999.9"
+    ev = await site.poll(bridge)
+    s = ev.sources["redis"]
+    assert ev.state == SAFE, ev.reasons
+    assert s.values["mearth"] is None and s.values["sky"] == -40.0
+    assert "mearth: sensor-down value -999.9" in s.notes and "sky from aurora" in s.notes
+    site.db["aurora"] = "-999.9"
+    ev = await site.poll(bridge, 10)
+    assert ev.reasons == ["redis: sky: no sensor available (mearth, aurora)"]
+
+
+async def test_mearth_rain_flag_never_trips_the_sky_limit(site):
+    """Weather-shadow report: Redis m_bolt 998 (MEarth's rain flag, 1,915
+    minutes of the run) failed the sky limit as "sky(mearth)=998 > -40",
+    enforcing MEarth rain against JDE's 2026-10-31 decision (998 shadow-only).
+    It is now a rain sentinel under the source's enforce_rain: reported as
+    "would close", IsSafe unaffected, and Aurora decides the sky."""
+    bridge = site.bridge()
+    site.db["m_bolt"] = "998.0"
+    ev = await site.poll(bridge)
+    s = ev.sources["redis"]
+    assert ev.state == SAFE, ev.reasons
+    assert not any("sky" in r for r in ev.reasons)
+    assert s.values["mearth"] is None and s.values["sky"] == -40.0
+    assert "mearth: rain sentinel 998" in s.notes
+    assert any("rain" in w for w in ev.would_close), ev.would_close
 
 
 @pytest.mark.parametrize(
@@ -617,3 +711,30 @@ def test_shadow_once_json_reports_would_close(raw, tmp_path, capsys):
     finally:
         redis.stop()
         feed.stop()
+
+
+async def test_a_failed_read_keeps_the_hysteresis_and_the_rain_hold(site):
+    """A Redis read that fails (night 2026-11-21) is judged on the last good
+    reading: the close limits still apply while safe, and rain seen in that
+    reading is held, not repeated or dropped."""
+    site.raw["sources"]["redis"]["timeout"] = 0.3
+    bridge = site.bridge()
+    assert (await site.poll(bridge)).safe
+    site.db["humidity"] = "77.0"  # above the open limit 75, below the close limit 80
+    assert (await site.poll(bridge, 10)).safe
+    site.db["rain_intensity"] = "0.6"  # shadow rain: would close
+    ev = await site.poll(bridge, 10)
+    assert ev.safe and ev.would_close
+    held = list(ev.would_close)
+    site.redis.feed.drop = True  # the next reads fail
+    ev = await site.poll(bridge, 10)
+    assert ev.safe, ev.reasons  # still judged on the close limits (77 < 80)
+    assert ev.would_close == held  # the same rain, held
+    assert ev.sources["redis"].notes[0].startswith("fetch failed:")
+    ev = await site.poll(bridge, 300)  # the last good reading is now stale
+    assert not ev.safe and ev.sources["redis"].reasons[0].startswith("stale: data")
+    assert ev.would_close  # the rain hold (3600 s) outlives the failure
+    site.redis.feed.drop = False
+    ev = await site.poll(bridge, 10)
+    # Unknown since the last verdict: the open limits apply again (77 > 75).
+    assert "redis: humidity=77 > 75 (open limit)" in ev.reasons

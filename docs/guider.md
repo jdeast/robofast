@@ -238,6 +238,62 @@ beamsplitter, so this is the light reaching the fiber's position, not the
 light coupled into the fiber: a relative flux. With offset guiding the
 fiber must be inside the guide window (`roi_size`) to be measured.
 
+### Guide log, offset alarm and header collection
+
+Three findings from the 2016-2020 MINERVA RVs (legacy minerva-control):
+
+* **Headers stalled guiding.** The legacy code collected FITS headers at
+  each exposure start in the thread that also guided: in 30-50 % of
+  (exposure, telescope) pairs no guide frame was taken for a median of
+  ~215 s, and the star was a median 1.7" off the fiber afterwards (~2 m/s
+  on tau Ceti). Here the guide loop runs in its own service; the
+  sequencer's FITS headers take the guider's values from the sequencer's
+  own registry, which `GuiderRemote` refreshes in the background, so an
+  exposure start never waits on the guider and the guider never waits on
+  a header. Everything a header or the console reads from the guider is an
+  HTTP read answered between frames; full frames are rendered and searched
+  off the event loop. `tests/core/test_guider_rv_findings.py`
+  (`test_header_collection_never_stalls_the_guide_loop`) hammers every
+  read endpoint from eight clients while guiding and asserts no gap
+  between guide frames.
+* **Held off the fiber for months.** T2 held stars 7-11" from its set
+  point in May-Jul 2019, and ~1" in Oct-Nov 2018 while the log said
+  0.3". The residual rms (`residual_high`) sees jitter, not a steady
+  offset. The `offset_high` alarm watches the star's **mean** offset from
+  the setpoint over `offset_alarm_window` seconds (default 10) of guide
+  frames and alarms when it stays above `offset_alarm` arcsec (default
+  1.5; needs `plate_scale`; `null` turns it off) for `offset_alarm_time`
+  seconds (default 30). The watch starts afresh at each (re)acquisition
+  and when the setpoint is moved by more than a pixel (offset guiding's
+  small setpoint updates keep it). The mean offset is in `GET /status`
+  (`telemetry.offset_arcsec`) and in the FITS headers (`GUIDOFFA`). It
+  measures the star against the guider's own setpoint: a wrong fiber
+  position is not seen, which is why the positions are logged.
+* **No per-telescope flux.** Legacy wrote `FLUXMID=UNKNOWN`; its exposure
+  meter summed all four fibers.
+
+The **guide log** answers the last two after the fact. With
+
+    "guide_log": {"dir": "/data/minerva/t1/guidelog", "interval": 5.0,
+                  "site": {"timezone": "America/Phoenix"}}
+
+in the service config (`robofast/guider/guide_log.py`), every guide frame
+(valid or not) becomes a line of `<dir>/<scope>.<night>.guide.csv`:
+exposure start and end (Unix seconds), whether the star was measured, the
+star's position, the setpoint (where the loop holds it: the fiber, or the
+offset star's setpoint), the fiber's position (guide-camera pixels), the
+star's distance from the setpoint (arcsec, with `plate_scale`), its
+background-subtracted flux in the centroid aperture (the FAU photometry,
+per telescope, at the guide cadence: enough for flux-weighted exposure
+midpoints), its FWHM, and the counts inside the fiber's footprint (with
+`fiber_flux`). The night is named by `site`'s night rule (`timezone`,
+`night_rollover_hour`, `longitude`; `robofast.clock.NightRule`, UTC
+without one). A worker thread writes every `interval` seconds, so a slow
+disk never delays the loop; rows that cannot be written are kept
+(`max_pending`, default 200000) and written with the next. `GET /status`
+shows it (`guide_log`). At MINERVA's FAU rate (seconds per frame) a night
+is a few MB; a fast tip/tilt loop at 100 Hz writes ~50 MB a night.
+
 ## Offloading
 
 The `Offloader` watches the tip/tilt's mean position over `window` seconds
@@ -334,14 +390,16 @@ hole; docs/seeing.md).
 
 **Value registry** (design.md 3.8): `<scope>.guide_state` (GUIDSTAT),
 `guide_rms` (GUIDRMS), `guide_rms_arcsec` (GUIDRMSA), `guide_flux`,
-`guide_fwhm`, `guide_seeing` (GUIDSEE, arcsec), `guide_rate`, `guide_latency`, `guide_exptime`, `fiber_x/y`
+`guide_fwhm`, `guide_seeing` (GUIDSEE, arcsec), `guide_rate`, `guide_latency`, `guide_exptime`,
+`guide_offset_arcsec` (GUIDOFFA, the mean offset from the setpoint), `fiber_x/y`
 (XSCIFIB/YSCIFIB, as tres-guider), `tiptilt_a/b` (TTPOSA/B). The service
 keeps its own registry; `GuiderRemote` copies them into the sequencer's
 registry every `poll_interval` while guiding, so they land in the FITS
 headers of the frames taken meanwhile (stale values are marked as such).
 
 **Alarms**: `star_lost`, `tiptilt_limit`, `residual_high`
-(`residual_alarm` px rms), `acquisition_failed`, `not_converging`,
+(`residual_alarm` px rms), `offset_high` (`offset_alarm` arcsec, above),
+`acquisition_failed`, `not_converging`,
 `device_error`; repeats within `alarm_repeat` seconds are counted.
 
 **Redis (optional, off by default)**: `"redis": {"host", "port",

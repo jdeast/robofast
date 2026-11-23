@@ -120,6 +120,11 @@ class ImagingConfig:
     #: Plate-solve light frames (:mod:`robofast.framesolve`; docs/sky.md):
     #: ``{"catalog": {...}, "telescopes": {name: solver settings}}``.
     solve: dict[str, Any] | None = None
+    #: Test frames (a rehearsal or dry run, not a science night; docs/data.md
+    #: "Test frames"): every frame is written with ``IMAGETYP = 'test'`` (its
+    #: real type in ``TESTTYP``) and ``.test`` in its file name, so no
+    #: pipeline mistakes it for data.
+    test_frames: bool = False
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> ImagingConfig:
@@ -266,6 +271,7 @@ class Imaging:
             compress=config.compress,
             rule=NightRule.from_site(site),
             index=config.index,
+            test=config.test_frames,
         )
         if config.solve is not None:
             from robofast.framesolve import FrameSolver

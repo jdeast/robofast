@@ -360,18 +360,38 @@ async def test_future_timestamp_is_unknown(make_bridge):
     [500, 404, httpx.ConnectError("refused"), httpx.ReadTimeout("slow")],
     ids=["http500", "http404", "refused", "readtimeout"],
 )
-async def test_fetch_error_makes_the_source_unknown_and_drops_old_values(make_bridge, fault):
+async def test_a_fetch_error_keeps_the_last_good_reading_until_it_is_stale(make_bridge, fault):
+    """Night 2026-11-21 (02:12:44 UTC): one Redis read timed out, the required
+    source went UNKNOWN at once, and the roof closed and reopened. A failed
+    fetch now judges the source's last good reading, with the failure as a
+    note, until that reading is older than its stale_after; then UNKNOWN."""
     pages, clock = _good()
     bridge = make_bridge(pages, clock)
     assert (await _poll(bridge)).safe
     pages.errors[RIDGE_URL] = fault
     clock.advance(10)
     ev = await _poll(bridge)
-    assert ev.state == UNKNOWN
-    assert ev.sources["ridge"].reasons[0].startswith("fetch failed:")
-    assert ev.sources["ridge"].values == {}  # the last good reading is not kept
+    ridge = ev.sources["ridge"]
+    assert ev.safe and ridge.state == SAFE, ev.reasons
+    assert ridge.notes[0].startswith("fetch failed:")
+    assert ridge.values  # the last good reading, still judged
+    limit = bridge.evaluator.specs["ridge"].stale_after
+    clock.advance(limit)
+    ev = await _poll(bridge)
+    ridge = ev.sources["ridge"]
+    assert ridge.state == UNKNOWN
+    assert ridge.reasons[0].startswith("stale: data") and "fetch failed" in ridge.reasons[0]
     del pages.errors[RIDGE_URL]
+    pages.good(clock.now)
     assert (await _poll(bridge)).safe
+
+
+async def test_a_fetch_error_before_any_reading_is_unknown(make_bridge):
+    pages, clock = _good()
+    pages.errors[RIDGE_URL] = 500
+    ev = await _poll(make_bridge(pages, clock))
+    assert ev.sources["ridge"].state == UNKNOWN
+    assert ev.sources["ridge"].reasons[0].startswith("fetch failed:")
 
 
 async def test_fetch_that_hangs_is_bounded(make_bridge, raw):

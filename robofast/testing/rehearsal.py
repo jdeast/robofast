@@ -11,8 +11,11 @@ opens; the real enclosure is never contacted), the supervisor, the guiders
 wherever the real mount points), KiwiSpec (simulator and service). A
 telescope not named on the command line stays simulated. Opt-in:
 ``--kiwispec URL`` uses an already-running (real) KiwiSpec service instead
-of the simulated one (only ``GET /status`` is checked first; never
-``/restart_camera`` or ``/backlight``), and ``--catalog-guide`` makes the
+of the simulated one (only ``GET /status`` is checked first, and it must
+report ``test_frames``: the service started with ``--test-frames``; never
+``/restart_camera`` or ``/backlight``). Every frame, imager and
+spectrograph, is a test frame (``IMAGETYP = 'test'``, ``.test`` in the
+file name; docs/data.md "Test frames"), and ``--catalog-guide`` makes the
 simulated FAU cameras show the real catalog star field around each target
 at the real FAU's geometry (docs/demo.md).
 
@@ -414,6 +417,12 @@ def check_kiwispec(url: str, timeout: float = 10.0) -> dict[str, Any]:
         raise RehearsalRefused(f"--kiwispec {url}: GET /status failed ({exc!r})") from exc
     if not isinstance(st, dict):
         raise RehearsalRefused(f"--kiwispec {url}: /status is not a JSON object: {st!r}")
+    if st.get("test_frames") is not True:
+        raise RehearsalRefused(
+            f"--kiwispec {url}: the service does not write test frames (/status test_frames"
+            f" {st.get('test_frames')!r}); a rehearsal's spectra must be marked as tests:"
+            ' start it with --test-frames (docs/data.md, "Test frames")'
+        )
     return st
 
 
@@ -1003,6 +1012,9 @@ def _loopback(host: str) -> bool:
 
 class Rehearsal(SimulatedNight):
     """The rehearsal's services and night (module doc)."""
+
+    #: A rehearsal is never a science night: every frame is a test frame.
+    TEST_FRAMES = True
 
     def __init__(self, out: Path, settings: RehearsalSettings) -> None:
         # Its own copy: the preflight may drop real telescopes.
@@ -1605,6 +1617,35 @@ def _at_altaz(c: httpx.Client, url: str, act: Any, tol: float = 0.5) -> bool:
 # -- checks and the report ------------------------------------------------------------------
 
 
+def slew_problems(slews: list[dict[str, Any]], tl: Timeline) -> list[str]:
+    """The guard's slews out of the altitude limits, or that never ended.
+
+    A slew cut short is not one that hung: by a device failure (the
+    sequencer's ``telescope_error`` for that telescope, then its recovery)
+    or by a cancel (``cancel_requested``: the enclosure went unsafe or the
+    night ended, and the cleanup aborted the slew) before that telescope's
+    next slew. night1121, 03:27 UTC: a slew started 0.6 s before an unsafe
+    cancel was reported as never ending."""
+    bad: list[str] = []
+    errors = tl.events("telescope_error", SEQUENCER)
+    cancels = tl.events("cancel_requested", SEQUENCER)
+    for r in slews:
+        if not MIN_ALT <= r["alt"] <= MAX_ALT:
+            bad.append(f"{r['telescope']}: slew to altitude {r['alt']:.1f}")
+        if "seconds" in r:
+            continue
+        nxt = min(
+            (x["t"] for x in slews if x["telescope"] == r["telescope"] and x["t"] > r["t"]),
+            default=math.inf,
+        )
+        cut = any(
+            e.detail.get("telescope") == r["telescope"] and r["t"] <= e.t <= nxt for e in errors
+        ) or any(r["t"] <= e.t <= nxt for e in cancels)
+        if not cut:
+            bad.append(f"{r['telescope']}: a slew never reported its end ({r['utc']})")
+    return bad
+
+
 def check(o: RehearsalOutcome) -> list[str]:
     """What went wrong in the rehearsal, as text (empty: all fine)."""
     bad: list[str] = list(o.errors)
@@ -1644,21 +1685,7 @@ def check(o: RehearsalOutcome) -> list[str]:
     # The guard: nothing refused, every slew within the limits and ended.
     for r in o.refused:
         bad.append(f"{r['telescope']} {r['device']}: {r['member']} refused ({r['why']})")
-    errors = tl.events("telescope_error", SEQUENCER)
-    for r in o.slews:
-        if not MIN_ALT <= r["alt"] <= MAX_ALT:
-            bad.append(f"{r['telescope']}: slew to altitude {r['alt']:.1f}")
-        # A slew cut short by a device failure (the sequencer's error, then
-        # its recovery) is that failure's, not a slew that hung.
-        nxt = min(
-            (x["t"] for x in o.slews if x["telescope"] == r["telescope"] and x["t"] > r["t"]),
-            default=math.inf,
-        )
-        cut = any(
-            e.detail.get("telescope") == r["telescope"] and r["t"] <= e.t <= nxt for e in errors
-        )
-        if "seconds" not in r and not cut:
-            bad.append(f"{r['telescope']}: a slew never reported its end ({r['utc']})")
+    bad += slew_problems(o.slews, tl)
     # Safety: never a spectrum unguided, every abort before a park, every
     # park before the (simulated) roof closes. The guard parks at once
     # (tracking off), so "still parking" cannot happen.
@@ -1699,6 +1726,7 @@ def frames(o: RehearsalOutcome) -> list[dict[str, Any]]:
             h = fits.getheader(path, ext=1 if str(path).endswith(".fz") else 0)
             for kw in (
                 "IMAGETYP",
+                "TESTTYP",
                 "EXPTIME",
                 "DATE-OBS",
                 "RA",
@@ -1730,6 +1758,8 @@ def output_problems(o: RehearsalOutcome) -> list[str]:
     if len(science) != n_done:
         bad.append(f"{len(science)} science sidecars for {n_done} spectra")
     for r in science:
+        if r.get("test") is not True or ".test." not in str(r.get("file")):
+            bad.append(f"{r['file']}: a rehearsal spectrum not marked as a test frame")
         b = r.get("barycentric") or {}
         if not b.get("bjd_tdb") or abs(b.get("barycentric_correction", 1e9)) > 31000:
             bad.append(f"{r['file']}: no barycentric correction")
@@ -1742,7 +1772,10 @@ def output_problems(o: RehearsalOutcome) -> list[str]:
         if any(c.startswith(f"IMG-{name}-") for c in imaging) and name not in taken:
             bad.append(f"{name}: imaging completed but no frame on disk")
     for f in fr:
-        if f["telescope"] not in s.real or f.get("IMAGETYP") != "LIGHT":
+        if not f.get("error") and (f.get("IMAGETYP") != "test" or ".test." not in f["file"]):
+            bad.append(f"{f['file']}: a rehearsal frame not marked as a test frame")
+    for f in fr:
+        if f["telescope"] not in s.real or f.get("TESTTYP", f.get("IMAGETYP")) != "LIGHT":
             continue
         if f.get("error"):
             bad.append(f"{f['file']}: {f['error']}")

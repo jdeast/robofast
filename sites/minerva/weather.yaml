@@ -70,13 +70,9 @@ sources:
       humidity:       {key: humidity, unit: percent}
       dewpoint:       {key: dew, unit: degC}
       pressure:       {key: pressure, unit: inHg}
-      # UNITS NOT ESTABLISHED. At capture Redis said wind 11.3 / gust 38.4
-      # while the ridge page said 7.21 / 20.38 mph: 11.3 km/h = 7.02 mph,
-      # so km/h fits the mean wind (gusts differ in averaging window). The
-      # MEarth station (same WXT keys: rain/hail intensity and duration)
-      # reported km/h in legacy getWeatherMearth. If it is really mph this
-      # reads wind 1.6x low -- the ridge page's mph limits still apply while
-      # it answers. Check in shadow mode (compare with ridge windSpeed).
+      # km/h: converted to mph they match the ridge page's windSpeed /
+      # windGustSpeed (median ratio 1.00 over 17,572 minutes of the
+      # 2026-10-31..11-14 shadow run).
       wind:           {key: wind, unit: km/h, to: mph}
       wind_gust:      {key: wind_gust, unit: km/h, to: mph}
       wind_direction: {key: wind_direction, unit: deg}
@@ -92,13 +88,22 @@ sources:
       # m_bolt = the MEarth cloud sensor (timed by mbolt_time), aurora = the
       # Aurora sensor; a_sky equalled aurora at capture. boltwood (timed by boltwood_time) read -0.0 = legacy's
       # "sensor down" 0.0; which sensor it is is unknown, so it is logged
-      # but not limited. 0.0 is "down" for all, as legacy.
-      mearth:         {key: m_bolt, time: mbolt_time, missing_values: [0.0]}
+      # but not limited. 0.0 is "down" for all, as legacy; -999.9 is MEarth's
+      # (and, as on the cloud page, Aurora's) "down": m_bolt read -999.9 from
+      # 2026-11-03 ~22 UTC to the end of the shadow run, and failed the sky
+      # limit instead of falling back to Aurora.
+      # m_bolt 998 is MEarth's rain flag (legacy oktoopen: "MearthCloud
+      # reports 998.0 when it's raining"): a rain sentinel under this
+      # source's enforce_rain (shadow-only, JDE 2026-10-31), never a sky
+      # value (it failed the sky limit as "998 > -40", enforcing it).
+      mearth:         {key: m_bolt, time: mbolt_time, missing_values: [0.0, -999.9],
+                       rain_values: [998.0]}
       boltwood:       {key: boltwood, time: boltwood_time, missing_values: [0.0]}
-      aurora:         {key: aurora, missing_values: [0.0]}
+      aurora:         {key: aurora, missing_values: [0.0, -999.9]}
       a_sky:          {key: a_sky, missing_values: [0.0]}
-      # The FLWO 48" observers' MEarth cloud limit (rts2 me_sky_limit,
-      # which legacy fetched with getskylimit.sh); see dynamic_limits.
+      # The FLWO 48" observers' MEarth cloud limit (rts2 me_sky_limit); see
+      # dynamic_limits. JDE 2026-11-21: Redis is its source; legacy's ssh to
+      # flwo48 (getskylimit.sh) is not ported.
       sky_limit:      {key: sky_limit}
     limits:
       # The ridge page's legacy limits (wind converted to mph above).
@@ -109,18 +114,30 @@ sources:
       dewpoint:       {open: [-100.0, 100.0], close: [-100.0, 100.0]}
       wind_direction: {open: [0.0, 360.0],    close: [0.0, 360.0]}
       pressure:       {open: [0, 2000],       close: [0, 2000]}
-      # Cloud limits as for the cloud page's MEarth and Aurora columns.
+      # Cloud limits as for the cloud page's MEarth and Aurora columns
+      # (legacy's). UNCALIBRATED ON THE REDIS SCALE: in the 2026-10-31..11-14
+      # shadow run the best nights read about -24 (MEarth) and -19 (Aurora),
+      # so -40 / -32 are never reached. MEarth's static limit is only the
+      # fallback when sky_limit is missing (dynamic_limits); Aurora's has no
+      # dynamic limit. Calibrate both against the cloud page side by side
+      # once ~/.config/robofast/sao-weather.credentials exists.
       mearth:         {open: [-999, -40.0], close: [-999, -38.0]}
       aurora:         {open: [-999, -32.0], close: [-999, -31.0]}
     groups:
       sky: [mearth, aurora]
     dynamic_limits:
-      # Legacy domeControl.py read me_sky_limit every 30 min (default -38)
-      # and applied it to the MEarth sensor only: close limit = sky_limit,
-      # open limit = sky_limit - 2. Off by default (JDE 2026-10-31); outside
-      # `range` the static limits apply.
-      mearth: {enabled: false, field: sky_limit, side: high,
-               open_offset: -2.0, close_offset: 0.0, range: [-50.0, -25.0]}
+      # Legacy domeControl.py read the observers' me_sky_limit every 30 min
+      # (getskylimit.sh, default -38) and oktoopen applied it to the MEarth
+      # sensor only: close limit = sky_limit, open limit = sky_limit - 2;
+      # the static -40/-38 only when the fetch failed. ENABLED (JDE
+      # 2026-11-21, weather-shadow report): with it off the static -40
+      # applied and the bridge never opened. The value comes from Redis
+      # `sky_limit` (no ssh to flwo48). The observers set it from 0 ("don't
+      # block on cloud") to -70/-75 ("don't open"), -15..-40 in between, so
+      # `range` is only a garbage guard; outside it, or missing, the static
+      # limits apply.
+      mearth: {enabled: true, field: sky_limit, side: high,
+               open_offset: -2.0, close_offset: 0.0, range: [-100.0, 10.0]}
     rain_rates:
       # Rain while the WXT intensity is above 0 (any rain).
       rain_intensity: 0.0

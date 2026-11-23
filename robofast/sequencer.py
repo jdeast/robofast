@@ -1210,6 +1210,9 @@ class Sequencer:
             if u.recovery is not None:
                 u.recovery.alarm = lambda text, u=u: self.alarm(u.name, text)
                 u.recovery.event = lambda what, u=u, **kw: self._event(what, telescope=u.name, **kw)
+            if u.guider is not None and hasattr(u.guider, "on_alarm"):
+                # The guider's forwarded alarms (offset_high: docs/guider.md).
+                u.guider.on_alarm = lambda text, u=u: self.alarm(u.name, text)
             if u.cooling is not None:
                 u.cooling.alarm = lambda text, u=u: self.alarm(u.name, text)
                 u.cooling.event = lambda what, u=u, **kw: self._event(what, telescope=u.name, **kw)
@@ -2885,30 +2888,40 @@ class Sequencer:
 
     async def _sequence_cleanup(self, r: Any, *, background: bool, strict: bool = False) -> None:
         """Every lamp the sequence switched on off (now), then its cleanup
-        steps with grants of their own: awaited, or -- cancelled --
-        finished in the background and waited for by the generation's
-        cleanup. ``strict``: a cleanup that fails fails the observation."""
+        steps with grants of their own, all in one task started before
+        anything is awaited: awaited, or -- cancelled -- finished in the
+        background and waited for by the generation's cleanup. A second
+        cancel (a TaskGroup passing the first on to its tasks a loop step
+        later) can then never stop the cleanup from starting: it once
+        landed during the lamp-off, before the cleanup steps' task existed,
+        and the calibration stage stayed in. ``strict``: a cleanup that
+        fails fails the observation."""
+        task = asyncio.ensure_future(self._sequence_cleanup_all(r))
+        if background:
+            self._keep_sequence_cleanup(r, task)
+            return
+        try:
+            problems = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            self._keep_sequence_cleanup(r, task)
+            raise
+        if strict and problems:
+            raise ObservationFailed(f"sequence {r.sequence.name}: cleanup: {'; '.join(problems)}")
+
+    def _keep_sequence_cleanup(self, r: Any, task: asyncio.Future[list[str]]) -> None:
+        """A cleanup left running: the generation's cleanup waits for it."""
+        tasks = self._sequence_cleanups.setdefault(r.unit.name, set())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def _sequence_cleanup_all(self, r: Any) -> list[str]:
         problems: list[str] = []
         for lamp, sid in list(r.lamps_on.items()):
             try:
                 await self._sequence_lamp_off(r, lamp, sid)
             except LampOff as exc:
                 problems.append(str(exc))
-        task = asyncio.ensure_future(self._sequence_cleanup_steps(r))
-        if background:
-            tasks = self._sequence_cleanups.setdefault(r.unit.name, set())
-            tasks.add(task)
-            task.add_done_callback(tasks.discard)
-            return
-        try:
-            problems += await asyncio.shield(task)
-        except asyncio.CancelledError:
-            tasks = self._sequence_cleanups.setdefault(r.unit.name, set())
-            tasks.add(task)
-            task.add_done_callback(tasks.discard)
-            raise
-        if strict and problems:
-            raise ObservationFailed(f"sequence {r.sequence.name}: cleanup: {'; '.join(problems)}")
+        return problems + await self._sequence_cleanup_steps(r)
 
     async def _sequence_cleanup_steps(self, r: Any) -> list[str]:
         from robofast.sequences import SEQUENCE_STEPS
@@ -4299,6 +4312,8 @@ class Sequencer:
         record: dict[str, Any] = {
             "version": 1,
             "kind": "science",
+            # A test frame (rehearsal / dry run): not data (docs/data.md).
+            **({"test": True} if result.get("test") else {}),
             "file": result.get("file"),
             "object": obs.object or obs.name,
             "observation": obs.name,
@@ -4407,6 +4422,8 @@ class Sequencer:
             record = {
                 "version": 1,
                 "kind": result.get("kind"),
+                # A test frame (rehearsal / dry run): not data (docs/data.md).
+                **({"test": True} if result.get("test") else {}),
                 "file": result.get("file"),
                 "object": result.get("object"),
                 "observation": obs.name,

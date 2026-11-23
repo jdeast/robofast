@@ -71,7 +71,8 @@ Config (JSON; every key optional except as noted)::
              section re-points it at each start's target_radec with real catalog
              stars (robofast.testing.skysim.GuiderSky; docs/demo.md)...},
      "redis": null | {"host", "port", "channel"},
-     "flux_report": null | {"url", "telescope", "interval"?, "timeout"?}}
+     "flux_report": null | {"url", "telescope", "interval"?, "timeout"?},
+     "guide_log": null | {"dir", "interval"?, "site"?}}
 
 Each ``kind`` is a backend registered in :mod:`robofast.guider.hardware`
 (a plug-in adds more: docs/plugins.md). MINERVA's FAU backlight is
@@ -83,6 +84,11 @@ by the built-in :mod:`robofast.devices` plug-in; the earlier form
 frame to the spectrograph service (``POST /flux``), for the spectrum's
 flux-weighted midpoint (:mod:`robofast.guider.flux_report`; it turns
 on ``guide.fiber_flux``). ``GET /status`` shows it (``flux_report``).
+
+``guide_log`` writes every guide frame -- star, setpoint and fiber
+positions, the star's flux and the fiber counts -- to a per-telescope,
+per-night CSV file at the guide rate (:mod:`robofast.guider.guide_log`;
+it turns on ``guide.guide_log``). ``GET /status`` shows it (``guide_log``).
 
 Safety
 ------
@@ -140,6 +146,7 @@ from robofast.guider.base import (
 )
 from robofast.guider.centroid import WindowedCOM
 from robofast.guider.flux_report import FluxReportConfig, FluxReporter
+from robofast.guider.guide_log import GuideLog, GuideLogConfig
 from robofast.guider.loop import (
     Backlight,
     GuideConfig,
@@ -206,6 +213,8 @@ class GuiderServiceConfig:
     #: Report the fiber flux to the spectrograph service
     #: (:class:`~robofast.guider.flux_report.FluxReportConfig`).
     flux_report: dict[str, Any] | None = None
+    #: Log every guide frame to a file (:class:`~robofast.guider.guide_log.GuideLogConfig`).
+    guide_log: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> GuiderServiceConfig:
@@ -347,6 +356,9 @@ class GuiderService:
         )
         if flux_cfg is not None:
             gcfg.fiber_flux = True
+        log_cfg = None if config.guide_log is None else GuideLogConfig.from_dict(config.guide_log)
+        if log_cfg is not None:
+            gcfg.guide_log = True
         self.pa_cal = self._pa_calibration()
         publisher = None
         if redis_client is not None or config.redis:
@@ -378,6 +390,7 @@ class GuiderService:
             publisher=publisher,
         )
         self.flux_reporter = None if flux_cfg is None else FluxReporter(self.guider, flux_cfg)
+        self.guide_log = None if log_cfg is None else GuideLog(self.guider, log_cfg)
         self._load_calibrations()
         self._catalog: Any = None
         self._solver: Any = None
@@ -488,6 +501,8 @@ class GuiderService:
         self.port = self._server.sockets[0].getsockname()[1]
         if self.flux_reporter is not None:
             self.flux_reporter.start()
+        if self.guide_log is not None:
+            self.guide_log.start()
         return self
 
     async def reconnect_camera(self) -> None:
@@ -515,6 +530,8 @@ class GuiderService:
             await self.guider.stop("service stopping")
         if self.flux_reporter is not None:
             await self.flux_reporter.stop()
+        if self.guide_log is not None:
+            await self.guide_log.stop()
         p = self.parts
         for dev in (p.tiptilt, p.mount, p.camera):
             if dev is not None:
@@ -569,6 +586,7 @@ class GuiderService:
         if self._sky is not None:
             s["sim_sky"] = self.sim_sky
         s["flux_report"] = None if self.flux_reporter is None else self.flux_reporter.status()
+        s["guide_log"] = None if self.guide_log is None else self.guide_log.status()
         s["calibrations"] = {
             "tiptilt": None if self.guider.tt_cal is None else self.guider.tt_cal.as_json(),
             "mount": None if self.guider.mount_cal is None else self.guider.mount_cal.as_json(),
@@ -980,7 +998,11 @@ class GuiderRemote:
       connection refused or a ``failed`` state still fails at once.
     * :meth:`stop` -- bounded and never raises (cleanup must go on to park).
     * with a ``registry``, a background task copies the guider's state into
-      it every ``poll_interval`` while guiding (the FITS headers).
+      it every ``poll_interval`` while guiding (the FITS headers), and hands
+      each new guider alarm whose kind is in ``forward_alarms`` (default
+      ``offset_high``: docs/guider.md, "Guide log, offset alarm and header
+      collection") to ``on_alarm`` (the sequencer's alarm: status,
+      console, notifier).
     """
 
     def __init__(
@@ -993,8 +1015,13 @@ class GuiderRemote:
         acquire_timeout: float = 120.0,
         poll_interval: float = 2.0,
         status_failures: int = 3,
+        forward_alarms: list[str] | tuple[str, ...] = ("offset_high",),
     ) -> None:
         self.url = url.rstrip("/")
+        self.forward_alarms = frozenset(forward_alarms)
+        #: Called with each forwarded alarm's text (the sequencer sets it).
+        self.on_alarm: Any = None
+        self._alarms_seen: set[tuple[str, Any]] = set()
         self.scope = scope
         self.registry = registry
         self.timeout = timeout
@@ -1150,11 +1177,29 @@ class GuiderRemote:
             if self._poll is not me:
                 return
             try:
-                self._publish(await self.status())
+                st = await self.status()
+                self._publish(st)
+                self._forward_alarms(st)
             except Exception as exc:
                 log.warning("guider %s status: %r", self.scope, exc)
                 if self.registry is not None:
                     self.registry.failed(f"{self.scope}.guide_state", repr(exc))
+
+    def _forward_alarms(self, st: dict[str, Any]) -> None:
+        """New guider alarms of the forwarded kinds to ``on_alarm`` (once each)."""
+        for a in st.get("alarms") or []:
+            kind = a.get("kind")
+            key = (kind, a.get("t"))
+            if kind not in self.forward_alarms or key in self._alarms_seen:
+                continue
+            self._alarms_seen.add(key)
+            text = f"guider {self.scope}: {kind}: {a.get('message', '')}"
+            log.warning("%s", text)
+            if self.on_alarm is not None:
+                try:
+                    self.on_alarm(text)
+                except Exception:
+                    log.exception("guider %s: on_alarm", self.scope)
 
     def _publish(self, st: dict[str, Any]) -> None:
         if self.registry is None:

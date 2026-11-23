@@ -4,7 +4,10 @@ Layout (``docs/data.md``)::
 
     <data_root>/<site>/<telescope>/n<YYYYMMDD>/n<YYYYMMDD>.<telescope>.<object>.<seq:04d>.fits
 
-``.fits.fz`` when Rice-compressed. The night is the local date of the
+``.fits.fz`` when Rice-compressed. Test frames (a rehearsal or dry run:
+``FrameStore(test=True)``) are named ``...<object>.test.<seq:04d>.fits``
+and written with ``IMAGETYP = 'test'``, their real type in ``TESTTYP``
+(docs/data.md, "Test frames"). The night is the local date of the
 *evening* by the site's :class:`robofast.clock.NightRule` (the one
 rule every night name comes from: before ``night_rollover_hour`` local
 time is the previous night), from the sequencer's clock when ``StartExposure`` was sent
@@ -490,6 +493,10 @@ def replace_wcs(h: fits.Header, cards: list[tuple[str, Any, str]]) -> None:
         pos += 1
 
 
+#: ``IMAGETYP`` of every test frame (module doc).
+TEST_IMAGETYP = "test"
+
+
 def imagetyp(light: bool, exptime: float, name: str) -> str:
     if not light:
         return "BIAS" if exptime <= 0 else "DARK"
@@ -513,8 +520,11 @@ class FrameStore:
         index: bool = True,
         clock: Clock = real_clock,
         solver: Any = None,
+        test: bool = False,
     ) -> None:
         self.root = Path(data_root)
+        #: Test frames (module doc): ``IMAGETYP = 'test'`` and ``.test`` in the name.
+        self.test = test
         #: Optional plate solver (``robofast.framesolve.FrameSolver``):
         #: called with the pixels, the header and the frame's info before
         #: the file is written; it replaces the approximate WCS when it
@@ -541,7 +551,8 @@ class FrameStore:
         self, telescope: str, night: date, obj: str, seq: int, compressed: bool = False
     ) -> str:
         ext = ".fits.fz" if compressed else ".fits"
-        return f"n{night:%Y%m%d}.{safe_name(telescope)}.{safe_name(obj)}.{seq:04d}{ext}"
+        test = ".test" if self.test else ""
+        return f"n{night:%Y%m%d}.{safe_name(telescope)}.{safe_name(obj)}{test}.{seq:04d}{ext}"
 
     def _scan(self, d: Path, telescope: str, night: date) -> int:
         pat = re.compile(
@@ -559,6 +570,9 @@ class FrameStore:
         """Build the header and write the frame (atomic, never overwrites)."""
         data = storage_array(image)
         header, _ = build_header(info, data.shape, self.clock())
+        if self.test:
+            _card(header, "TESTTYP", info.imagetyp, "Frame type had this not been a test")
+            _card(header, "IMAGETYP", TEST_IMAGETYP, "Test frame (rehearsal / dry run): not data")
         solved: dict[str, Any] | None = None
         if self.solver is not None and info.light:
             try:
@@ -600,7 +614,8 @@ class FrameStore:
             "file": rel,
             "telescope": info.telescope,
             "object": info.object,
-            "imagetyp": info.imagetyp,
+            "imagetyp": TEST_IMAGETYP if self.test else info.imagetyp,
+            **({"test_of": info.imagetyp} if self.test else {}),
             "date_obs": header["DATE-OBS"],
             "exptime": header["EXPTIME"],
             "filter": info.filter,

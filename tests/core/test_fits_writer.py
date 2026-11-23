@@ -279,6 +279,21 @@ def test_layout_night_and_round_trip(tmp_path):
     assert [p.name for p in w.path.parent.iterdir() if p.name.startswith(".")] == []
 
 
+def test_test_frames_are_marked_in_name_header_and_index(tmp_path):
+    """Rehearsal / dry-run frames (docs/data.md "Test frames")."""
+    store = FrameStore(tmp_path, "minerva", rule=NightRule(longitude=SITE["longitude"]), test=True)
+    w = store.write(info(registry()), image())
+    assert w.relpath == "minerva/t1/n20261113/n20261113.t1.HD_1234.test.0001.fits"
+    h = fits.getheader(w.path)
+    assert h["IMAGETYP"] == "test" and h["TESTTYP"] == "LIGHT"
+    assert h["FILENAME"] == w.path.name
+    (line,) = (w.path.parent / "n20261113.t1.frames.jsonl").read_text().splitlines()
+    rec = json.loads(line)
+    assert rec["imagetyp"] == "test" and rec["test_of"] == "LIGHT"
+    # Numbering counts on across test frames.
+    assert store.write(info(registry()), image()).seq == 2
+
+
 def test_night_by_timezone(tmp_path):
     store = FrameStore(tmp_path, "s", rule=NightRule("America/Phoenix", rollover_hour=12))
     assert store.night(datetime(2026, 11, 14, 18, 59, tzinfo=UTC)) == date(2026, 11, 13)

@@ -44,6 +44,8 @@ class FakeSpectrograph:
         self.calls: list[tuple[str, dict]] = []
         self.current: int | None = None
         self.fail_next: str | None = None
+        #: A KiwiSpec service run with --test-frames: every result says "test".
+        self.test_frames = False
 
     def _log(self, what, **detail):
         self.calls.append((what, detail))
@@ -84,6 +86,7 @@ class FakeSpectrograph:
                         "flux_midpoint_jd": 2461000.0,
                         "iodine": {"requested": f.get("iodine", "in"), "mm": 11.0, "name": "in"},
                         "warnings": [],
+                        **({"test": True} if self.test_frames else {}),
                     }
                 )
             if self.fail_next:
@@ -551,3 +554,28 @@ def _img_group():
     from .test_dispatch import group
 
     return group("img", -0.5, priority=5.0, telescopes=["t2"])
+
+
+async def test_a_test_frame_spectrum_is_marked_in_its_sidecar(make_rig, tmp_path):
+    """night1121 / A1: the spectrograph marked its frames as tests (``"test":
+    true`` in each result) but the sequencer's science record dropped the
+    mark (only calibrations kept it), so the sidecars and the spectra index
+    looked like data."""
+    plan = StaticPlan([spectrum_target(params={"iodine": "out"})], ["t1", "t2"])
+    rig = rv_rig(make_rig, tmp_path, plan)
+    rig.spec.test_frames = True
+    await run_to_end(rig)
+    [rec] = rig.sequencer.spectrum_records
+    assert rec["kind"] == "science" and rec["test"] is True
+    [side] = tmp_path.glob("minerva/kiwispec/n*/*.fits.json")
+    assert json.loads(side.read_text())["test"] is True
+    [index] = tmp_path.glob("minerva/kiwispec/n*/*.spectra.jsonl")
+    assert json.loads(index.read_text().splitlines()[0])["test"] is True
+
+
+async def test_an_ordinary_spectrum_has_no_test_mark(make_rig, tmp_path):
+    plan = StaticPlan([spectrum_target(params={"iodine": "out"})], ["t1", "t2"])
+    rig = rv_rig(make_rig, tmp_path, plan)
+    await run_to_end(rig)
+    [rec] = rig.sequencer.spectrum_records
+    assert "test" not in rec

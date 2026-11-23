@@ -447,6 +447,48 @@ async def test_science_exposure(http, sim):
     assert sim.heater_on
 
 
+async def test_test_frames_are_marked_in_name_and_header(sim):
+    """A rehearsal / dry run's spectra are test frames (docs/data.md "Test
+    frames"): 2026-11-19 the legacy pipeline extracted dry-run frames that
+    had real object names and IMAGETYP science."""
+    server = await KiwiSpecServer(service_config(sim, test_frames=True)).start(status_loop=False)
+    try:
+        async with httpx.AsyncClient(base_url=server.url, timeout=10) as http:
+            assert (await http.get("/status")).json()["test_frames"] is True
+            job = await run_job(
+                http,
+                "/expose",
+                {"kind": "science", "exptime": 0.5, "object": "HD1234", "telescopes": ["T1"]},
+            )
+            assert job["state"] == "done", job
+            r = job["results"][0]
+            # The name the spectrograph PC saves under: the legacy extraction
+            # skips every name containing "test".
+            assert r["file"].endswith(".HD1234.test.0001.fits") and r["test"] is True
+            assert r["kind"] == "science"
+            h = sim.files[r["file"]]["header"]
+            assert h["IMAGETYP"][0] == "test" and h["TESTTYP"][0] == "science"
+            job = await run_job(http, "/calibrate", {"frames": [{"kind": "bias", "n": 1}]})
+            (b,) = job["results"]
+            assert ".test." in b["file"] and sim.files[b["file"]]["header"]["IMAGETYP"][0] == "test"
+    finally:
+        await server.stop()
+
+
+async def test_ordinary_frames_are_not_test_frames(http, sim):
+    assert (await http.get("/status")).json()["test_frames"] is False
+    job = await run_job(http, "/calibrate", {"frames": [{"kind": "bias", "n": 1}]})
+    (b,) = job["results"]
+    assert "test" not in b["file"] and b["test"] is False
+    h = sim.files[b["file"]]["header"]
+    assert h["IMAGETYP"][0] == "bias" and "TESTTYP" not in h
+
+
+def test_test_frames_config_is_a_bool(sim):
+    with pytest.raises(ValueError, match="test_frames"):
+        service_config(sim, test_frames="yes")
+
+
 async def test_flux_midpoint_follows_a_ramp(http, sim):
     # Ramp from the moment the camera starts, not from set_sky(): the delay
     # before the shutter opens varies on a loaded runner and would pull the

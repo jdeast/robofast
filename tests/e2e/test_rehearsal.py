@@ -146,7 +146,10 @@ async def test_a_rehearsal_with_an_external_kiwispec_and_catalog_guiding(tmp_pat
         real[name] = RealTelescope(ep, Endpoint.parse(f"{srvs[1].address}/0"), ep, ep)
     # The "external" KiwiSpec: the simulated night's own, on the same clock
     # file as the rehearsal (the rehearsal rewrites it with its clock).
+    # Run with --test-frames, as a real one must be for a rehearsal
+    # (check_kiwispec refuses a service that would write ordinary frames).
     external = SimulatedNight(out)
+    external.TEST_FRAMES = True
     await external._start_spectrograph()
     url = external._spectrograph_url()
     settings = RehearsalSettings(

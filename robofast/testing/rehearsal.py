@@ -11,8 +11,11 @@ opens; the real enclosure is never contacted), the supervisor, the guiders
 wherever the real mount points), KiwiSpec (simulator and service). A
 telescope not named on the command line stays simulated. Opt-in:
 ``--kiwispec URL`` uses an already-running (real) KiwiSpec service instead
-of the simulated one (only ``GET /status`` is checked first; never
-``/restart_camera`` or ``/backlight``), and ``--catalog-guide`` makes the
+of the simulated one (only ``GET /status`` is checked first, and it must
+report ``test_frames``: the service started with ``--test-frames``; never
+``/restart_camera`` or ``/backlight``). Every frame, imager and
+spectrograph, is a test frame (``IMAGETYP = 'test'``, ``.test`` in the
+file name; docs/data.md "Test frames"), and ``--catalog-guide`` makes the
 simulated FAU cameras show the real catalog star field around each target
 at the real FAU's geometry (docs/demo.md).
 
@@ -414,6 +417,12 @@ def check_kiwispec(url: str, timeout: float = 10.0) -> dict[str, Any]:
         raise RehearsalRefused(f"--kiwispec {url}: GET /status failed ({exc!r})") from exc
     if not isinstance(st, dict):
         raise RehearsalRefused(f"--kiwispec {url}: /status is not a JSON object: {st!r}")
+    if st.get("test_frames") is not True:
+        raise RehearsalRefused(
+            f"--kiwispec {url}: the service does not write test frames (/status test_frames"
+            f" {st.get('test_frames')!r}); a rehearsal's spectra must be marked as tests:"
+            ' start it with --test-frames (docs/data.md, "Test frames")'
+        )
     return st
 
 
@@ -1003,6 +1012,9 @@ def _loopback(host: str) -> bool:
 
 class Rehearsal(SimulatedNight):
     """The rehearsal's services and night (module doc)."""
+
+    #: A rehearsal is never a science night: every frame is a test frame.
+    TEST_FRAMES = True
 
     def __init__(self, out: Path, settings: RehearsalSettings) -> None:
         # Its own copy: the preflight may drop real telescopes.
@@ -1714,6 +1726,7 @@ def frames(o: RehearsalOutcome) -> list[dict[str, Any]]:
             h = fits.getheader(path, ext=1 if str(path).endswith(".fz") else 0)
             for kw in (
                 "IMAGETYP",
+                "TESTTYP",
                 "EXPTIME",
                 "DATE-OBS",
                 "RA",
@@ -1745,6 +1758,8 @@ def output_problems(o: RehearsalOutcome) -> list[str]:
     if len(science) != n_done:
         bad.append(f"{len(science)} science sidecars for {n_done} spectra")
     for r in science:
+        if r.get("test") is not True or ".test." not in str(r.get("file")):
+            bad.append(f"{r['file']}: a rehearsal spectrum not marked as a test frame")
         b = r.get("barycentric") or {}
         if not b.get("bjd_tdb") or abs(b.get("barycentric_correction", 1e9)) > 31000:
             bad.append(f"{r['file']}: no barycentric correction")
@@ -1757,7 +1772,10 @@ def output_problems(o: RehearsalOutcome) -> list[str]:
         if any(c.startswith(f"IMG-{name}-") for c in imaging) and name not in taken:
             bad.append(f"{name}: imaging completed but no frame on disk")
     for f in fr:
-        if f["telescope"] not in s.real or f.get("IMAGETYP") != "LIGHT":
+        if not f.get("error") and (f.get("IMAGETYP") != "test" or ".test." not in f["file"]):
+            bad.append(f"{f['file']}: a rehearsal frame not marked as a test frame")
+    for f in fr:
+        if f["telescope"] not in s.real or f.get("TESTTYP", f.get("IMAGETYP")) != "LIGHT":
             continue
         if f.get("error"):
             bad.append(f"{f['file']}: {f['error']}")

@@ -91,7 +91,9 @@ class WatchConfig:
             p = Path(v).expanduser()
             return p if p.is_absolute() or base is None else base / p
 
-        models = cameras.models_dir(path("models"))
+        # The models are needed only to check the cameras listed: with none,
+        # there is nothing to watch and no models directory is required.
+        models = cameras.models_dir(path("models")) if raw.get("cameras") else path("models")
         cams = {}
         for name, spec in (raw.get("cameras") or {}).items():
             spec = dict(spec or {})

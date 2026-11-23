@@ -449,6 +449,14 @@ class KiwiSpecConfig:
     #: Every frame is a test frame (module doc, "Test frames"): a rehearsal
     #: or dry run. ``--test-frames`` on the command line sets it too.
     test_frames: bool = False
+    #: Detector constants written to every frame (GAIN, RDNOISE). Gain is the
+    #: photon-transfer measurement from slit-flat pairs, 1.264-1.270 e-/ADU in
+    #: 2016-12..2019-01, +/- 0.02 by method (specfast FINDINGS 2026-11-23; legacy
+    #: headers wrote the datasheet 1.3); read noise 2.85 ADU = 3.63 e-. No slit
+    #: flats since 2022-03 (lamp broken), so the current era is unmeasured.
+    #: JDE 2026-11-23. Informational: no pipeline reads them from the header.
+    gain: float = 1.265
+    read_noise: float = 3.63
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> KiwiSpecConfig:
@@ -1544,6 +1552,8 @@ class KiwiSpec:
             "ccd_temp": ccd,
             "spec_pressure": spec_pressure,
             "simulated": simulated,
+            "gain": c.gain,
+            "read_noise": c.read_noise,
             "targets": {
                 t: {"n": telescope_number(t, c.telescopes), **f.targets.get(t, {})}
                 for t in f.telescopes
@@ -1666,6 +1676,14 @@ class KiwiSpec:
             "SPECPRES": [
                 "UNKNOWN" if r.get("spec_pressure") is None else r["spec_pressure"],
                 "Spectrograph pressure (mbar)",
+            ],
+            "GAIN": [
+                "UNKNOWN" if r.get("gain") is None else r["gain"],
+                "Detector gain (e-/ADU), photon transfer 2016-19",
+            ],
+            "RDNOISE": [
+                "UNKNOWN" if r.get("read_noise") is None else r["read_noise"],
+                "Detector read noise (e-)",
             ],
         }
         for tel in r["telescopes"]:

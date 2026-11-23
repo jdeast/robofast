@@ -509,6 +509,9 @@ async def test_header_has_pressure_simulate_and_targets_per_telescope(http, sim)
     r = job["results"][0]
     h = sim.files[r["file"]]["header"]
     assert h["SPECPRES"] == [0.002, "Spectrograph pressure (mbar)"]
+    # Detector constants, units in the comments (JDE 2026-11-23: the measured gain).
+    assert h["GAIN"] == [1.265, "Detector gain (e-/ADU), photon transfer 2016-19"]
+    assert h["RDNOISE"] == [3.63, "Detector read noise (e-)"]
     assert h["SIMULATE"] == [True, "Simulated spectrograph: no light"]
     assert h["TARGRA1"] == [26.0175, "Target RA (ICRS deg at TARGEPO1)"]
     assert h["TARGDEC1"] == [-15.9375, "Target Dec (ICRS deg at TARGEPO1)"]

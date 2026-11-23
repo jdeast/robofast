@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from robofast import hwgate
-from robofast.cancel import stop_task
+from robofast.cancel import shielded, stop_task
 from robofast.instruments import SpectrographBusy, SpectrographError
 
 log = logging.getLogger(__name__)
@@ -623,7 +623,7 @@ class SIAcquisition:
         """Wait for the camera's ``Done`` (exposure end + readout), bounded."""
         try:
             async with asyncio.timeout(timeout):
-                err = await asyncio.shield(self._done)
+                err = await shielded(self._done)
         except TimeoutError:
             raise KiwiSpecTimeout(f"SI acquisition not done within {timeout:.1f} s") from None
         if err:

@@ -70,6 +70,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from robofast import hwgate
+from robofast.cancel import shielded
 from robofast.owner import DeviceError, DeviceTimeout
 
 log = logging.getLogger(__name__)
@@ -259,7 +260,7 @@ class RoofInterface:
         fut = loop.run_in_executor(self._pool, fn)
         try:
             async with asyncio.timeout(self.timeout):
-                return await asyncio.shield(fut)
+                return await shielded(fut)
         except TimeoutError:
             raise RoofPortTimeout(f"roof port {what}: no answer within {self.timeout} s") from None
 

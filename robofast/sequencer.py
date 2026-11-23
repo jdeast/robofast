@@ -315,7 +315,7 @@ from robofast.autofocus import (
     term_source,
 )
 from robofast.camera_state import CAMERA_IDLE, image_ready
-from robofast.cancel import stop_task, stop_tasks
+from robofast.cancel import shielded, stop_task, stop_tasks
 from robofast.clock import Clock, NightRule, real_clock
 from robofast.cooling import CameraCooling, CoolingStatus
 from robofast.escalation import DEFAULT_SAFE, AgentResult, Incident, fault_signature, run_agent
@@ -2768,7 +2768,7 @@ class Sequencer:
         task = asyncio.ensure_future(grant.call("SetSwitch", sid, False, timeout=timeout))
         task.add_done_callback(lambda t: grant.revoke("lamp frames over"))
         try:
-            await asyncio.shield(task)
+            await shielded(task)
         except asyncio.CancelledError:
             task.add_done_callback(lambda t: t.cancelled() or t.exception())
             raise
@@ -2901,7 +2901,7 @@ class Sequencer:
             self._keep_sequence_cleanup(r, task)
             return
         try:
-            problems = await asyncio.shield(task)
+            problems = await shielded(task)
         except asyncio.CancelledError:
             self._keep_sequence_cleanup(r, task)
             raise

@@ -51,6 +51,7 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from robofast.cancel import shielded
 from robofast.timeline import Timeline
 
 log = logging.getLogger(__name__)
@@ -387,7 +388,7 @@ class DeviceOwner:
             task = asyncio.ensure_future(self._send(grant, op, member, args, timeout))
             task.add_done_callback(_swallow)
             try:
-                return await asyncio.shield(task)
+                return await shielded(task)
             except asyncio.CancelledError:
                 # The command runs on; the next one waits for it (module doc).
                 if not task.done():

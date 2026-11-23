@@ -134,7 +134,7 @@ from http import HTTPStatus
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from robofast.cancel import isolated, stop_task
+from robofast.cancel import isolated, shielded, stop_task
 from robofast.clock import NightRule, clock_from_config
 from robofast.config import load_device_config, require_keys
 from robofast.devices.kiwispec_aux import (
@@ -934,7 +934,7 @@ class KiwiSpec:
         log.info("%s (%s) waits for the spectrograph (held by %s)", what, client, self._held)
         try:
             async with asyncio.timeout(wait):
-                await asyncio.shield(fut)
+                await shielded(fut)
         except TimeoutError:
             if fut.done() and not fut.cancelled():
                 return  # handed over just as the wait ran out: it is ours
@@ -1130,7 +1130,7 @@ class KiwiSpec:
                 self._held = "restarting SI Image"
                 task = asyncio.get_running_loop().create_task(self._maybe_restart_camera())
                 task.add_done_callback(lambda _t: self._release())
-                await asyncio.shield(task)
+                await shielded(task)
             else:
                 self._release()
 

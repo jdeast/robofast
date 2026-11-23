@@ -305,15 +305,106 @@ async def test_shadow_closes_on_an_enclosure_fault(make_rig):
     assert "enclosure fault" in ev.detail["risk"]
 
 
-async def test_shadow_does_not_act_on_what_it_does_not_know(make_rig):
-    # No successful weather read (the feed is down): not an active risk, so
-    # a restarted supervisor in shadow leaves the other system's dome alone.
+# -- unknown weather is a risk too (JDE 2026-11-23, "yes, safety first") ----------------
+# The rig's stale_after is 0.6 s: the staleness bound and the startup grace.
+
+
+async def _shadow_open_and_safe(make_rig):
+    rig = make_rig(modes={"mode": "shadow"})
+    await rig.start(sequencer=False)
+    await asyncio.sleep(0.3)  # weather read: safe
+    rig.dome._move(0)  # the legacy system opens
+    await wait_until(lambda: rig.supervisor.critical(), 3, what="watch alarm")
+    return rig
+
+
+async def test_shadow_closes_on_a_stale_weather_feed(make_rig):
+    rig = await _shadow_open_and_safe(make_rig)
+    rig.weather.freeze()  # IsSafe still true, but the data stop updating
+    await wait_until(rig.dome_closed, 5, what="closed on stale weather")
+    (ev,) = rig.timeline.events("shadow_intervened")
+    assert ev.detail["risk"].startswith("weather unknown (weather data stale")
+    assert ev.detail["shutter"] == "OPEN"
+    assert any("intervened" in a for a in rig.supervisor.alarms)
+    # Fresh again: back to watching, and shadow never opens.
+    rig.weather.thaw()
+    await wait_until(
+        lambda: any(e.detail.get("after") for e in rig.timeline.events("watching")),
+        3,
+        what="watching again",
+    )
+    await asyncio.sleep(1.0)
+    assert rig.dome_closed() and not rig.timeline.events("open_commanded")
+
+
+async def test_shadow_closes_on_a_failed_weather_read(make_rig):
+    rig = await _shadow_open_and_safe(make_rig)
+    rig.sm.fail("weather bridge down")
+    await wait_until(rig.dome_closed, 5, what="closed on a failed read")
+    (ev,) = rig.timeline.events("shadow_intervened")
+    assert ev.detail["risk"].startswith("weather unknown (weather read failed")
+    assert "weather bridge down" in ev.detail["risk"]
+
+
+async def test_shadow_gives_a_restart_the_staleness_bound_to_read_then_closes(make_rig):
+    # No successful weather read (the feed is down) on a fresh start: inside
+    # the grace (stale_after from the start) shadow leaves the other
+    # system's open enclosure alone; still no read after it: unknown, close.
     rig = make_rig(modes={"mode": "shadow"})
     rig.sm.fail("weather bridge down")
     rig.dome._move(0)
     await rig.start(sequencer=False)
-    await asyncio.sleep(1.0)
+    await asyncio.sleep(0.4)  # < stale_after
     assert not rig.supervisor.safe and rig.dome_open()
+    assert not rig.timeline.events("shadow_intervened")
+    await wait_until(rig.dome_closed, 5, what="closed after the grace")
+    (ev,) = rig.timeline.events("shadow_intervened")
+    assert ev.detail["risk"].startswith("weather unknown (weather read failed")
+    (start,) = rig.timeline.events("supervisor_start")
+    assert ev.t - start.t >= 0.6
+
+
+async def test_shadow_does_not_close_when_the_first_read_lands_inside_the_grace(make_rig):
+    rig = make_rig(modes={"mode": "shadow"})
+    rig.sm.fail("weather bridge still starting")
+    rig.dome._move(0)
+    await rig.start(sequencer=False)
+    await asyncio.sleep(0.3)
+    rig.sm.unfail()  # the first successful read, inside the grace
+    await asyncio.sleep(1.5)
+    assert rig.supervisor.safe and rig.dome_open()
+    assert not rig.timeline.events("shadow_intervened")
+    assert not rig.timeline.events("close_commanded")
+
+
+async def test_shadow_acts_only_on_the_enforced_verdict(make_rig):
+    # Inputs under validation (a source with enforce_rain false, an advisory
+    # source failing) never move the bridge's IsSafe nor its freshness
+    # (test_weather_redis.py: test_rain_is_shadow_only_by_default,
+    # test_missing_rain_data_only_matters_when_enforced). So an enforced
+    # verdict that stays safe and fresh, however long, never makes shadow
+    # close -- well past the grace and many staleness bounds.
+    rig = await _shadow_open_and_safe(make_rig)
+    await asyncio.sleep(3.0)  # 5 x stale_after
+    assert rig.supervisor.safe and rig.dome_open()
+    assert rig.supervisor.active_risk() is None
+    assert not rig.timeline.events("shadow_intervened")
+    assert not rig.timeline.events("close_commanded")
+
+
+async def test_shadow_still_ignores_an_unreadable_fault_channel(make_rig):
+    # Out of scope of the 2026-11-23 rule: an unreadable fault channel is
+    # not a risk (only a fault read from it is).
+    rig = make_rig(modes={"mode": "shadow"}, safety=dict(fault_action="Faults"))
+
+    def action(name, parameters=""):
+        raise RuntimeError("fault channel down")
+
+    rig.dome.Action = action
+    await rig.start(sequencer=False)
+    rig.dome._move(0)
+    await asyncio.sleep(1.5)
+    assert rig.supervisor.safe and rig.dome_open()
     assert not rig.timeline.events("shadow_intervened")
 
 

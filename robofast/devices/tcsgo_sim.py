@@ -18,7 +18,8 @@ The mount (equatorial, HA/Dec axes) follows the manual's model:
   "target captured"), 3 chase (like slewing, but stays in chase);
 * ``#13`` stops (hold); ``#50`` starts tracking at the current position;
   ``#7`` offsets the target (east = +RA, divided by cos Dec), and in follow
-  mode the mount does not move until a ``#12`` (manual); ``#61`` pulse guides
+  mode the mount does not move until a ``#12`` (manual; robofast never sends
+  ``#7``, which FLWO found broken on the real TCS); ``#61`` pulse guides
   at ``guide_rate`` arcsec/s, setting the "ASCOM is pulseguiding" bit;
 * ``#58`` parks at (``park_ha``, ``park_dec``): a slew, then hold; ``#59``
   clears the internal parked flag. (The TCS reports no parked bit in

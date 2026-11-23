@@ -47,6 +47,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from robofast.allsky.config import bridge_sources as allsky_sources
 from robofast.plugins import load_config_plugins
 from robofast.sun import now_utc
 from robofast.weather_eval import (
@@ -99,6 +100,7 @@ _TOP_KEYS = {
     "server_stale_after",
     "sources",
     "conditions",
+    "allsky",
 }
 
 
@@ -164,8 +166,15 @@ def parse_config(raw: dict[str, Any]) -> BridgeConfig:
         for s in raw["sources"].values()
     ):
         raise ValueError("site.elevation is required by the sun source (its refraction)")
+    # The all-sky cameras the site lists: one shadow source each, plus the
+    # pooled map (robofast.allsky.config; none listed -> none).
+    every = dict(raw["sources"])
+    for name, spec in allsky_sources(raw.get("allsky")).items():
+        if name in every:
+            raise ValueError(f"source {name}: also made by the allsky section; rename one")
+        every[name] = spec
     sources: list[tuple[SourceConfig, SourceSpec]] = []
-    for name, spec in raw["sources"].items():
+    for name, spec in every.items():
         spec = dict(spec)
         if not spec.pop("enabled", True):
             continue

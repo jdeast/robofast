@@ -247,6 +247,11 @@ class SimulatedNight:
     """The services and the night (module doc). ``out`` receives every
     config, log, data file and record."""
 
+    #: Every frame a test frame (IMAGETYP test, ``.test`` in the name;
+    #: docs/data.md "Test frames"). The rehearsal, which drives real
+    #: hardware, sets it; the all-simulated night writes ordinary frames.
+    TEST_FRAMES = False
+
     def __init__(self, out: Path, settings: NightSettings | None = None) -> None:
         self.out = Path(out)
         self.out.mkdir(parents=True, exist_ok=True)
@@ -482,6 +487,8 @@ class SimulatedNight:
             clock={"file": str(self.clock_file)},
             raw_fits={"dir": str(self.out / "kiwispec-pc"), "wait": 5},
         )
+        if self.TEST_FRAMES:
+            base["test_frames"] = True
         path = self.out / "kiwispec.json"
         path.write_text(json.dumps(base, indent=1))
         self.kiwispec = Service(
@@ -639,6 +646,8 @@ class SimulatedNight:
             "spectrograph_abort_wait": 5.0,
         }
         cfg["images"].update(data_root=str(self.out / "data"), queue_size=4, imagebytes=False)
+        if self.TEST_FRAMES:
+            cfg["images"]["test_frames"] = True
         cfg["spectrograph"] = {
             "type": "kiwispec",
             "url": self.kiwispec_url,

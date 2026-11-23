@@ -4312,6 +4312,8 @@ class Sequencer:
         record: dict[str, Any] = {
             "version": 1,
             "kind": "science",
+            # A test frame (rehearsal / dry run): not data (docs/data.md).
+            **({"test": True} if result.get("test") else {}),
             "file": result.get("file"),
             "object": obs.object or obs.name,
             "observation": obs.name,
@@ -4420,6 +4422,8 @@ class Sequencer:
             record = {
                 "version": 1,
                 "kind": result.get("kind"),
+                # A test frame (rehearsal / dry run): not data (docs/data.md).
+                **({"test": True} if result.get("test") else {}),
                 "file": result.get("file"),
                 "object": result.get("object"),
                 "observation": obs.name,

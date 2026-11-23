@@ -57,6 +57,18 @@ All bodies are JSON; errors are ``{"error": ...}`` with 400 (bad request),
   again at once (its CCD cooler stops while it is down); also done by the
   service itself after ``camera_restart_after`` camera failures in a row.
 
+Test frames
+-----------
+A rehearsal or dry run (not a science night) runs the service with
+``test_frames: true`` in its config, or ``--test-frames`` on the command
+line (``GET /status`` reports ``test_frames``). Every frame is then a test
+frame: its raw file is named ``<night>.<object>.test.<index>.fits`` (the
+name the spectrograph PC saves under, so the legacy extraction, which
+skips names containing ``test``, never touches it), the header says
+``IMAGETYP = 'test'`` with the real kind in ``TESTTYP``, and the result
+says ``"test": true`` (docs/data.md, "Test frames"; JDE 2026-11-19: dry-run
+frames with real object names and IMAGETYP science were extracted as data).
+
 One job at a time. ``configure``, ``expose``, ``calibrate`` and
 ``backlight`` take an optional ``"wait": S`` and ``"client": name``: while
 the spectrograph is busy, the request waits in a first-come, first-served
@@ -178,6 +190,8 @@ FLUX_SOURCES = ("fau", "expmeter", "none")
 LAMP_KINDS = ("thar", "fiberflat")
 #: The iodine stage's named positions (the server's ``[I2POSITIONS]`` names).
 STAGE_NAMES = ("in", "flat", "out")
+#: ``IMAGETYP`` of a test frame (module doc, "Test frames").
+TEST_IMAGETYP = "test"
 #: Legacy object names in file names (``n20261031.<object>.0001.fits``).
 DEFAULT_OBJECT = {
     "thar": "ThAr",
@@ -402,6 +416,9 @@ class KiwiSpecConfig:
     #: chiller at 21 C the CCD holds about -80.5 at full cooling (docs/kiwispec.md).
     ccd_setpoint: float = -80.0
     ccd_operational_temp: float = -75.0
+    #: Every frame is a test frame (module doc, "Test frames"): a rehearsal
+    #: or dry run. ``--test-frames`` on the command line sets it too.
+    test_frames: bool = False
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> KiwiSpecConfig:
@@ -424,6 +441,8 @@ class KiwiSpecConfig:
             raise ValueError("slit_flat_led must be true or false")
         if not isinstance(d.get("backlight", True), bool):
             raise ValueError("backlight must be true or false")
+        if not isinstance(d.get("test_frames", False), bool):
+            raise ValueError("test_frames must be true or false")
         if d.get("flux_source", "fau") not in FLUX_SOURCES:
             raise ValueError(f"flux_source: one of {list(FLUX_SOURCES)}, not {d['flux_source']!r}")
         if d.get("pressure_alarm", "alarm") not in ("alarm", "warning"):
@@ -701,6 +720,7 @@ class KiwiSpec:
             "stage_request": self.last_stage_request,
             "stage_positions_live": dict(self.stage_learned),
             "frame_kinds": self.config.frame_kinds(),
+            "test_frames": self.config.test_frames,
             "flux_source": self.config.flux_source,
             "flux_reports": self.flux.status(),
             "camera_restarts": self.camera_restarts[-5:],
@@ -1240,7 +1260,8 @@ class KiwiSpec:
         index = await self.spec.get_index()
         # One night label for the file name and its directory (module doc).
         night_label = f.night or night(self.clock(), self.night_rule)
-        file_name = f"{night_label}.{f.object}.{index:04d}.fits"
+        test = ".test" if c.test_frames else ""
+        file_name = f"{night_label}.{f.object}{test}.{index:04d}.fits"
         await self.spec.call("set_file_name", file_name)
 
         source = c.flux_source if uses_meter else "none"
@@ -1360,6 +1381,7 @@ class KiwiSpec:
         result: dict[str, Any] = {
             "file": file_name,
             "kind": f.kind,
+            "test": c.test_frames,
             "object": f.object,
             "telescopes": f.telescopes,
             "dark": dark,
@@ -1468,7 +1490,11 @@ class KiwiSpec:
             return v.replace("'", "") if isinstance(v, str) else v
 
         h: dict[str, Any] = {
-            "IMAGETYP": [r["kind"], "Type of image"],
+            "IMAGETYP": (
+                [TEST_IMAGETYP, "Test frame (rehearsal / dry run): not data"]
+                if r.get("test")
+                else [r["kind"], "Type of image"]
+            ),
             "OBJECT": [r["object"], "Object name"],
             "EXPTERM": [r["ended_by"], "What ended the exposure (time/counts/stop)"],
             "FLUXSRC": [r["flux_source"], "Flux record for FLUXMID (fau/expmeter/none)"],
@@ -1494,6 +1520,8 @@ class KiwiSpec:
             "FIBFEED": [",".join(r["telescopes"]) or "NONE", "Telescopes feeding the fiber"],
             "SWCREATE": ["robofast kiwispec_service", "Software that drove the exposure"],
         }
+        if r.get("test"):
+            h["TESTTYP"] = [r["kind"], "Frame type had this not been a test"]
         h["I2TEMPA"] = [
             "UNKNOWN" if r.get("heater_temp") is None else r["heater_temp"],
             "Iodine Cell Actual Temperature (C)",
@@ -1828,6 +1856,13 @@ def main(argv: list[str] | None = None) -> None:
         help="allow a real spectrograph PC (the config must also say allow_hardware)",
     )
     ap.add_argument("--listen", help="host:port, overriding the config")
+    ap.add_argument(
+        "--test-frames",
+        action="store_true",
+        help=(
+            "every frame is a test frame (a rehearsal or dry run): IMAGETYP test, .test in the name"
+        ),
+    )
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args(argv)
     logging.basicConfig(
@@ -1836,6 +1871,10 @@ def main(argv: list[str] | None = None) -> None:
     config = load_device_config(args.config, KiwiSpecConfig.from_dict)
     if args.listen:
         config.listen = args.listen
+    if args.test_frames:
+        config.test_frames = True
+    if config.test_frames:
+        log.warning("test frames: every frame is IMAGETYP test, with .test in its name")
 
     async def run() -> None:
         try:

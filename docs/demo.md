@@ -263,7 +263,10 @@ python -m robofast.testing.rehearsal --out /tmp/rehearsal \
   sequencer's spectra go to it, so the spectra are taken by the real
   spectrograph (the enclosure closed: dark spectra, as intended). Before
   anything starts the rehearsal sends it `GET /status` and refuses if it
-  does not answer; it logs that KiwiSpec is EXTERNAL. Nothing in the
+  does not answer, or if it does not report `test_frames` (start it with
+  `--test-frames`: every rehearsal frame, imager or spectrograph, is a test
+  frame, `IMAGETYP = 'test'` and `.test` in the file name; docs/data.md
+  "Test frames"); it logs that KiwiSpec is EXTERNAL. Nothing in the
   rehearsal sends it `/restart_camera` or `/backlight` (the guiders'
   backlight stays simulated).
 * **`--catalog-guide`** (opt-in): the simulated FAU guide cameras show the

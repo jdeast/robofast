@@ -157,9 +157,15 @@ systemd user unit; it never writes to Redis or anything at the site.
   but they take no part in the combiner: not their state, reasons or rain.
   A shadow source cannot be required, cannot feed ObservingConditions, and
   does not count as the required source a config needs. The `allsky` type
-  reads the all-sky cloud map's `latest.json` (`path`; docs/allsky.md) and
-  gives `clear`, `zenith60_clear`, `coverage`, `trend_per_hour` and
-  `frame_age`.
+  reads the all-sky cloud map's `latest.json` (`path`; with `camera`, that
+  camera's own map, else the pooled one; docs/allsky.md) and gives
+  `clear`, `zenith60_clear`, `coverage`, `trend_per_hour` and `frame_age`.
+- **All-sky cameras** are listed in the config's top-level `allsky`
+  section (`cameras`, the watcher's settings, and the sources'
+  `stale_after` and `limits`; docs/allsky.md). Each listed camera becomes a
+  shadow source `allsky_<camera>`, and with two or more the pooled map is
+  the shadow source `allsky`. No camera listed, no all-sky source. A
+  source of the same name under `sources` is an error.
 - **Reasons** (which limit tripped, which source is stale, what would close
   if rain were enforced, ...) are in the status JSON: `GET /weather/status`
   on the Alpaca server, and `Action("WeatherStatus")` on the SafetyMonitor.

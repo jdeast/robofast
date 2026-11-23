@@ -79,8 +79,10 @@ PAGE_CONDITIONS = {
 
 
 def pages_only(data: dict) -> dict:
-    """The shipped config with only the SAO pages, required and enforcing rain."""
+    """The shipped config with only the SAO pages, required and enforcing rain
+    (and no all-sky cameras: test_weather_allsky_shadow adds its own)."""
     data["sources"]["redis"]["enabled"] = False
+    data.pop("allsky", None)
     for name in ("ridge", "cloud"):
         data["sources"][name]["required"] = True
         data["sources"][name]["enforce_rain"] = True
@@ -628,8 +630,12 @@ async def test_bridge_error_fails_closed(make_bridge):
 
 def test_shipped_config_parses():
     cfg = parse_config(load_config(CONFIG))
-    # MEarth disabled
-    assert [s.name for s, _ in cfg.sources] == ["redis", "ridge", "cloud", "sun"]
+    # MEarth disabled; every all-sky source (one per camera, and the pooled
+    # one) is shadow-only
+    names = [s.name for s, _ in cfg.sources]
+    assert [n for n in names if not n.startswith("allsky")] == ["redis", "ridge", "cloud", "sun"]
+    allsky = [spec for s, spec in cfg.sources if s.name.startswith("allsky")]
+    assert allsky and all(spec.shadow and not spec.required for spec in allsky)
     assert [s.name for s, spec in cfg.sources if spec.required] == ["redis", "sun"]
     assert cfg.poll_interval == 60
     assert cfg.rain_hold == 3600

@@ -160,6 +160,37 @@ async def test_cancelled_caller_does_not_reorder_commands():
     owner.close()
 
 
+async def test_a_command_that_fails_after_its_caller_gave_up_logs_no_traceback():
+    """Night 2026-11-22/23 (night1122): a caller gave up on t2's Tracking
+    read, the read then failed with a PWI ReadTimeout, and asyncio.shield
+    (Python 3.12+) logged "DriverException exception in shielded future"
+    with a traceback although the owner had retrieved and recorded it. The
+    failure is in the timeline; the loop's exception handler hears nothing."""
+    tl = Timeline()
+    release = asyncio.Event()
+
+    class Failing:
+        async def call(self, member: str, *args, timeout: float | None = None):
+            await release.wait()
+            raise RuntimeError("ReadTimeout")
+
+    owner = DeviceOwner("failing", lambda: Failing(), tl)
+    g = owner.grant("x")
+    reported: list[dict] = []
+    asyncio.get_running_loop().set_exception_handler(lambda _loop, ctx: reported.append(ctx))
+    t = asyncio.create_task(g.call("work"))
+    await asyncio.sleep(0.01)
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t
+    release.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert tl.commands(outcome="error")  # recorded where it belongs
+    assert reported == []
+    owner.close()
+
+
 async def test_not_connected_reconnects_and_retries_once():
     """Night 2026-11-09/10: T2's PWI server, restarted mid-night, starts with
     Connected false and answers NotConnected (0x407); the owner connects it

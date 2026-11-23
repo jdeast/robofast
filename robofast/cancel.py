@@ -36,6 +36,23 @@ def _retrieve(task: asyncio.Future[Any]) -> None:
         task.exception()
 
 
+async def shielded[T](fut: asyncio.Future[T]) -> T:
+    """Wait for ``fut`` without cancelling it: :func:`asyncio.shield` without
+    its log.
+
+    The caller's cancellation (or an ``asyncio.timeout`` around this) reaches
+    the caller only; ``fut`` runs on. The result, exception or cancellation
+    is ``fut``'s own. Unlike ``asyncio.shield`` (Python 3.12+), an exception
+    ``fut`` ends with after the caller has gone is not logged as "exception
+    in shielded future" with a traceback even when a done callback already
+    retrieved it (night 2026-11-22: a PWI ReadTimeout the timeline had
+    recorded came out as an ERROR traceback).
+    """
+    if not fut.done():
+        await asyncio.wait([fut])
+    return fut.result()
+
+
 async def isolated[T](aw: Awaitable[T]) -> T:
     """Await ``aw`` (an httpx request) in its own task (module doc).
 
@@ -44,7 +61,7 @@ async def isolated[T](aw: Awaitable[T]) -> T:
     """
     task = asyncio.ensure_future(aw)
     try:
-        return await asyncio.shield(task)
+        return await shielded(task)
     except asyncio.CancelledError:
         task.cancel()
         task.add_done_callback(_retrieve)

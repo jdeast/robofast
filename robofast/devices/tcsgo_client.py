@@ -59,7 +59,7 @@ import time
 from dataclasses import dataclass, fields
 
 from robofast import hwgate
-from robofast.cancel import stop_task
+from robofast.cancel import shielded, stop_task
 from robofast.owner import DeviceError, DeviceTimeout
 
 log = logging.getLogger(__name__)
@@ -565,7 +565,7 @@ class TCSClient:
         self._queue.put_nowait(job)
         try:
             async with asyncio.timeout(timeout):
-                return await asyncio.shield(fut)
+                return await shielded(fut)
         except TimeoutError:
             fut.cancel()  # skipped if not yet started; runs to its own bound if it has
             raise TCSTimeout(
@@ -615,7 +615,7 @@ class TCSClient:
             task = asyncio.ensure_future(self._run(job.number, job.args))
             self._inflight = (job.number, task)
             try:
-                result = await asyncio.shield(task)
+                result = await shielded(task)
             except asyncio.CancelledError:
                 me = asyncio.current_task()
                 if not task.cancelled() or (me is not None and me.cancelling()):

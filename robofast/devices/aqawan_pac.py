@@ -70,7 +70,7 @@ import time
 from dataclasses import dataclass, field
 
 from robofast import hwgate
-from robofast.cancel import stop_task
+from robofast.cancel import shielded, stop_task
 from robofast.owner import DeviceError, DeviceTimeout
 
 log = logging.getLogger(__name__)
@@ -470,7 +470,7 @@ class PACClient:
                     inner = asyncio.ensure_future(self._exchange(command))
                     self._inflight = (command, inner)
                     try:
-                        return await asyncio.shield(inner)
+                        return await shielded(inner)
                     except asyncio.CancelledError:
                         inner.cancel()
                         me = asyncio.current_task()

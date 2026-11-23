@@ -8,7 +8,7 @@ import asyncio
 
 import pytest
 
-from robofast.cancel import isolated, stop_task
+from robofast.cancel import isolated, shielded, stop_task
 from robofast.lease_client import RemoteLease, RemoteSupervisor
 
 
@@ -113,3 +113,44 @@ async def test_remote_lease_workers_end_when_their_cancels_are_lost():
     assert done, "aclose() hangs on lease workers whose cancels were lost"
     assert lost_get and lost_post
     assert all(w.done() for w in workers), "a lease worker outlived aclose()"
+
+
+async def test_shielded_is_shield_without_the_log():
+    """shielded(fut): the result or exception is fut's own; the caller's
+    cancel (or a timeout) leaves fut running; and a failure after the caller
+    has gone reaches no exception handler (night1122, see test_owner)."""
+    loop = asyncio.get_running_loop()
+    reported: list[dict] = []
+    loop.set_exception_handler(lambda _loop, ctx: reported.append(ctx))
+
+    async def answer(v, delay=0.01):
+        await asyncio.sleep(delay)
+        if isinstance(v, BaseException):
+            raise v
+        return v
+
+    assert await shielded(asyncio.ensure_future(answer(7))) == 7
+    with pytest.raises(ValueError, match="no"):
+        await shielded(asyncio.ensure_future(answer(ValueError("no"))))
+    done = asyncio.ensure_future(answer(3, 0))
+    await done
+    assert await shielded(done) == 3
+
+    # A timeout around it: the caller times out, the future runs on.
+    slow = asyncio.ensure_future(answer(ValueError("late"), 0.05))
+    slow.add_done_callback(lambda t: t.exception())
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.01):
+            await shielded(slow)
+    assert not slow.done()
+    await asyncio.sleep(0.08)
+    assert slow.done() and isinstance(slow.exception(), ValueError)
+
+    # The future's own cancellation is the caller's CancelledError.
+    gone = asyncio.ensure_future(answer(1, 1))
+    waiter = asyncio.ensure_future(shielded(gone))
+    await asyncio.sleep(0)
+    gone.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert reported == []

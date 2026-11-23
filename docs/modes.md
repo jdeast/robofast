@@ -42,7 +42,8 @@ modes exist and what each means, so "robotic at MINERVA, attended at the
   hardware heartbeat keeps being pinged (a ping moves nothing; stopping it
   would make the hardware close). An enclosure found open in shadow is a
   critical alarm, and robofast leaves it to whoever opened it -- **unless
-  there is an active safety risk** (below), which it closes at once. The weather bridge's own `--shadow` flag (the bridge
+  there is an active safety risk** (below; unknown weather is one), which
+  it closes at once. The weather bridge's own `--shadow` flag (the bridge
   alone, serving nothing; docs/weather_bridge.md) is a different thing: to
   shadow with all of robofast, serve the bridge and put the enclosure in
   this mode.
@@ -61,13 +62,24 @@ An active condition is:
 
 * the weather verdict unsafe: the safety monitor's last successful
   `IsSafe` read said false (a read failure afterwards keeps it);
+* the weather verdict **unknown** (JDE 2026-11-23, "yes, safety first"):
+  no weather read has succeeded for `safety.stale_after` (reads failing,
+  the bridge unreachable, a timeout), or the feed's data are older than
+  `stale_after`; the risk reads `weather unknown (...)`. A single failed
+  read after a good one does nothing: shadow closes only once
+  `stale_after` has passed since the last good read with none since;
 * an enclosure fault read from the fault channel (`safety.fault_action`).
 
-Not knowing is not an active risk: no weather read yet, a weather feed
-whose reads fail or whose data are stale, an unreadable fault channel, an
-expired operator duty or the reopen hold do **not** make shadow close, so a
-supervisor restarted in shadow does not close what another system has
-open just because it has not read anything yet.
+**Startup grace.** A supervisor that has just started has not read the
+weather yet. It gets `stale_after` (the same bound as a stale feed) from
+its start to make its first successful read (the same rule, counted from
+the start); inside that grace "no read yet", and any failed reads, do not
+make shadow close, so a restart does not close what another system has
+open merely because it has not read anything yet. Still no successful read
+after the grace is unknown weather, and shadow closes.
+
+Not risks: an unreadable fault channel, an expired operator duty and the
+reopen hold do **not** make shadow close.
 
 **Only enforced conditions count.** The verdict is the weather bridge's
 `IsSafe`, which only the sources and limits it *enforces* move: a sensor
@@ -94,7 +106,7 @@ Every mode is a `ModePolicy`:
 | `attended_only` | bool | no lease unless an operator is on duty |
 | `duty_expiry` | `close`, `alarm` | an expired duty closes after `duty_grace` (`close`), or only raises the critical alarm (`alarm`) |
 | `duty_ttl`, `duty_grace` | seconds or null | null: the `safety` entry's |
-| `intervene` | bool | a `watch` mode closes an open enclosure on an active safety risk (above); default true for `shadow`, false otherwise |
+| `intervene` | bool | a `watch` mode closes an open enclosure on an active safety risk, unknown weather included (above); default true for `shadow`, false otherwise |
 | `fault_auto_clear` | bool or null | the supervisor's automatic fault clearing (docs/aqawan.md); null: the `safety` entry's; true needs `safety.fault_action` |
 | `description` | text | shown on the console |
 

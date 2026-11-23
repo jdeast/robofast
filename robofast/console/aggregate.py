@@ -150,6 +150,11 @@ class ConsoleEnclosure:
     emergency_fallback: str = "none"
     #: The enclosure parks its telescopes before closing (a roll-off roof).
     park_before_close: bool = False
+    #: The park-before-close interlock (``safety.require_park_before_close``:
+    #: a roof that can hit an unparked telescope). The console then never
+    #: closes the dome directly (JDE 2026-11-23): that channel cannot see
+    #: whether the telescopes are parked.
+    park_interlock: bool = False
     #: Where the sequencer saves frames (``images.data_root`` and ``site``;
     #: docs/data.md), and where the spectrograph's raw frames land
     #: (``spectrograph_frames`` in the console's entry): the image viewer.
@@ -249,6 +254,13 @@ class ConsoleEnclosure:
                 )
             if fallback == "dome" and not isinstance(dome, str):
                 raise ValueError(f"enclosure {name}: emergency_close: no devices.dome to close")
+        interlock = bool((config.get("safety") or {}).get("require_park_before_close"))
+        if interlock and fallback == "dome":
+            raise ValueError(
+                f"enclosure {name}: emergency_close.fallback 'dome' closes the dome without"
+                " checking that the telescopes are parked, which the park-before-close"
+                " interlock (safety.require_park_before_close) forbids: set fallback 'none'"
+            )
         return cls(
             name=name,
             supervisor_url=(
@@ -269,6 +281,7 @@ class ConsoleEnclosure:
             emergency_token_file=token_file,
             emergency_fallback=fallback,
             park_before_close=bool((config.get("safety") or {}).get("park_before_close")),
+            park_interlock=interlock,
             images_root=None
             if not images.get("data_root")
             else _resolve(images["data_root"], cbase),
@@ -373,6 +386,7 @@ class Aggregator:
         enclosure["emergency"] = {
             "fallback": enc.emergency_fallback,
             "park_before_close": enc.park_before_close,
+            "park_interlock": enc.park_interlock,
         }
         tels = {}
         for t in enc.telescopes:

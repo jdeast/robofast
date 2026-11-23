@@ -72,9 +72,10 @@ is random per process start, so after a restart every old token is unknown
   an operator who has made the telescope safe; logged.
 * ``POST /close`` ``{"operator", "reason", "emergency"?}`` -- an operator
   asks for the enclosure to close: the current lease is revoked (logged).
-  ``"emergency": true`` (the console's EMERGENCY CLOSE) overrides the
-  park-before-close interlock (``require_park_before_close``); otherwise it
-  is a routine close. Answers ``{"revoked": bool}``. There is no endpoint
+  ``"emergency": true`` (the console's EMERGENCY CLOSE) makes it an
+  emergency close; like every close it still waits for the park-before-close
+  interlock (``require_park_before_close``) where that is on. Answers
+  ``{"revoked": bool}``. There is no endpoint
   that opens.
 * ``GET /timeline?n=N`` -- the last ``N`` (at most 500) timeline entries,
   newest last, each with its wall-clock ``time``.

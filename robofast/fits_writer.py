@@ -27,13 +27,20 @@ temporary name removed. A reader never sees a partial frame, and nothing
 
 Times are UTC from the camera: ``DATE-OBS`` is the camera's
 ``LastExposureStartTime`` (ASCOM: UTC), written with milliseconds, and
-``EXPTIME`` its ``LastExposureDuration``. Nothing is ever derived from
-local time plus an offset (the legacy ``fix_fits.py`` assumed UTC = local +
-7 h and rewrote raw files in place; neither happens here). If the camera
-does not report a start time, or reports one more than
-:data:`MAX_CLOCK_SKEW` from the host's (NTP) time of ``StartExposure`` (a
-PC clock that drifted, or a driver reporting local time), the host's time
-is used and ``TIMESRC`` says so; ``CLKSKEW`` still records the camera's.
+``EXPTIME`` its ``LastExposureDuration``. No time zone is ever assumed (the
+legacy ``fix_fits.py`` assumed UTC = local + 7 h and rewrote raw files in
+place; neither happens here). If the camera does not report a start time,
+or reports one more than :data:`MAX_CLOCK_SKEW` from the host's (NTP) time
+of ``StartExposure`` (``DATE-CMD``; a PC clock that drifted), the host's
+time is used and ``TIMESRC`` says so; ``CLKSKEW`` still records the
+camera's. One exception, measured per frame and never assumed: a driver
+that reports *local* time labelled UTC (night1121/1122 T1 Andor, "Ascom
+Driver for Andor CCD Cameras" 6.0: ``CLKSKEW`` -25200.5 s on every frame,
+JDE 2026-11-23). When the skew is a nonzero whole number of 15 minutes
+within -14 h .. +14 h plus a remainder within :data:`MAX_CLOCK_SKEW`
+(:func:`local_time_offset`), that whole offset is removed, the corrected
+camera time is ``DATE-OBS``, ``TIMESRC`` is ``camera-local`` and
+``TZCORR`` the offset removed in hours; ``CLKSKEW`` stays the raw value.
 
 Registry values (:mod:`robofast.registry`) go in under their own
 keywords, units in the comments. A stale value is written *undefined*, with
@@ -65,8 +72,18 @@ log = logging.getLogger(__name__)
 
 #: [s] Largest believable ``LastExposureStartTime - DATE-CMD``. Beyond it
 #: the camera's clock is wrong (MINERVA 2026-11-05: an Andor driver on a
-#: PC 30 s fast reported local time, 7 h off) and the host's time is used.
+#: PC 30 s fast reported local time, 7 h off) and the host's time is used,
+#: unless the skew is a whole time-zone offset (:func:`local_time_offset`).
 MAX_CLOCK_SKEW = 5.0
+
+#: [s] Time zones are whole multiples of 15 minutes (30/45-minute zones
+#: included) between UTC-14 h and UTC+14 h (:func:`local_time_offset`).
+_TZ_STEP = 900.0
+_TZ_MAX = 14 * 3600.0
+
+#: Telescopes whose camera has been logged as reporting local time (once
+#: per camera per process, not per frame).
+_LOCAL_TIME_LOGGED: set[str] = set()
 
 #: Order of the registry scopes in a header (then the per-telescope ones).
 _SCOPE_ORDER = ("site", "software", "enclosure", "weather", "sky")
@@ -155,6 +172,38 @@ def parse_camera_time(text: Any) -> datetime | None:
             return None
         dt += timedelta(microseconds=int((frac + "000000")[:6]))
     return dt.replace(tzinfo=UTC)
+
+
+def local_time_offset(skew: float | None) -> float | None:
+    """[s] The time-zone offset of a camera driver that reports local time
+    labelled UTC, from ``skew`` (camera start time minus ``DATE-CMD``); None
+    if ``skew`` does not look like one.
+
+    It does when ``skew`` is ``k * 15 min + r`` with ``k`` nonzero, ``|k *
+    15 min| <= 14 h`` (every real zone, either sign, 30- and 45-minute zones
+    included) and ``|r| <= MAX_CLOCK_SKEW`` (the bound a UTC camera must
+    meet: shutter latency, or whole-second reporting). A camera already
+    within ``MAX_CLOCK_SKEW`` (``k == 0``) is never corrected; any other
+    skew (e.g. 3000 s) is a wrong clock and the host's time is used, as
+    before. Cause: night1121/1122 T1 Andor ("Ascom Driver for Andor CCD
+    Cameras" 6.0, SDK2) reports MST as UTC, ``CLKSKEW`` -25200.5 s, so
+    ``DATE-OBS`` fell back to the host's command time, ~0.5 s before the
+    shutter (JDE 2026-11-23).
+
+    The ambiguity is harmless: a camera clock genuinely off by exactly N
+    hours (plus a few seconds) is indistinguishable from a local-time
+    driver, but either way the corrected time agrees with the host's NTP
+    time within ``MAX_CLOCK_SKEW`` -- the same check a UTC camera passes --
+    and is a better start time than the command time. ``CLKSKEW`` keeps the
+    raw value, so nothing is hidden.
+    """
+    if skew is None or not math.isfinite(skew):
+        return None
+    k = round(skew / _TZ_STEP)
+    offset = k * _TZ_STEP
+    if k == 0 or abs(offset) > _TZ_MAX or abs(skew - offset) > MAX_CLOCK_SKEW:
+        return None
+    return offset
 
 
 def iso_ms(dt: datetime) -> str:
@@ -277,8 +326,21 @@ def build_header(
     # Times: the camera's, in UTC.
     cam_start = parse_camera_time(get(cam + "last_start", end))
     skew = None if cam_start is None else (cam_start - info.host_start).total_seconds()
+    tz_offset = local_time_offset(skew)
     if cam_start is not None and skew is not None and abs(skew) <= MAX_CLOCK_SKEW:
         date_obs, timesrc = cam_start, "camera"
+    elif cam_start is not None and tz_offset is not None:
+        # A driver reporting local time labelled UTC (local_time_offset).
+        date_obs, timesrc = cam_start - timedelta(seconds=tz_offset), "camera-local"
+        if tel not in _LOCAL_TIME_LOGGED:
+            _LOCAL_TIME_LOGGED.add(tel)
+            log.warning(
+                "%s camera reports local time as UTC (clock skew %.3f s): "
+                "removing %+.2f h from its start times (TIMESRC camera-local)",
+                tel,
+                skew,
+                tz_offset / 3600.0,
+            )
     else:
         date_obs, timesrc = info.host_start.astimezone(UTC), "host"
     exptime = get(cam + "last_duration", end)
@@ -291,7 +353,14 @@ def build_header(
     _card(h, "DATE-OBS", iso_ms(date_obs), "UTC start of exposure")
     _card(h, "DATE-END", iso_ms(date_obs + timedelta(seconds=exptime)), "UTC end of exposure")
     _card(h, "TIMESYS", "UTC", "Time scale of DATE keywords")
-    _card(h, "TIMESRC", timesrc, "DATE-OBS from the camera, or host clock")
+    _card(h, "TIMESRC", timesrc, "DATE-OBS from: camera, camera-local, host")
+    if timesrc == "camera-local" and tz_offset is not None:
+        _card(
+            h,
+            "TZCORR",
+            round(tz_offset / 3600.0, 4),
+            "[h] offset removed: driver reports local time",
+        )
     _card(h, "MJD-OBS", round(float(t_obs.mjd), 8), "MJD (UTC) at start of exposure")
     _card(h, "JD", round(float(t_obs.jd), 8), "JD (UTC) at start of exposure")
     _card(h, "DATE-CMD", iso_ms(info.host_start), "Host UTC when StartExposure was sent")

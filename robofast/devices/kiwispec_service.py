@@ -21,7 +21,11 @@ All bodies are JSON; errors are ``{"error": ...}`` with 400 (bad request),
   "heater": bool, "heater_setpoint": C}`` (every key optional) -- waits
   (bounded) for the iodine stage to arrive and the slit-flat LED to warm up.
 * ``POST /expose`` ``{"kind", "exptime", "object"?, "telescopes"?,
-  "target_counts"?, "iodine"?}`` -- start one frame; 202 with the job. Kinds:
+  "target_counts"?, "iodine"?, "targets"?}`` -- start one frame; 202 with
+  the job. ``targets`` (science only, optional) is the target's catalogue
+  astrometry per feeding telescope, ``{telescope: {"ra", "dec", "pm_ra"?,
+  "pm_dec"?, "epoch"?, "parallax"?, "rv"?}}`` (module doc, "The header").
+  Kinds:
   ``science`` (``telescopes`` -- the ones feeding the fiber -- required;
   ``iodine`` default from config; terminated on the flux record
   (``flux_source``: the FAU guide frames, or the legacy exposure meter)
@@ -68,6 +72,31 @@ skips names containing ``test``, never touches it), the header says
 ``IMAGETYP = 'test'`` with the real kind in ``TESTTYP``, and the result
 says ``"test": true`` (docs/data.md, "Test frames"; JDE 2026-11-19: dry-run
 frames with real object names and IMAGETYP science were extracted as data).
+
+The header
+----------
+Besides the frame's own keywords (``IMAGETYP``, ``OBJECT``, the iodine
+cell and stage, the flux record), every frame's header says:
+
+* ``SPECPRES`` -- the spectrograph's vacuum pressure (mbar) at the start of
+  the exposure: the status loop's last reading if it is at most
+  ``max(2 * status_interval, 30)`` s old, else one read just before the
+  shutter opens. A failed read is ``UNKNOWN`` (with a warning), never left
+  out and never -999 (legacy's placeholder).
+* ``SIMULATE`` -- ``T`` when the spectrograph PC is a simulator (no light:
+  :mod:`robofast.devices.kiwispec_sim`), else ``F``. With the hardware gate
+  closed only a verified simulator can be reached, so it is ``T``; with it
+  open, ``T`` only if :func:`robofast.hwgate.is_simulator` verifies the
+  camera or spectrograph server endpoint. The simulator also stamps
+  ``SIMULATE = T`` into the raw files it writes itself.
+* For each telescope ``n`` feeding the fiber (``FIBFEED``), legacy's
+  per-telescope target keywords: ``TARGRAn``/``TARGDECn`` (catalogue
+  position, ICRS degrees at the epoch ``TARGEPOn``, Julian years),
+  ``PMRAn``/``PMDECn`` (mas/yr; ``PMRAn`` is mu_alpha cos(dec)),
+  ``PARLAXn`` (mas) and ``RVn`` (systemic, km/s), from the request's
+  ``targets``; ``UNKNOWN`` when not given. ``n`` is the trailing number of
+  the telescope's name in the config (``T1`` -> 1), else its place in
+  ``telescopes`` (1-based).
 
 One job at a time. ``configure``, ``expose``, ``calibrate`` and
 ``backlight`` take an optional ``"wait": S`` and ``"client": name``: while
@@ -134,6 +163,7 @@ from http import HTTPStatus
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from robofast import hwgate
 from robofast.cancel import isolated, shielded, stop_task
 from robofast.clock import NightRule, clock_from_config
 from robofast.config import load_device_config, require_keys
@@ -517,6 +547,9 @@ class Frame:
     iodine: str | float | None = None
     #: The night the raw file is named for (None: this service's clock).
     night: str | None = None
+    #: The target's catalogue astrometry per feeding telescope (module doc,
+    #: "The header"): ``{telescope: {"ra", "dec", "pm_ra", ...}}``.
+    targets: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -561,6 +594,65 @@ def _num(value: Any, what: str) -> float:
     return x
 
 
+#: A request's target astrometry (``targets``): key -> (range, header
+#: keyword stem, comment with ``{n}`` the telescope's number). Units:
+#: degrees, mas/yr, Julian year, mas, km/s.
+TARGET_KEYS: dict[str, tuple[tuple[float, float], str, str]] = {
+    "ra": ((0.0, 360.0), "TARGRA", "Target RA (ICRS deg at TARGEPO{n})"),
+    "dec": ((-90.0, 90.0), "TARGDEC", "Target Dec (ICRS deg at TARGEPO{n})"),
+    "pm_ra": ((-1e5, 1e5), "PMRA", "Target PM in RA*cos(Dec) (mas/yr)"),
+    "pm_dec": ((-1e5, 1e5), "PMDEC", "Target Proper Motion in DEC (mas/yr)"),
+    "epoch": ((1800.0, 2200.0), "TARGEPO", "Epoch of TARGRA{n}/TARGDEC{n} (Julian yr)"),
+    "parallax": ((0.0, 1e4), "PARLAX", "Target Parallax (mas)"),
+    "rv": ((-3e5, 3e5), "RV", "Target RV (km/s)"),
+}
+
+
+def parse_targets(d: Any, telescopes: list[str]) -> dict[str, dict[str, float]]:
+    """A request's ``targets`` (module doc): only feeding telescopes and
+    only :data:`TARGET_KEYS` (else ValueError). A value that is not a finite
+    number in range is left out (logged; the header says ``UNKNOWN``): a
+    header keyword never fails a spectrum."""
+    if d is None:
+        return {}
+    if not isinstance(d, dict):
+        raise ValueError("targets must be {telescope: {ra, dec, ...}}")
+    out: dict[str, dict[str, float]] = {}
+    for tel, t in d.items():
+        if tel not in telescopes:
+            raise ValueError(f"targets: {tel!r} is not feeding this frame ({telescopes})")
+        if not isinstance(t, dict):
+            raise ValueError(f"targets[{tel!r}] must be an object")
+        unknown = set(t) - set(TARGET_KEYS)
+        if unknown:
+            raise ValueError(f"targets[{tel!r}]: unknown keys {sorted(unknown)}")
+        one: dict[str, float] = {}
+        for key, ((lo, hi), _, _) in TARGET_KEYS.items():
+            if t.get(key) is None:
+                continue
+            try:
+                x = _num(t[key], f"targets[{tel!r}].{key}")
+            except ValueError as exc:
+                log.warning("%s: left out of the header", exc)
+                continue
+            if not lo <= x <= hi:
+                log.warning("targets[%r].%s %s outside %s..%s: left out", tel, key, x, lo, hi)
+                continue
+            one[key] = x
+        out[str(tel)] = one
+    return out
+
+
+def telescope_number(name: str, telescopes: list[str]) -> int:
+    """The digit of a telescope's per-telescope header keywords
+    (``TARGRA1``): the trailing number of its name (``T1``, ``t2``), else
+    its place in the config's ``telescopes`` (1-based)."""
+    m = re.search(r"(\d+)$", name)
+    if m:
+        return int(m.group(1))
+    return telescopes.index(name) + 1 if name in telescopes else 0
+
+
 class KiwiSpec:
     """The spectrograph and its one job at a time."""
 
@@ -569,10 +661,15 @@ class KiwiSpec:
         config: KiwiSpecConfig,
         spec: SpecServerClient,
         camera: SICameraClient,
+        *,
+        hardware: bool = False,
     ) -> None:
         self.config = config
         self.spec = spec
         self.camera = camera
+        #: The hardware gate is open (config and ``--hardware``): the PC may
+        #: be the real one. Closed: only a verified simulator is reachable.
+        self.hardware = hardware
         #: What holds the spectrograph now (a job, configure, backlight).
         self._held: str | None = None
         #: Requests waiting for it, first come first served: [future, what,
@@ -884,6 +981,42 @@ class KiwiSpec:
             out.append(value)
         return out[0], out[1]
 
+    def simulated(self) -> bool:
+        """Whether frames come from a simulator (header ``SIMULATE``; module
+        doc, "The header"). The gate closed, :mod:`robofast.hwgate` lets
+        only a verified simulator be reached; open, the camera's or the
+        spectrograph server's endpoint must verify as one."""
+        if not self.hardware:
+            return True
+        for client in (self.camera, self.spec):
+            host, port = getattr(client, "host", None), getattr(client, "port", None)
+            if host is None or port is None:
+                continue
+            try:
+                if hwgate.is_simulator(str(host), int(port)):
+                    return True
+            except Exception:  # cannot tell: the real spectrograph
+                continue
+        return False
+
+    async def _pressure_reading(self, warnings: list[str]) -> float | None:
+        """The spectrograph pressure (mbar) for the header (``SPECPRES``):
+        the status loop's last reading when it is recent, else a read now.
+        None, with a warning, when that read fails (a stale reading is
+        never written)."""
+        max_age = max(2 * self.config.status_interval, 30.0)
+        r = self.readings.get("spec_pressure") or {}
+        if r.get("ok_at") is not None and time.time() - r["ok_at"] <= max_age:
+            return r["value"]
+        try:
+            value = await self.spec.spec_pressure()
+        except (KiwiSpecError, TimeoutError) as exc:
+            self._record("spec_pressure", error=f"{type(exc).__name__}: {exc}")
+            warnings.append(f"spectrograph pressure unknown ({exc}); header says UNKNOWN")
+            return None
+        self._record("spec_pressure", value)
+        return value
+
     async def ensure_camera(self) -> None:
         if self._camera_ready and self.camera.connected:
             return
@@ -1054,6 +1187,7 @@ class KiwiSpec:
         night_label = d.get("night")
         if night_label is not None and not _NIGHT.match(str(night_label)):
             raise ValueError(f"night {night_label!r} must look like n20261109")
+        targets = parse_targets(d.get("targets"), teles)
         return Frame(
             kind,
             exptime,
@@ -1062,6 +1196,7 @@ class KiwiSpec:
             counts,
             iodine,
             None if night_label is None else str(night_label),
+            targets,
         )
 
     def submit(self, kind: str, frames: list[Frame], client: str = "") -> Job:
@@ -1277,6 +1412,8 @@ class KiwiSpec:
             warnings.append(
                 "no flux source (flux_source none): target_counts ignored, time-terminated"
             )
+        spec_pressure = await self._pressure_reading(warnings)
+        simulated = self.simulated()
         if self._abort.is_set():
             raise Aborted(job.abort_reason or "aborted")
 
@@ -1405,6 +1542,12 @@ class KiwiSpec:
             "heater_temp": heater_temp,
             "heater_setpoint": heater_setpoint,
             "ccd_temp": ccd,
+            "spec_pressure": spec_pressure,
+            "simulated": simulated,
+            "targets": {
+                t: {"n": telescope_number(t, c.telescopes), **f.targets.get(t, {})}
+                for t in f.telescopes
+            },
             "warnings": warnings,
         }
         job.phase = f"{f.kind}: header"
@@ -1519,7 +1662,22 @@ class KiwiSpec:
             "I2POSSS": [r["iodine"]["requested"], "Iodine Stage Set Position [string]"],
             "FIBFEED": [",".join(r["telescopes"]) or "NONE", "Telescopes feeding the fiber"],
             "SWCREATE": ["robofast kiwispec_service", "Software that drove the exposure"],
+            "SIMULATE": [bool(r.get("simulated")), "Simulated spectrograph: no light"],
+            "SPECPRES": [
+                "UNKNOWN" if r.get("spec_pressure") is None else r["spec_pressure"],
+                "Spectrograph pressure (mbar)",
+            ],
         }
+        for tel in r["telescopes"]:
+            t = (r.get("targets") or {}).get(tel) or {}
+            n = t.get("n")
+            if not n:
+                continue
+            for key, (_, stem, comment) in TARGET_KEYS.items():
+                h[f"{stem}{n}"] = [
+                    "UNKNOWN" if t.get(key) is None else t[key],
+                    comment.format(n=n),
+                ]
         if r.get("test"):
             h["TESTTYP"] = [r["kind"], "Frame type had this not been a test"]
         h["I2TEMPA"] = [
@@ -1617,7 +1775,7 @@ class KiwiSpecServer:
             routed = AuxRouted(spec, self.aux)
             log.info("aux devices through the Alpaca server at %s", aux_cfg.address)
         self.config = config
-        self.kiwispec = KiwiSpec(config, routed, camera)
+        self.kiwispec = KiwiSpec(config, routed, camera, hardware=allow)
         if self.aux is not None and self.aux.cfg.chiller:
             self.kiwispec.chiller = AuxChiller(self.aux, self.aux.cfg.chiller_tolerance)
         host, _, port = config.listen.rpartition(":")

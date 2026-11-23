@@ -4157,6 +4157,11 @@ class Sequencer:
             "object": _spec_object(obs.object or obs.name),
             "telescopes": [self._spec_name(t) for t in feeding],
         }
+        # The target's catalogue astrometry, per feeding telescope, for the
+        # header's TARGRAn/TARGDECn/PMRAn... (kiwispec_service, "The header").
+        astrometry = _spec_astrometry(spec.get("target"), obs)
+        if astrometry:
+            frame["targets"] = {self._spec_name(t): dict(astrometry) for t in feeding}
         # The instrument's own parameters, as it takes them (kinds.Spectrum).
         frame.update(spec.get("params") or {})
         asked = self.clock()
@@ -4622,6 +4627,31 @@ class Sequencer:
 def _spec_object(name: str) -> str:
     """An object name the spectrograph service accepts (its file names)."""
     return re.sub(r"[^A-Za-z0-9_+-]", "_", name)[:60] or "object"
+
+
+def _spec_astrometry(target: Any, obs: Observation) -> dict[str, float]:
+    """A spectrum target's catalogue astrometry as the spectrograph service
+    takes it (``targets``: ``ra``/``dec`` degrees, ``pm_ra``/``pm_dec``
+    mas/yr, ``epoch`` Julian year, ``parallax`` mas, ``rv`` km/s), from the
+    plan's ``spectrum["target"]`` (:meth:`robofast.request_model.Target.
+    internal`), else the observation's own coordinates. The epoch defaults
+    to 2000.0, as the request model's does; an unknown value is left out."""
+    t = target if isinstance(target, dict) else {}
+    out: dict[str, float] = {}
+
+    def put(key: str, value: Any) -> None:
+        if isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value):
+            out[key] = float(value)
+
+    put("ra", t.get("ra_hours", obs.ra_hours))
+    if "ra" in out:
+        out["ra"] = (out["ra"] * 15.0) % 360.0
+    put("dec", t.get("dec_deg", obs.dec_deg))
+    for key in ("pm_ra", "pm_dec", "epoch", "parallax", "rv"):
+        put(key, t.get(key))
+    if "ra" in out and "dec" in out:
+        out.setdefault("epoch", 2000.0)
+    return out
 
 
 def _accepts_files(report: Callable[..., Any]) -> bool:

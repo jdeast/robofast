@@ -264,6 +264,38 @@ def test_proper_motion_moves_the_target():
     assert propagate({"ra_hours": 1.0, "dec_deg": 2.0}, datetime.now(UTC)) == (1.0, 2.0)
 
 
+def test_spectrum_astrometry_for_the_header():
+    """What the sequencer sends the spectrograph as each feeding telescope's
+    ``targets`` (kiwispec_service, "The header")."""
+    from robofast.plan import Observation
+    from robofast.sequencer import _spec_astrometry
+
+    obs = Observation("x", ra_hours=2.0, dec_deg=10.0)
+    full = {
+        "ra_hours": 23.99,
+        "dec_deg": -5.0,
+        "pm_ra": 1.0,
+        "pm_dec": -2.0,
+        "epoch": 2016.0,
+        "parallax": 10.0,
+        "rv": 3.5,
+        "name": "star",
+    }
+    assert _spec_astrometry(full, obs) == {
+        "ra": pytest.approx(359.85),
+        "dec": -5.0,
+        "pm_ra": 1.0,
+        "pm_dec": -2.0,
+        "epoch": 2016.0,
+        "parallax": 10.0,
+        "rv": 3.5,
+    }
+    # No plan target: the observation's coordinates; epoch J2000.
+    assert _spec_astrometry(None, obs) == {"ra": 30.0, "dec": 10.0, "epoch": 2000.0}
+    # Nothing known: nothing sent (the header says UNKNOWN).
+    assert _spec_astrometry({"pm_ra": None}, Observation("y")) == {}
+
+
 def test_sidecars_are_never_overwritten(tmp_path):
     rec = SpectrumRecorder(tmp_path, "minerva", MTHOPKINS, "kiwispec")
     r = {
@@ -290,6 +322,10 @@ async def test_two_telescopes_feed_one_spectrum(make_rig, tmp_path):
     assert sorted(frame["telescopes"]) == ["t1", "t2"]
     assert frame["iodine"] == "out" and frame["target_counts"] == 5e5
     assert frame["object"] == "rv1"
+    # The target's catalogue astrometry for every feeding telescope's
+    # TARGRAn/TARGDECn/PMRAn header keywords (degrees, mas/yr; epoch J2000).
+    want = {"ra": TARGET["ra_hours"] * 15, "dec": TARGET["dec_deg"], "pm_ra": -1729.7}
+    assert frame["targets"] == {t: {**want, "epoch": 2000.0} for t in ("t1", "t2")}
     # Never without guiding: both were guiding before it started.
     start = rig.timeline.events("expose", "spectrograph")[0].t
     for name in ("t1", "t2"):

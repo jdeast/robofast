@@ -1548,7 +1548,7 @@ async def test_regression_20261124_stop_leaves_no_task_pending(make, backend):
     on a stopped loop; the garbage collector destroyed it during a later test
     and asyncio logged an ERROR there. stop() now cancels and finishes the
     loop's background tasks first."""
-    sim, server = make(backend, sim_kw={"slew_rate": 0.2, "alt": 30.0, "az": 200.0})
+    _sim, server = make(backend, sim_kw={"slew_rate": 0.2, "alt": 30.0, "az": 200.0})
     tel = await device(server)
     try:
         await tel.call("Park", timeout=T)

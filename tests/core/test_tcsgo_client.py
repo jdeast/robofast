@@ -105,7 +105,8 @@ def test_encode_and_parse():
 
 
 def test_allowlist_excludes_configuration_commands():
-    never = {2, 3, 4, 5, 8, 9, 14, 15, 16, 18, 19, 22, 23, 24, 29, 30, 31, 37, 38, 39}
+    # #7: "broken on the DFM side" (FLWO's live TRES guider); offsets use #6 + chase.
+    never = {2, 3, 4, 5, 7, 8, 9, 14, 15, 16, 18, 19, 22, 23, 24, 29, 30, 31, 37, 38, 39}
     never |= {42, 51, 53, 54, 55, 56, 57, 60, 63, 66, 67, 68, 69, 70, 72, 73}
     assert ALLOWED.isdisjoint(never)
     assert ALLOWED | never == set(COMMANDS) - {28}
@@ -115,7 +116,7 @@ def test_allowlist_excludes_configuration_commands():
 
 async def test_refuses_disallowed_commands_and_hardware(rig):
     sim, c = rig()
-    for n in (3, 24, 30, 31, 56, 60, 11):
+    for n in (3, 7, 24, 30, 31, 56, 60, 11):
         with pytest.raises(ValueError):
             await c.command(n)
     assert sim.log == []
@@ -211,12 +212,16 @@ async def test_offset_and_pulse_guide(rig):
     sim, c = rig()
     await c.command(50)
     m0 = await c.mount()
-    await c.command(7, 0.0, 36.0)  # target 36" north; follow mode: the mount waits
+    # The live guider's offset: a new target 36" north (#6); follow mode: the
+    # mount waits; chase (#12,3) moves it there and stays in chase.
+    await c.command(6, m0.ra_hours, m0.dec_deg + 0.01, m0.equinox)
     await asyncio.sleep(0.2)
-    assert (await c.mount()).dec_deg == pytest.approx(m0.dec_deg)
-    await c.command(12, 2)
-    await until(lambda: _mode(c, "follow"), 5, "offset done")
+    assert (await c.mount()).dec_deg == pytest.approx(m0.dec_deg, abs=1e-4)
+    await c.command(12, 3)
+    await until(lambda: _captured(c), 5, "offset done")
+    assert (await c.status()).mode == "chase"
     assert (await c.mount()).dec_deg == pytest.approx(m0.dec_deg + 0.01, abs=1e-5)
+    await c.command(12, 1)
     m1 = await c.mount()
     await c.command(61, NORTH, 400)
     assert (await c.status()).pulse_guiding
@@ -325,11 +330,11 @@ async def test_set_commands_are_never_resent_once_sent(rig):
     sim, c = rig(max_attempts=3)
     await c.command(50)
     before = c.exchanges
-    await c.command(7, 1.0, 1.0)
-    assert c.exchanges == before + 1 and sim.numbers().count(7) == 1
+    await c.command(61, NORTH, 100)
+    assert c.exchanges == before + 1 and sim.numbers().count(61) == 1
     # A TCS that never reads: the connect works, the write lands, no retry.
     sim.set_mode("hang")
-    await c.command(7, 1.0, 1.0)  # documented: no reply, so nothing to wait for
+    await c.command(61, NORTH, 100)  # documented: no reply, so nothing to wait for
     assert c.exchanges == before + 2 and c.retries == 0
     sim.set_mode("ok")
 

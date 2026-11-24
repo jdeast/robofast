@@ -372,3 +372,53 @@ async def test_clear_spectrograph_goes_through_the_command_box(mc):
     assert line["action"] == "clear_spectrograph" and line["status"] == 200
     st = await rig.status()
     assert st["spectrograph"]["queue"] == []
+
+
+# -- the park-before-close interlock (JDE 2026-11-23) -----------------------------------
+
+
+def test_the_interlock_forbids_the_dome_fallback_in_the_config(tmp_path):
+    """A roof that can hit an unparked telescope: the console may not be set
+    up to close the dome directly (that channel cannot see the telescopes)."""
+    from robofast.console.aggregate import ConsoleEnclosure
+    from tests.core.test_console import write_site
+
+    write_site(tmp_path)
+    token_file(tmp_path)
+    cfg = tmp_path / "aqawan1.json"
+    raw = json.loads(cfg.read_text())
+    raw.setdefault("safety", {}).update(park_before_close=True, require_park_before_close=True)
+    cfg.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="park-before-close interlock"):
+        ConsoleEnclosure.from_spec(
+            "a",
+            {"config": "aqawan1.json", "emergency_close": {"token_file": "emergency.token"}},
+            tmp_path,
+        )
+    ok = ConsoleEnclosure.from_spec(
+        "a",
+        {
+            "config": "aqawan1.json",
+            "emergency_close": {"token_file": "emergency.token", "fallback": "none"},
+        },
+        tmp_path,
+    )
+    assert ok.park_interlock and ok.emergency_fallback == "none"
+
+
+@pytest.mark.parametrize("direct", [False, True])
+async def test_the_interlock_never_closes_the_dome_directly(mc, direct):
+    """Even asked for (direct) or with the supervisor down: no direct close,
+    a failure reported, the dome never called."""
+    fakes = DomeFakes()
+    fakes.supervisor_down = True
+    rig = await console_with_dome(mc, fakes)
+    for enc in rig.app.enclosures.values():
+        enc.park_interlock = True
+    await rig.login("alice")
+    r = await rig.act("emergency_close", direct=direct, confirm=True)
+    assert r.status_code == 502, r.text
+    assert "park-before-close interlock" in r.json()["error"]
+    assert not [c for c in fakes.calls if c[1].startswith("dome")]
+    alarm = (await rig.status())["alarms"][0]
+    assert alarm["level"] == "critical" and "FAILED" in alarm["text"]

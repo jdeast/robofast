@@ -372,9 +372,12 @@ async def test_an_unreadable_telescope_holds_a_routine_close(make_rig):
     await wait_until(rig.dome_closed, 3)
 
 
-async def test_unsafe_weather_overrides_the_interlock(make_rig):
-    """An emergency (weather) still closes after park_wait, parked or not."""
-    rig = make_rig(safety=INTERLOCK)
+async def test_unsafe_weather_does_not_override_the_interlock(make_rig):
+    """JDE 2026-11-23: the interlock exists because a telescope can hit the
+    roof, so an emergency (weather) close waits for the park too: the roof
+    stays open, the alarm is critical at once (not after
+    park_interlock_escalate), and it closes as soon as the telescope parks."""
+    rig = make_rig(safety={**INTERLOCK, "park_interlock_escalate": 60.0})
     await rig.start(sequencer=False)
     lease = await _open(rig)
     rig.tel.Unpark()
@@ -383,16 +386,39 @@ async def test_unsafe_weather_overrides_the_interlock(make_rig):
     await wait_until(
         lambda: rig.supervisor.status()["close_interlock"]["blocked"], 3, what="blocked"
     )
-    assert rig.dome_open()
     rig.weather.set_safe(False)
-    await wait_until(rig.dome_closed, 3, what="emergency close")
-    assert not rig.parked()
-    assert rig.timeline.events("close_unblocked")[-1].detail["how"].startswith("overridden")
-    assert rig.supervisor.status()["close_interlock"]["blocked"] is None
+    await wait_until(lambda: rig.supervisor.critical(), 3, what="critical at once")
+    assert "HELD OPEN IN AN EMERGENCY" in rig.supervisor.critical()[0]
+    await asyncio.sleep(0.5)
+    assert rig.dome_open()
+    sent = rig.timeline.commands(device="dome", outcome="sent")
+    assert not [c for c in sent if c.what == "CloseShutter"]
+    assert rig.timeline.events("close_blocked_escalated")[-1].detail["emergency"]
+    del rig.tel.Park  # it parks again (the class's Park)
+    await wait_until(rig.dome_closed, 3, what="closed once parked")
+    assert rig.parked()
+    assert rig.timeline.events("close_unblocked")[-1].detail["how"] == "all parked"
 
 
-async def test_unsafe_weather_closes_on_an_unparked_telescope_without_waiting(make_rig):
+async def test_an_operator_emergency_close_waits_for_the_park_too(make_rig):
     rig = make_rig(safety=INTERLOCK)
+    await rig.start(sequencer=False)
+    await _open(rig)
+    rig.tel.Unpark()
+    _stuck(rig.tel)
+    rig.supervisor.operator_close("alice", "lightning", emergency=True)
+    await wait_until(lambda: rig.supervisor.critical(), 3, what="critical")
+    await asyncio.sleep(0.3)
+    assert rig.dome_open()
+    del rig.tel.Park
+    await wait_until(rig.dome_closed, 3, what="closed once parked")
+
+
+async def test_without_the_interlock_unsafe_weather_closes_on_an_unparked_telescope(make_rig):
+    """The default (park_before_close alone): an emergency closes after
+    park_wait, parked or not -- rain on the optics is worse than an unlikely
+    roof contact."""
+    rig = make_rig(safety=dict(park_before_close=True, park_wait=1.0))
     await rig.start(sequencer=False)
     await _open(rig)
     rig.tel.Unpark()
@@ -406,20 +432,14 @@ async def test_unsafe_weather_closes_on_an_unparked_telescope_without_waiting(ma
     assert not rig.timeline.events("close_blocked")
 
 
-async def test_an_operator_emergency_close_overrides_the_interlock(make_rig):
+async def test_an_operator_emergency_close_is_cleared_once_closed(make_rig):
     rig = make_rig(safety=INTERLOCK)
     await rig.start(sequencer=False)
-    lease = await _open(rig)
-    rig.tel.Unpark()
-    _stuck(rig.tel)
+    await _open(rig)
     sup = rig.supervisor
-    assert sup.operator_close("alice", "stop") is True  # routine: held back
-    lease.release()
-    await wait_until(lambda: sup.status()["close_interlock"]["blocked"], 3, what="blocked")
-    assert rig.dome_open()
     sup.operator_close("alice", "EMERGENCY: smoke", emergency=True)
     await wait_until(rig.dome_closed, 3, what="emergency close")
-    assert not rig.parked()
+    assert rig.parked()
     # cleared on the supervisor's next pass once closed (not the same instant)
     await wait_until(
         lambda: sup.status()["close_interlock"]["emergency_close"] is None, 3, what="cleared"

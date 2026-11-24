@@ -61,9 +61,10 @@ these two devices:
 * Before it "closes" the sky it **parks every telescope** itself
   (`park_before_close`), after giving the sequencer `park_wait / 2` for its
   own cleanup; so a sequencer that died leaves no telescope tracking. The
-  park-before-close interlock (`require_park_before_close`) holds a routine
-  close, parking again on every pass, until every telescope reports
-  `AtPark`, and raises a critical alarm after `park_interlock_escalate`.
+  park-before-close interlock (`require_park_before_close`) holds every
+  close, emergencies included, parking again on every pass, until every
+  telescope reports `AtPark`, and raises a critical alarm (after
+  `park_interlock_escalate`, or at once in an emergency).
 * A dead sequencer's lease is recovered (or cleared by an operator) only
   once the sky reads closed, so only after that park; and no lease is
   granted until every telescope reports `AtPark`.

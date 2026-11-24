@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import subprocess
 import sys
@@ -244,14 +245,25 @@ async def test_offset_action_and_pulse_guide(make_rig):
     await tel.call("SlewToCoordinatesAsync", *(await target_above(tel)))
     await until_false(tel, "Slewing", 5)
     ra0, dec0 = await tel.get("RightAscension"), await tel.get("Declination")
+    target0 = rig.sim.target_values(time.monotonic())[2:5]
+    n0 = len(rig.sim.numbers())
     reply = json.loads(await tel.call("Action", "Offset", json.dumps({"east": 30, "north": -36})))
-    assert reply["sent"] == [[7, 30.0, -36.0], [12, 2]]
+    # The live TRES guider's jog(): #6 at mount + offset, then chase.
+    assert [c[0] for c in reply["sent"]] == [6, 12] and reply["sent"][1] == [12, 3]
+    assert reply["sent"][0][2] == pytest.approx(dec0 - 0.01, abs=1e-6)
+    await wait_until(lambda: rig.sim.state()["mode"] == 1, 5, what="back to follow")
     await until_false(tel, "Slewing", 5)
     assert (await tel.get("Declination") - dec0) * 3600 == pytest.approx(-36, abs=0.1)
-    cosd = __import__("math").cos(__import__("math").radians(dec0))
+    cosd = math.cos(math.radians(dec0))
     dra = (await tel.get("RightAscension") - ra0) * 15 * 3600 * cosd
     assert dra == pytest.approx(30, abs=0.2)
     assert await tel.get("Tracking") is True
+    sent = [(n, a) for _, n, a in rig.sim.log[n0:] if n not in (25, 26, 32)]
+    assert [n for n, _ in sent] == [6, 12, 12, 6]  # target, chase, follow, restore
+    assert sent[1][1] == (3.0,) and sent[2][1] == (1.0,)
+    assert sent[3][1] == pytest.approx(target0)  # the original target is back
+    await asyncio.sleep(0.3)  # follow: restoring the target does not move the mount
+    assert (await tel.get("Declination") - dec0) * 3600 == pytest.approx(-36, abs=0.1)
     with pytest.raises(InvalidValueException, match="max_offset"):
         await tel.call("Action", "Offset", json.dumps({"east": 5000}))
     with pytest.raises(InvalidValueException):
@@ -267,6 +279,78 @@ async def test_offset_action_and_pulse_guide(make_rig):
     assert (await tel.get("Declination") - d0) * 3600 == pytest.approx(5 * 0.3, abs=0.2)
     with pytest.raises(InvalidValueException):
         await tel.call("PulseGuide", 4, 300)
+
+
+async def test_offset_never_sends_7(make_rig):
+    """Regression (FLWO's live TRES guider: #7 is "broken on the DFM side"):
+    an offset, from follow or chase, and back to back, never sends #7; a
+    second offset before capture keeps the first one's target to restore."""
+    rig = make_rig()
+    tel = rig.telescope()
+    await tel.call("Unpark")
+    await tel.set("Tracking", True)
+    await tel.call("SlewToCoordinatesAsync", *(await target_above(tel)))
+    await until_false(tel, "Slewing", 5)
+    target0 = rig.sim.target_values(time.monotonic())[2:5]
+    dec0 = await tel.get("Declination")
+    await tel.call("Action", "Offset", json.dumps({"north": 600}))
+    assert await tel.get("Slewing") is True  # chasing until captured
+    await tel.call("Action", "Offset", json.dumps({"north": 60}))  # re-aimed mid-chase
+    await wait_until(lambda: rig.sim.state()["mode"] == 1, 10, what="back to follow")
+    await asyncio.sleep(0.1)
+    assert 7 not in rig.sim.numbers()
+    assert rig.sim.target_values(time.monotonic())[2:5] == pytest.approx(target0)
+    # The second offset starts from wherever the chase had got to.
+    assert 60 < (await tel.get("Declination") - dec0) * 3600 <= 660.1
+
+
+async def test_offset_out_of_range_restores_target(make_rig):
+    rig = make_rig()
+    tel = rig.telescope()
+    await tel.call("Unpark")
+    await tel.set("Tracking", True)
+    await tel.call("SlewToCoordinatesAsync", *(await target_above(tel, 0.0, 49.9)))
+    await until_false(tel, "Slewing", 5)
+    target0 = rig.sim.target_values(time.monotonic())[2:5]
+    rig.sim.dec_limits = (-40.0, 50.0)
+    with pytest.raises(InvalidOperationException, match="out of range"):
+        await tel.call("Action", "Offset", json.dumps({"north": 900}))
+    assert rig.sim.target_values(time.monotonic())[2:5] == pytest.approx(target0)
+    assert 7 not in rig.sim.numbers() and rig.sim.numbers()[-1] != 12
+
+
+async def test_zenith_stow_holds_and_parks_the_dome(make_rig):
+    """park_command "zenith": the legacy 60-inch stow (#10, #12,2, then #12,0
+    once at the zenith), and the dome to dome_park_az when robofast drives it."""
+    rig = make_rig({"dome_rate": 60.0}, park_command="zenith", dome=True, dome_park_az=235.0)
+    tel = rig.telescope()
+    await tel.call("Unpark")
+    await tel.set("Tracking", True)
+    await tel.call("SlewToCoordinatesAsync", *(await target_above(tel, 2.0, 0.0)))
+    await until_false(tel, "Slewing", 5)
+    n0 = len(rig.sim.numbers())
+    await tel.call("Park")
+    t0 = time.monotonic()
+    while not await tel.get("AtPark"):  # AtPark needs hold mode: the #12,0 has landed
+        assert time.monotonic() - t0 < 10, "not parked after 10 s"
+        await asyncio.sleep(0.05)
+    assert rig.sim.state()["mode"] == 0 and await tel.get("Altitude") == pytest.approx(90)
+    sent = [(n, a) for _, n, a in rig.sim.log[n0:] if n not in (25, 26, 32, 62, 64)]
+    assert [n for n, _ in sent] == [10, 12, 43, 20, 12]
+    assert sent[1][1] == (2.0,) and sent[2][1] == (235.0,) and sent[4][1] == (0.0,)
+    assert 58 not in rig.sim.numbers()
+    await wait_until(lambda: abs(rig.sim.state()["dome_az"] - 235.0) < 0.5, 10, what="dome")
+    # Abort mid-stow: nothing more is sent (no hold from a stale sequence).
+    await tel.call("Unpark")
+    await tel.set("Tracking", True)
+    await tel.call("SlewToCoordinatesAsync", *(await target_above(tel, 2.0, 0.0)))
+    await until_false(tel, "Slewing", 5)
+    await tel.call("Park")
+    await asyncio.sleep(0.05)
+    await tel.call("AbortSlew")
+    n1 = len(rig.sim.numbers())
+    await asyncio.sleep(1.0)
+    assert [n for n in rig.sim.numbers()[n1:] if n not in (25, 26, 62)] == []
 
 
 async def test_status_and_faults_actions(make_rig):
@@ -420,6 +504,8 @@ def test_server_refuses_a_non_loopback_tcs(tmp_path):
 def test_shipped_flwo60_configs():
     cfg = TCSGOConfig.from_dict(json.loads((ROOT / "sites/flwo60/tcsgo.json").read_text()))
     assert cfg.tcs.host == "127.0.0.1" and not cfg.allow_hardware and not cfg.dome
+    # The legacy 60-inch stow, never #58 (docs/tcsgo.md Q6).
+    assert cfg.park_command == "zenith" and cfg.dome_park_az == 235.0
     site = json.loads((ROOT / "sites/flwo60/flwo60.json").read_text())
     # No watchdog (JDE 2026-10-31): attended only.
     assert SafetyConfig(**site["safety"]).attended_only is True
@@ -448,11 +534,20 @@ async def test_flwo60_unsafe_weather_mid_exposure(make_rig, dome_kind):
     server, and the supervisor closes the dome (a fake one, since the 60-inch
     dome is not known to be TCS-controlled; and the TCS's own, if it is)."""
     site = json.loads((ROOT / "sites/flwo60/flwo60.json").read_text())
+    shipped = json.loads((ROOT / "sites/flwo60/tcsgo.json").read_text())
     rig = make_rig(
         {"slew_rate": 30.0, "shutter_time": 0.3},
         dome=dome_kind == "tcs",
         latitude=site["site"]["latitude"],
+        park_command=shipped["park_command"],
+        dome_park_az=shipped["dome_park_az"],
+        sequence_poll=0.05,
     )
+
+    def stowed() -> bool:
+        st = rig.sim.state()
+        return st["mode"] == 0 and st["alt"] > 89.9
+
     (tel_name,) = telescopes(site)
     tl = Timeline()
     weather = FakeWeather(safe=True)
@@ -521,7 +616,7 @@ async def test_flwo60_unsafe_weather_mid_exposure(make_rig, dome_kind):
         weather.set_safe(False)
         t0 = time.monotonic()
         await wait_until(
-            lambda: dome_state() == "closed" and rig.sim.parked() and cam._state == 0,
+            lambda: dome_state() == "closed" and stowed() and cam._state == 0,
             15,
             what="closed, parked, camera idle",
         )
@@ -530,7 +625,7 @@ async def test_flwo60_unsafe_weather_mid_exposure(make_rig, dome_kind):
         await wait_until(lambda: tl.events("cleanup_done"), 5)
         report = seq.cleanups[0]
         assert report.aborted == [tel_name] and report.parked == [tel_name] and not report.errors
-        assert 58 in rig.sim.numbers()  # parked with the TCS's PARK MOUNT
+        assert 58 not in rig.sim.numbers() and 10 in rig.sim.numbers()  # the legacy stow
         print(f"FLWO 60-inch ({dome_kind} dome): safe state {dt:.2f} s after unsafe")
     finally:
         for t in reversed(tasks):

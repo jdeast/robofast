@@ -43,7 +43,6 @@ ARCSEC_PER_RAD = 206264.806
 COVERED = {
     "README.md",
     "allsky",
-    "allsky_watch.yaml",
     "aqawan1.json",
     "remote",
     "autofocus.example.json",
@@ -82,7 +81,8 @@ def test_every_site_file_is_covered():
 
 def test_allsky_cameras_models_and_watcher_load():
     """sites/minerva/allsky: the cameras, each fitted model and its static
-    mask; allsky_watch.yaml through the watcher's loader."""
+    mask; the weather config's allsky section through the watcher's loader
+    (both cameras listed)."""
     from robofast.allsky import cameras, watch
     from robofast.allsky.model import CameraModel
 
@@ -96,9 +96,10 @@ def test_allsky_cameras_models_and_watcher_load():
         assert m.camera in specs, path.name
         assert (SITE / "allsky" / m.sky["static_mask"]).is_file(), path.name
         assert m.meta["fit"]["median_px"] < 0.6, path.name
-    cfg = watch.load_config(SITE / "allsky_watch.yaml")
+    cfg = watch.load_config(SITE / "weather.yaml")
     assert cfg.models == (SITE / "allsky").resolve()
     assert set(cfg.cameras) == {"mmto", "ridge"} and cfg.fetch is False
+    assert set(cfg.cameras) <= set(specs)
 
 
 def test_no_addresses_or_credentials():

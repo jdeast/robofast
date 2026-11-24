@@ -107,13 +107,18 @@ reads the shutter and records what it would do (``shadow_would`` events,
 ``would_open`` in the status); a shutter found open then is a critical
 alarm, not a close -- unless the mode's ``intervene`` is set (``shadow``'s is) and
 an enforced close condition is active (:meth:`SafetySupervisor.active_risk`:
-the safety monitor's verdict unsafe, or an enclosure fault read from the
-fault channel): then it closes at once, as the robotic mode would
-(``park_before_close`` included), with a critical alarm and a
-``shadow_intervened`` event, and goes back to watching once closed. Not
-knowing (no weather read yet, a stale feed, an unreadable fault channel)
-is not an active risk: a restarted supervisor does not close what another
-system has open.
+the safety monitor's verdict unsafe, the weather unknown, or an enclosure
+fault read from the fault channel): then it closes at once, as the robotic
+mode would (``park_before_close`` included), with a critical alarm and a
+``shadow_intervened`` event, and goes back to watching once closed. Unknown
+weather counts as a risk (JDE 2026-11-23, "yes, safety first"): no
+successful weather read for ``stale_after`` (reads failing, the bridge
+unreachable), or data older than ``stale_after``. A single failed read
+after a good one is not: it waits out ``stale_after`` from the last good
+read. A supervisor just started counts the same ``stale_after`` from its
+start (the startup grace), so a restart does not close what another system
+has open merely because it has not read anything yet. An unreadable fault
+channel and an expired duty are still not risks.
 
 A switch never opens by itself: a mode that may open grants a lease only
 through :meth:`request_open`, with every check above. A switch to a mode
@@ -132,21 +137,21 @@ of ``park_wait`` to park, then parks every telescope itself (in parallel,
 bounded by the other half), then closes -- parked or not: rain on the optics
 is worse than an unlikely roof contact. Some roofs can hit some telescopes,
 though, so ``require_park_before_close`` (per enclosure, default off) adds
-an interlock (JDE 2026-11-02): a **routine** close waits until every
-telescope under the roof reports ``AtPark``. Routine is every close that is
-not an emergency: a lease released (the night or an idle period over), a
-lease not renewed, an operator's close (the console's enclosure ``stop``),
-a mode switch, an operator's duty expiring. While held back the roof stays
-open, the supervisor parks the telescopes again on every pass, alarms (a
-``close_blocked`` timeline event, ``close_interlock`` in the status) and,
-after ``park_interlock_escalate``, raises a critical alarm; it never closes
-on an unparked telescope for a routine reason. An **emergency** close goes
-ahead after ``park_wait`` as before, parked or not (:meth:`emergency`):
-weather unsafe or unknown (no read yet, a stale feed, a failed read), an
-enclosure fault, a shutter error, an operator's emergency close
-(:meth:`operator_close` with ``emergency=True``: the console's EMERGENCY
-CLOSE), and the supervisor stopping (its final close; on an enclosure with
-a heartbeat the hardware would close by itself anyway).
+an interlock (JDE 2026-11-02, extended 2026-11-23): **no close of any kind**
+until every telescope under the roof reports ``AtPark`` -- routine (a lease
+released or not renewed, an operator's ``stop``, a mode switch, a duty
+expiring) or emergency (:meth:`emergency`: weather unsafe or unknown, an
+enclosure fault, a shutter error, an operator's EMERGENCY CLOSE, the
+supervisor stopping). While held back the roof stays open, the supervisor
+parks the telescopes again on every pass, alarms (a ``close_blocked``
+timeline event, ``close_interlock`` in the status) and raises a critical
+alarm -- after ``park_interlock_escalate`` for a routine close, at once in
+an emergency. **The price, and the reason it is off by default:** a
+telescope that will not park keeps the roof open in rain or any other
+emergency until a person parks it. Turn it on only for a roof that can
+actually hit an unparked telescope. Outside robofast, an enclosure with a
+hardware heartbeat (the Aqawan PAC) still closes by itself if robofast stops
+sending it, interlock or not.
 
 Recovering from a sequencer crash
 ---------------------------------
@@ -262,11 +267,14 @@ class SafetyConfig:
     park_before_close: bool = False
     park_wait: float = 60.0
     #: The park-before-close interlock (module doc, "Closing on unparked
-    #: telescopes"): a roof that can hit a telescope closes routinely only
-    #: once every telescope under it reports ``AtPark``. An emergency close
-    #: (unsafe or unknown weather, an enclosure fault, a shutter error, an
-    #: operator's emergency close, the supervisor stopping) still goes ahead
-    #: after ``park_wait``. Needs ``park_before_close``.
+    #: telescopes"): a roof that can hit a telescope closes only once every
+    #: telescope under it reports ``AtPark`` -- **every** close, emergencies
+    #: included (unsafe or unknown weather, an enclosure fault, a shutter
+    #: error, an operator's emergency close, the supervisor stopping). Turn
+    #: it on only for an enclosure that can collide with an unparked
+    #: telescope: with a telescope that will not park, the enclosure STAYS
+    #: OPEN in rain or any other emergency (critical alarm at once) until
+    #: someone parks it. Needs ``park_before_close``.
     require_park_before_close: bool = False
     #: A routine close blocked by the interlock this long becomes a critical
     #: alarm (the enclosure stays open; an operator parks the telescopes or
@@ -510,6 +518,12 @@ class SafetySupervisor:
         self._intervening: str | None = None
         #: The safety monitor's last successful verdict, if unsafe.
         self._unsafe_verdict: str | None = None
+        #: When :meth:`run` started: the start of the grace before "no
+        #: weather read yet" counts as unknown weather (:meth:`active_risk`).
+        self._started: float | None = None
+        #: The latest successful read's data were older than ``stale_after``
+        #: (why), else None; a failed read leaves it as it was.
+        self._stale_data: str | None = None
         self._dome = dome.grant(name, privileged=True)
         self._sm = safety_monitor.grant(name)
         self._oc = observing_conditions.grant(name) if observing_conditions else None
@@ -1032,9 +1046,10 @@ class SafetySupervisor:
         and the enclosure closes, as for any revocation. True if a live
         lease was revoked; False if there was none (it is closed, or closing,
         already). There is no operator *open*: only this supervisor's policy
-        opens. ``emergency`` (the console's EMERGENCY CLOSE) overrides the
-        park-before-close interlock until the enclosure is closed (module
-        doc); otherwise it is a routine close."""
+        opens. ``emergency`` (the console's EMERGENCY CLOSE) makes it an
+        emergency close (no reopen until closed; critical alarm at once if
+        the park-before-close interlock holds it); it does not override
+        that interlock (module doc, JDE 2026-11-23)."""
         lease = self._lease
         self.timeline.event(
             self.name, "operator_close", operator=operator, reason=reason, emergency=emergency
@@ -1134,12 +1149,14 @@ class SafetySupervisor:
                 age = await self._oc.call("TimeSinceLastUpdate", "", timeout=to)
         except DeviceError as exc:
             return False, f"weather read failed: {exc}", False
+        self._stale_data = None
         if is_safe is not True:
             self._unsafe_verdict = f"SafetyMonitor.IsSafe={is_safe!r}"
             return False, self._unsafe_verdict, True
         self._unsafe_verdict = None
         if age is not None and not (0 <= float(age) <= self.config.stale_after):
-            return False, f"weather data stale ({float(age):.1f} s old)", True
+            self._stale_data = f"weather data stale ({float(age):.1f} s old)"
+            return False, self._stale_data, True
         return True, "safe", True
 
     async def _weather_loop(self) -> None:
@@ -1383,23 +1400,52 @@ class SafetySupervisor:
             )
             log.info("%s: mode %s: would %s", self.name, self.mode, "open" if would else "close")
 
-    def active_risk(self) -> str | None:
+    def active_risk(self, now: float | None = None) -> str | None:
         """An enforced close condition active now, which a ``watch`` mode
         with ``intervene`` acts on (module doc): the safety monitor's
-        last successful verdict unsafe (a read failure keeps it), or a fault
-        read from the enclosure's fault channel. None: none known."""
+        last successful verdict unsafe (a read failure keeps it), a fault
+        read from the enclosure's fault channel, or the weather unknown
+        (:meth:`_weather_unknown`; JDE 2026-11-23). None: none."""
         if self._unsafe_verdict is not None:
             return f"weather unsafe ({self._unsafe_verdict})"
         if self._fault is not None and isinstance(self._fault_kind, tuple):
             return f"enclosure fault ({self._fault})"
+        unknown = self._weather_unknown(time.monotonic() if now is None else now)
+        if unknown is not None:
+            return f"weather unknown ({unknown})"
         return None
+
+    def _weather_unknown(self, now: float) -> str | None:
+        """Why the enforced weather verdict is unknown now, or None (known).
+
+        Unknown (JDE 2026-11-23, "yes, safety first"): not safe without an
+        unsafe verdict, and either the latest successful read's data were
+        older than ``stale_after``, or no read has succeeded for
+        ``stale_after`` (reads failing, the bridge unreachable, the loop
+        stuck). One failed read after a good one is not unknown (JDE
+        2026-11-23: a transient failure must not close). Before the first
+        successful read the same bound counts from :meth:`run`'s start (the
+        startup grace).
+        Only ``IsSafe`` and the feed's age count: a source the bridge does
+        not enforce never moves either."""
+        if self._safe:
+            return None
+        bound = self.config.stale_after
+        if self._stale_data is not None:
+            return self._stale_data
+        since = self._last_good_read if self._last_good_read is not None else self._started
+        if since is None or now - since <= bound:
+            return None
+        if self._last_good_read is None:
+            return f"no successful weather read in {bound:g} s since start: {self._reason}"
+        return f"no successful weather read for > {bound:g} s: {self._reason}"
 
     async def _watch(self) -> None:
         """A ``watch`` mode: read the shutter, command nothing -- except
         close on an active risk when the mode's ``intervene`` is set (module doc)."""
         self._opening_since = None
         status = await self._shutter_status()
-        risk = self.active_risk() if self.policy.intervene else None
+        risk = self.active_risk(time.monotonic()) if self.policy.intervene else None
         if risk is not None and status != Shutter.CLOSED:
             if self._intervening is None:
                 self._intervening = risk
@@ -1540,20 +1586,14 @@ class SafetySupervisor:
         return None
 
     async def _close_interlock_clear(self) -> bool:
-        """``require_park_before_close``: may the enclosure close now? Yes
-        for an emergency, or once every telescope reports ``AtPark`` (an
-        unreadable one counts as unparked). Otherwise the close is held
-        back: alarm, and escalate after ``park_interlock_escalate``."""
-        why = self.emergency()
-        if why is not None:
-            if self._close_blocked is not None:
-                self._alarm(
-                    f"closing with telescopes possibly unparked: {why} overrides the"
-                    " park-before-close interlock",
-                    "critical",
-                )
-                self._unblock_close(f"overridden: {why}")
-            return True
+        """``require_park_before_close``: may the enclosure close now? Only
+        once every telescope reports ``AtPark`` (an unreadable one counts as
+        unparked), for *any* close, an emergency included (JDE 2026-11-23:
+        the interlock is there because a telescope can hit the roof, and an
+        emergency does not make that collision any less likely). Otherwise
+        the close is held back: alarm, and escalate to critical after
+        ``park_interlock_escalate`` -- at once in an emergency, since then
+        the enclosure is being held open in rain, wind or a fault."""
 
         async def parked(tel: Grant) -> str | None:
             try:
@@ -1564,31 +1604,42 @@ class SafetySupervisor:
                 return f"{tel.owner.name} unreadable ({exc})"
 
         problems = [p for p in await asyncio.gather(*(parked(t) for t in self._tels)) if p]
-        if self.emergency() is not None:
-            return await self._close_interlock_clear()  # it became one meanwhile
         if not problems:
             self._unblock_close("all parked")
             return True
+        why = self.emergency()
         now = time.monotonic()
         blocked = "; ".join(problems)
         if self._close_blocked_since is None:
             self._close_blocked_since = now
-            self.timeline.event(self.name, "close_blocked", why=blocked, level="warning")
+            self.timeline.event(
+                self.name, "close_blocked", why=blocked, emergency=why, level="warning"
+            )
         if blocked != self._close_blocked:
+            what = f"{why}: emergency close" if why is not None else "routine close"
             self._alarm(
-                f"routine close held back by the park-before-close interlock ({blocked});"
+                f"{what} held back by the park-before-close interlock ({blocked});"
                 " the enclosure stays open until every telescope is parked"
             )
         self._close_blocked = blocked
         waited = now - self._close_blocked_since
-        if self._close_blocked_critical is None and waited >= self.config.park_interlock_escalate:
-            self._close_blocked_critical = (
-                f"enclosure NOT CLOSED for {waited:.0f} s: the park-before-close interlock"
-                f" holds a routine close ({blocked}); park the telescopes, or close as"
-                " an emergency"
-            )
+        due = why is not None or waited >= self.config.park_interlock_escalate
+        if self._close_blocked_critical is None and due:
+            if why is not None:
+                self._close_blocked_critical = (
+                    f"enclosure HELD OPEN IN AN EMERGENCY ({why}): the park-before-close"
+                    f" interlock holds the close ({blocked}); park the telescopes (by hand"
+                    " if need be), or clear them of the roof and close at the enclosure"
+                )
+            else:
+                self._close_blocked_critical = (
+                    f"enclosure NOT CLOSED for {waited:.0f} s: the park-before-close"
+                    f" interlock holds a routine close ({blocked}); park the telescopes"
+                )
             self._alarm(self._close_blocked_critical, "critical")
-            self.timeline.event(self.name, "close_blocked_escalated", why=blocked, waited=waited)
+            self.timeline.event(
+                self.name, "close_blocked_escalated", why=blocked, waited=waited, emergency=why
+            )
         return False
 
     def _unblock_close(self, how: str) -> None:
@@ -1724,7 +1775,15 @@ class SafetySupervisor:
         closing.
         """
         self.timeline.event(self.name, "supervisor_start", config=vars(self.config))
+        if self.config.require_park_before_close:
+            log.warning(
+                "%s: require_park_before_close is ON: no close, not even an emergency"
+                " (rain, wind, a fault), until every telescope reports AtPark; a"
+                " telescope that will not park keeps the enclosure OPEN",
+                self.name,
+            )
         self._stopping = False
+        self._started = time.monotonic()
         loops = [
             asyncio.create_task(self._weather_loop(), name=f"{self.name}-weather"),
             asyncio.create_task(self._enclosure_loop(), name=f"{self.name}-enclosure"),

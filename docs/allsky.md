@@ -23,8 +23,8 @@ frames come from, a starting guess at its geometry (centre, horizon
 radius, orientation) and the pixels that are never sky (text, the mast,
 the overlay); beside it, the fitted model of each camera
 (`<camera>.json`) and its static mask (`<camera>.static.png`). Commands
-take `--models DIR` (or `$ROBOFAST_ALLSKY_MODELS`); the watcher's config
-names it (`models:`, relative to the config file).
+take `--models DIR` (or `$ROBOFAST_ALLSKY_MODELS`); the site config's
+`allsky` section names it (`models:`, relative to the config file).
 
 ## Dependencies
 
@@ -140,10 +140,37 @@ cirrus that the bright stars shine through can read clear.
 
 ## Shadow wiring
 
-1. **The watcher** writes the map:
+A site turns the cloud map on by **listing its cameras** in the `allsky`
+section of its weather config (`sites/minerva/weather.yaml`; the section's
+shape is in `robofast/allsky/config.py`):
+
+```yaml
+allsky:
+  cameras:                 # each needs cameras.yaml + <camera>.json in models
+    mmto:  {dir: ~/allsky/mmto,  url: https://skycam.mmto.arizona.edu/skycam/latest_image.jpg}
+    ridge: {dir: ~/allsky/ridge, url: http://linmax.sao.arizona.edu/weather/sky/last_sky.jpg}
+  output: ~/allsky/shadow/latest.json   # absolute or ~
+  history: ~/allsky/shadow/history.jsonl
+  interval: 60
+  max_age: 180
+  stale: 600
+  trend_frames: 10
+  models: allsky
+  fetch: false
+  stale_after: 600         # the bridge's sources
+  limits:                  # their "would" verdicts (never enforced)
+    clear: {open: [0.7, null], close: [0.3, null]}
+```
+
+No camera listed (or no section) means no watcher work and no all-sky
+source; there is no separate on/off switch. Adding a camera is a config
+change: its definition in `cameras.yaml`, its fitted model, and its entry
+under `cameras`.
+
+1. **The watcher** writes the map from the same section:
 
    ```
-   python -m robofast.allsky watch --config sites/minerva/allsky_watch.yaml
+   python -m robofast.allsky watch --config sites/minerva/weather.yaml
    ```
 
    Every `interval` it takes each camera's newest frame from a directory
@@ -153,16 +180,23 @@ cirrus that the bright stars shine through can read clear.
    pools frames within `max_age` of each other, and writes `latest.json`
    atomically (temporary file, then rename): the map's time, whole-sky
    and zenith-60 clear fraction, coverage, the 36 cells, the trend, the
-   Sun and Moon, and each camera's frame and its age. `history` keeps the
-   maps for the trend across restarts. Downloading the frames itself is
+   Sun and Moon, and each camera's frame and its age. Under `per_camera`
+   it also writes each camera's own map: its time, whole-sky and
+   zenith-60 clear fraction, coverage, flags and trend, or (no `time`) why
+   there is none (no frame, too old, an error). `history` keeps the pooled
+   maps for the trend across restarts (each camera's own trend is kept in
+   memory). With no camera listed it exits at once. Downloading the frames itself is
    opt-in (`fetch: true` and each camera's `url`); at MINERVA the site
    fetcher already saves them, so the shipped config reads the directory.
-2. **The weather bridge's `allsky` source** (docs/weather_bridge.md)
-   reads that file. Its type is shadow-only: whatever it reads, or if it
-   fails, it is logged in every evaluation (`--json`, the status JSON, the
-   log line, the console's weather card) and never part of the
-   safe/unsafe/unknown verdict. It is in `sites/minerva/weather.yaml`,
-   disabled until the watcher runs on the bridge's host.
+2. **The weather bridge** makes a source for each listed camera,
+   `allsky_<camera>` (that camera's map), and, with two or more, `allsky`
+   (the pooled map), all reading that file (docs/weather_bridge.md). The
+   `allsky` type is shadow-only: whatever each reads, or if it fails, it is
+   logged in every evaluation (`--json`, the status JSON, the log line, the
+   console's weather card, each with its own clear fraction, state and
+   age) and never part of the safe/unsafe/unknown verdict, never required,
+   never ObservingConditions. The bridge must run where it can read
+   `output` (the watcher's host).
 
 ## Recalibrating
 
@@ -205,7 +239,7 @@ python -m robofast.allsky --models sites/minerva/allsky calibrate ~/allsky/mmto/
 python -m robofast.allsky --models sites/minerva/allsky check  ~/allsky/mmto/20261122/mmto_20261122T060000Z.jpg
 python -m robofast.allsky --models sites/minerva/allsky analyze ~/allsky/mmto/20261122/mmto_20261122T060000Z.jpg \
     [~/allsky/ridge/20261122/ridge_20261122T060012Z.jpg] [--at 60,180,10]
-python -m robofast.allsky watch --config sites/minerva/allsky_watch.yaml [--once]
+python -m robofast.allsky watch --config sites/minerva/weather.yaml [--once]
 python -m robofast.allsky.validate run NIGHT_DIR --camera mmto-png --model M.json \
     --models sites/minerva/allsky --log LOG --log-keys KEY1,KEY2 --out N.jsonl
 python -m robofast.allsky.validate report *.jsonl --sensor KEY1 --out-dir plots/

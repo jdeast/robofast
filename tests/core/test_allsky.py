@@ -566,3 +566,80 @@ def test_watch_step_writes_latest_json_from_the_newest_frames(fake_sky, tmp_path
     # Much later: the camera is down; nothing is analysed, the file says so.
     doc = w.step(now=when + timedelta(hours=2))
     assert doc["whole_sky_clear"] is None and doc["frames"][0]["used"] is False
+    own = doc["per_camera"]["synth"]
+    assert own["time"] is None and own["used"] is False and own["age_s"] == 7200.0
+
+
+def test_watch_step_reports_each_camera_on_its_own(fake_sky, tmp_path, monkeypatch):
+    """``per_camera``: each listed camera's own map (what the bridge's
+    per-camera shadow sources read), beside the pooled one; a camera with
+    no frames says so."""
+    pytest.importorskip("PIL")
+    from robofast.allsky import cameras, imageio, watch
+
+    cat, _ = fake_sky
+    spec = cameras.CameraSpec(name="synth", title="", url="", width=400, height=400,
+                              x0=200.0, y0=200.0, horizon_px=185.0, site=SITE)  # fmt: skip
+    monkeypatch.setitem(cameras.CAMERAS, "synth", spec)
+    monkeypatch.setitem(cameras.CAMERAS, "other", spec)
+    model = CameraModel(camera="synth", width=400, height=400, x0=200.0, y0=200.0,
+                        f1=185.0 / (math.pi / 2))  # fmt: skip
+    model.sky = {"m0": 4.0, "a1": -0.3, "width": 0.3, "radius_px": 2.0}
+    models = tmp_path / "models"
+    models.mkdir()
+    model.save(models / "synth.json")
+    model.save(models / "other.json")
+    when = datetime(2026, 11, 22, 6, tzinfo=UTC)
+    day = tmp_path / "synth" / "20261122"
+    day.mkdir(parents=True)
+    img = np.clip(_render(model, cat, when), 0, 255).astype(np.uint8)
+    imageio.write_png(day / f"synth_{when:%Y%m%dT%H%M%S}Z.png", img)
+    (tmp_path / "other").mkdir()
+    # The weather config's allsky section, read by the watcher's loader.
+    weather = tmp_path / "weather.yaml"
+    section = {
+        "output": str(tmp_path / "latest.json"),
+        "models": str(models),
+        "stale_after": 600,
+        "limits": {"clear": {"open": [0.7, None], "close": [0.3, None]}},
+        "cameras": {
+            "synth": {"dir": str(tmp_path / "synth")},
+            "other": {"dir": str(tmp_path / "other")},
+        },
+    }
+    weather.write_text(json.dumps({"sources": {}, "allsky": section}))
+    cfg = watch.load_config(weather)
+    assert set(cfg.cameras) == {"synth", "other"}
+    doc = watch.Watcher(cfg).step(now=when + timedelta(seconds=30))
+    own = doc["per_camera"]["synth"]
+    assert own["used"] is True and own["age_s"] == 30.0
+    assert own["time"] == doc["time"]
+    assert own["whole_sky_clear"] == doc["whole_sky_clear"] > 0.85
+    assert own["trend"]["whole_sky"]["state"] == "unknown"
+    assert doc["per_camera"]["other"] == {
+        "frame": None,
+        "age_s": None,
+        "used": False,
+        "time": None,
+    }
+
+
+def test_watch_with_no_camera_listed_does_nothing(tmp_path, capsys):
+    """Listing cameras is what turns the watcher on: a weather config
+    without any (no section, or an empty one) gives it nothing to do."""
+    from robofast.allsky import watch
+    from robofast.allsky.__main__ import main
+
+    out = tmp_path / "latest.json"
+    for section in (None, {}, {"cameras": {}, "output": str(out)}):
+        weather = tmp_path / "weather.yaml"
+        raw: dict = {"sources": {}}
+        if section is not None:
+            raw["allsky"] = section
+        weather.write_text(json.dumps(raw))
+        cfg = watch.load_config(weather)
+        assert cfg.cameras == {}
+        watch.Watcher(cfg).run()  # returns at once
+        assert main(["watch", "--config", str(weather)]) == 0
+        assert "no all-sky camera" in capsys.readouterr().err
+    assert not out.exists()

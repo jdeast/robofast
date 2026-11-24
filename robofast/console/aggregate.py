@@ -23,6 +23,12 @@ Sources, per enclosure (docs/console.md):
 * the throughput monitor -- its status file (``throughput`` in the
   enclosure's entry; docs/throughput.md): each telescope's efficiency
   trend, and an alarm when it has dropped.
+
+And for the whole site (``site`` in the document, not an enclosure):
+
+* the disk watch -- its status file (``diskwatch`` in the console's
+  config; docs/diskwatch.md): free space on every computer, an alarm per
+  disk low or full or unreadable, and one when the file goes stale.
 """
 
 from __future__ import annotations
@@ -309,8 +315,11 @@ class Aggregator:
         timeout: float = 2.0,
         record_lines: int = 40,
         timeline_entries: int = 60,
+        diskwatch: Path | None = None,
     ) -> None:
         self.enclosures = enclosures
+        #: The disk watch's status file (robofast.diskwatch); site-wide.
+        self.diskwatch = diskwatch
         self.http = http
         self.timeout = timeout
         self.record_lines = record_lines
@@ -347,7 +356,27 @@ class Aggregator:
                 out[n] = {"error": "could not gather status", "alarms": []}
             else:
                 out[n] = r
-        return {"time": datetime.now(UTC).isoformat(), "enclosures": out}
+        return {"time": datetime.now(UTC).isoformat(), "enclosures": out, "site": self.site()}
+
+    def site(self) -> dict[str, Any]:
+        """What belongs to no enclosure: the disk watch, and its alarms
+        (enclosure ``site``)."""
+        alarms: list[dict[str, Any]] = []
+
+        def alarm(source: str, text: str, level: str = "alarm", detail: str = "") -> None:
+            alarms.append(
+                {
+                    "id": alarm_id("site", source, text),
+                    "enclosure": "site",
+                    "source": source,
+                    "level": level,
+                    "text": text,
+                    "detail": detail,
+                }
+            )
+
+        disks = None if self.diskwatch is None else self._diskwatch_view(self.diskwatch, alarm)
+        return {"diskwatch": disks, "alarms": alarms}
 
     async def enclosure(self, enc: ConsoleEnclosure) -> dict[str, Any]:
         guider_urls = {t: f"{u}/status" for t, u in enc.guiders.items()}
@@ -711,6 +740,41 @@ class Aggregator:
                     str(a.get("detail", "")),
                 )
         return {"time": doc.get("time"), "series": series}
+
+    @staticmethod
+    def _diskwatch_view(path: Path, alarm: Any) -> dict[str, Any]:
+        """The disk watch's rows and alarms. Its alarm texts name the disk
+        and the level only (the free space is in ``detail``), so an alarm
+        keeps its id while the disk fills. A stale or missing file is an
+        alarm of its own, and stale rows raise nothing."""
+        try:
+            doc = json.loads(path.read_text())
+            age = (datetime.now(UTC) - datetime.fromisoformat(doc["time"])).total_seconds()
+        except FileNotFoundError:
+            alarm("diskwatch", "disk watch not running (no status file)", "alarm", str(path))
+            return {"time": None, "rows": [], "detail": "no status yet"}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            alarm("diskwatch", "disk watch status unreadable", "alarm", f"{exc}"[:200])
+            return {"time": None, "rows": [], "detail": f"unreadable: {exc}"[:200]}
+        stale = age > float(doc.get("max_age", 960))
+        if stale:
+            alarm(
+                "diskwatch",
+                "disk watch not running (status file stale)",
+                "alarm",
+                f"last written {age:.0f} s ago",
+            )
+        else:
+            for a in doc.get("alarms") or []:
+                if isinstance(a, dict):
+                    alarm(
+                        "diskwatch",
+                        str(a.get("text")),
+                        str(a.get("level", "warning")),
+                        str(a.get("detail", "")),
+                    )
+        rows = [r for r in doc.get("rows") or [] if isinstance(r, dict)]
+        return {"time": doc.get("time"), "age": round(age, 1), "stale": stale, "rows": rows}
 
     def _plan_view(self, enc: ConsoleEnclosure) -> dict[str, Any]:
         out: dict[str, Any] = {"recent": [], "upcoming": [], "record": None}

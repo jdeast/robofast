@@ -113,16 +113,29 @@ its frames are on disk. The report carries their paths relative to
 
 All times are UTC. `DATE-OBS` is the camera's `LastExposureStartTime`,
 which ASCOM defines as UTC. It is written with milliseconds: `CCYY-MM-DDThh:mm:ss.sss`.
-`EXPTIME` is the camera's `LastExposureDuration`. Nothing is ever computed
-as local time plus an offset. If the camera does not report a start time,
-or reports one more than 5 s from the host's time of `StartExposure`
-(`MAX_CLOCK_SKEW`: a Windows PC whose clock drifted, or a driver that reports
-local time, as MINERVA T1's Andor driver does), `DATE-OBS` is the host's UTC
-time just before `StartExposure` and `TIMESRC` is `host`. The host keeps NTP
-time; the camera PCs may not. `DATE-CMD` (the host's time when the command was sent) and
+`EXPTIME` is the camera's `LastExposureDuration`. No time zone is ever
+assumed. If the camera does not report a start time, or reports one more
+than 5 s from the host's time of `StartExposure` (`MAX_CLOCK_SKEW`: a
+Windows PC whose clock drifted), `DATE-OBS` is the host's UTC time just
+before `StartExposure` and `TIMESRC` is `host`. The host keeps NTP time; the
+camera PCs may not. `DATE-CMD` (the host's time when the command was sent) and
 `CLKSKEW` (the camera's start time minus `DATE-CMD`) are always written, so a camera clock
 that drifts is visible. Some cameras report whole seconds (OmniSim does),
 which makes `CLKSKEW` negative by up to a second.
+
+**Drivers that report local time.** Some drivers report local time
+labelled UTC (MINERVA T1's Andor driver reports MST: `CLKSKEW` is
+-25200.5 s on every frame). This is detected on each frame, never assumed.
+If `CLKSKEW` is a nonzero whole number of 15 minutes between -14 h and
++14 h (30- and 45-minute zones included), plus no more than 5 s
+(`MAX_CLOCK_SKEW`), that whole offset is removed. The corrected camera time
+is `DATE-OBS`, `TIMESRC` is `camera-local`, and `TZCORR` records the offset
+removed, in hours (-7.0 for MST). `CLKSKEW` keeps the raw value. robofast
+logs a warning the first time it sees each such camera. A camera clock that
+is really off by exactly a whole number of hours gets the same correction.
+That is harmless: the corrected time still agrees with the host's NTP time
+within 5 s, which is the same check a UTC camera must pass. Any other skew
+(for example 3000 s) still falls back to the host's time.
 
 Note: astropy's `CHECKSUM`/`DATASUM` *comments* carry its own timestamp in
 the host's local time. These are comments and do not affect any keyword
@@ -151,7 +164,8 @@ name the snapshot that a value comes from.
 | `DATE-OBS` | camera | UTC start of exposure (ms) |
 | `DATE-END` | derived | `DATE-OBS + EXPTIME` |
 | `TIMESYS` | | `UTC` |
-| `TIMESRC` | | `camera` or `host` (see Times) |
+| `TIMESRC` | | `camera`, `camera-local` or `host` (see Times) |
+| `TZCORR` | derived | [h] camera clock offset removed (only when `TIMESRC` is `camera-local`) |
 | `MJD-OBS`, `JD` | derived | at `DATE-OBS`, UTC |
 | `DATE-CMD` | host | UTC when `StartExposure` was sent |
 | `CLKSKEW` | derived | [s] camera start time - `DATE-CMD` |

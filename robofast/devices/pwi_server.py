@@ -2439,6 +2439,8 @@ class PWIServer(ThreadingHTTPServer):
         return self
 
     def stop(self) -> None:
+        if not self._loop.is_running():
+            return  # stopped already: a second stop would wait on a dead loop
         if self._discovery is not None:
             self._discovery.stop()
         if self._watch is not None:
@@ -2450,8 +2452,24 @@ class PWIServer(ThreadingHTTPServer):
             self._http_thread.join(timeout=5)
         with contextlib.suppress(Exception):
             asyncio.run_coroutine_threadsafe(self.mount.pwi.aclose(), self._loop).result(5)
+        with contextlib.suppress(Exception):
+            asyncio.run_coroutine_threadsafe(_cancel_pending(), self._loop).result(5)
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._loop_thread.join(timeout=5)
+
+
+async def _cancel_pending() -> None:
+    """Cancel and finish the loop's background tasks (the park finisher, the
+    setmodel check) before the loop stops. Left pending, they were destroyed
+    later by the garbage collector, and asyncio logged "Task was destroyed
+    but it is pending!" as an ERROR wherever that happened (PR #173's CI,
+    2026-11-24)."""
+    me = asyncio.current_task()
+    tasks = [t for t in asyncio.all_tasks() if t is not me and not t.done()]
+    for t in tasks:
+        t.cancel()
+    if tasks:
+        await asyncio.wait(tasks, timeout=2)
 
 
 def main(argv: list[str] | None = None) -> None:

@@ -1540,3 +1540,22 @@ async def test_driver_info_carries_the_pwi_version_into_fits_headers(make, backe
     value, comment = _mntswver(info, age=600.0)
     assert value is None or isinstance(value, fits.card.Undefined)
     assert comment.startswith("STALE") and "PlaneWave" in comment
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_regression_20261124_stop_leaves_no_task_pending(make, backend):
+    """PR #173's CI: a server stopped mid-park left its park finisher pending
+    on a stopped loop; the garbage collector destroyed it during a later test
+    and asyncio logged an ERROR there. stop() now cancels and finishes the
+    loop's background tasks first."""
+    sim, server = make(backend, sim_kw={"slew_rate": 0.2, "alt": 30.0, "az": 200.0})
+    tel = await device(server)
+    try:
+        await tel.call("Park", timeout=T)
+        assert server.mount.park_state == "parking"
+    finally:
+        await tel.aclose()
+    server.stop()
+    pending = [t for t in asyncio.all_tasks(server._loop) if not t.done()]
+
+    assert not pending, pending

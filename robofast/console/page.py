@@ -215,6 +215,7 @@ BODY = """
   <section id="spectrograph"><h2>Spectrograph</h2><div id="spectrograph-body"></div></section>
   <section id="plan"><h2>Plan</h2><div id="plan-body"></div></section>
   <section id="throughput" class="wide hidden"><h2>Throughput</h2><div id="throughput-body"></div></section>
+  <section id="disks" class="wide hidden"><h2>Disks</h2><div id="disks-body"></div></section>
   <section id="timeline" class="wide"><h2>Timeline</h2>
     <ul class="list scroll mono" id="timeline-list"></ul></section>
   <section id="requests" class="wide"><h2>Requests and ToOs</h2>
@@ -483,7 +484,8 @@ function render(doc) {
   const encs = Object.entries(doc.enclosures || {});
   const multi = encs.length > 1;
   const title = (name) => multi ? h("h3", {}, name) : null;
-  const alarms = encs.flatMap(([, e]) => e.alarms || []);
+  const site = doc.site || {};
+  const alarms = encs.flatMap(([, e]) => e.alarms || []).concat(site.alarms || []);
   alarms.sort((a, b) => (a.ack ? 1 : 0) - (b.ack ? 1 : 0));
   fill("alarm-list", alarms.length ? alarms.map((a) => h("li", {class: a.ack ? "acked" : ""},
     badge(a.level, a.level === "warning" ? "warn" : "bad"), " ",
@@ -642,6 +644,22 @@ function render(doc) {
           h("td", {}, s.alarm ? badge("low", "bad") : s.step_down ? badge("step down", "bad") : badge("ok", "ok"),
             (s.events || []).length ? h("span", {class: "dim"}, " " + s.events[s.events.length - 1].night + " " + s.events[s.events.length - 1].what) : null)))))) : null);
   }));
+
+  // The disk watch (docs/diskwatch.md): every computer's disks, shown only where configured.
+  const dw = site.diskwatch;
+  $("disks").classList.toggle("hidden", !dw);
+  const gb = (x) => x === null || x === undefined ? "—" : fmt(x / 1e9, 1);
+  const lvl = (r) => r.same_as ? h("span", {class: "dim"}, "same as " + r.same_as)
+    : badge(r.level, r.level === "ok" ? "ok" : r.level === "warning" || r.level === "unknown" ? "warn" : "bad");
+  fill("disks-body", dw ? [
+    h("p", {class: dw.stale ? "warn" : "dim"}, dw.time ? "updated " + ago(dw.time) + (dw.stale ? " (stale: is the disk watch running?)" : "") : fmt(dw.detail)),
+    h("div", {class: "tablewrap"}, h("table", {class: "targets"},
+      h("thead", {}, h("tr", {}, ["disk", "host", "free GB", "of GB", "used", "full in", ""].map((x) => h("th", {}, x)))),
+      h("tbody", {}, (dw.rows || []).map((r) => h("tr", {},
+        h("td", {}, r.name), h("td", {}, fmt(r.host)), h("td", {}, gb(r.free)), h("td", {}, gb(r.total)),
+        h("td", {}, r.used_pct === undefined || r.used_pct === null ? "—" : fmt(r.used_pct, 1) + "%"),
+        h("td", {}, r.days_to_full === undefined || r.days_to_full === null ? "—" : fmt(r.days_to_full, 1) + " d"),
+        h("td", {}, lvl(r), r.error ? h("span", {class: "dim"}, " " + r.error) : null))))))] : []);
 
   const tl = encs.flatMap(([name, e]) => (e.timeline || []).map((x) => ({...x, enc: name})));
   tl.sort((a, b) => (a.time < b.time ? 1 : -1));

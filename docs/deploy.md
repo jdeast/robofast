@@ -37,6 +37,7 @@ token in one service then reaches only what that user can write.
 | `robofast-api` | `robofast-request-api` | the drop box (`too_dropbox`), its audit log, the tokens file (`tokens add`) |
 | `robofast-console` | `robofast-console` | `operator_control/inbox/`, the drop box (requests through the request API's code), its acknowledgements, its audit log |
 | `robofast-notifier` | `robofast-notifier` | its own state (`StateDirectory=`) |
+| `robofast-diskwatch` | `robofast-diskwatch` | its status file (`StateDirectory=`); reads the disks, writes nothing on them |
 | `robofast-guider`, `robofast-kiwispec`, `robofast-weather`, ... | the device services, on their hosts | their calibration or state directories |
 
 and three groups, for the deliberate file exchanges of `docs/design.md` 3.8:
@@ -49,7 +50,7 @@ and three groups, for the deliberate file exchanges of `docs/design.md` 3.8:
 
 ```
 for g in robofast robofast-dropbox robofast-control; do groupadd --system "$g"; done
-for u in supervisor sequencer api console notifier; do
+for u in supervisor sequencer api console notifier diskwatch; do
     useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin \
         --gid robofast "robofast-$u"
 done
@@ -88,6 +89,7 @@ sees half a file.
     console/acks.json         console acks          robofast-console:robofast 2750 dir
     modes/aqawan1.json        operating mode        robofast-supervisor:robofast 2750 dir (docs/modes.md)
 /var/lib/robofast-notifier/   notifier state (systemd StateDirectory=, 0700)
+/var/lib/robofast-diskwatch/  disk watch status (systemd StateDirectory=, 0750; the console and notifier read it)
 /var/log/robofast/            root:robofast 0750: the audit logs, one file per service
 <data_root>/                  frames and sidecars (docs/data.md), robofast-sequencer, on its own filesystem
 ```
@@ -138,6 +140,7 @@ cd /opt/robofast/current/deploy
 install -m 0644 robofast-supervisor@.service robofast-sequencer@.service \
     robofast-sequencer@.timer robofast-calibrations@.service \
     robofast-request-api.service robofast-console.service robofast-notifier.service \
+    robofast-diskwatch.service \
     /etc/systemd/system/
 systemctl daemon-reload
 ```
@@ -162,6 +165,7 @@ UMask=0027
 | `robofast-request-api.service` | the request API on loopback, behind the TLS proxy | `systemctl enable --now robofast-request-api` |
 | `robofast-console.service` | the observer console on loopback, behind the TLS proxy | `systemctl enable --now robofast-console` |
 | `robofast-notifier.service` | the alarm notifier (`docs/notifier.md`); its secrets by `LoadCredential=` | `systemctl enable --now robofast-notifier` |
+| `robofast-diskwatch.service` | free disk space on every computer, as console alarms (`docs/diskwatch.md`); its ssh key by `LoadCredential=` | `systemctl enable --now robofast-diskwatch` |
 
 `Caddyfile.request-api` and `nginx-request-api.conf` are the TLS proxy for
 the request API; the console uses the same with its port (8400) and response

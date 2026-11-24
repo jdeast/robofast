@@ -35,6 +35,7 @@ shows, with the same ids:
 | KiwiSpec, `GET /status` | its alarms, not answering |
 | weather bridge, `GET /weather/status` | *would close* (shadow rain), not answering |
 | the throughput monitor, its status file (`throughput` in the console's enclosure entry) | a telescope's clear-night throughput more than `alarm_drop` below its baseline (warning), a sudden step down (alarm); docs/throughput.md |
+| the disk watch, its status file (`diskwatch` in the console's config) | a disk low or filling within `warn_days` (warning), nearly full (alarm), full (critical), unreadable (warning), the watch not running (alarm); docs/diskwatch.md |
 | the console | its acknowledgements file (`acks` in its config) acknowledges; with `console_url`, the console not answering `/healthz` is itself an alarm |
 | the notifier | a source that raises or times out (critical) |
 

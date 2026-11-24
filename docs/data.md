@@ -191,7 +191,7 @@ name the snapshot that a value comes from.
 | `ALT`, `AZ` | telescope, start | [deg] |
 | `LST` | telescope, start | [h] sidereal time from the mount |
 | `TRACKING` | telescope, start | mount tracking |
-| `MNTSWVER` | telescope, start | the telescope's `DriverInfo`: the mount's driver and control software. The PWI server puts PWI's version first (`PlaneWave PWI4 4.1.6; robofast pwi_server 0.1.0`; PWI2 reports no version) |
+| `MNTSWVER` | telescope, start | the telescope's `DriverInfo`: the mount's driver and control software. The PWI server puts PWI's version, from its live status, first (`PlaneWave PWI4 4.1.6; robofast pwi_server 0.1.0`). PWI2 reports no version: `PlaneWave PWI2 (reports no version); ...`. Light frames only, like the other mount keywords |
 | `FOCPOS`, `FOCTEMP` | focuser, start | [step], [C] |
 | `ROTPOS`, `ROTMECH` | rotator, start | [deg] sky and mechanical angle |
 | `ADCTRACK`, `ADCSETTL`, `ADCDEFL`, `ADCANGA`, `ADCANGB` | the ADC server (docs/adc.md), start of light frames | tracking, settled on this target, prism deflection [deg], each motor's angle from home [deg] |

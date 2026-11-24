@@ -1482,10 +1482,80 @@ async def test_targets_do_not_carry_over_to_a_new_session(make):
     await tel2.aclose()
 
 
-async def test_driver_info_carries_the_pwi_version(make):
-    """It goes in FITS headers as MNTSWVER (docs/data.md)."""
-    _, server = make("pwi4", sim_kw={"version": "4.1.6.0"})
+def _mntswver(driver_info: str, age: float = 0.0):
+    """``DriverInfo`` through the imaging pipeline's telescope read
+    (:data:`robofast.imaging.TELESCOPE_MEMBERS`) into a light frame's header:
+    (value, comment) of ``MNTSWVER``."""
+    from datetime import UTC, datetime, timedelta
+
+    from robofast.fits_writer import FrameInfo, build_header
+    from robofast.imaging import TELESCOPE_MEMBERS
+    from robofast.registry import ValueRegistry
+
+    now = datetime(2026, 11, 23, 6, 0, tzinfo=UTC)
+    name, kw, unit, comment = TELESCOPE_MEMBERS["DriverInfo"]
+    r = ValueRegistry()
+    r.publish(
+        f"t1.{name}",
+        driver_info,
+        max_age=60.0,  # ImagingConfig.pointing_max_age
+        measured=now - timedelta(seconds=age),
+        unit=unit,
+        keyword=kw,
+        comment=comment,
+    )
+    info = FrameInfo(
+        telescope="t1",
+        object="HD 1",
+        obs_name="HD 1 [c1#0]",
+        imagetyp="LIGHT",
+        light=True,
+        exptime_requested=1.0,
+        host_start=now,
+        index=0,
+        start=r.snapshot(["t1"], now=now),
+    )
+    h, _ = build_header(info, (4, 4))
+    return h["MNTSWVER"], h.comments["MNTSWVER"]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_driver_info_carries_the_pwi_version_into_fits_headers(make, backend):
+    """The live PWI version reaches each light frame's header as MNTSWVER
+    (docs/data.md); PWI2, which reports none, says so; a stale read is
+    written undefined like any other registry value."""
+    from astropy.io import fits
+
+    _, server = make(backend, sim_kw={"version": "4.1.6.0"})
     tel = await device(server)
     info = await tel.get("DriverInfo", timeout=T)
-    assert info.startswith("PlaneWave PWI4 4.1.6.0;") and "pwi_server" in info
     await tel.aclose()
+    if backend == "pwi4":
+        assert info.startswith("PlaneWave PWI4 4.1.6.0;") and "pwi_server" in info
+    else:
+        assert info.startswith("PlaneWave PWI2 (reports no version);"), info
+        assert "4.1.6" not in info
+    value, _ = _mntswver(info)
+    assert value == info
+    value, comment = _mntswver(info, age=600.0)
+    assert value is None or isinstance(value, fits.card.Undefined)
+    assert comment.startswith("STALE") and "PlaneWave" in comment
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_regression_20261124_stop_leaves_no_task_pending(make, backend):
+    """PR #173's CI: a server stopped mid-park left its park finisher pending
+    on a stopped loop; the garbage collector destroyed it during a later test
+    and asyncio logged an ERROR there. stop() now cancels and finishes the
+    loop's background tasks first."""
+    _sim, server = make(backend, sim_kw={"slew_rate": 0.2, "alt": 30.0, "az": 200.0})
+    tel = await device(server)
+    try:
+        await tel.call("Park", timeout=T)
+        assert server.mount.park_state == "parking"
+    finally:
+        await tel.aclose()
+    server.stop()
+    pending = [t for t in asyncio.all_tasks(server._loop) if not t.done()]
+
+    assert not pending, pending

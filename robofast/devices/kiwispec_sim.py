@@ -35,9 +35,11 @@ With ``data_dir`` set, ``save_image`` also writes the raw frame to
 ``PARAMnn`` keywords and a local-time ``DATE-OBS``), and
 ``write_header_done`` updates it in place as the real server does (the
 keywords added, ``PARAMnn`` removed, ``DATE-OBS`` to UTC), still not legal
-FITS. ``kill_si_image`` stops the camera server (and its cooler) and
-``start_si_image`` starts it again on the same port. The backlight is an
-LED on an arm (``backlight_arm``: ``in`` over the fiber, or ``out``).
+FITS. Every raw file it writes says ``SIMULATE = T`` (no light), even if
+the header the service sent says otherwise. ``kill_si_image`` stops the
+camera server (and its cooler) and ``start_si_image`` starts it again on
+the same port. The backlight is an LED on an arm (``backlight_arm``:
+``in`` over the fiber, or ``out``).
 
 Faults (:meth:`set_fault`): ``hang`` (the spectrograph server reads a command
 and never answers, blocking every later one, as the real single-threaded
@@ -699,6 +701,9 @@ class KiwiSpecSim:
                 time.strftime(fmt, time.gmtime(local)) + ".000",
                 kf.SI_DATE_COMMENT,
             )
+        # The simulator knows it is one: every raw file it writes says so,
+        # whatever the service's header said (kiwispec_service, "The header").
+        cards["SIMULATE"] = (True, "Simulated spectrograph: no light")
         path = self.raw_path(name)
         path.parent.mkdir(parents=True, exist_ok=True)
         kf.write_si_raw(path, f["pixels"], cards)

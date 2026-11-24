@@ -524,7 +524,24 @@ switch the pump or its valves.
   to the legacy server.
 * **FITS header:** every frame gets `I2TEMPA` and `I2TEMPS` (the cell's
   temperature and set point) and the stage's `I2POSAF`/`I2POSAS`/`I2POSSS`;
-  a failed read is written `UNKNOWN`, never left out.
+  a failed read is written `UNKNOWN`, never left out. Also on every frame
+  (asked for by the RV pipeline, 2026-11-23): `SPECPRES` (spectrograph
+  pressure, mbar, at the exposure's start: the status loop's reading if at
+  most `max(2 * status_interval, 30)` s old, else read then; `UNKNOWN`
+  when that fails, never legacy's -999) and `SIMULATE` (`T` when the
+  spectrograph PC is a simulator: no light; `F` on the real one). For each
+  telescope `n` in `FIBFEED`: `TARGRAn`, `TARGDECn` (catalogue position,
+  ICRS degrees, as legacy), `TARGEPOn` (its epoch, Julian years; default
+  2000.0), `PMRAn`, `PMDECn` (mas/yr, `PMRAn` = mu_alpha cos dec),
+  `PARLAXn` (mas), `RVn` (systemic, km/s), from the sequencer's request
+  (`targets`), `UNKNOWN` when not known. `n` is the trailing number of the
+  service's telescope name (`T1` -> 1). Legacy wrote the same `TARGRAn`
+  etc. (no epoch keyword; unsuffixed when only one telescope was listed);
+  robofast always suffixes. **Written by the spectrograph PC, not
+  robofast:** the legacy server's `write_header_done` derives `DATE-OBS`
+  (local to UTC), `JD`, `EXPTIME` (SI's `TIME` start/stop), `MEXPTIME`,
+  `CCD-TEMP` (`PARAM0`), `SET-TEMP`, `BACKTEMP`, `SHUTTER` and the other
+  SI camera keywords from SI Image's `PARAMnn` cards.
 * **The spectrograph PC's clock** is MST without daylight saving
   (`pc_utc_offset_hours: -7`); SI Image stamps `DATE-OBS` in it.
 

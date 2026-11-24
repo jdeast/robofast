@@ -14,6 +14,8 @@
     "does not answer within 2 s; fallback 'dome' closes without waiting for the telescopes to park (docs/console.md).",
     "throughput: the throughput monitor's status file (throughput.example.json; docs/throughput.md): its section",
     "and its alarms (a drop below the baseline, a sudden step down) on the page and so through the notifier.",
+    "diskwatch: the disk watch's status file (deploy/diskwatch.example.json; docs/diskwatch.md): a Disks table",
+    "for the whole site and an alarm per disk low, full or unreadable, and when the file goes stale.",
     "Every address is a 127.0.0.1 placeholder."
   ],
   "listen": "127.0.0.1:8400",
@@ -21,6 +23,7 @@
   "audit_log": "/var/log/robofast/console-audit.jsonl",
   "acks": "/var/lib/robofast/console-acks.json",
   "cookie_secure": true,
+  "diskwatch": "/var/lib/robofast-diskwatch/status.json",
   "enclosures": {
     "aqawan1": {
       "config": "aqawan1.json",

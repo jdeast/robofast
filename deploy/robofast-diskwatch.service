@@ -1,0 +1,47 @@
+# Example systemd unit for the disk watch (robofast/diskwatch.py,
+# docs/diskwatch.md). Not installed anywhere; copy and adapt. Paths below are
+# placeholders.
+#
+#   systemctl enable --now robofast-diskwatch
+#
+# Every interval it reads the free space of every computer's disks (statvfs
+# on the gateway's own disks and its CIFS/NFS mounts, df or wmic over ssh)
+# and writes a status file that the observer console reads, so the notifier
+# sends its alarms. It only reads: it never deletes or changes anything, and
+# nothing waits for it. Its ssh key (key authentication only, BatchMode) and
+# known_hosts are handed over by LoadCredential=. Check the config with
+#
+#   sudo -u robofast-diskwatch /opt/robofast/current/venv/bin/python -m robofast.diskwatch \
+#       --config /etc/robofast/diskwatch.json --once
+#
+# (run outside the unit it cannot see $CREDENTIALS_DIRECTORY: path targets
+# work, ssh targets need a copy of the config pointing at the key.)
+
+[Unit]
+Description=robofast disk watch
+After=network-online.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=robofast-diskwatch
+# The shared read group (docs/deploy.md): its config in /etc/robofast.
+SupplementaryGroups=robofast
+WorkingDirectory=/opt/robofast/current
+ExecStart=/opt/robofast/current/venv/bin/python -m robofast.diskwatch --config /etc/robofast/diskwatch.json
+LoadCredential=ssh-key:/etc/robofast/secrets/diskwatch-ssh-key
+LoadCredential=known_hosts:/etc/robofast/secrets/diskwatch-known_hosts
+# The console and the notifier (group robofast) read the status file.
+StateDirectory=robofast-diskwatch
+StateDirectoryMode=0750
+Restart=always
+RestartSec=30
+NoNewPrivileges=yes
+# Read-only everywhere but its state directory. Not ProtectHome: a disk
+# mounted under /home must still be readable by statvfs.
+ProtectSystem=strict
+PrivateTmp=yes
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

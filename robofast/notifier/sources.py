@@ -28,7 +28,8 @@ log = logging.getLogger(__name__)
 
 
 class AggregatorSource:
-    """Every enclosure's alarms, as the console gathers them."""
+    """Every enclosure's alarms and the site's (the disk watch), as the
+    console gathers them."""
 
     name = "services"
 
@@ -54,6 +55,8 @@ class AggregatorSource:
                     }
                 )
             out.extend(a for a in enc.get("alarms") or [] if isinstance(a, dict))
+        site = doc.get("site") or {}
+        out.extend(a for a in site.get("alarms") or [] if isinstance(a, dict))
         return out
 
 

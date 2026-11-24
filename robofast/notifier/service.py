@@ -21,9 +21,10 @@ The config (``deploy/notifier.example.json``)::
                            "timeout": ..., "retries": ..., ...the sink's own keys}}
     }
 
-Instead of ``console``, ``enclosures`` (the console's form) and ``acks``
-may be given directly. Paths are relative to the config file;
-``$CREDENTIALS_DIRECTORY`` (systemd ``LoadCredential=``) is expanded.
+Instead of ``console``, ``enclosures`` (the console's form), ``acks`` and
+``diskwatch`` (the disk watch's status file) may be given directly. Paths
+are relative to the config file; ``$CREDENTIALS_DIRECTORY`` (systemd
+``LoadCredential=``) is expanded.
 """
 
 from __future__ import annotations
@@ -60,6 +61,7 @@ TOP_KEYS = {
     "status_timeout",
     "state",
     "plugins",
+    "diskwatch",
 }
 WORKER_KEYS = {"min_level", "on", "rate", "timeout", "retries", "retry_base", "retry_max"}
 WORKER_KEYS |= {"queue_size", "type", "deliver_timeout"}
@@ -133,12 +135,14 @@ def build(
     from robofast.console.server import build_enclosures, load_console_config
 
     acks = raw.get("acks")
+    diskwatch = raw.get("diskwatch")
     timeout = float(raw.get("status_timeout", 3.0))
     if "console" in raw:
         if "enclosures" in raw:
             raise ValueError(f"{path}: give console or enclosures, not both")
         cconf, spec, cbase = load_console_config(_path(raw["console"], base))
         acks = acks or cconf.acks
+        diskwatch = diskwatch or cconf.diskwatch
     elif isinstance(raw.get("enclosures"), dict) and raw["enclosures"]:
         spec, cbase = raw["enclosures"], base
     else:
@@ -150,7 +154,14 @@ def build(
     }
     sources: list[Any] = [
         AggregatorSource(
-            Aggregator(enclosures, http, timeout=timeout, record_lines=0, timeline_entries=1)
+            Aggregator(
+                enclosures,
+                http,
+                timeout=timeout,
+                record_lines=0,
+                timeline_entries=1,
+                diskwatch=None if diskwatch is None else Path(_path(diskwatch, base)),
+            )
         )
     ]
     if raw.get("console_url"):

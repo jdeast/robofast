@@ -129,6 +129,8 @@ class ConsoleConfig:
     audit_log: str | None = None
     #: Alarm acknowledgements (JSON), kept across restarts; None: in memory.
     acks: str | None = None
+    #: The disk watch's status file (docs/diskwatch.md); None: not shown.
+    diskwatch: str | None = None
     tls_cert: str | None = None
     tls_key: str | None = None
     #: The session cookie's ``Secure`` flag; None: on when TLS ends here.
@@ -345,6 +347,7 @@ class Console:
             timeout=c.status_timeout,
             record_lines=c.record_lines,
             timeline_entries=c.timeline_entries,
+            diskwatch=None if c.diskwatch is None else Path(c.diskwatch),
         )
         self.supervisors = {
             n: SupervisorClient(e.supervisor_url, self.http, c.status_timeout)
@@ -404,7 +407,7 @@ class Console:
             enc = out["enclosures"].get(e["enclosure"])
             if enc is not None:
                 enc.setdefault("alarms", []).insert(0, dict(e))
-        for enc in out["enclosures"].values():
+        for enc in [*out["enclosures"].values(), out.get("site") or {}]:
             for a in enc.get("alarms", []):
                 a["ack"] = self.acks.acks.get(a["id"])
         return out
@@ -1418,7 +1421,7 @@ def load_console_config(path: str | Path) -> tuple[ConsoleConfig, dict[str, Any]
     base = path.parent
     if not config.tokens:
         raise ValueError(f"{path}: 'tokens' (the request API's tokens file) is required")
-    for key in ("tokens", "audit_log", "acks", "tls_cert", "tls_key"):
+    for key in ("tokens", "audit_log", "acks", "diskwatch", "tls_cert", "tls_key"):
         v = getattr(config, key)
         if v is not None:
             p = Path(v)

@@ -1,0 +1,41 @@
+{
+  "_note": [
+    "The disk watch (robofast/diskwatch.py; docs/diskwatch.md): free space on every computer, as console alarms.",
+    "  python -m robofast.diskwatch --config /etc/robofast/diskwatch.json --once   # one pass, a table",
+    "The console reads status (\"diskwatch\" in its config) and so the notifier sends its alarms.",
+    "path: statvfs on the gateway: its own disks, and the other computers' through its CIFS/NFS mounts.",
+    "ssh: df -Pk (linux) or wmic (windows) over ssh with a key only (BatchMode); every fixed disk is a row,",
+    "including drives no share exposes. The key and known_hosts come from systemd LoadCredential=",
+    "(deploy/robofast-diskwatch.service). volume: two targets on one disk alarm once (docs/diskwatch.md).",
+    "Thresholds at the top apply to every target; a target may set its own (null turns one off).",
+    "Every host and address is a placeholder (192.0.2.x, example.org)."
+  ],
+  "status": "/var/lib/robofast-diskwatch/status.json",
+  "interval": 300,
+  "timeout": 10,
+  "ssh_timeout": 30,
+  "unknown_after": 600,
+  "ssh_command": ["ssh", "-i", "$CREDENTIALS_DIRECTORY/ssh-key",
+                  "-o", "UserKnownHostsFile=$CREDENTIALS_DIRECTORY/known_hosts"],
+  "warn_free_gb": 20,
+  "alarm_free_gb": 5,
+  "critical_free_gb": 1,
+  "warn_pct": 90,
+  "alarm_pct": 97,
+  "warn_days": 7,
+  "window_hours": 24,
+  "targets": [
+    {"name": "gateway /", "host": "gateway", "path": "/"},
+    {"name": "gateway data", "host": "gateway", "path": "/data", "warn_pct": null},
+    {"name": "SPECTROGRAPH-PC data", "host": "192.0.2.22", "path": "/mnt/spectrograph/data",
+     "volume": "192.0.2.22 D:"},
+    {"name": "SPECTROGRAPH-PC logs", "host": "192.0.2.22", "path": "/mnt/spectrograph/logs",
+     "volume": "192.0.2.22 D:"},
+    {"name": "SPECTROGRAPH-PC", "host": "192.0.2.22", "probe": "ssh", "ssh": "spectrograph-pc.example.org",
+     "os": "windows"},
+    {"name": "T1 camera PC", "host": "192.0.2.11", "probe": "ssh", "ssh": "t1-camera.example.org",
+     "os": "windows", "drives": ["C:", "D:"]},
+    {"name": "guide PC", "host": "192.0.2.30", "probe": "ssh", "ssh": "guider.example.org",
+     "os": "linux", "mounts": ["/", "/data"]}
+  ]
+}

@@ -33,7 +33,10 @@ This client
   encoder zero points, the pointing model, the park position or the
   handpaddle setup (``#2``, ``#3``, ``#5``, ``#14``-``#16``, ``#22``-``#24``,
   ``#30``, ``#31``, ``#37``, ``#42``, ``#53``-``#56``, ``#60``, ``#66``-``#70``)
-  are documented in :data:`COMMANDS` but never sent by robofast.
+  are documented in :data:`COMMANDS` but never sent by robofast. Nor is
+  ``#7`` (offset target): FLWO's live TRES guider found it "broken on the
+  DFM side" and offsets with ``#6`` + chase instead, as the server does
+  (docs/tcsgo.md).
 * Every exchange has a hard deadline (connect, write, reply). Queries are
   retried at most ``max_attempts`` times in a loop (no recursion); a set
   command is re-sent only if it never reached the wire (the connection
@@ -163,9 +166,9 @@ COMMANDS: dict[int, Command] = {
 #: What robofast may send. Reads; target setting; mount mode, stop, tracking,
 #: park/unpark; offsets and pulse guiding; focus moves; the dome and its
 #: shutters. Nothing that rewrites encoders, the pointing model, the park
-#: position, rates or other TCS configuration.
+#: position, rates or other TCS configuration. Not #7 (see the module doc).
 ALLOWED = frozenset(
-    {6, 7, 10, 12, 13, 20, 25, 26, 27, 32, 35, 36, 40, 41, 43, 44, 50, 58, 59, 61, 62, 64}
+    {6, 10, 12, 13, 20, 25, 26, 27, 32, 35, 36, 40, 41, 43, 44, 50, 58, 59, 61, 62, 64}
 )
 
 MOUNT_MODES = {0: "hold", 1: "follow", 2: "slew", 3: "chase"}

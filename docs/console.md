@@ -250,18 +250,24 @@ of them, or the one chosen in the dialog), in this order:
 2. **Ask the safety supervisor** (`POST /close` with `"emergency": true`;
    the lease is revoked, the sequencer aborts and parks, the supervisor
    closes; on a roll-off roof with `park_before_close` it parks the
-   telescopes first, bounded by `park_wait`). Being an emergency, it
-   overrides the park-before-close interlock
-   (`require_park_before_close`): the roof closes after `park_wait` even
-   on a telescope that did not park. The enclosure `stop` above is a
-   routine close, which that interlock holds until every telescope is
-   parked.
+   telescopes first, bounded by `park_wait`). On an enclosure with the
+   park-before-close interlock (`require_park_before_close`, for a roof
+   that can hit an unparked telescope), even this close waits until every
+   telescope reports `AtPark` (JDE 2026-11-23): the roof stays open, with a
+   critical alarm at once, until someone parks it. The enclosure `stop`
+   above is held the same way.
 3. **If the supervisor does not answer within `emergency_timeout`**
    (2 s), or answers with an error, close **through the dome's emergency
    channel**: `PUT /robofast/v1/emergency_close` on the dome server, with a
    bearer token (`robofast/emergency.py`). The dialog's *skip the
    supervisor* box goes straight to this step (for a supervisor that
-   answers but whose close does not happen).
+   answers but whose close does not happen). **Not on an enclosure with
+   the park-before-close interlock** (`safety.require_park_before_close`,
+   JDE 2026-11-23): this channel cannot tell whether a telescope is in the
+   roof's way, so the console never uses it there (its config must say
+   `"fallback": "none"`, or it is refused at start) and reports the close
+   as failed instead; someone parks the telescopes and closes at the
+   enclosure.
 
 Every emergency close is audited (the console's audit log, and on the dome
 server its own `emergency_close.log`) and raised as an alarm: `critical`

@@ -19,14 +19,21 @@ Devices
   ``slew_report_min`` s ago. ``AbortSlew``: ``#12,1`` (follow from where it
   is: stops the slew and keeps tracking, as ASCOM asks) while slewing to a
   target, ``#13`` (stop: hold position) while parking. ``Tracking``: TCS mode
-  follow, chase or slew; setting it true sends ``#50`` (start tracking),
-  false ``#13`` (hold). ``Park``: ``#58`` (``park_command: "park"``) or
-  ``#10`` + ``#12,2`` (``"zenith"``, the manual's "stow at zenith");
-  ``Unpark``: ``#59``. The TCS has no "parked" status bit, so ``AtPark`` is
-  true when the mount holds position within ``park_tolerance`` of
-  (``park_alt``, ``park_az``) and no ``Unpark``/motion has been commanded
-  since; a server restart re-derives it from the position. ``PulseGuide``:
-  ``#61`` at the TCS's guide rate (``guide_rate`` must say what that is).
+  follow, chase or slew; setting it true sends ``#50`` (start tracking), false
+  ``#13`` (hold). ``Park``: ``#58`` (``park_command: "park"``) or the legacy
+  60-inch stow (``"zenith"``): ``#10`` + ``#12,2``, then, once the mount
+  follows the captured zenith target, ``#12,0`` (hold), as FLWO's TCS window
+  does; with the dome on and ``dome_park_az`` set, also ``#43`` + ``#20,2``
+  (the window stows the dome at azimuth 235). ``Unpark``: ``#59``. The TCS has
+  no "parked" status bit, so ``AtPark`` is true when the mount holds position
+  within ``park_tolerance`` of (``park_alt``, ``park_az``) and no
+  ``Unpark``/motion has been commanded since; a server restart re-derives it
+  from the position. ``PulseGuide``: ``#61`` at the TCS's guide rate
+  (``guide_rate`` must say what that is), with the manual's directions (0 N, 1
+  S, 2 E, 3 W, the same as ASCOM). *Caution*: FLWO's FAST guider sends east as
+  3 and west as 2 ("rev e-w"), probably for its camera's orientation; nothing
+  shows the TCS itself reversed, so robofast keeps the manual's mapping
+  (docs/tcsgo.md, Q9).
   RA/Dec/Alt/Az/SiderealTime come from ``#25``; RA/Dec are converted to
   J2000 (``EquatorialSystem`` 2) if the TCS's display equinox is not 2000.
   No sync (it would rewrite the encoder zero points), no MoveAxis (the TCS
@@ -46,11 +53,20 @@ Devices
 Actions (telescope)
 -------------------
 * ``Action("Offset", '{"east": E, "north": N}')`` -- the guider's offset, in
-  arcseconds on the sky (east = +RA; the TCS divides by cos Dec). Sends
-  ``#7,E,N`` and then, unless the mount is in chase mode, ``#12,offset_mode``
-  (the manual: in follow mode the target moves but the mount does not until
-  a mode command). Refused unless tracking, beyond ``max_offset`` per axis,
-  or while parked. Returns JSON of what was sent.
+  arcseconds on the sky (east = +RA). Never ``#7``: the live TRES guider
+  (``dfm_telescope.py`` ``jog()``, FLWO tres-new-guider, 2024) found ``#7``
+  "broken on the DFM side" and offsets this way instead, which this mirrors:
+  read the target (``#32``, to restore) and the mount (``#25``); set a new
+  target at the mount position + offset (RA by E/cos Dec, in the ``#25``
+  equinox) with ``#6``; chase it (``#12,3``); once captured (bounded by
+  ``offset_capture_timeout``), follow (``#12,1``) and set the old target back
+  with ``#6`` (in follow mode a new target does not move the mount). The
+  request returns after ``#12,3``; the rest runs in the background, and
+  ``Slewing`` is true until capture. An offset while one is pending re-aims
+  from the current mount position and keeps the original target to restore.
+  Refused unless tracking, beyond ``max_offset`` per axis, or while parked;
+  if the TCS flags the new target out of range, the old one is set back and
+  the offset refused. Returns JSON of what was sent.
 * ``Action("Status", "")`` -- JSON: the parsed ``#26`` flags, mount mode,
   limits, and ``#25`` coordinates.
 * ``Action("Faults", "")`` -- JSON ``{"fault": bool, "reasons": [...]}``:
@@ -122,6 +138,7 @@ from robofast.devices.tcsgo_client import (
     WEST,
     HardwareNotAllowed,
     MountCoords,
+    TargetCoords,
     TCSClient,
     TCSError,
     TCSStatus,
@@ -180,7 +197,7 @@ class TCSGOConfig:
     elevation: float
     #: robofast refuses slews below this altitude (deg), before the TCS's own.
     min_alt: float
-    #: "park" (#58) or "zenith" (#10 + #12,2).
+    #: "park" (#58) or "zenith" (#10 + #12,2, then #12,0 once captured).
     park_command: str
     #: Where the mount is when parked (for AtPark).
     park_alt: float
@@ -198,10 +215,15 @@ class TCSGOConfig:
     #: How close to (park_alt, park_az) counts as parked, deg.
     park_tolerance: float = 1.0
     max_pulse_ms: int = 10000
-    #: Offset action: per-axis bound (arcsec; legacy MAX_JOG) and the #12
-    #: mode sent after #7 unless already chasing (2 slew, 3 chase; None: none).
+    #: Offset action: per-axis bound (arcsec; legacy MAX_JOG), how long to wait
+    #: for the chase to capture (the live guider's 10 s), and the status poll.
     max_offset: float = 1000.0
-    offset_mode: int | None = 2
+    offset_capture_timeout: float = 10.0
+    sequence_poll: float = 0.3
+    #: Zenith stow: how long to wait for capture before giving up on the hold.
+    stow_timeout: float = 300.0
+    #: Dome azimuth to send the dome to on Park (dome on only); None: leave it.
+    dome_park_az: float | None = None
     #: Slewing is reported true this long after a slew/park is commanded.
     slew_report_min: float = 0.5
     #: Reads reuse a TCS reply this recent.
@@ -240,8 +262,8 @@ class TCSGOConfig:
         cfg = cls(tcs=TCSConfig(**tcs), **d)
         if cfg.park_command not in ("park", "zenith"):
             raise ValueError("park_command must be 'park' or 'zenith'")
-        if cfg.offset_mode not in (None, 2, 3):
-            raise ValueError("offset_mode must be 2, 3 or null")
+        if cfg.dome_park_az is not None and not 0.0 <= cfg.dome_park_az < 360.0:
+            raise ValueError("dome_park_az must be in [0, 360)")
         for key in ("shutter_open_order", "shutter_close_order"):
             if sorted(getattr(cfg, key)) != ["lower", "upper"]:
                 raise ValueError(f"{key} must name 'upper' and 'lower' once each")
@@ -296,6 +318,11 @@ class TCSGO:
         self._pulse_until = 0.0
         self._focus_since = -1e9
         self._shutter_cmd: str | None = None
+        #: The background end of an offset or zenith stow (one at a time).
+        self._seq_task: asyncio.Task[None] | None = None
+        self._seq_kind: str | None = None
+        self._seq_gen = 0
+        self._offset_restore: TargetCoords | None = None
 
     # -- reads ------------------------------------------------------------------
 
@@ -324,6 +351,70 @@ class TCSGO:
             await self.tcs.command(number, *args)
         finally:
             self._invalidate()
+
+    # -- background sequences (offset, stow) -----------------------------------
+
+    def _supersede(self) -> None:
+        """Any new motion command ends a pending offset/stow sequence: it
+        sends nothing more (it checks the generation before each command)."""
+        self._seq_gen += 1
+        self._seq_kind = None
+        self._offset_restore = None
+
+    def _start(self, kind: str, fn: Callable[[int], Awaitable[None]]) -> None:
+        self._seq_gen += 1
+        self._seq_kind = kind
+        gen = self._seq_gen
+
+        async def run() -> None:
+            try:
+                await fn(gen)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("%s sequence failed", kind)
+            finally:
+                if self._seq_gen == gen:
+                    self._seq_kind = None
+
+        self._seq_task = asyncio.get_running_loop().create_task(run())
+
+    def _pending(self, kind: str) -> bool:
+        return self._seq_kind == kind and self._seq_task is not None and not self._seq_task.done()
+
+    async def shutdown(self) -> None:
+        self._supersede()
+        if self._seq_task is not None and not self._seq_task.done():
+            self._seq_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._seq_task
+
+    async def _wait_captured(
+        self,
+        gen: int,
+        mode: str,
+        timeout: float,
+        there: Callable[[], Awaitable[bool]] | None = None,
+    ) -> bool | None:
+        """Poll until the target is captured in ``mode`` (and ``there()``):
+        True; timeout: False; superseded, or the mount left the expected
+        modes (someone else commanded it): None. A chase stays in chase; a
+        slew (``#12,2``) passes through slew to follow."""
+        allowed = {"chase"} if mode == "chase" else {"slew", mode}
+        deadline = time.monotonic() + timeout
+        while True:
+            await asyncio.sleep(self.config.sequence_poll)
+            if gen != self._seq_gen:
+                return None
+            st = await self.status(0)
+            if gen != self._seq_gen:
+                return None
+            if st.mode not in allowed:
+                return None
+            if st.mode == mode and st.target_captured and (there is None or await there()):
+                return True
+            if time.monotonic() > deadline:
+                return False
 
     async def radec_j2000(self) -> tuple[float, float]:
         m = await self.mount()
@@ -405,8 +496,10 @@ class TCSGO:
             if await self.tracking():
                 return
             self._park_state = "unparked"
+            self._supersede()
             await self._send(50)
         else:
+            self._supersede()
             if (await self.status(0)).mode == "hold":
                 return
             await self._send(13)
@@ -429,6 +522,7 @@ class TCSGO:
                 f"slew: target altitude {alt:.1f} deg is below min_alt {self.config.min_alt}",
             )
         self.target_ra, self.target_dec = ra, dec
+        self._supersede()
         await self._send(6, ra, dec, self.config.equinox)
         st = await self.status(0)
         if st.target_out_of_range:
@@ -440,6 +534,7 @@ class TCSGO:
 
     async def abort(self) -> None:
         self._moving_since = -1e9
+        self._supersede()
         if self._parking:
             await self._send(13)
             self._park_state = "unknown"
@@ -452,14 +547,43 @@ class TCSGO:
         if self._park_state == "parked" and await self.at_park():
             return
         await self._check_motion_allowed()
+        cfg = self.config
+        self._supersede()
         self._park_state = "parking"
         self._moving_since = time.monotonic()
-        if self.config.park_command == "park":
+        if cfg.park_command == "park":
             await self._send(58)
         else:
+            # The legacy 60-inch stow (FLWO tres-tcs win.c TeleStow; the live
+            # window then waits for follow mode and holds): zenith target,
+            # slew, and hold once there.
             await self._send(10)
             await self._send(12, 2)
-        log.info("parking (%s)", self.config.park_command)
+            self._start("stow", self._finish_stow)
+        if cfg.dome and cfg.dome_park_az is not None:
+            await self._send(43, cfg.dome_park_az)
+            await self._send(20, 2)
+        log.info("parking (%s)", cfg.park_command)
+
+    async def _finish_stow(self, gen: int) -> None:
+        cfg = self.config
+
+        async def at_zenith() -> bool:
+            m = await self.mount(0)
+            return (
+                _sep_deg(m.altitude_deg, m.azimuth_deg, cfg.park_alt, cfg.park_az)
+                <= cfg.park_tolerance
+            )
+
+        got = await self._wait_captured(gen, "follow", cfg.stow_timeout, at_zenith)
+        if got is None or gen != self._seq_gen:
+            return
+        if not got:
+            log.error("stow: zenith not captured within %.0f s; not holding", cfg.stow_timeout)
+            self._park_state = "unknown"
+            return
+        await self._send(12, 0)
+        log.info("stowed at zenith: holding")
 
     async def unpark(self) -> None:
         await self._send(59)
@@ -502,14 +626,48 @@ class TCSGO:
         st = await self.status(0)
         if st.mode not in ("follow", "chase"):
             raise AlpacaException(INVALID_OPERATION, f"Offset: mount is in {st.mode} mode")
-        await self._send(7, east, north)
-        sent: list[list[float]] = [[7, east, north]]
-        if st.mode != "chase" and cfg.offset_mode is not None:
-            self._moving_since = time.monotonic()
-            await self._send(12, cfg.offset_mode)
-            sent.append([12, cfg.offset_mode])
-        log.info('offset east %.2f" north %.2f"', east, north)
+        # The live TRES guider's jog() (module doc): never #7.
+        if self._pending("offset"):
+            restore = self._offset_restore  # keep the target from before the first offset
+        else:
+            t = TargetCoords.from_values(await self.tcs.command(32))
+            restore = t if t.equinox > 0 else None
+        m = await self.mount(0)
+        cosd = max(math.cos(math.radians(m.dec_deg)), 0.01)
+        ra = (m.ra_hours + east / 3600.0 / 15.0 / cosd) % 24.0
+        dec = m.dec_deg + north / 3600.0
+        if not -90.0 <= dec <= 90.0:
+            raise AlpacaException(INVALID_VALUE, f"Offset: Dec {dec:.4f} beyond the pole")
+        self._supersede()
+        await self._send(6, ra, dec, m.equinox)
+        sent: list[list[float]] = [[6, ra, dec, m.equinox]]
+        if (await self.status(0)).target_out_of_range:
+            if restore is not None:
+                await self._send(6, restore.ra_hours, restore.dec_deg, restore.equinox)
+            raise AlpacaException(INVALID_OPERATION, "Offset: the TCS says target out of range")
+        self._moving_since = time.monotonic()
+        await self._send(12, 3)
+        sent.append([12, 3])
+        self._start("offset", self._finish_offset)
+        self._offset_restore = restore
+        log.info('offset east %.2f" north %.2f" (chase)', east, north)
         return json.dumps({"east": east, "north": north, "sent": sent})
+
+    async def _finish_offset(self, gen: int) -> None:
+        got = await self._wait_captured(gen, "chase", self.config.offset_capture_timeout)
+        if got is None or gen != self._seq_gen:
+            return
+        if not got:
+            log.warning(
+                "offset: not captured within %.1f s; following from here",
+                self.config.offset_capture_timeout,
+            )
+        restore = self._offset_restore
+        await self._send(12, 1)
+        if restore is not None and gen == self._seq_gen:
+            await self._send(6, restore.ra_hours, restore.dec_deg, restore.equinox)
+        if gen == self._seq_gen:
+            self._offset_restore = None
 
     # -- focuser ----------------------------------------------------------------------
 
@@ -1240,6 +1398,8 @@ class TCSGOServer(ThreadingHTTPServer):
         self.server_close()
         if self._http_thread is not None:
             self._http_thread.join(timeout=5)
+        with contextlib.suppress(Exception):
+            asyncio.run_coroutine_threadsafe(self.tcsgo.shutdown(), self._loop).result(5)
         with contextlib.suppress(Exception):
             asyncio.run_coroutine_threadsafe(self.tcsgo.tcs.aclose(), self._loop).result(5)
         self._loop.call_soon_threadsafe(self._loop.stop)

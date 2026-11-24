@@ -38,11 +38,13 @@ from robofast.devices.kiwispec_client import (
     si_temp_raw,
 )
 from robofast.devices.kiwispec_service import (
+    KiwiSpec,
     KiwiSpecConfig,
     KiwiSpecRemote,
     KiwiSpecServer,
     flux_weighted_midpoint,
     main,
+    telescope_number,
 )
 from robofast.devices.kiwispec_sim import KiwiSpecSim, SimConfig
 
@@ -482,6 +484,138 @@ async def test_ordinary_frames_are_not_test_frames(http, sim):
     assert "test" not in b["file"] and b["test"] is False
     h = sim.files[b["file"]]["header"]
     assert h["IMAGETYP"][0] == "bias" and "TESTTYP" not in h
+
+
+# -- header keywords the RV pipeline asked for (specfast 2026-11-23) ----------------
+
+
+async def test_header_has_pressure_simulate_and_targets_per_telescope(http, sim):
+    """SPECPRES, SIMULATE and, for every telescope feeding the fiber,
+    legacy's TARGRAn/TARGDECn/PMRAn/PMDECn (+ epoch, parallax, RV): given
+    in the request, else UNKNOWN; never for a telescope not feeding."""
+    hd = {"ra": 26.0175, "dec": -15.9375, "pm_ra": -1729.7, "pm_dec": 855.3, "epoch": 2000.0}
+    job = await run_job(
+        http,
+        "/expose",
+        {
+            "kind": "science",
+            "exptime": 0.3,
+            "object": "HD10700",
+            "telescopes": ["T1", "T3"],
+            "targets": {"T1": {**hd, "parallax": 273.8, "rv": -16.7}},
+        },
+    )
+    assert job["state"] == "done", job
+    r = job["results"][0]
+    h = sim.files[r["file"]]["header"]
+    assert h["SPECPRES"] == [0.002, "Spectrograph pressure (mbar)"]
+    # Detector constants, units in the comments (JDE 2026-11-23: the measured gain).
+    assert h["GAIN"] == [1.265, "Detector gain (e-/ADU), photon transfer 2016-19"]
+    assert h["RDNOISE"] == [3.63, "Detector read noise (e-)"]
+    assert h["SIMULATE"] == [True, "Simulated spectrograph: no light"]
+    assert h["TARGRA1"] == [26.0175, "Target RA (ICRS deg at TARGEPO1)"]
+    assert h["TARGDEC1"] == [-15.9375, "Target Dec (ICRS deg at TARGEPO1)"]
+    assert h["PMRA1"] == [-1729.7, "Target PM in RA*cos(Dec) (mas/yr)"]
+    assert h["PMDEC1"] == [855.3, "Target Proper Motion in DEC (mas/yr)"]
+    assert h["TARGEPO1"] == [2000.0, "Epoch of TARGRA1/TARGDEC1 (Julian yr)"]
+    assert h["PARLAX1"] == [273.8, "Target Parallax (mas)"]
+    assert h["RV1"] == [-16.7, "Target RV (km/s)"]
+    # T3 feeds without coordinates: every keyword written, UNKNOWN.
+    for stem in ("TARGRA", "TARGDEC", "PMRA", "PMDEC", "TARGEPO", "PARLAX", "RV"):
+        assert h[f"{stem}3"][0] == "UNKNOWN", stem
+        assert f"{stem}2" not in h and f"{stem}4" not in h
+    assert r["spec_pressure"] == 0.002 and r["simulated"] is True
+    assert r["targets"]["T1"]["n"] == 1 and r["targets"]["T3"] == {"n": 3}
+
+
+async def test_targets_are_optional_and_checked(http, sim):
+    """Backwards compatible: a request without ``targets`` still gets every
+    feeding telescope's keywords (UNKNOWN). A telescope not feeding the
+    frame, or an unknown key, is refused; a bad value is only left out."""
+    job = await run_job(
+        http, "/expose", {"kind": "science", "exptime": 0.2, "object": "X", "telescopes": ["T2"]}
+    )
+    h = sim.files[job["results"][0]["file"]]["header"]
+    assert h["TARGRA2"][0] == "UNKNOWN" and h["PMRA2"][0] == "UNKNOWN"
+    base = {"kind": "science", "exptime": 0.2, "object": "X", "telescopes": ["T2"]}
+    for targets in ({"T1": {"ra": 1.0}}, {"T2": {"ra": 1.0, "glon": 3.0}}, {"T2": 5}, [1]):
+        r = await http.post("/expose", json={**base, "targets": targets})
+        assert r.status_code == 400, (targets, r.text)
+    job = await run_job(
+        http, "/expose", {**base, "targets": {"T2": {"ra": 400.0, "dec": "x", "pm_ra": 3.0}}}
+    )
+    h = sim.files[job["results"][0]["file"]]["header"]
+    assert h["TARGRA2"][0] == "UNKNOWN" and h["TARGDEC2"][0] == "UNKNOWN"
+    assert h["PMRA2"][0] == 3.0
+    # A calibration frame has no telescopes, so no target keywords.
+    job = await run_job(http, "/calibrate", {"frames": [{"kind": "bias", "n": 1}]})
+    h = sim.files[job["results"][0]["file"]]["header"]
+    assert not any(k.startswith("TARGRA") for k in h) and h["SIMULATE"][0] is True
+
+
+def test_telescope_numbers():
+    assert telescope_number("T1", ["T1", "T2"]) == 1
+    assert telescope_number("t4", ["t4"]) == 4
+    assert telescope_number("east", ["west", "east"]) == 2
+
+
+async def test_spec_pressure_unknown_when_unread_or_stale(http, sim, service):
+    """SPECPRES is the reading at the exposure's start: the status loop's if
+    recent, else a read now; a failed read is UNKNOWN (with a warning), and a
+    stale reading is never written in its place (legacy wrote -999)."""
+    k = service.kiwispec
+
+    async def broken():
+        raise KiwiSpecTimeout("get_spec_pressure: no reply")
+
+    k.spec.spec_pressure = broken
+    k.readings["spec_pressure"] = {"value": 0.001, "at": 0.0, "ok_at": time.time() - 3600}
+    job = await run_job(http, "/calibrate", {"frames": [{"kind": "bias", "n": 1}]})
+    r = job["results"][0]
+    assert sim.files[r["file"]]["header"]["SPECPRES"] == [
+        "UNKNOWN",
+        "Spectrograph pressure (mbar)",
+    ]
+    assert r["spec_pressure"] is None
+    assert any("spectrograph pressure unknown" in w for w in r["warnings"])
+    # A recent reading (the status loop's) is used without a read.
+    k.readings["spec_pressure"] = {"value": 0.0042, "at": time.time(), "ok_at": time.time()}
+    job = await run_job(http, "/calibrate", {"frames": [{"kind": "bias", "n": 1}]})
+    assert sim.files[job["results"][0]["file"]]["header"]["SPECPRES"][0] == 0.0042
+
+
+async def test_simulate_is_false_for_the_real_spectrograph(sim):
+    """SIMULATE is T only for a simulator: with the hardware gate closed only
+    a verified simulator is reachable; with it open (the real PC), F unless
+    the endpoint verifies as a simulator."""
+    real = KiwiSpecServer(gate_config(allow_hardware=True), hardware=True)
+    assert real.kiwispec.hardware is True and real.kiwispec.simulated() is False
+    assert json.loads(KiwiSpec._header(header_result(simulated=False)))["SIMULATE"] == [
+        False,
+        "Simulated spectrograph: no light",
+    ]
+    # The gate open, but the endpoints are this simulator: still T.
+    opened = KiwiSpecServer(service_config(sim, allow_hardware=True), hardware=True)
+    assert opened.kiwispec.simulated() is True
+    assert KiwiSpecServer(service_config(sim)).kiwispec.simulated() is True
+
+
+def header_result(**over) -> dict:
+    """A frame result as :meth:`KiwiSpec._take` makes it, for ``_header``."""
+    return {
+        "kind": "science",
+        "object": "X",
+        "ended_by": "time",
+        "flux_source": "none",
+        "expmeter_counts": None,
+        "fau_counts": None,
+        "target_counts": None,
+        "flux_midpoint_jd": None,
+        "iodine": {"mm": 11.0, "name": "in", "requested": "in"},
+        "telescopes": ["T1"],
+        "targets": {"T1": {"n": 1}},
+        **over,
+    }
 
 
 def test_test_frames_config_is_a_bool(sim):

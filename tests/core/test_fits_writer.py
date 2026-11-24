@@ -149,20 +149,80 @@ def test_header_without_a_camera_time_uses_the_host_clock():
     r.failed("t1.camera.last_start", "NotConnected")
     h, _ = fw.build_header(info(r, end=r.snapshot(now=T0)), (48, 32))
     assert h["DATE-OBS"] == "2026-11-14T05:06:07.891" and h["TIMESRC"] == "host"
+    assert "TZCORR" not in h
 
 
-@pytest.mark.parametrize("offset", [timedelta(hours=-7), timedelta(seconds=30)])
-def test_a_camera_clock_far_off_the_hosts_is_not_used(offset):
-    # MINERVA T1, 2026-11-05: local time (7 h off) from a PC 30 s fast.
+def _with_camera_start(cam_start: datetime) -> ValueRegistry:
     r = registry()
-    cam_start = T0 + offset + timedelta(seconds=0.2)
     r.publish(
         "t1.camera.last_start", cam_start.strftime("%Y-%m-%dT%H:%M:%S.%f"), max_age=60, measured=T0
     )
-    h, date_obs = fw.build_header(info(r), (48, 32))
+    return r
+
+
+@pytest.mark.parametrize(
+    "offset",
+    [
+        timedelta(seconds=30),  # MINERVA T1, 2026-11-05: a PC 30 s fast
+        timedelta(seconds=3000),  # not a whole 15 minutes
+        timedelta(hours=-7, seconds=30),  # local time, but the PC 30 s fast too
+        timedelta(hours=15),  # a whole hour, but no such time zone
+    ],
+)
+def test_a_camera_clock_far_off_the_hosts_is_not_used(offset):
+    cam_start = T0 + offset + timedelta(seconds=0.2)
+    h, date_obs = fw.build_header(info(_with_camera_start(cam_start)), (48, 32))
     assert h["TIMESRC"] == "host" and h["DATE-OBS"] == "2026-11-14T05:06:07.891"
-    assert date_obs == T0
+    assert date_obs == T0 and "TZCORR" not in h
     assert h["CLKSKEW"] == pytest.approx((cam_start - T0).total_seconds(), abs=1e-3)
+
+
+@pytest.mark.parametrize(
+    ("hours", "latency"),
+    [(-7.0, 0.51), (5.5, 0.2), (5.75, -0.8), (-3.5, 4.9), (14.0, 0.3), (-12.0, 0.3)],
+)
+def test_a_driver_reporting_local_time_is_corrected(hours, latency, caplog):
+    # night1121/1122 T1 Andor ("Ascom Driver for Andor CCD Cameras" 6.0):
+    # MST labelled UTC, CLKSKEW -25200.51 s; DATE-OBS fell back to the host's
+    # command time, 0.5 s early (JDE 2026-11-23).
+    fw._LOCAL_TIME_LOGGED.discard("t1")
+    shutter = T0 + timedelta(seconds=latency)
+    cam_start = shutter + timedelta(hours=hours)
+    r = _with_camera_start(cam_start)
+    with caplog.at_level("WARNING", logger="robofast.fits_writer"):
+        h, date_obs = fw.build_header(info(r), (48, 32))
+        h2, _ = fw.build_header(info(r), (48, 32))
+    assert h["TIMESRC"] == h2["TIMESRC"] == "camera-local"
+    assert h["DATE-OBS"] == fw.iso_ms(shutter)
+    assert abs((date_obs - shutter).total_seconds()) < 1e-3
+    assert h["TZCORR"] == hours and h["TIMESYS"] == "UTC"
+    assert h["CLKSKEW"] == pytest.approx((cam_start - T0).total_seconds(), abs=1e-3)
+    assert h["DATE-CMD"] == "2026-11-14T05:06:07.891"
+    # Logged once per camera, not per frame.
+    assert sum("reports local time" in m for m in caplog.messages) == 1
+
+
+def test_the_t1_andor_frame_to_the_millisecond():
+    # CLKSKEW -25200.51 s as on night1121/1122.
+    cam_start = T0 + timedelta(seconds=-25200.51)
+    h, _ = fw.build_header(info(_with_camera_start(cam_start)), (48, 32))
+    assert h["DATE-OBS"] == fw.iso_ms(T0 + timedelta(seconds=-0.51))
+    assert h["TIMESRC"] == "camera-local" and h["TZCORR"] == -7.0
+
+
+def test_a_camera_within_the_skew_bound_is_never_corrected():
+    cam_start = T0 + timedelta(seconds=4.9)
+    h, date_obs = fw.build_header(info(_with_camera_start(cam_start)), (48, 32))
+    assert h["TIMESRC"] == "camera" and date_obs == cam_start and "TZCORR" not in h
+
+
+def test_local_time_offset_rule():
+    assert fw.local_time_offset(-25200.51) == -25200.0
+    assert fw.local_time_offset(19800.2) == 19800.0  # +5.5 h
+    assert fw.local_time_offset(20700.0) == 20700.0  # +5.75 h
+    assert fw.local_time_offset(-50400.0) == -50400.0  # -14 h
+    for skew in (None, 0.0, 4.9, -4.9, 3000.0, -25200 + 30.0, 50400 + 900.0, float("nan")):
+        assert fw.local_time_offset(skew) is None
 
 
 def test_parse_camera_time_variants():

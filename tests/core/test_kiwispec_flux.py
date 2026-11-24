@@ -315,14 +315,43 @@ async def test_raw_file_is_made_legal_in_place(sim, tmp_path):
                 "/expose",
                 {"kind": "bias", "night": "n20261109"},
             )
+            sci = await run_job(
+                http,
+                "/expose",
+                {
+                    "kind": "science",
+                    "exptime": 0.2,
+                    "object": "HD10700",
+                    "telescopes": ["T2"],
+                    "night": "n20261109",
+                    "targets": {"T2": {"ra": 26.0175, "dec": -15.9375, "pm_ra": -1729.7}},
+                },
+            )
     finally:
         await server.stop()
+    # The new keywords survive into the legal file, cards and comments
+    # whole (specfast 2026-11-23).
+    assert sci["state"] == "done", sci
+    with fits.open(tmp_path / "pc" / "n20261109" / sci["results"][0]["file"]) as hdul:
+        h = hdul[0].header
+        assert h["SIMULATE"] is True
+        assert h.comments["SIMULATE"] == "Simulated spectrograph: no light"
+        assert h["SPECPRES"] == pytest.approx(0.002)
+        assert h.comments["SPECPRES"] == "Spectrograph pressure (mbar)"
+        assert h["TARGRA2"] == pytest.approx(26.0175) and h["TARGDEC2"] == -15.9375
+        assert h.comments["TARGRA2"] == "Target RA (ICRS deg at TARGEPO2)"
+        assert h["PMRA2"] == -1729.7 and h["PMDEC2"] == "UNKNOWN"
+        assert h.comments["TARGEPO2"] == "Epoch of TARGRA2/TARGDEC2 (Julian yr)"
+        assert "TARGRA1" not in h
     r = job["results"][0]
     assert job["state"] == "done", job
     fits_info = r["fits"]
     assert fits_info["rewritten"] is True, fits_info
     path = tmp_path / "pc" / "n20261109" / r["file"]
-    assert sorted(p.name for p in path.parent.iterdir()) == [r["file"]]  # one copy at rest
+    # One copy at rest of each frame.
+    assert sorted(p.name for p in path.parent.iterdir()) == sorted(
+        [r["file"], sci["results"][0]["file"]]
+    )
     with fits.open(path, checksum=True) as hdul:
         hdul.verify("exception")
         data = hdul[0].data
@@ -331,6 +360,7 @@ async def test_raw_file_is_made_legal_in_place(sim, tmp_path):
         assert h["DATASUM"] == fits_info["datasum"]
         assert h["OBJECT"] == "Bias" and h["FLUXSRC"] == "none"
         assert "PARAM0" not in h
+        assert h["SIMULATE"] is True and h["SPECPRES"] == pytest.approx(0.002)
     assert kf.pixel_sha256(data) == fits_info["pixel_sha256"]
 
 

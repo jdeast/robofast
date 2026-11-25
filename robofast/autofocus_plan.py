@@ -101,13 +101,15 @@ class AutofocusTriggers:
         config: TriggerConfig | None = None,
         *,
         registry: ValueRegistry | None = None,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] | None = None,
         telescopes: Sequence[str] | None = None,
     ) -> None:
         self.inner = inner
         self.config = config or TriggerConfig()
         self.registry = registry
-        self.clock = clock
+        # time.monotonic read at each call, not bound here (virtual time
+        # patches it: robofast/testing/virtual_time.py).
+        self.clock = clock or (lambda: time.monotonic())
         self._only = set(self.config.telescopes or telescopes or []) or None
         self._state: dict[str, _State] = {}
         #: (telescope, reason) of every autofocus handed out.

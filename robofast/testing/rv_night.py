@@ -61,7 +61,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 import numpy as np
@@ -272,7 +272,7 @@ class PACProcess:
 
     def start(self) -> PACProcess:
         self.out.mkdir(parents=True, exist_ok=True)
-        log = open(self.out / "aqawan_sim.log", "w")  # noqa: SIM115 (the child keeps it)
+        log = open(self.out / "aqawan_sim.log", "w")  # the child keeps it open
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "robofast.devices.aqawan_sim", "--port", "0",
              "--state-file", str(self.state), *self.args],
@@ -447,7 +447,7 @@ class SimulatedNight:
     PAC_PROCESS = False
     #: The PAC client's (``pac``) and the enclosure server's timings: fast
     #: here, for an accelerated night; the rehearsal uses production's.
-    PAC_TIMINGS: dict[str, dict[str, float]] = {
+    PAC_TIMINGS: ClassVar[dict[str, dict[str, float]]] = {
         "pac": {
             "connect_timeout": 1.0,
             "command_timeout": 2.0,

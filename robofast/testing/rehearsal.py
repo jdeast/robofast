@@ -103,7 +103,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 import numpy as np
@@ -1019,7 +1019,7 @@ class Rehearsal(SimulatedNight):
     #: production's timings (the client's and server's defaults), so the
     #: dry runs see only the PAC drops the real system could.
     PAC_PROCESS = True
-    PAC_TIMINGS: dict[str, dict[str, float]] = {
+    PAC_TIMINGS: ClassVar[dict[str, dict[str, float]]] = {
         "pac": {},
         "server": {"start_grace": 1.0, "shutter_open_timeout": 5.0},
     }

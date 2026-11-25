@@ -316,6 +316,12 @@ class SafetyConfig:
     #: broken shutter is not cycled every reopen hold.
     shutter_unreadable_grace: float = 15.0
     shutter_error_backoff: float = 1800.0
+    #: A fault channel that cannot be read for this long counts as faulted
+    #: (revokes the lease, closes). Until then no new lease is granted, but
+    #: an open enclosure is not cycled for one dropped reply (night1124: a
+    #: single PAC STATUS read that came back late cost a spectrum and a roof
+    #: cycle). A fault the enclosure *reports* still acts at once.
+    fault_unreadable_grace: float = 15.0
     #: The enclosure must not run unattended: no lease (so no opening)
     #: unless an operator is on duty, in every mode (module doc; a floor the
     #: modes cannot lower). ``None``: true exactly when there is no hardware
@@ -540,6 +546,8 @@ class SafetySupervisor:
         self._fault: str | None = "not read yet" if self._faults else None
         self._fault_kind: object = "not read yet"  # (fault, error), or why unknown
         self._fault_escalated = False
+        #: Since when the fault channel has failed to read (None: it reads).
+        self._fault_unreadable_since: float | None = None
         #: The enclosure reports an emergency stop (never cleared automatically).
         self._estop: str | None = None
         #: Automatic clearing (``fault_auto_clear``): when, how many, whether
@@ -1033,7 +1041,12 @@ class SafetySupervisor:
 
     def _grantable(self) -> bool:
         """Everything but the park check that a grant needs."""
-        return not self._close_committed and self.open_allowed() and self.outstanding() is None
+        return (
+            not self._close_committed
+            and self._fault_unreadable_since is None
+            and self.open_allowed()
+            and self.outstanding() is None
+        )
 
     def _revoke_lease(self, reason: str) -> None:
         lease = self._lease
@@ -1220,6 +1233,7 @@ class SafetySupervisor:
             kind: object = "unreadable"
             problem: str | None = f"cannot read enclosure faults: {exc}"
         else:
+            self._fault_unreadable_since = None
             kind = (fault, error)
             parts = [
                 name + (f" ({data.get(text)})" if data.get(text) else "")
@@ -1227,6 +1241,19 @@ class SafetySupervisor:
                 if flag
             ]
             problem = f"enclosure reports {', '.join(parts)}" if parts else None
+        if kind == "unreadable" and self._fault_kind != "unreadable":
+            # Within the grace a failed read changes nothing but new grants
+            # (_grantable); a reported fault stays reported.
+            now = time.monotonic()
+            if self._fault_unreadable_since is None:
+                self._fault_unreadable_since = now
+                log.warning("%s: %s; %g s grace", self.name, problem, cfg.fault_unreadable_grace)
+            if now - self._fault_unreadable_since < cfg.fault_unreadable_grace:
+                return
+            problem = (
+                f"enclosure faults unreadable for {now - self._fault_unreadable_since:.0f} s"
+                f" ({problem})"
+            )
         previous = self._fault
         if kind == self._fault_kind:
             self._fault = problem  # same condition; its text may have arrived
@@ -1502,7 +1529,12 @@ class SafetySupervisor:
             # The dangerous case: a fault with the enclosure not closed.
             self._fault_escalated = True
             name = "unknown" if status is None else Shutter(status).name
-            self._alarm(f"FAULT WITH ENCLOSURE NOT CLOSED (shutter {name}): {self._fault}; closing")
+            what = (
+                "FAULT WITH ENCLOSURE NOT CLOSED"
+                if isinstance(self._fault_kind, tuple)
+                else "ENCLOSURE FAULTS UNKNOWN WITH ENCLOSURE NOT CLOSED"
+            )
+            self._alarm(f"{what} (shutter {name}): {self._fault}; closing")
         if status == Shutter.CLOSING:
             self._close_committed = True  # however it began: no grant until CLOSED
             if self._closing_since is None:

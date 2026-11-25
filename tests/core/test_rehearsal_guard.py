@@ -6,6 +6,8 @@ plan. The whole rehearsal runs in tests/e2e/test_rehearsal.py."""
 from __future__ import annotations
 
 import argparse
+import os
+import time
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -510,3 +512,39 @@ def test_a_slew_cut_short_by_a_cancel_is_not_a_hung_slew() -> None:
     # Out of the altitude limits is still reported, cancel or not.
     low = [{"telescope": "t1", "alt": MIN_ALT - 1, "t": t + 30, "utc": "low", "seconds": 5.0}]
     assert slew_problems(low, tl) == [f"t1: slew to altitude {MIN_ALT - 1:.1f}"]
+
+
+def _sockets_to(port: int) -> int:
+    """This process's established TCP sockets whose peer is ``port``."""
+    inodes = set()
+    for name in ("/proc/net/tcp", "/proc/net/tcp6"):
+        for line in open(name).read().splitlines()[1:]:
+            f = line.split()
+            if f[3] == "01" and int(f[2].rsplit(":", 1)[1], 16) == port:
+                inodes.add(f[9])
+    n = 0
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            continue
+        if target.startswith("socket:[") and target[8:-1] in inodes:
+            n += 1
+    return n
+
+
+@pytest.mark.skipif(not os.path.exists("/proc/net/tcp"), reason="needs Linux /proc")
+def test_regression_20261125_reconnecting_clients_do_not_leak_upstream_sockets(mount, guard):
+    """night1124 ran out of file descriptors after 11.5 h: robofast's clients
+    reconnect to the guard after each idle gap, every connection got its own
+    thread and upstream client, and none was closed until the guard stopped.
+    Now a connection's upstream client closes when the connection does."""
+    _, _, srv = mount
+    port = int(srv.address.rsplit(":", 1)[1])
+    for _ in range(40):  # 40 connections, one after another (httpx.get: a new client each)
+        assert get(guard, "telescope/0/tracking")["ErrorNumber"] == 0
+    deadline = time.monotonic() + 5
+    while (_sockets_to(port) > 2 or len(guard._clients) > 1) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert len(guard._clients) <= 1, len(guard._clients)
+    assert _sockets_to(port) <= 2, _sockets_to(port)

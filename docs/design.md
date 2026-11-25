@@ -1112,6 +1112,7 @@ support is often worse. So:
 | `mode` | none: `robotic` (`attended` without a heartbeat) | the operating mode started in when its mode file is missing or unreadable; the shipped sites: `attended` (docs/modes.md) |
 | `duty_ttl`, `duty_grace` | 300 s, 300 s | an operator's duty not renewed this long raises a critical alarm; after the grace, the supervisor closes |
 | `shutter_unreadable_grace` | 15 s | while open is wanted, a shutter unreadable this long revokes the lease and closes (shutterError does so at once) |
+| `fault_unreadable_grace` | 15 s | a fault channel unreadable this long counts as faulted: revokes the lease and closes. Until then no new lease is granted; a fault the enclosure reports acts at once |
 | `shutter_error_backoff` | 30 min | no reopen after a shutter error, so a broken shutter is not cycled |
 | `min_alt`, `max_alt` | 21°, 83° | per-telescope altitude limits (legacy MINALT, MAXALT) |
 | `max_sun_alt` | -12° | observe light frames only with the Sun below this (legacy HORIZON) |

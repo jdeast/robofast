@@ -151,13 +151,15 @@ class CameraCooling:
         *,
         alarm: Callable[[str], None] | None = None,
         event: Callable[..., None] | None = None,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self.name = name
         self.config = config
         self.alarm = alarm or (lambda text: None)
         self.event = event or (lambda what, **kw: None)
-        self.clock = clock
+        # time.monotonic read at each call, not bound here (virtual time
+        # patches it: robofast/testing/virtual_time.py).
+        self.clock = clock or (lambda: time.monotonic())
         #: Why this camera cannot be cooled (None: it can, as far as known).
         self.unsupported: str | None = None
         #: ``clock()`` when the cooler was last set (None: not yet).

@@ -18,8 +18,12 @@ An autofocus is due on a telescope when (each optional, in this order):
 * ``temperature_change`` -- the registry value ``temperature_value``
   (default the focuser's temperature) has moved more than this (deg C)
   since the last successful autofocus;
-* ``fwhm_degradation`` -- the image pipeline's FWHM (``fwhm_value``) is
-  more than this factor above the FWHM right after the last autofocus;
+* ``fwhm_degradation`` -- a measured FWHM (``fwhm_value``) is more than
+  this factor above the same value right after the last autofocus. By
+  default the image pipeline's (``{tel}.image.fwhm``, from imager frames)
+  and the guider's (``{tel}.guide_fwhm_arcsec``, the median of the last
+  guide frames: robofast.guider.loop), each against its own baseline, so a
+  telescope that takes only guide frames (spectra) has the trigger too;
 * ``max_interval`` -- seconds since the last successful autofocus.
 
 A failed autofocus is not retried for ``retry_after`` seconds (the
@@ -50,6 +54,11 @@ __all__ = ["AutofocusTriggers", "TriggerConfig"]
 #: The observation kinds an autofocus may be inserted before.
 FOCUS_BEFORE = ("expose", "spectrum")
 
+#: The default FWHM values of the FWHM trigger: the image pipeline's
+#: (imager frames, robofast.imaging) and the guider's running median
+#: (guide frames, robofast.guider.loop).
+FWHM_VALUES = ("{tel}.image.fwhm", "{tel}.guide_fwhm_arcsec")
+
 
 @dataclass
 class TriggerConfig:
@@ -57,13 +66,20 @@ class TriggerConfig:
     temperature_change: float | None = 1.0
     temperature_value: str = "{tel}.focuser.temperature"
     fwhm_degradation: float | None = 1.5
-    fwhm_value: str = "{tel}.image.fwhm"
+    #: The FWHM values (arcsec) the trigger watches, each against its own
+    #: baseline (a name or a list of names).
+    fwhm_value: str | list[str] = field(default_factory=lambda: list(FWHM_VALUES))
     max_interval: float | None = None
     retry_after: float = 1800.0
     #: Overrides for the autofocus observations (``Observation.autofocus``).
     autofocus: dict[str, Any] = field(default_factory=dict)
     #: Only these telescopes (None: every telescope of the plan).
     telescopes: list[str] | None = None
+
+    @property
+    def fwhm_values(self) -> list[str]:
+        v = self.fwhm_value
+        return [v] if isinstance(v, str) else list(v)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> TriggerConfig:
@@ -81,7 +97,10 @@ class _State:
     last_attempt: float | None = None
     last_failed: bool = False
     temperature: float | None = None
-    fwhm: float | None = None
+    #: Each FWHM value's baseline (the first after the last autofocus) and
+    #: its latest reading at an observation's end, by registry template.
+    fwhm: dict[str, float] = field(default_factory=dict)
+    fwhm_latest: dict[str, float] = field(default_factory=dict)
     #: The plan's next observation, held while the autofocus runs (plans
     #: without ``peek``).
     held: Observation | Idle | None = None
@@ -169,7 +188,8 @@ class AutofocusTriggers:
                 st.last_success = st.last_attempt
                 st.last_failed = False
                 st.temperature = self._value(self.config.temperature_value, telescope)
-                st.fwhm = None  # re-learned from the next frames
+                st.fwhm.clear()  # re-learned from the next frames
+                st.fwhm_latest.clear()
             elif outcome in ("failed", "unsupported"):
                 st.last_failed = True
             # "interrupted": due again at once (nothing was learned).
@@ -180,9 +200,14 @@ class AutofocusTriggers:
             self.inner.report(telescope, obs, outcome, frames, files=files)
         else:
             self.inner.report(telescope, obs, outcome, frames)
-        # The FWHM baseline: the first value after an autofocus.
-        if st.last_success is not None and st.fwhm is None and obs.light:
-            st.fwhm = self._value(self.config.fwhm_value, telescope)
+        # The FWHM baselines: each value's first after an autofocus.
+        if st.last_success is not None and obs.light:
+            for name in self.config.fwhm_values:
+                v = self._value(name, telescope)
+                if v is None or v <= 0:
+                    continue
+                st.fwhm_latest[name] = v
+                st.fwhm.setdefault(name, v)
 
     def autofocus_result(self, telescope: str, obs: Observation, result: dict[str, Any]) -> None:
         """The sequencer's autofocus result: kept, and written to the plan record."""
@@ -244,10 +269,16 @@ class AutofocusTriggers:
             t = self._value(cfg.temperature_value, telescope)
             if t is not None and abs(t - st.temperature) > cfg.temperature_change:
                 return f"temperature changed {t - st.temperature:+.2f} C"
-        if cfg.fwhm_degradation is not None and st.fwhm is not None:
-            f = self._value(cfg.fwhm_value, telescope)
-            if f is not None and f > cfg.fwhm_degradation * st.fwhm:
-                return f"FWHM {f:.2f} > {cfg.fwhm_degradation:g} x {st.fwhm:.2f}"
+        if cfg.fwhm_degradation is not None:
+            for name, base in st.fwhm.items():
+                # Now, or (gone stale: the guider stopped) at the last
+                # observation's end.
+                f = self._value(name, telescope)
+                if f is None:
+                    f = st.fwhm_latest.get(name)
+                if f is not None and f > cfg.fwhm_degradation * base:
+                    which = name.replace("{tel}.", "")
+                    return f"FWHM {f:.2f} > {cfg.fwhm_degradation:g} x {base:.2f} ({which})"
         if cfg.max_interval is not None and now - st.last_success > cfg.max_interval:
             return f"{now - st.last_success:.0f} s since the last autofocus"
         return None

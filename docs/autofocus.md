@@ -342,13 +342,47 @@ model, like any, only predicts where an autofocus starts.
   * `start_of_night`: no success yet tonight;
   * `temperature_change`: more than this many degrees C since the last
     success (`temperature_value`, default `{tel}.focuser.temperature`);
-  * `fwhm_degradation`: the image pipeline's FWHM (`{tel}.image.fwhm`,
-    published when `images.measure_fwhm` is on) above this factor times
-    the FWHM just after the last autofocus;
+  * `fwhm_degradation`: a measured FWHM above this factor times the same
+    value just after the last autofocus. `fwhm_value` names the values
+    (one name or a list; default both of): the image pipeline's
+    `{tel}.image.fwhm` (imager frames, published when
+    `images.measure_fwhm` is on) and the guider's `{tel}.guide_fwhm_arcsec`
+    (the median FWHM of its last `fwhm_frames` guide frames, default 5;
+    needs the guider's `plate_scale`; never from the annulus centroider,
+    whose star sits in the fiber hole: docs/guider.md). Each value is
+    compared with its own baseline, never one camera's with the other's.
+    A baseline is the value read when the first light observation after a
+    successful autofocus ends, so it comes from frames taken after that
+    autofocus. A value gone stale (the guider stopped at the observation's
+    end) counts as its reading when the last observation ended. On RV
+    nights only the guide cameras take frames, so the guider's value is
+    the one that fires;
   * `max_interval`: seconds since the last success.
 
   A failed autofocus is not retried for `retry_after` (30 min). The
   telescope observes on at its old focus meanwhile.
+* **Focus at slew.** While a telescope slews to an `expose` or `spectrum`
+  observation, the sequencer moves its focuser to where focus is expected
+  for that observation's port and filter: the model's prediction
+  (section 6) at the focuser's temperature and the **target's** altitude
+  (computed from the mount's sidereal time and latitude, since the mount
+  is not there yet), anchored on the last measured focus; without a model
+  zero point, the last measured focus of that port/filter. It runs beside
+  the slew (it costs no time and takes no exposure), and the observation
+  waits for it before anything is exposed. The focuser is left alone when
+  there is neither a model nor a last focus, when it is within
+  `slew_focus_deadband` steps (default 10) of the prediction, during an
+  exposure, and while an autofocus runs or was cut short (it is restored
+  first). A focuser error, or a prediction outside the focuser's limits,
+  never fails the observation: it is logged and recorded
+  (`slew_focus_failed`), and the telescope observes at the focus it has.
+  A move is recorded as the timeline event `slew_focus` (`predicted_from`
+  `model` or `last`, `start`, `focus` (the prediction), `position`,
+  `altitude`, `temperature`, `duration`). Every
+  imager frame's `FOCPOS` is read from the focuser at its start, so it is
+  the position the move reached; a spectrum's sidecar keeps each feeding
+  telescope's focuser at its slew under `focus`. `slew_focus: false`
+  (in the `autofocus` entry or an override) turns it off.
 * **The coarse fallback.** The sequencer gives every run the coarse
   mode's reference (two frames 2 deg away in declination, then back on
   the target), so a fine run that finds no focus tries the coarse mode
@@ -408,6 +442,7 @@ with `-` for any):
 | `coarse_fallback` | true | run the coarse mode when the fine mode fails |
 | `coarse_exptime`, `coarse_step` | `exptime`, travel / 64 | the coarse mode's first exposure and step |
 | `saturation` | camera's `MaxADU` | full scale, for the coarse mode's clipping |
+| `slew_focus`, `slew_focus_deadband` | true, 10 steps | focus at slew (section 7): move to the prediction while slewing, unless already this close |
 
 Also in the entry: `model` (above), `store` (the JSON file, relative to
 the config file) and `overrides`.

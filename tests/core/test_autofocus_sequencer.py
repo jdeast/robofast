@@ -306,6 +306,68 @@ async def test_triggers_start_temperature_fwhm_interval_and_retry():
     assert "since the last autofocus" in trig.due("t1")
 
 
+async def test_regression_20261125_guide_frame_fwhm_fires_the_fwhm_trigger():
+    """The FWHM trigger read only the image pipeline's ``{tel}.image.fwhm``
+    (imager frames); on an RV night only the guide cameras take frames, so
+    it could never fire. The guide loop now publishes the median FWHM of
+    its last frames (``{tel}.guide_fwhm_arcsec``), which the trigger
+    watches against its own baseline from the guide frames after the
+    autofocus."""
+    from robofast.guider.base import VirtualClock
+
+    from .test_guider_loop import _guide_for, _rig
+
+    reg, clock = ValueRegistry(), Clock()
+
+    class Spectra(Inner):
+        def _obs(self):
+            return Observation(
+                f"rv{self.n}", ra_hours=2.0, dec_deg=5.0, port="fau", kind="spectrum",
+                spectrum={"id": f"s{self.n}", "feed": ["t1"]},
+            )  # fmt: skip
+
+    trig = AutofocusTriggers(
+        Spectra(),
+        TriggerConfig(temperature_change=None, fwhm_degradation=1.5),
+        registry=reg,
+        clock=clock,
+    )
+    vclock = VirtualClock()
+    guider, world = _rig(
+        vclock, config={"scope": "t1", "plate_scale": 0.5, "publish_interval": 0.1}
+    )
+    guider.registry = reg
+    world.fwhm = 3.0  # pixels: 1.5"
+    af = await trig.next_observation("t1")
+    assert af.kind == "autofocus" and af.port == "fau"
+    trig.report("t1", af, "complete", 2)
+    # The spectrum after the autofocus: guide frames only, never an image.
+    obs = await trig.next_observation("t1")
+    assert obs.kind == "spectrum"
+    await _guide_for(guider, vclock, 1.0)
+    baseline = reg.get("t1.guide_fwhm_arcsec")
+    assert baseline.unit == "arcsec" and baseline.keyword == "GUIDFWHA"
+    assert baseline.value == pytest.approx(1.5, rel=0.15)
+    assert reg.get("t1.image.fwhm") is None
+    trig.report("t1", obs, "complete", 1)
+    assert trig.due("t1") is None
+    # The focus drifts: the star swells to 4" over the next frames (the
+    # windowed centre of mass measures ~3" of it).
+    obs = await trig.next_observation("t1")
+    assert obs.kind == "spectrum"
+    world.fwhm = 8.0
+    t0 = vclock.now()
+    while vclock.now() < t0 + 1.0:
+        await vclock.sleep(0.05)
+    await guider.stop()
+    assert reg.get("t1.guide_fwhm_arcsec").value > 1.8 * baseline.value
+    trig.report("t1", obs, "complete", 1)
+    why = trig.due("t1")
+    assert why is not None and why.startswith("FWHM") and "guide_fwhm_arcsec" in why
+    af = await trig.next_observation("t1")
+    assert af.kind == "autofocus" and af.port == "fau"
+
+
 async def test_triggers_hold_the_observation_of_a_plan_without_peek():
     inner = Inner(n=2, peek=False)
     trig = AutofocusTriggers(inner, TriggerConfig(), registry=ValueRegistry())

@@ -192,6 +192,16 @@ def hour_angle(lst_hours: float, ra_hours: float) -> float:
     return (lst_hours - ra_hours + 12.0) % 24.0 - 12.0
 
 
+def altitude(latitude: float, lst_hours: float, ra_hours: float, dec_deg: float) -> float:
+    """Altitude (deg) of ``ra_hours, dec_deg`` at local sidereal time
+    ``lst_hours`` from ``latitude`` (geometric; the same precession caveat
+    as :func:`hour_angle`)."""
+    phi, dec = math.radians(latitude), math.radians(dec_deg)
+    ha = math.radians(15.0 * hour_angle(lst_hours, ra_hours))
+    s = math.sin(phi) * math.sin(dec) + math.cos(phi) * math.cos(dec) * math.cos(ha)
+    return math.degrees(math.asin(max(-1.0, min(1.0, s))))
+
+
 def setting_hour_angle(latitude: float, dec_deg: float, alt_deg: float) -> float:
     """Hour angle (hours, >= 0) at which a target of declination ``dec_deg``
     sinks below ``alt_deg``; ``inf`` if it never does, ``-inf`` if it never

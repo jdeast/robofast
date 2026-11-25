@@ -6,10 +6,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import time
 from datetime import UTC, datetime
 
 import pytest
 
+from robofast import sky
 from robofast.clock import NightRule
 from robofast.guider.base import GuiderError
 from robofast.plan import CalibrationPlan, Observation, StaticPlan
@@ -615,3 +618,145 @@ async def test_an_ordinary_spectrum_has_no_test_mark(make_rig, tmp_path):
     await run_to_end(rig)
     [rec] = rig.sequencer.spectrum_records
     assert "test" not in rec
+
+
+# -- focus at slew (docs/autofocus.md section 7) ---------------------------------------------
+
+
+class _TimedFocuser:
+    """Wraps a SimFocuser: the virtual time of every Move."""
+
+    def __init__(self, foc):
+        self.foc, self.move_times = foc, []
+
+    def __getattr__(self, name):
+        return getattr(self.foc, name)
+
+    async def get(self, member, *, timeout=None):
+        return await self.foc.get(member, timeout=timeout)
+
+    async def set(self, member, value, *, timeout=None):
+        await self.foc.set(member, value, timeout=timeout)
+
+    async def call(self, member, *args, timeout=None):
+        if member == "Move":
+            self.move_times.append(time.monotonic())
+        return await self.foc.call(member, *args, timeout=timeout)
+
+
+def _slew_focus_rig(make_rig, tmp_path, *, model=None, store=None, start=20000, speed=1000.0):
+    """rv_rig with a focuser (moving ``speed`` steps/s) and an autofocus
+    setup on t1; the mount slews for 0.5 s."""
+    from robofast.autofocus import AutofocusSetup, FocusModel, FocusStore
+    from robofast.owner import DeviceOwner
+    from robofast.testing.focus_sim import SimFocuser
+
+    from .test_autofocus_sequencer import AF_BASE
+
+    plan = StaticPlan([spectrum_target()], ["t1", "t2"])
+    rig = rv_rig(make_rig, tmp_path, plan)
+    for t in rig.tels:
+        t._slew_time = 0.5
+    unit = rig.sequencer.units["t1"]
+    foc = _TimedFocuser(SimFocuser(position=start, speed=speed, temperature=12.0))
+    unit.focuser = DeviceOwner("t1.focuser", lambda: foc, rig.timeline, default_timeout=2)
+    unit.autofocus = AutofocusSetup(
+        dict(AF_BASE), model=model or FocusModel(), store=store or FocusStore()
+    )
+    slews = []
+    tel = rig.tels[0]
+    slew = tel.SlewToCoordinatesAsync
+
+    def timed_slew(ra, dec):
+        slews.append(time.monotonic())
+        slew(ra, dec)
+
+    tel.SlewToCoordinatesAsync = timed_slew
+    return rig, plan, foc, slews
+
+
+async def test_regression_20261125_a_slew_to_a_spectrum_sets_the_model_focus(make_rig, tmp_path):
+    """The legacy RV night autofocused every telescope on the target before
+    every spectrum (~3 min, ~10 FAU frames), and a late telescope focused
+    on through the running exposure. Now the focuser goes to the focus
+    model's prediction (temperature and the target's altitude, anchored on
+    the last measured focus) while the mount slews: no time, no exposure."""
+    from robofast.autofocus import FocusModel, FocusStore
+
+    temp, alt = "{tel}.focuser.temperature", "sin:{tel}.tel.alt"
+    model = FocusModel({temp: -50.0, alt: 2000.0}, {temp: 10.0, alt: 0.5})
+    store = FocusStore()
+    store.data["models"]["t1/-/-"] = {"zero_point": 20000.0, "updated": "2026-11-24"}
+    rig, plan, foc, slews = _slew_focus_rig(
+        make_rig, tmp_path, model=model, store=store, start=19000
+    )
+    await run_to_end(rig)
+    [ev] = events(rig, "slew_focus")
+    d = ev.detail
+    # The prediction at the focuser's 12 C and the target's altitude (not
+    # the mount's, which the fake keeps at 60 deg).
+    tel = rig.tels[0]
+    assert d["altitude"] == pytest.approx(
+        sky.altitude(tel.SiteLatitude, tel.SiderealTime, TARGET["ra_hours"], TARGET["dec_deg"]),
+        abs=0.2,
+    )
+    want = 20000 - 50.0 * 2 + 2000.0 * (math.sin(math.radians(d["altitude"])) - 0.5)
+    assert d["focus"] == round(want) and d["predicted_from"] == "model" and d["start"] == 19000
+    assert foc.Position == round(want) == d["position"]
+    # Beside the slew: the move started before the slew ended (0.5 s) and
+    # the mount was on target no later than the slower of the two (the
+    # move is ~1 s at 1000 steps/s), not after both in turn.
+    [slew_t], [move_t] = slews, foc.move_times
+    assert move_t < slew_t + 0.5
+    on_target = next(e for e in events(rig, "on_target") if e.detail["telescope"] == "t1").t
+    move_s = abs(round(want) - 19000) / 1000.0
+    assert on_target - min(slew_t, move_t) < max(0.5, move_s) + 0.3
+    # No exposure, no autofocus; the spectrum started after the move.
+    assert rig.cams[0].exposures_started == 0
+    assert not rig.timeline.events("autofocus_start")
+    assert ev.t < rig.timeline.events("expose", "spectrograph")[0].t
+    # The sidecar keeps each telescope's focus at its slew.
+    [rec] = rig.sequencer.spectrum_records
+    assert rec["focus"]["t1"]["position"] == round(want) and rec["focus"]["t1"]["moved"]
+    assert rec["focus"]["t2"] is None  # no focuser
+    assert [o[2] for o in plan.history] == ["complete", "complete"]
+
+
+@pytest.mark.parametrize("case", ["nothing known", "inside the deadband"])
+async def test_regression_20261125_no_slew_focus_without_a_model_or_inside_the_deadband(
+    make_rig, tmp_path, case
+):
+    from robofast.autofocus import FocusStore
+
+    store = FocusStore()
+    if case == "inside the deadband":
+        # A last measured focus (no model): 6 steps away, inside the 10.
+        store.data["last"]["t1/-/-"] = {"focus": 20006.0, "time": "2026-11-24T03:00:00"}
+    rig, plan, foc, _ = _slew_focus_rig(make_rig, tmp_path, store=store, start=20000)
+    await run_to_end(rig)
+    assert foc.moves == [] and foc.Position == 20000
+    assert not events(rig, "slew_focus") and not events(rig, "slew_focus_failed")
+    [rec] = rig.sequencer.spectrum_records
+    assert rec["focus"]["t1"] == {"position": 20000.0, "moved": False}
+    assert [o[2] for o in plan.history] == ["complete", "complete"]
+
+
+async def test_regression_20261125_a_focuser_error_at_slew_does_not_fail_the_spectrum(
+    make_rig, tmp_path
+):
+    from robofast.autofocus import FocusStore
+
+    store = FocusStore()
+    store.data["last"]["t1/-/-"] = {"focus": 20500.0, "time": "2026-11-24T03:00:00"}
+    rig, plan, foc, _ = _slew_focus_rig(make_rig, tmp_path, store=store, start=20000)
+    foc.foc.fail_moves = 1
+    await run_to_end(rig)
+    [failed] = events(rig, "slew_focus_failed")
+    assert failed.detail["telescope"] == "t1" and "focuser move failed" in failed.detail["error"]
+    assert not events(rig, "slew_focus")
+    assert not rig.timeline.events("telescope_error")
+    # Both telescopes fed the spectrum, t1 at the focus it had.
+    [frame] = rig.spec.science()
+    assert sorted(frame["telescopes"]) == ["t1", "t2"]
+    assert foc.Position == 20000
+    assert [o[2] for o in plan.history] == ["complete", "complete"]

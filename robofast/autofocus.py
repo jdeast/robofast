@@ -271,6 +271,12 @@ class AutofocusConfig:
     coarse_step: float | None = None
     #: The camera's full scale (ADU; None: its MaxADU, else 65535).
     saturation: float | None = None
+    #: Focus at slew (docs/autofocus.md section 7): while the telescope
+    #: slews to an ``expose`` or ``spectrum`` observation, move the focuser
+    #: to :meth:`Autofocus.prediction` for its port and filter, unless it is
+    #: within ``slew_focus_deadband`` steps of it already.
+    slew_focus: bool = True
+    slew_focus_deadband: float = 10.0
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> AutofocusConfig:
@@ -304,6 +310,8 @@ class AutofocusConfig:
             raise ValueError("autofocus.sweep_fit must be 'hyperbola' or 'parabola'")
         if self.mode not in MODES:
             raise ValueError(f"autofocus.mode {self.mode!r}: expected one of {MODES}")
+        if self.slew_focus_deadband < 0:
+            raise ValueError("autofocus.slew_focus_deadband must be >= 0")
         for name in ("coarse_exptime", "coarse_step", "saturation"):
             v = getattr(self, name)
             if v is not None and v <= 0:
@@ -743,6 +751,23 @@ class Autofocus:
             raise ValueError("autofocus: far_offset must exceed near_offset")
         return near, far
 
+    def prediction(
+        self, values: dict[str, float | None] | None = None
+    ) -> tuple[float | None, str | None]:
+        """Where focus is expected now, and from what: the model's
+        prediction (``"model"``: its zero point re-anchored on the last
+        measured focus), else the last measured focus of this key
+        (``"last"``); ``(None, None)`` with neither. ``values`` defaults to
+        ``values()``."""
+        values = dict(self._values()) if values is None else values
+        predicted = self.model.predict(values)
+        if predicted is not None:
+            return predicted, "model"
+        last = self.store.last_focus(self.key)
+        if last is not None:
+            return float(last), "last"
+        return None, None
+
     async def run(
         self, method: str | None = None, *, start: float | None = None, mode: str | None = None
     ) -> AutofocusResult:
@@ -776,9 +801,7 @@ class Autofocus:
         self._result = res
         res.predicted = self.model.predict(values)
         if start is None:
-            start = res.predicted
-        if start is None:
-            start = self.store.last_focus(self.key)
+            start, _ = self.prediction(values)
         if start is None:
             start = float(await self.focuser.get("Position"))
         res.start = float(start)

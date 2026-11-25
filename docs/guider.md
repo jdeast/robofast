@@ -390,7 +390,11 @@ hole; docs/seeing.md).
 
 **Value registry** (design.md 3.8): `<scope>.guide_state` (GUIDSTAT),
 `guide_rms` (GUIDRMS), `guide_rms_arcsec` (GUIDRMSA), `guide_flux`,
-`guide_fwhm`, `guide_seeing` (GUIDSEE, arcsec), `guide_rate`, `guide_latency`, `guide_exptime`,
+`guide_fwhm`, `guide_seeing` (GUIDSEE, arcsec), `guide_fwhm_arcsec` (GUIDFWHA: the
+median FWHM of the last `fwhm_frames` guide frames, default 5, with `plate_scale`;
+never from the annulus centroider; the autofocus FWHM trigger's value on a
+telescope that takes only guide frames, docs/autofocus.md section 7),
+`guide_rate`, `guide_latency`, `guide_exptime`,
 `guide_offset_arcsec` (GUIDOFFA, the mean offset from the setpoint), `fiber_x/y`
 (XSCIFIB/YSCIFIB, as tres-guider), `tiptilt_a/b` (TTPOSA/B). The service
 keeps its own registry; `GuiderRemote` copies them into the sequencer's

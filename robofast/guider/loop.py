@@ -36,7 +36,11 @@ one (the guide star is clear of the fiber hole).
 Telemetry (:meth:`Guider.status`): the last frame, and over the last
 ``window`` frames the residual rms (pixels, and arcsec with a plate scale),
 loop rate, latency (median, 95th percentile, max), flux, FWHM, tip/tilt
-position and how much of its range is used. It is published, at most once
+position and how much of its range is used; and the median FWHM (arcsec)
+of the last ``fwhm_frames`` frames (``guide_fwhm_arcsec``), the autofocus
+FWHM trigger's value on a telescope that takes only guide frames
+(docs/autofocus.md section 7). It counts only a whole star's FWHM, so
+never the annulus centroider's (the star's core is in the fiber hole). It is published, at most once
 per ``publish_interval``, to a value registry (``<scope>.guide_*``, with
 FITS keywords; design.md 3.8) and optionally to a Redis channel in
 tres-guider's ``tracking_data`` format (:mod:`~robofast.guider.redis_pub`).
@@ -156,6 +160,11 @@ class GuideConfig:
     publish_interval: float = 1.0
     #: Arcsec per pixel, for telemetry in arcsec (optional).
     plate_scale: float | None = None
+    #: The guide star's FWHM for the autofocus FWHM trigger
+    #: (``<scope>.guide_fwhm_arcsec``; needs ``plate_scale``): the median
+    #: over the last ``fwhm_frames`` guide frames that measured a whole
+    #: star (module doc).
+    fwhm_frames: int = 5
     #: Value registry scope (the telescope's name: "t2").
     scope: str = "guider"
     #: Measure the counts inside the fiber's footprint on every guide frame
@@ -192,6 +201,8 @@ class GuideConfig:
             raise ValueError("roi_size out of range")
         if c.offset_alarm is not None and c.offset_alarm <= 0:
             raise ValueError("offset_alarm must be positive (or null: off)")
+        if c.fwhm_frames < 1:
+            raise ValueError("fwhm_frames must be >= 1")
         if c.offset_alarm_time < 0 or c.offset_alarm_window <= 0:
             raise ValueError("offset_alarm_time >= 0 and offset_alarm_window > 0")
         if c.fiber_annulus is not None:
@@ -330,6 +341,9 @@ class Guider:
         self.offset_arcsec = math.nan
         self._offset_high_since: float | None = None
         self.alarms: deque[Alarm] = deque(maxlen=50)
+        #: The FWHMs (pixels) of the last ``fwhm_frames`` whole-star guide
+        #: frames of this acquisition (:meth:`_watch_fwhm`).
+        self._fwhms: deque[float] = deque(maxlen=config.fwhm_frames)
         self.last: Measurement | None = None
         self.frames = 0
         self.reacquisitions = 0
@@ -732,6 +746,7 @@ class Guider:
         self.controller.set_target(*c.target)
         self._roi = ROI.centred(c.target[0], c.target[1], c.roi_size, self.camera.sensor)
         self._reset_offset_watch()  # each (re)acquisition starts the watch afresh
+        self._fwhms.clear()  # and the FWHM median (another star, perhaps)
         self._set_state("guiding")
         guess: tuple[float, float] = (star.x, star.y)
         bad = 0
@@ -829,6 +844,7 @@ class Guider:
             )
         if valid:
             self._watch_offset(frame.t_end, m.x - tgt[0], m.y - tgt[1])
+            self._watch_fwhm(m)
         self.records.append(
             FrameRecord(
                 frame.t_end,
@@ -885,6 +901,16 @@ class Guider:
                 offset_pixels=[round(mx, 3), round(my, 3)],
             )
 
+    def _watch_fwhm(self, m: Measurement) -> None:
+        """Keep a valid frame's FWHM for the running median, when it is a
+        whole star's: never the annulus centroider's (a star in the fiber
+        hole is fitted with a width it learned or was given, not measured)."""
+        if not (math.isfinite(m.fwhm) and m.fwhm > 0):
+            return
+        if getattr(self._centroider, "name", "") == "annulus":
+            return
+        self._fwhms.append(float(m.fwhm))
+
     # -- telemetry --------------------------------------------------------------------
 
     def summary(self) -> dict[str, Any]:
@@ -934,6 +960,10 @@ class Guider:
                 out["offset_arcsec"] = self.offset_arcsec
             if self.last is not None and math.isfinite(self.last.fwhm):
                 out["fwhm_arcsec"] = out["fwhm"] * ps
+            if self._fwhms:
+                # For the autofocus FWHM trigger: a median of the last few
+                # frames (a cloud or a bad frame does not fire it).
+                out["fwhm_median_arcsec"] = statistics.median(self._fwhms) * ps
             # The live seeing (docs/seeing.md): a whole star's FWHM; on the
             # fiber (annulus) the width learned from a star clear of the
             # hole, never the fit of the spill around it.
@@ -1037,6 +1067,7 @@ VALUES: dict[str, tuple[str, str, str]] = {
     "guide_flux": ("GUIDFLUX", "adu", "Guide star flux per frame (ADU)"),
     "guide_fwhm": ("GUIDFWHM", "pix", "Guide star FWHM (pixels)"),
     "guide_seeing": ("GUIDSEE", "arcsec", "Seeing FWHM from the guide camera"),
+    "guide_fwhm_arcsec": ("GUIDFWHA", "arcsec", "Guide star FWHM, median of the last frames"),
     "guide_rate": ("GUIDRATE", "Hz", "Guide loop rate"),
     "guide_latency": ("GUIDLAT", "s", "Guide latency, exposure end to command (median)"),
     "guide_exptime": ("GUIDEXP", "s", "Guide exposure time"),
@@ -1089,6 +1120,7 @@ def publish_values(
             ("guide_flux", "flux"),
             ("guide_fwhm", "fwhm"),
             ("guide_seeing", "seeing_arcsec"),
+            ("guide_fwhm_arcsec", "fwhm_median_arcsec"),
             ("guide_rate", "loop_rate"),
             ("guide_latency", "latency_median"),
             ("guide_offset_arcsec", "offset_arcsec"),

@@ -410,6 +410,10 @@ POINTING_RUN_DEFAULTS: dict[str, Any] = {
 #: What a target's acquisition entry passes to the guider (docs/acquisition.md).
 ACQ_KEYS = ("mode", "fallback", "companions", "tolerance")
 
+#: The observation kinds whose slew sets the focus model's prediction
+#: (focus at slew, docs/autofocus.md section 7).
+SLEW_FOCUS_KINDS = ("expose", "spectrum")
+
 #: Preemption policies, weakest first (module doc).
 PREEMPT_POLICIES = ("next", "now-after-readout", "now")
 
@@ -614,6 +618,9 @@ class TelescopeUnit:
     focus_restore: float | None = field(default=None, init=False)
     #: Every autofocus result tonight (:class:`~robofast.autofocus.AutofocusResult`).
     autofocus_results: list[Any] = field(default_factory=list, init=False)
+    #: The focus at the last slew to an observation (:meth:`Sequencer._focus_at_slew`):
+    #: the focuser's position, whether it moved, and to what (None: not read).
+    slew_focus: dict[str, Any] | None = field(default=None, init=False)
     #: The spectrum this telescope leads or feeds (its id), while it does.
     spectrum: str | None = field(default=None, init=False)
     #: An operator asked to park it now (why; :meth:`Sequencer.request_park`).
@@ -2463,7 +2470,22 @@ class Sequencer:
                 lst = await tel.get("SiderealTime")
                 lat = await tel.get("SiteLatitude")
                 ra, dec = (lst - 0.5) % 24.0, max(-89.0, min(89.0, lat - 10.0))
-            await self._slew(state, unit, tel, obs, ra, dec)
+            unit.slew_focus = None
+            focus = None
+            if obs.kind in SLEW_FOCUS_KINDS:
+                # The focus model's prediction, set while the mount slews.
+                focus = asyncio.create_task(
+                    self._focus_at_slew(state, unit, tel, obs, ra, dec),
+                    name=f"{self.name}-{unit.name}-slew-focus",
+                )
+            try:
+                await self._slew(state, unit, tel, obs, ra, dec)
+            except BaseException:
+                if focus is not None:
+                    await stop_task(focus, self.config.cancel_ack_timeout)
+                raise
+            if focus is not None:
+                await focus  # before any exposure; raises only a revoked grant or lease
             self._event("on_target", gen=gen, telescope=unit.name, ra=ra, dec=dec)
             if unit.adc is not None:
                 await self._adc_track(state, unit)
@@ -3615,19 +3637,28 @@ class Sequencer:
         extra: dict[str, Any] | None = None,
         exposer: Any = None,
         sky_beside: Any = None,
+        overrides: dict[str, float] | None = None,
     ) -> Autofocus:
+        """The telescope's autofocus for ``port``/``filter``. The model's
+        values come from the registry, except those in ``overrides``
+        (registry names with ``{tel}``, e.g. the target's ``{tel}.tel.alt``)."""
         setup, fg = unit.autofocus, state.focusers.get(unit.name)
         if setup is None or fg is None:
             raise Unsupported(f"{unit.name} cannot autofocus (no focuser or autofocus config)")
         model = setup.model
         tel_name = unit.name
+        given = dict(overrides or {})
 
         def values() -> dict[str, float | None]:
             snap = self.registry.snapshot()
             names = {*model.terms, *FOCUS_CONTEXT}
-            return {
-                name: snap.current(term_source(name).replace("{tel}", tel_name)) for name in names
-            }
+            out: dict[str, float | None] = {}
+            for name in names:
+                src = term_source(name)
+                out[name] = (
+                    given[src] if src in given else snap.current(src.replace("{tel}", tel_name))
+                )
+            return out
 
         return Autofocus(
             unit.name,
@@ -3783,6 +3814,90 @@ class Sequencer:
             await imaging.flush(unit.name)
         if not result.success:
             raise ObservationFailed(f"autofocus: {result.message}")
+
+    async def _focus_at_slew(
+        self,
+        state: _Generation,
+        unit: TelescopeUnit,
+        tel: Grant,
+        obs: Observation,
+        ra: float,
+        dec: float,
+    ) -> None:
+        """Focus at slew (docs/autofocus.md section 7), run beside the slew
+        to (``ra``, ``dec``): move the focuser to the focus model's
+        prediction for ``obs``'s port and filter at the focuser's temperature
+        and the target's altitude (:meth:`Autofocus.prediction`), if it is
+        more than ``slew_focus_deadband`` steps away. Nothing without a
+        model or a last measured focus, during an exposure, or while an
+        autofocus is running or left unfinished (``focus_restore``). Never
+        fails the observation: an error is logged and recorded
+        (``slew_focus_failed``); only a revoked grant or lease is raised."""
+        fg = state.focusers.get(unit.name)
+        setup = unit.autofocus
+        if fg is None or setup is None or unit.exposing or unit.focus_restore is not None:
+            return
+        t0 = time.monotonic()
+        try:
+            cfg = setup.config_for(obs.port, obs.filter)
+            if not cfg.slew_focus:
+                return
+            await self._read_focuser(unit, fg)
+            lst = float(await tel.get("SiderealTime"))
+            lat = float(await tel.get("SiteLatitude"))
+            alt = sky.altitude(lat, lst, ra, dec)
+            af = self._focus_runner(
+                state,
+                unit,
+                None,
+                obs.port,
+                obs.filter,
+                exposer=_no_exposures,
+                overrides={"{tel}.tel.alt": alt},
+            )
+            target, source = af.prediction()
+            start = float(await fg.get("Position"))
+            unit.slew_focus = {"position": start, "moved": False}
+            if target is None or abs(target - start) <= cfg.slew_focus_deadband:
+                return
+            await af.move(target)
+            position = float(await fg.get("Position"))
+            unit.slew_focus = {
+                "position": position,
+                "moved": True,
+                "start": start,
+                "target": round(target),
+                "predicted_from": source,
+                "altitude": round(alt, 3),
+            }
+            self._event(
+                "slew_focus",
+                gen=state.gen,
+                telescope=unit.name,
+                target=obs.name,
+                port=obs.port,
+                filter=obs.filter,
+                predicted_from=source,
+                start=start,
+                focus=round(target),
+                position=position,
+                altitude=round(alt, 3),
+                temperature=self.registry.snapshot().current(f"{unit.name}.focuser.temperature"),
+                duration=round(time.monotonic() - t0, 3),
+            )
+        except (GrantRevoked, LeaseRevoked):
+            raise
+        except Exception as exc:
+            # The observation goes on at whatever focus the focuser has.
+            log.warning("%s: %s: focus at slew failed: %r", self.name, unit.name, exc)
+            self._event(
+                "slew_focus_failed",
+                gen=state.gen,
+                telescope=unit.name,
+                target=obs.name,
+                error=repr(exc),
+                level="warning",
+            )
 
     async def _restore_focus(self, state: _Generation, unit: TelescopeUnit) -> None:
         """Undo an autofocus that was cut short (the focuser was left defocused)."""
@@ -4334,6 +4449,8 @@ class Sequencer:
             "dropped": dict(session.dropped),
             "guide": stats,
             "acquisition": {t: self.units[t].acquisition for t in feeding if t in self.units},
+            # Each feeding telescope's focuser at its slew (focus at slew).
+            "focus": {t: self.units[t].slew_focus for t in feeding if t in self.units},
             "exptime": result.get("exptime"),
             "exptime_requested": result.get("exptime_requested", obs.exptime),
             "ended_by": result.get("ended_by"),

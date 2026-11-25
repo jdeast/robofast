@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import UTC, datetime
 
 import pytest
 
 from robofast.clock import NightRule
+from robofast.devices.kiwispec_client import KiwiSpecBusy, KiwiSpecError
 from robofast.guider.base import GuiderError
 from robofast.plan import CalibrationPlan, Observation, StaticPlan
 from robofast.sky import Site
@@ -170,6 +172,145 @@ class FakeGuider:
         self._log("stop", reason=reason)
         self.guiding = False
         return True
+
+
+class OutageSpectrograph(FakeSpectrograph):
+    """A :class:`FakeSpectrograph` behind a KiwiSpec service that can stop
+    answering, as :class:`~robofast.devices.kiwispec_service.KiwiSpecRemote`
+    sees it (night1123: the KiwiSpec server hung all night):
+
+    * ``mode = "hang"``: every request runs into the client's ``timeout``
+      (``wait`` + ``timeout`` for a job poll) and raises ``KiwiSpecError``;
+      ``abort`` gives up after ``abort_timeout`` (False);
+    * ``mode = "down"``: every request is refused at once
+      (``KiwiSpecError``); ``abort`` answers False at once.
+
+    A job already running goes on (the spectrograph PC still exposes). A new
+    ``expose`` while a job runs is ``KiwiSpecBusy`` (the service's 409).
+    ``refused`` counts the ``expose`` requests that reached it while out."""
+
+    def __init__(self, timeline, *, timeout: float = 10.0, abort_timeout: float = 45.0, **kw):
+        super().__init__(timeline, **kw)
+        self.timeout, self.abort_timeout = timeout, abort_timeout
+        self.mode: str | None = None
+        self.refused = 0
+
+    async def _out(self, what: str, wait: float = 0.0) -> None:
+        if self.mode == "hang":
+            await asyncio.sleep(wait + self.timeout)
+            raise KiwiSpecError(f"{what}: ReadTimeout: timed out")
+        raise KiwiSpecError(f"{what}: ConnectError: connection refused")
+
+    def _start(self, kind: str, frames: list[dict]) -> dict:
+        if self.current is not None and self.jobs[self.current]["state"] == "running":
+            raise KiwiSpecBusy(f"POST /{kind}: busy (job {self.current})")
+        return super()._start(kind, frames)
+
+    async def expose(self, **frame):
+        if self.mode is not None:
+            self.refused += 1
+            self._log("expose_refused", mode=self.mode)
+            await self._out("POST /expose")
+        return await super().expose(**frame)
+
+    async def calibrate(self, frames, night=None):
+        if self.mode is not None:
+            await self._out("POST /calibrate")
+        return await super().calibrate(frames, night)
+
+    async def job(self, job_id, wait=0.0):
+        if self.mode is not None:
+            await self._out(f"GET /jobs/{job_id}", wait)
+        return await super().job(job_id, wait)
+
+    async def status(self, refresh=False):
+        if self.mode is not None:
+            await self._out("GET /status")
+        return await super().status(refresh)
+
+    async def abort(self, reason, *, timeout=None):
+        if self.mode is not None:
+            self._log("abort_unanswered", reason=reason, mode=self.mode)
+            if self.mode == "hang":
+                await asyncio.sleep(self.abort_timeout if timeout is None else timeout)
+            return False
+        return await super().abort(reason, timeout=timeout)
+
+    def running(self) -> dict | None:
+        """The science job exposing now, if any (ground truth)."""
+        job = self.jobs.get(self.current) if self.current else None
+        if job is None or job["state"] != "running" or job["kind"] != "expose":
+            return None
+        return job
+
+
+class CloudyGuider(FakeGuider):
+    """A :class:`FakeGuider` under clouds (``set_clouds``), as the guider
+    service behaves (robofast/guider/loop.py and service.py): a guiding star
+    is *lost* (``check`` passes while the service re-acquires) and after
+    ``fail_after`` s of that the guider is *failed* (``check`` raises);
+    ``start`` under clouds waits ``acquire_timeout`` and raises (an
+    acquisition timeout). Clouds that clear before ``fail_after`` bring a
+    lost star back. ``reconnect`` (the recovery ladder's rung) reopens a
+    camera that works. ``state()`` is the ground truth."""
+
+    def __init__(self, timeline, scope, *, fail_after=120.0, acquire_timeout=60.0):
+        super().__init__(timeline, scope)
+        self.fail_after, self.acquire_timeout = fail_after, acquire_timeout
+        self.clouds = False
+        self._state = "idle"
+        self._lost_at = 0.0
+        #: When it last started guiding (None: stopped since).
+        self.started_at: float | None = None
+        self.reconnects = 0
+
+    def state(self) -> str:
+        if self._state == "lost" and time.monotonic() - self._lost_at >= self.fail_after:
+            self._state = "failed"
+        return self._state
+
+    def set_clouds(self, on: bool) -> None:
+        self.clouds = on
+        state = self.state()
+        if on and state == "guiding":
+            self._state, self._lost_at = "lost", time.monotonic()
+        elif not on and state == "lost":
+            self._state = "guiding"
+
+    @property
+    def guiding(self) -> bool:  # FakeGuider's attribute, from the state
+        return self.state() in ("guiding", "lost")
+
+    @guiding.setter
+    def guiding(self, value: bool) -> None:
+        pass  # the state decides
+
+    async def start(self, **params):
+        self._log("start", **params)
+        if self.clouds:
+            self._state = "acquiring"
+            await asyncio.sleep(self.acquire_timeout)
+            if self._state == "acquiring":
+                self._state = "idle"
+            raise GuiderError(f"guider {self.scope}: not guiding after {self.acquire_timeout} s")
+        self._state, self.started_at = "guiding", time.monotonic()
+
+    async def check(self):
+        state = self.state()
+        if state in ("failed", "idle"):
+            raise GuiderError(f"guider {self.scope}: {state}: star lost 4 times")
+
+    async def status(self):
+        return {**await super().status(), "state": self.state()}
+
+    async def stop(self, reason="requested"):
+        self._log("stop", reason=reason)
+        self._state, self.started_at = "idle", None
+        return True
+
+    async def reconnect(self):
+        self._log("reconnect")
+        self.reconnects += 1
 
 
 SEQ = dict(
@@ -615,3 +756,54 @@ async def test_an_ordinary_spectrum_has_no_test_mark(make_rig, tmp_path):
     await run_to_end(rig)
     [rec] = rig.sequencer.spectrum_records
     assert "test" not in rec
+
+
+# -- the fakes of the fault nights (tests/core/test_fault_nights.py) ------------------
+
+
+async def test_an_outage_spectrograph_times_out_or_refuses_as_the_client_does():
+    from robofast import Timeline
+
+    spec = OutageSpectrograph(Timeline(), readout=0.0)
+    job = await spec.expose(kind="science", exptime=5.0)
+    spec.mode = "hang"
+    t = time.monotonic()
+    with pytest.raises(KiwiSpecError, match="ReadTimeout"):
+        await spec.job(job["id"], wait=2.0)
+    assert time.monotonic() - t == pytest.approx(12.0, abs=0.1)
+    assert await spec.abort("cleanup") is False
+    spec.mode = "down"
+    with pytest.raises(KiwiSpecError, match="ConnectError"):
+        await spec.expose(kind="science", exptime=1.0)
+    assert spec.refused == 1
+    spec.mode = None
+    assert (await spec.job(job["id"]))["state"] == "done"  # the PC went on exposing
+    second = await spec.expose(kind="science", exptime=5.0)
+    with pytest.raises(KiwiSpecBusy):
+        await spec.expose(kind="science", exptime=5.0)
+    assert spec.running()["id"] == second["id"]
+
+
+async def test_a_cloudy_guider_loses_its_star_then_fails_and_cannot_acquire():
+    from robofast import Timeline
+
+    g = CloudyGuider(Timeline(), "t1", fail_after=120.0, acquire_timeout=60.0)
+    await g.start()
+    g.set_clouds(True)
+    await g.check()  # lost: the service re-acquires
+    assert g.state() == "lost" and g.guiding
+    g.set_clouds(False)
+    assert g.state() == "guiding"
+    g.set_clouds(True)
+    await asyncio.sleep(120.0)
+    with pytest.raises(GuiderError, match="failed"):
+        await g.check()
+    await g.stop()
+    assert not g.guiding
+    t = time.monotonic()
+    with pytest.raises(GuiderError, match="not guiding after 60"):
+        await g.start()
+    assert time.monotonic() - t == pytest.approx(60.0, abs=0.1)
+    g.set_clouds(False)
+    await g.start()
+    assert g.guiding and g.started_at is not None

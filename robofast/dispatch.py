@@ -699,7 +699,7 @@ class DispatchScheduler:
                 **self._seeing_record(now),
                 **self._summary(None, cands),
             )
-            return Idle(self.config.idle_poll, "nothing observable")
+            return self._idle_answer(now)
         self._idle.discard(telescope)
         req = best.request
         visit = self._new_visit(req, now, best.score)
@@ -734,6 +734,30 @@ class DispatchScheduler:
         self._wake_feed(obs)
         return obs
 
+    def _idle_answer(self, now: datetime) -> Idle:
+        """Nothing is observable: wait ``idle_poll``, or less if a pending
+        request's window opens (or a cadence gap ends) sooner. Polling alone
+        wasted up to ``idle_poll`` whenever a window opened (night1124:
+        about 30 s of every 113 s spectrum cycle). Other changes (a rising
+        target, the Moon, the seeing) still wait for the next poll."""
+        soonest: datetime | None = None
+        for req in self.requests.values():
+            if req.done:
+                continue
+            times = [w.start for w in req.windows if w.start > now]
+            if req.cadence is not None:
+                last = max(self.visits.get(req.id, ()), default=None)
+                if last is not None:
+                    times.append(last + timedelta(seconds=req.cadence.min_interval))
+            for t in times:
+                if t > now and (soonest is None or t < soonest):
+                    soonest = t
+        wait = self.config.idle_poll
+        if soonest is not None:
+            # A second past the opening, so the request fits when asked.
+            wait = min(wait, max(1.0, (soonest - now).total_seconds() + 1.0))
+        return Idle(wait, "nothing observable")
+
     async def peek(self, telescope: str) -> Observation | Idle | None:
         """What :meth:`next_observation` would answer now, without handing
         it out, recording it or changing any state."""
@@ -749,7 +773,7 @@ class DispatchScheduler:
             return None
         best, _ = self._best(telescope, now, sky_now)
         if best is None:
-            return Idle(self.config.idle_poll, "nothing observable")
+            return self._idle_answer(now)
         return self._make_observation(self._new_visit(best.request, now, best.score))
 
     def report(
@@ -890,6 +914,10 @@ class DispatchScheduler:
         self._refuse_undoable(group.requests)
         log.info("request group %s received (%s)", group.id, group.submitter or "no submitter")
         self._save_state()
+        # Idle telescopes ask again now instead of at their next idle poll
+        # (a ToO already did this; an ordinary request waited up to idle_poll).
+        for tel in sorted(self._idle):
+            self._call_preempt(tel, "next", f"new request group {group.id}")
         return group.id
 
     def _vet(self, group: RequestGroup, now: datetime) -> None:

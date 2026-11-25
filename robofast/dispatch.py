@@ -914,6 +914,10 @@ class DispatchScheduler:
         self._refuse_undoable(group.requests)
         log.info("request group %s received (%s)", group.id, group.submitter or "no submitter")
         self._save_state()
+        # Idle telescopes ask again now instead of at their next idle poll
+        # (a ToO already did this; an ordinary request waited up to idle_poll).
+        for tel in sorted(self._idle):
+            self._call_preempt(tel, "next", f"new request group {group.id}")
         return group.id
 
     def _vet(self, group: RequestGroup, now: datetime) -> None:

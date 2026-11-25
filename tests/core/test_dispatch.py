@@ -1031,3 +1031,12 @@ async def test_regression_20261125_idle_until_the_next_window_opens():
     # Nothing pending opens later: the full idle_poll.
     d2 = make([], config=DispatchConfig(idle_poll=600.0))
     assert (await d2.next_observation("t1")).seconds == 600.0
+
+
+async def test_a_new_request_wakes_an_idle_telescope():
+    d = make([])
+    p = Preempts()
+    d.set_preempt_callback(p)
+    assert isinstance(await d.next_observation("t1"), Idle)
+    await d.submit(group("new"))
+    assert p.calls == [("t1", "next", "new request group new")]

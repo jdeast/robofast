@@ -8,8 +8,10 @@
     "including drives no share exposes. The key and known_hosts come from systemd LoadCredential=",
     "(deploy/robofast-diskwatch.service). volume: two targets on one disk alarm once (docs/diskwatch.md).",
     "Thresholds at the top apply to every target; a target may set its own (null turns one off).",
-    "Every host and address is a placeholder (192.0.2.x, example.org)."
+    "Every host and address is a placeholder (192.0.2.x, example.org).",
+    "processes: this host's robofast processes, open files against their own soft limit and (optional) memory."
   ],
+  "processes": {"match": ["robofast"], "fd_warn_pct": 50, "fd_alarm_pct": 80, "rss_warn_gb": 3.0},
   "status": "/var/lib/robofast-diskwatch/status.json",
   "interval": 300,
   "timeout": 10,

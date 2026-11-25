@@ -464,3 +464,65 @@ def test_the_example_config_loads(monkeypatch: pytest.MonkeyPatch) -> None:
     assert c.ssh_command[2] == "/run/credentials/robofast-diskwatch.service/ssh-key"
     assert {t.probe for t in c.targets} == {"path", "ssh"}
     assert all(t.probe == "path" or t.ssh for t in c.targets)
+
+
+# -- this host's processes ---------------------------------------------------------------
+
+
+def fake_proc(root: Path, pid: int, args: list[str], fds: int, limit: int, rss_kb: int) -> None:
+    d = root / str(pid)
+    (d / "fd").mkdir(parents=True)
+    for i in range(fds):
+        (d / "fd" / str(i)).touch()
+    (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in args) + b"\0")
+    (d / "limits").write_text(
+        "Limit                     Soft Limit           Hard Limit           Units\n"
+        f"Max open files            {limit}                 524288               files\n"
+    )
+    (d / "status").write_text(f"Name:\tpython\nVmRSS:\t{rss_kb} kB\n")
+
+
+def test_regression_20261125_a_process_running_out_of_files_alarms(tmp_path: Path) -> None:
+    """night1124 died at 1024 open files after 11.5 h with nothing to say it
+    was coming. The watch now grades each robofast process's open files
+    against its own soft limit, and the alarm text stays stable as the count
+    grows."""
+    proc = tmp_path / "proc"
+    py = "/opt/robofast/current/venv/bin/python"
+    fake_proc(
+        proc, 101, [py, "-m", "robofast.testing.rehearsal", "--out", "x"], 600, 1024, 2_500_000
+    )
+    fake_proc(
+        proc, 102, [py, "-m", "robofast.guider.service", "--config", "g"], 30, 1024, 1_300_000
+    )
+    fake_proc(proc, 103, ["/bin/bash", "-c", "python -m robofast.testing.rehearsal"], 900, 1024, 1)
+    fake_proc(proc, 104, [py, "-m", "robofast.sequencer_service"], 900, 1024, 1)
+    cfg = config([], tmp_path, processes={"rss_warn_gb": 2.0})
+    watch = dw.DiskWatch(cfg, proc_root=proc)
+    doc = watch.run_pass()
+    by_pid = {r["pid"]: r for r in doc["processes"]}
+    assert set(by_pid) == {101, 102, 104}  # the shell is not a robofast process
+    assert by_pid[101]["level"] == "warning" and "600 of 1024 open files" in by_pid[101]["reason"]
+    assert "resident memory 2.56 GB" in by_pid[101]["reason"]
+    assert by_pid[102]["level"] == "ok"
+    assert by_pid[104]["level"] == "alarm"
+    texts = {a["text"]: a["level"] for a in doc["alarms"]}
+    host = watch.host
+    assert texts == {
+        f"process robofast.testing.rehearsal ({host}): running out of resources": "warning",
+        f"process robofast.sequencer_service ({host}): about to run out of resources": "alarm",
+    }
+    # More files, same level: the same alarm text (so the same console id).
+    for i in range(600, 700):
+        (proc / "101" / "fd" / str(i)).touch()
+    again = {a["text"] for a in watch.run_pass()["alarms"]}
+    assert again == set(texts)
+
+
+def test_process_watch_config_is_checked(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="processes"):
+        config([], tmp_path, processes={"fd_warn_pct": 90, "fd_alarm_pct": 50})
+    with pytest.raises(ValueError, match="processes"):
+        config([], tmp_path, processes={"bogus": 1})
+    with pytest.raises(ValueError, match="no targets"):
+        config([], tmp_path)

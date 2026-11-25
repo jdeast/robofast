@@ -115,6 +115,22 @@ The disk watch itself is watched: a status file older than its `max_age`
 raises "disk watch not running (status file stale)" (`alarm`) and its rows
 then raise nothing; a missing or unreadable file is an alarm too.
 
+## This host's processes (`processes`)
+
+With a `processes` entry the watch also reads every process on its own host
+whose name (the module after `-m`, or its script) contains one of `match`
+(default `["robofast"]`): its open files against its own soft limit
+(`/proc/PID/limits`), and its resident memory. It warns at `fd_warn_pct`
+(50 %) and alarms at `fd_alarm_pct` (80 %); `rss_warn_gb` and `rss_alarm_gb`
+are off unless set. One alarm per process name and level, with the counts in
+`detail`, so the alarm keeps its id while the count grows. The rows go to
+`processes` in the status file. The watch runs as the robofast user, so it
+sees robofast's processes; another user's are skipped.
+
+Why: night1124 (2026-11-25) ran out of file descriptors at 1024 after 11.5 h
+(a leak in the rehearsal's mount guard), and nothing said it was coming.
+At a leak of ~90 per hour, the 50 % warning comes about 6 h before the end.
+
 ## Configuration (`deploy/diskwatch.example.json`)
 
 | Key | Default | What |

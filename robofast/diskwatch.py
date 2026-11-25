@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -80,7 +81,25 @@ class Thresholds:
 THRESHOLD_KEYS = {f.name for f in fields(Thresholds)}
 TARGET_KEYS = {"name", "host", "probe", "path", "ssh", "os", "drives", "mounts", "volume"}
 TOP_KEYS = {"_note", "status", "interval", "timeout", "ssh_timeout", "connect_timeout"}
-TOP_KEYS |= {"unknown_after", "ssh_command", "targets"}
+TOP_KEYS |= {"unknown_after", "ssh_command", "targets", "processes"}
+PROCESS_KEYS = {"match", "fd_warn_pct", "fd_alarm_pct", "rss_warn_gb", "rss_alarm_gb"}
+
+
+@dataclass
+class ProcessWatch:
+    """This host's own processes (``processes`` in the config): open files
+    against each process's soft limit, and optionally resident memory.
+    night1124 (2026-11-25) died when a leaking process reached its 1024 open
+    files after 11.5 h, with nothing to say it was coming."""
+
+    #: A process is watched if its name (the module after ``-m``, or its
+    #: script) contains any of these: a shell whose command line merely
+    #: mentions robofast is not.
+    match: list[str] = field(default_factory=lambda: ["robofast"])
+    fd_warn_pct: float = 50.0
+    fd_alarm_pct: float = 80.0
+    rss_warn_gb: float | None = None
+    rss_alarm_gb: float | None = None
 
 
 @dataclass
@@ -110,6 +129,7 @@ class Config:
     #: A disk that cannot be read alarms only after this long (a PC rebooting).
     unknown_after: float = 600.0
     ssh_command: list[str] = field(default_factory=lambda: ["ssh"])
+    processes: ProcessWatch | None = None
 
 
 def load(path: str | Path) -> Config:
@@ -152,7 +172,15 @@ def load(path: str | Path) -> Config:
                 thresholds=th,
             )
         )
-    if not targets:
+    procs = None
+    if raw.get("processes") is not None:
+        pw = raw["processes"]
+        if not isinstance(pw, dict) or set(pw) - PROCESS_KEYS:
+            raise ValueError(f"{path}: processes: keys are {sorted(PROCESS_KEYS)}")
+        procs = ProcessWatch(**pw)
+        if not 0 < procs.fd_warn_pct <= procs.fd_alarm_pct <= 100:
+            raise ValueError(f"{path}: processes: need 0 < fd_warn_pct <= fd_alarm_pct <= 100")
+    if not targets and procs is None:
         raise ValueError(f"{path}: no targets")
     names = [t.name for t in targets]
     if len(set(names)) != len(names):
@@ -165,7 +193,7 @@ def load(path: str | Path) -> Config:
     if "ssh_command" in raw:
         # $CREDENTIALS_DIRECTORY (systemd LoadCredential=: the ssh key) is expanded.
         kw["ssh_command"] = [os.path.expandvars(str(x)) for x in raw["ssh_command"]]
-    return Config(targets=targets, status=status, **kw)  # type: ignore[arg-type]
+    return Config(targets=targets, status=status, processes=procs, **kw)  # type: ignore[arg-type]
 
 
 # -- reading a disk ----------------------------------------------------------------------
@@ -380,6 +408,87 @@ def alarm_text(name: str, host: str, level: str) -> str:
     return f"{name} ({host}): {UNKNOWN if level == 'unknown' else PHRASE[level]}"
 
 
+# -- this host's processes -----------------------------------------------------------------
+
+
+def _proc_name(args: list[str]) -> str:
+    """A process's stable name: the module after ``-m`` (robofast.guider.service),
+    else its script."""
+    if "-m" in args[:-1]:
+        return args[args.index("-m") + 1]
+    return Path(args[1]).name if len(args) > 1 else Path(args[0]).name
+
+
+def _soft_nofile(pid: str, proc: Path) -> int | None:
+    try:
+        for line in (proc / pid / "limits").read_text().splitlines():
+            if line.startswith("Max open files"):
+                soft = line.split()[3]
+                return None if soft == "unlimited" else int(soft)
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def scan_processes(pw: ProcessWatch, proc: Path = Path("/proc")) -> list[dict[str, Any]]:
+    """Every readable process whose command line matches: open files, the
+    soft limit, resident memory. Ones that vanish or cannot be read (another
+    user's) are skipped."""
+    out = []
+    me = os.getpid()
+    for d in proc.iterdir():
+        if not d.name.isdigit() or int(d.name) == me:
+            continue
+        try:
+            args = [
+                a.decode(errors="replace") for a in (d / "cmdline").read_bytes().split(b"\0") if a
+            ]
+            name = _proc_name(args) if args else ""
+            if not any(m in name for m in pw.match):
+                continue
+            fds = len(os.listdir(d / "fd"))
+            rss_kb = 0
+            for line in (d / "status").read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    rss_kb = int(line.split()[1])
+        except (OSError, ValueError):
+            continue
+        out.append(
+            {
+                "pid": int(d.name),
+                "name": name,
+                "fds": fds,
+                "fd_limit": _soft_nofile(d.name, proc),
+                "rss": rss_kb * 1024,
+            }
+        )
+    return sorted(out, key=lambda r: (r["name"], r["pid"]))
+
+
+def grade_process(r: dict[str, Any], pw: ProcessWatch) -> tuple[str, str]:
+    level, why = "ok", []
+    lim = r.get("fd_limit")
+    if lim:
+        pct = 100.0 * r["fds"] / lim
+        if pct >= pw.fd_alarm_pct:
+            level = "alarm"
+        elif pct >= pw.fd_warn_pct:
+            level = "warning"
+        if pct >= pw.fd_warn_pct:
+            why.append(f"{r['fds']} of {lim} open files ({pct:.0f}%)")
+    gb = r["rss"] / GB
+    for limit, lv in ((pw.rss_alarm_gb, "alarm"), (pw.rss_warn_gb, "warning")):
+        if limit is not None and gb >= limit:
+            if LEVELS.index(lv) > LEVELS.index(level):
+                level = lv
+            why.append(f"resident memory {gb:.2f} GB")
+            break
+    return level, "; ".join(why)
+
+
+PROCESS_PHRASE = {"warning": "running out of resources", "alarm": "about to run out of resources"}
+
+
 # -- the watcher ---------------------------------------------------------------------------
 
 
@@ -390,9 +499,13 @@ def _iso(t: float) -> str:
 class DiskWatch:
     """Reads every target, grades it and builds the status document."""
 
-    def __init__(self, config: Config, clock: Any = time.time) -> None:
+    def __init__(
+        self, config: Config, clock: Any = time.time, proc_root: Path = Path("/proc")
+    ) -> None:
         self.config = config
         self.clock = clock
+        self.proc_root = proc_root
+        self.host = socket.gethostname()
         self.probes = {
             t.name: PathProbe(str(t.path), config.timeout)
             for t in config.targets
@@ -441,7 +554,7 @@ class DiskWatch:
         the status document."""
         c = self.config
         wait = c.unknown_after if unknown_after is None else unknown_after
-        with concurrent.futures.ThreadPoolExecutor(min(8, len(c.targets))) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max(1, min(8, len(c.targets)))) as pool:
             results = list(pool.map(self._probe, c.targets))
         now = self.clock()
         rows: list[dict[str, Any]] = []
@@ -514,6 +627,24 @@ class DiskWatch:
                             }
                         )
                 rows.append(row)
+        procs: list[dict[str, Any]] = []
+        if c.processes is not None:
+            seen: set[tuple[str, str]] = set()
+            for r in scan_processes(c.processes, self.proc_root):
+                level, reason = grade_process(r, c.processes)
+                procs.append({**r, "level": level, "reason": reason})
+                # The text names the process and level only (its id stays put
+                # while the count grows; one alarm per name and level).
+                if level != "ok" and (r["name"], level) not in seen:
+                    seen.add((r["name"], level))
+                    alarms.append(
+                        {
+                            "name": r["name"],
+                            "level": level,
+                            "text": f"process {r['name']} ({self.host}): {PROCESS_PHRASE[level]}",
+                            "detail": f"pid {r['pid']}: {reason}",
+                        }
+                    )
         # A disk not read for a week (renamed, removed) is forgotten.
         self.history = {k: v for k, v in self.history.items() if v and now - v[-1][0] < 7 * 86400}
         return {
@@ -522,6 +653,7 @@ class DiskWatch:
             # Older than this, the console says the watch is not running.
             "max_age": 3 * c.interval + 60,
             "rows": rows,
+            "processes": procs,
             "alarms": alarms,
             "history": self.history,
         }

@@ -223,3 +223,13 @@ class RemoteLease(OpenLease):
                     return
             if attempt + 1 < attempts:
                 await asyncio.sleep(self._client.retry)
+        if action == "release":
+            # Fails closed: the supervisor grants no new lease until it
+            # declares this one orphaned (night1124: every observation
+            # stopped until then). Say so, loudly.
+            log.error(
+                "lease %s: release not delivered after %d attempts; no new lease"
+                " until the supervisor declares it orphaned",
+                self.token,
+                attempts,
+            )

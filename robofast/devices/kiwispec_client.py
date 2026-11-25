@@ -396,7 +396,11 @@ class SpecServerClient:
                     self.last = (time.monotonic(), name, type(exc).__name__)
                     if attempt >= attempts:
                         raise
-                    log.warning("%s attempt %d failed (%r); retrying", name, attempt, exc)
+                    # The first retry of a call is worth a WARNING; the rest
+                    # (night1123: the server hung all night, 9,442 lines) DEBUG.
+                    (log.warning if attempt == 1 else log.debug)(
+                        "%s attempt %d failed (%r); retrying", name, attempt, exc
+                    )
                     await asyncio.sleep(self.retry_delay)
                     continue
                 self.last = (time.monotonic(), name, "success")

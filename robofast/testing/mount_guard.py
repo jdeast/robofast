@@ -180,6 +180,13 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:  # quiet
         log.debug("%s " + fmt, self.address_string(), *args)
 
+    def finish(self) -> None:
+        try:
+            super().finish()
+        finally:
+            # This connection's thread ends here: so does its upstream client.
+            self.server._drop_client()
+
     def _send(self, code: int, body: bytes, ctype: str = "application/json") -> None:
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -372,6 +379,22 @@ class MountGuard(ThreadingHTTPServer):
         return self._parked[name]
 
     # -- upstream ----------------------------------------------------------------------
+
+    def _drop_client(self) -> None:
+        """Close the calling thread's upstream client. Each inbound
+        connection is served by its own thread (ThreadingHTTPServer), and
+        robofast's clients reconnect after every idle gap longer than their
+        keep-alive, so a client left open per thread leaked one upstream
+        socket per reconnect: night1124 ran out of file descriptors (1024)
+        after 11.5 h, 2026-11-25."""
+        c = getattr(self._local, "client", None)
+        if c is None:
+            return
+        self._local.client = None
+        with self._lock:
+            if c in self._clients:
+                self._clients.remove(c)
+        c.close()
 
     def _client(self) -> httpx.Client:
         c = getattr(self._local, "client", None)

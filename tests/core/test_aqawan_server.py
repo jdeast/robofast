@@ -768,7 +768,7 @@ async def test_supervisor_fault_while_closed_only_alarms(make_rig):
 
 async def test_supervisor_unreadable_faults_count_as_a_fault(make_rig):
     rig = make_rig({"heartbeat_timeout": 2.0})
-    s = start_supervisor(rig, fault_action="NoSuchAction")
+    s = start_supervisor(rig, fault_action="NoSuchAction", fault_unreadable_grace=0.5)
     try:
         await wait_until(lambda: (s.sup.fault or "").startswith("cannot read"), 3)
         await asyncio.sleep(0.5)

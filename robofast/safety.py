@@ -1201,7 +1201,11 @@ class SafetySupervisor:
         last = self._alarmed_at.get(msg)
         if self.alarms and (
             self.alarms[-1] == msg
-            or (msg in self.alarms[-4:] and last is not None and now - last < self.ALARM_REPEAT)
+            or (
+                msg in list(self.alarms)[-4:]
+                and last is not None
+                and now - last < self.ALARM_REPEAT
+            )
         ):
             return
         self._alarmed_at[msg] = now

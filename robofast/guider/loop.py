@@ -9,9 +9,12 @@
    fiber (or the brightest) is found. If it is farther than
    ``capture_radius`` pixels, the mount is offset to bring it in (through
    the mount's calibration), waiting ``coarse_settle``; repeated up to
-   ``coarse_iterations`` times. A distance that grows instead of shrinking
-   is the legacy "acquisition not converging" alarm (usually a wrong
-   calibration or rotator angle) and fails the acquisition.
+   ``coarse_iterations`` times. Each move measures the mount calibration's
+   rotation (:mod:`robofast.guider.selfcal`); a rotated one is corrected
+   for the rest of the acquisition (event ``mount_cal_corrected``) and,
+   once several acquisitions agree, saved. A distance that still grows
+   instead of shrinking is the legacy "acquisition not converging" alarm
+   (a parity flip, a wrong star, no star) and fails the acquisition.
 3. **Guide** (state ``guiding``). A ``roi_size`` window around the target,
    ``exposure`` seconds per frame: centroid, controller, calibration,
    tip/tilt move, as fast as the camera delivers. Every frame records the
@@ -58,7 +61,8 @@ to a per-telescope file at the guide rate.
 
 Alarms: ``star_lost``, ``tiptilt_limit``, ``residual_high``,
 ``offset_high`` (the star held off its setpoint: ``offset_alarm``),
-``acquisition_failed``, ``not_converging``, ``device_error``; repeated
+``acquisition_failed``, ``not_converging``, ``mount_cal_suspect``,
+``mount_cal_parity``, ``device_error``; repeated
 alarms within ``alarm_repeat`` seconds are counted, not duplicated.
 """
 
@@ -93,6 +97,7 @@ from robofast.guider.calibration import Calibration
 from robofast.guider.centroid import WindowedCOM, find_stars, make_centroider
 from robofast.guider.controller import Controller, Gains
 from robofast.guider.offload import Offloader
+from robofast.guider.selfcal import SelfCal, SelfCalConfig, pa_advice
 
 log = logging.getLogger(__name__)
 
@@ -170,6 +175,10 @@ class GuideConfig:
     #: positions, star flux, fiber counts: :attr:`Guider.log_frames`);
     #: turned on by the service's ``guide_log`` (robofast.guider.guide_log).
     guide_log: bool = False
+    #: Self-correcting mount calibration (:mod:`robofast.guider.selfcal`):
+    #: true (the defaults), false (off: the legacy behaviour) or a mapping
+    #: of :class:`~robofast.guider.selfcal.SelfCalConfig`'s fields.
+    mount_selfcal: Any = True
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> GuideConfig:
@@ -199,6 +208,7 @@ class GuideConfig:
             if not 0 < c.fiber_annulus[0] < c.fiber_annulus[1]:
                 raise ValueError("fiber_annulus: 0 < inner < outer")
         Gains.from_dict(c.gains)
+        SelfCalConfig.from_any(c.mount_selfcal)
         return c
 
 
@@ -306,7 +316,22 @@ class Guider:
         self.tiptilt = tiptilt
         self.tt_cal = tt_cal
         self.mount = mount
+        sc = SelfCalConfig.from_any(config.mount_selfcal)
+        #: The online estimate of the mount calibration's error (None: off).
+        self.selfcal: SelfCal | None = None if sc is None else SelfCal(sc)
+        #: This acquisition's corrected mount matrix (None: the stored one).
+        self._acq_cal: Calibration | None = None
         self.mount_cal = mount_cal
+        #: Called with a corrected mount calibration to persist (the
+        #: service saves it to its store); without it, it is only used.
+        self.on_mount_cal_persist: Callable[[Calibration], None] | None = None
+        #: The port's rotator, for alarms about the PA (the service sets
+        #: it from its PA calibration: "t1/fau: PA = offset + sense * mech").
+        self.rotator_note: str | None = None
+        #: Guider events (``mount_cal_corrected``, ``mount_cal_persisted``):
+        #: dicts with ``kind``, ``t``, ``utc``; ``on_event(kind, **fields)``.
+        self.events: deque[dict[str, Any]] = deque(maxlen=50)
+        self.on_event: Callable[..., None] | None = None
         self.offloader = offloader
         self.backlight = backlight
         self.clock = clock or RealClock()
@@ -371,7 +396,30 @@ class Guider:
 
     @property
     def fine_cal(self) -> Calibration | None:
-        return self.tt_cal if self.tiptilt is not None else self.mount_cal
+        return self.tt_cal if self.tiptilt is not None else self.acq_mount_cal
+
+    @property
+    def mount_cal(self) -> Calibration | None:
+        """The stored mount calibration. Setting it (a new calibration)
+        resets the online estimate (:mod:`robofast.guider.selfcal`)."""
+        return self._mount_cal
+
+    @mount_cal.setter
+    def mount_cal(self, cal: Calibration | None) -> None:
+        self._mount_cal = cal
+        self._acq_cal = None
+        if self.selfcal is not None:
+            self.selfcal.reset()
+
+    @property
+    def acq_mount_cal(self) -> Calibration | None:
+        """The mount matrix in use: this acquisition's correction, if any."""
+        return self._acq_cal if self._acq_cal is not None else self._mount_cal
+
+    @property
+    def mount_cal_suspect(self) -> str | None:
+        """Why the mount calibration should be measured again (None: no reason)."""
+        return None if self.selfcal is None else self.selfcal.suspect
 
     def _make_centroider(self) -> Any:
         c = self.config
@@ -492,6 +540,23 @@ class Guider:
         self.alarms.append(
             Alarm(kind, message, now, datetime.now(UTC).isoformat(timespec="seconds"), extra=extra)
         )
+
+    def event(self, kind: str, message: str, **extra: Any) -> None:
+        """Record a guider event (:attr:`events`) and hand it to ``on_event``."""
+        log.info("guider %s event %s: %s", self.config.scope, kind, message)
+        e = {
+            "kind": kind,
+            "message": message,
+            "t": self.clock.now(),
+            "utc": datetime.now(UTC).isoformat(timespec="seconds"),
+            **extra,
+        }
+        self.events.append(e)
+        if self.on_event is not None:
+            try:
+                self.on_event(kind, message=message, **extra)
+            except Exception:
+                log.exception("guider %s: on_event", self.config.scope)
 
     # -- control --------------------------------------------------------------------
 
@@ -662,6 +727,13 @@ class Guider:
         worse = 0
         exposure = c.acq_exposure
         retried = False
+        # The online mount-calibration estimate (robofast.guider.selfcal):
+        # the last move sent and where the star was before it.
+        self._acq_cal = None
+        if self.selfcal is not None:
+            self.selfcal.begin()
+        before: Measurement | None = None
+        sent: tuple[np.ndarray, bool] | None = None
         for i in range(c.coarse_iterations + 1):
             if self._stop.is_set():
                 return None
@@ -694,35 +766,179 @@ class Guider:
                 m = self._select(frame, hint)
             if m is None:
                 self.reason = self._why
+                before = sent = None  # no pair across a frame without the star
                 await self.clock.sleep(0)
                 continue
             off = np.array(c.target) - np.array([m.x, m.y])
             dist = float(np.hypot(*off))
+            if sent is not None and before is not None:
+                verdict = self._selfcal_pair(before, m, sent)
+                if verdict == "parity":
+                    return None
+                if verdict == "corrected":
+                    prev, worse = None, 0  # a fresh chance with the corrected matrix
+            before = sent = None
             if dist <= c.capture_radius:
                 self._ref_flux = None
                 self.acquired_at = self.clock.now()
+                self._selfcal_finish(True)
                 return m
             if prev is not None and dist > 0.8 * prev:
                 # Twice no real progress, or once clearly the wrong way.
                 worse += 2 if dist > 1.5 * prev else 1
                 if worse >= 2:
-                    self.alarm(
-                        "not_converging",
-                        f"acquisition not converging ({prev:.1f} -> {dist:.1f} px):"
-                        " check the mount calibration (rotator angle)",
-                    )
-                    self.reason = "not converging"
+                    self._not_converging(prev, dist)
                     return None
             prev = dist
-            if self.mount is None or self.mount_cal is None or c.mode != "closed":
+            cal = self.acq_mount_cal
+            if self.mount is None or cal is None or c.mode != "closed":
                 self.reason = f"star {dist:.1f} px from the target and no calibrated mount"
                 return None
-            move = self.mount_cal.to_device(off)
+            move = cal.to_device(off)
             log.info("acquire %d: star %.1f px away; mount %.2f, %.2f", i, dist, move[0], move[1])
-            await self.mount.move_by(float(move[0]), float(move[1]))
+            p0 = np.asarray(self.mount.position, float)
+            res = await self.mount.move_by(float(move[0]), float(move[1]))
+            applied = np.asarray(res.position, float) - p0
+            before, sent = m, (applied, bool(res.at_limit))
             await self.clock.sleep(c.coarse_settle)
         self.reason = self.reason or "did not converge"
+        self._selfcal_finish(False)
         return None
+
+    # -- the online mount calibration (robofast.guider.selfcal) -----------------------
+
+    def _saturated(self, m: Measurement) -> bool:
+        assert self.selfcal is not None
+        return m.peak + m.background >= self.selfcal.config.saturation
+
+    def _selfcal_pair(
+        self, before: Measurement, after: Measurement, sent: tuple[np.ndarray, bool]
+    ) -> str | None:
+        """Offer one acquisition move to the estimate; correct the matrix
+        for the rest of this acquisition when it is clearly rotated.
+        Returns "corrected", "parity" (the acquisition fails) or None."""
+        sc, base = self.selfcal, self._mount_cal
+        if sc is None or base is None:
+            return None
+        u, clipped = sent
+        d = (after.x - before.x, after.y - before.y)
+        why = sc.add(
+            base.m,
+            u,
+            d,
+            clipped=clipped,
+            saturated=self._saturated(before) or self._saturated(after),
+        )
+        if why is not None:
+            log.info(
+                "guider %s: mount move not used for the calibration: %s", self.config.scope, why
+            )
+            return None
+        e = sc.current
+        assert e is not None
+        if sc.parity_flipped():
+            self._acq_cal = None
+            sc.applied = False
+            msg = (
+                f"the star's motion is mirrored relative to the mount calibration"
+                f" ({e.n} moves: rotation fit rms {e.rms:.1f} px, mirrored {e.rms_mirror:.1f} px):"
+                " a parity (flip) error; not corrected -- run the full calibration"
+            )
+            self.alarm("mount_cal_parity", msg, **e.as_json())
+            sc.mark(f"parity flip: {msg}")
+            self.alarm("not_converging", f"acquisition not converging: {msg}")
+            self.reason = "not converging (mount calibration mirrored)"
+            return "parity"
+        cal = sc.corrected(base)
+        if cal is None:
+            if self._acq_cal is not None:  # the estimate fell back under the threshold
+                self._acq_cal = None
+                sc.applied = False
+            return None
+        first = not sc.applied
+        self._acq_cal = cal
+        sc.applied = True
+        extra: dict[str, Any] = {**e.as_json()}
+        advice = pa_advice(base, e.theta)
+        if advice is not None:
+            extra["pa"] = advice
+        text = (
+            f"mount calibration rotated {e.theta:+.1f} deg, scale {e.scale:.3f}"
+            f" ({e.n} moves): corrected for this acquisition"
+        )
+        text += self._pa_text(advice)
+        if first:
+            self.event("mount_cal_corrected", text, **extra)
+        else:
+            log.info("guider %s: %s", self.config.scope, text)
+        if abs(e.theta) >= sc.config.alarm_deg:
+            self.alarm(
+                "mount_cal_suspect",
+                f"{text}; above {sc.config.alarm_deg:g} deg: run the full calibration",
+                **extra,
+            )
+        return "corrected" if first else None
+
+    def _pa_text(self, advice: dict[str, Any] | None) -> str:
+        if advice is None:
+            return ""
+        t = (
+            f"; the PA looks {advice['pa_change_deg']:+.1f} deg off (stored"
+            f" {advice['pa_stored']:.1f}, moves say {advice['pa_measured']:.1f})"
+        )
+        if self.rotator_note:
+            t += (
+                f"; {self.rotator_note}: its offset looks"
+                f" {advice['rotcal_offset_change_deg']:+.1f} deg off -- fix the PA calibration"
+            )
+        return t
+
+    def _not_converging(self, prev: float, dist: float) -> None:
+        sc = self.selfcal
+        e = None if sc is None else sc.current
+        what = "check the mount calibration (rotator angle)"
+        if e is not None:
+            what += (
+                f"; online estimate {e.theta:+.1f} deg, scale {e.scale:.2f} from {e.n} moves"
+                f"{' (applied)' if sc is not None and sc.applied else ''}"
+            )
+        self.alarm(
+            "not_converging",
+            f"acquisition not converging ({prev:.1f} -> {dist:.1f} px): {what}",
+        )
+        if sc is not None:
+            sc.mark(f"acquisition not converging ({prev:.1f} -> {dist:.1f} px)")
+        self.reason = "not converging"
+
+    def _selfcal_finish(self, converged: bool) -> None:
+        sc, base = self.selfcal, self._mount_cal
+        if sc is None or base is None:
+            return
+        out = sc.finish(base, converged)
+        new = out.get("persist")
+        if new is not None:
+            prov = new.extra["online"]
+            text = (
+                f"mount calibration corrected by {prov['theta_deg']:+.2f} deg, scale"
+                f" {prov['scale']:.4f}, from {prov['acquisitions']} agreeing acquisitions"
+                f" ({prov['pairs']} moves)"
+            )
+            text += self._pa_text(prov.get("pa"))
+            self._mount_cal = new  # not the setter: keep the estimate's record
+            if self.offloader is not None:
+                self.offloader.mount_cal = new
+            if self.on_mount_cal_persist is not None:
+                try:
+                    self.on_mount_cal_persist(new)
+                except Exception:
+                    log.exception("guider %s: saving the mount calibration", self.config.scope)
+            self.event(
+                "mount_cal_persisted",
+                text,
+                **{k: v for k, v in prov.items() if k not in ("estimates", "previous_matrix")},
+            )
+        if out.get("alarm"):
+            self.alarm("mount_cal_suspect", out["alarm"])
 
     async def _guide(self, star: Measurement) -> str | None:
         """Guide until stopped (None) or the star is lost (the reason)."""
@@ -987,6 +1203,9 @@ class Guider:
             else {"name": self.mount.name, "offset_total": list(self.mount.position)},
             "offloads": 0 if self.offloader is None else self.offloader.count,
             "reacquisitions": self.reacquisitions,
+            "mount_cal": None if self.selfcal is None else self.selfcal.status(),
+            "mount_cal_suspect": self.mount_cal_suspect is not None,
+            "events": list(self.events),
             "telemetry": self.summary(),
             "alarms": [asdict(a) for a in self.alarms],
         }
@@ -1015,6 +1234,7 @@ class Guider:
                     tiptilt_position=None if self.tiptilt is None else self.tiptilt.position,
                     offset=self.status_offset(),
                 )
+                publish_cal_suspect(self.registry, self.config.scope, self.mount_cal_suspect)
             except Exception:
                 log.exception("guider: publishing values")
         if self.publisher is not None and self.records and self.state == "guiding":
@@ -1111,6 +1331,24 @@ def publish_values(
             keyword=kw,
             comment=comment,
         )
+
+
+def publish_cal_suspect(
+    registry: Any, scope: str, reason: str | None, measured: datetime | None = None
+) -> None:
+    """``<scope>.guide_cal_suspect`` (no FITS keyword): whether the mount
+    calibration should be measured again (robofast.guider.selfcal), and
+    ``<scope>.guide_cal_suspect_reason``."""
+    registry.publish(
+        f"{scope}.guide_cal_suspect",
+        reason is not None,
+        max_age=None,
+        measured=measured,
+        comment="Guider mount calibration suspect: run the calibration",
+    )
+    registry.publish(
+        f"{scope}.guide_cal_suspect_reason", reason or "", max_age=None, measured=measured
+    )
 
 
 def _offset_values(offset: dict[str, Any]) -> dict[str, Any]:

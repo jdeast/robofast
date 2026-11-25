@@ -203,8 +203,15 @@ async def test_acquisition_without_a_mount_fails_far_from_the_target():
 
 
 async def test_wrong_mount_calibration_is_not_converging():
+    """Without the online correction (``mount_selfcal: false``; with it the
+    sign error is corrected: tests/core/test_guider_selfcal.py)."""
     clock = VirtualClock()
-    g, _ = _rig(clock, star=(380.0, 200.0), mount=True, config={"max_reacquire": 0})
+    g, _ = _rig(
+        clock,
+        star=(380.0, 200.0),
+        mount=True,
+        config={"max_reacquire": 0, "mount_selfcal": False},
+    )
     g.mount_cal = Calibration("mount", "fau", (-g.mount_cal.m).tolist())  # sign error
     g.start()
     await g.wait_state(("failed",), 60)

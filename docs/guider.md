@@ -192,6 +192,83 @@ The mount is calibrated the same way (its units are arcseconds of offset).
 Its matrix depends on the port and, without a derotator, on the field
 rotation: calibrate per port, and recalibrate if the rotator angle changes.
 
+### Self-correcting mount calibration
+
+Fine acquisition has no feedback from the spectrograph: it drives the star
+to the fiber pixel through the mount's matrix. When the matrix is rotated
+from the truth (almost always a poorly known rotator angle, the PA), a
+north correction bleeds into east: the star spirals in slowly, walks away,
+or never gets under `capture_radius`. Legacy MINERVA, Dec 2025 - Apr 2026:
+57% of spectra hit the 750 s acquire timeout; the median rotation error
+per telescope-night was steady at -3.5 deg on T1, episodic on T2 (17% of
+nights over 10 deg) and a stale -15 deg on all of T4's April nights, and
+every telescope-night with a 5-10 deg error left its telescope behind.
+
+`robofast.guider.selfcal` (on by default; `guide.mount_selfcal`: `false`
+for the legacy behaviour, or a mapping of `SelfCalConfig`'s fields) treats
+every acquisition mount move as a measurement: the move `u` actually sent
+and the star's displacement `d` between the frame before and the frame
+after it (after `coarse_settle`). It fits `d = s R(theta) M u` (a rotation
+`theta` and scale `s` relative to the stored `M`) by complex least
+squares, and the mirrored model beside it. A move counts only when the
+predicted motion is at least `min_move` (15) pixels, the star is found in
+both frames and not saturated (`saturation` 60000 ADU), the move was not
+clipped, and `|d|/|p|` is within a factor 2 of 1 (else another star). One
+move of tens of arcsec gives `theta` to about a degree.
+
+* **During an acquisition**: once this acquisition's own moves give
+  `|theta| >= correct_deg` (5), the corrected matrix `Z @ M` is used for
+  the rest of the acquisition (and for a mount-driven fine loop in the
+  observation that follows), the event `mount_cal_corrected` is recorded
+  (theta, scale, pairs, and with a PA-seeded matrix the PA change) and
+  the convergence watch starts afresh. Above `alarm_deg` (20) it also
+  alarms `mount_cal_suspect`: run the full calibration.
+* **Parity**: with two or more moves whose directions span at least 30
+  deg, a mirrored fit three times better than any rotation is a parity
+  flip: alarm `mount_cal_parity` and `not_converging`; the acquisition
+  fails. A parity is never corrected online. (One move cannot tell a
+  mirror from a rotation, so the first move of a mirrored calibration is
+  still "corrected", and the second shows the mirror.)
+* **Persisting**: a converged acquisition's estimate above `correct_deg`
+  is kept. When `persist_count` (3) in a row agree within
+  `persist_tolerance_deg` (3 deg) and 5% in scale, their mean correction
+  is saved to the calibration store with provenance in
+  `extra.online` (`source: "online"`, `theta_deg`, `scale`, `pairs`,
+  `acquisitions`, the estimates, `time`, the previous matrix), and the
+  event `mount_cal_persisted` is recorded. One outlier never rewrites the
+  stored calibration; three that disagree alarm `mount_cal_suspect`
+  ("unstable"). An acquisition whose moves agree with the store (under
+  `correct_deg`) resets the run. A residual under 5 deg (T1's -3.5) is
+  left alone.
+* **Calibration suspect**: `status()["mount_cal_suspect"]` (and
+  `["mount_cal"]`, with the reason, estimate and history), the registry
+  value `<scope>.guide_cal_suspect` (and `_reason`), and
+  `GuiderRemote.cal_suspect`. Set by an estimate above `correct_deg` not
+  yet persisted, an unstable estimate, a parity flip, or `not_converging`;
+  cleared by an acquisition that agrees with the store, by persisting, or
+  by a new calibration (`POST /calibrate` with `"device": "mount"`).
+* **The rotator**: when the stored matrix came from a PA (seeded from the
+  PA calibration, docs/rotcal.md), a consistent `theta` is a PA error:
+  the guider's PA is off by `-parity * theta` and the PA calibration's
+  offset (`pa = offset + sense * mechanical`) by `-theta`. The event and
+  the alarm say so (`pa.pa_change_deg`, `pa.rotcal_offset_change_deg`):
+  fix the PA calibration rather than only the matrix.
+
+Not (yet) used: the guide loop's own mount moves (sub-pixel, or offloads
+the tip/tilt cancels), and the full 2x2 fit (non-orthogonality).
+
+The sequencer does **not** run the full calibration by itself: the mount
+calibration moves the mount by `+/- step` around a star for a minute or
+more, which needs a suitable star and a slot between spectra (never on a
+spectrum's target with its shutter open). Its alarms
+(`mount_cal_suspect`, `mount_cal_parity`) reach the sequencer's console
+alarm through `GuiderRemote` (`forward_alarms`), and the events its
+timeline. To run it: between observations, with a star near the fiber
+and the guider stopped, `POST /calibrate {"device": "mount", "step": 20}`
+on the telescope's guider service (or rerun the PA calibration,
+docs/rotcal.md, and restart the guider service to reseed the matrix when
+the PA is the cause).
+
 ## Fiber acquisition
 
 1. **Locate the fiber**: `POST /locate` turns the backlight on (MINERVA:
@@ -204,9 +281,13 @@ rotation: calibrate per port, and recalibrate if the rotator angle changes.
    frame, which a near-equal neighbour cannot fool: docs/sky.md section 8).
    Farther than `capture_radius`
    pixels: offset the mount through its calibration, wait `coarse_settle`,
-   repeat (up to `coarse_iterations`). A distance that grows is the legacy
-   "acquisition not converging" alarm (usually a wrong mount calibration
-   or rotator angle) and fails the attempt.
+   repeat (up to `coarse_iterations`). Each move also measures the mount
+   calibration's rotation, and a rotation of 5 deg or more is corrected for
+   the rest of the acquisition ("Self-correcting mount calibration",
+   above). A distance that still grows is the legacy "acquisition not
+   converging" alarm (`not_converging`: a parity flip, a wrong star, no
+   star, or a calibration the correction cannot fix), which fails the
+   attempt and marks the mount calibration suspect.
 3. **Guide**: the fine loop in a `roi_size` window around the target. The
    annulus centroider learns the seeing FWHM from stars measured clear of
    the hole during acquisition (or takes `guide.fwhm`).
@@ -399,7 +480,8 @@ headers of the frames taken meanwhile (stale values are marked as such).
 
 **Alarms**: `star_lost`, `tiptilt_limit`, `residual_high`
 (`residual_alarm` px rms), `offset_high` (`offset_alarm` arcsec, above),
-`acquisition_failed`, `not_converging`,
+`acquisition_failed`, `not_converging`, `mount_cal_suspect`,
+`mount_cal_parity` (the self-correcting mount calibration, above),
 `device_error`; repeats within `alarm_repeat` seconds are counted.
 
 **Redis (optional, off by default)**: `"redis": {"host", "port",

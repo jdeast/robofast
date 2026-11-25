@@ -1213,6 +1213,12 @@ class Sequencer:
             if u.guider is not None and hasattr(u.guider, "on_alarm"):
                 # The guider's forwarded alarms (offset_high: docs/guider.md).
                 u.guider.on_alarm = lambda text, u=u: self.alarm(u.name, text)
+            if u.guider is not None and hasattr(u.guider, "on_event"):
+                # Guider events (mount_cal_corrected / _persisted: docs/guider.md,
+                # "Self-correcting mount calibration") on the timeline.
+                u.guider.on_event = lambda what, u=u, **kw: self._event(
+                    what, telescope=u.name, **kw
+                )
             if u.cooling is not None:
                 u.cooling.alarm = lambda text, u=u: self.alarm(u.name, text)
                 u.cooling.event = lambda what, u=u, **kw: self._event(what, telescope=u.name, **kw)

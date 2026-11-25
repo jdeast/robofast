@@ -151,6 +151,7 @@ from robofast.guider.loop import (
     Backlight,
     GuideConfig,
     Guider,
+    publish_cal_suspect,
     publish_values,
 )
 from robofast.guider.offload import OffloadConfig, Offloader
@@ -389,6 +390,13 @@ class GuiderService:
             registry=self.registry,
             publisher=publisher,
         )
+        self.guider.on_mount_cal_persist = self._persist_mount_cal
+        if self.pa_cal is not None:
+            pc = self.pa_cal
+            self.guider.rotator_note = (
+                f"the PA calibration {pc.telescope}/{pc.port}"
+                f" (PA = {pc.offset:.2f} {'+' if pc.sense > 0 else '-'} mechanical)"
+            )
         self.flux_reporter = None if flux_cfg is None else FluxReporter(self.guider, flux_cfg)
         self.guide_log = None if log_cfg is None else GuideLog(self.guider, log_cfg)
         self._load_calibrations()
@@ -468,6 +476,18 @@ class GuiderService:
             parity=cal.parity,
             notes=f"seeded from the PA calibration measured {cal.measured}",
         )
+
+    def _persist_mount_cal(self, cal: calib.Calibration) -> None:
+        """Save an online-corrected mount calibration (robofast.guider.selfcal:
+        only after several acquisitions agree)."""
+        if self.store is not None:
+            path = self.store.save(cal)
+            log.warning(
+                "guider %s: mount calibration corrected online (%s) and saved to %s",
+                self.config.scope,
+                cal.notes,
+                path,
+            )
 
     def _rebuild_offloader(self) -> None:
         g = self.guider
@@ -1001,8 +1021,15 @@ class GuiderRemote:
       it every ``poll_interval`` while guiding (the FITS headers), and hands
       each new guider alarm whose kind is in ``forward_alarms`` (default
       ``offset_high``: docs/guider.md, "Guide log, offset alarm and header
-      collection") to ``on_alarm`` (the sequencer's alarm: status,
-      console, notifier).
+      collection"; ``mount_cal_suspect`` and ``mount_cal_parity``:
+      "Self-correcting mount calibration") to ``on_alarm`` (the
+      sequencer's alarm: status, console, notifier).
+    * each new guider event (``mount_cal_corrected``,
+      ``mount_cal_persisted``) goes to ``on_event`` (the sequencer's
+      timeline), and :attr:`cal_suspect` holds the guider's "mount
+      calibration suspect" reason (None: not suspect). Alarms and events
+      are also read when :meth:`start` ends, so an acquisition's are
+      seen even without a registry.
     """
 
     def __init__(
@@ -1015,13 +1042,25 @@ class GuiderRemote:
         acquire_timeout: float = 120.0,
         poll_interval: float = 2.0,
         status_failures: int = 3,
-        forward_alarms: list[str] | tuple[str, ...] = ("offset_high",),
+        forward_alarms: list[str] | tuple[str, ...] = (
+            "offset_high",
+            "mount_cal_suspect",
+            "mount_cal_parity",
+        ),
     ) -> None:
         self.url = url.rstrip("/")
         self.forward_alarms = frozenset(forward_alarms)
         #: Called with each forwarded alarm's text (the sequencer sets it).
         self.on_alarm: Any = None
         self._alarms_seen: set[tuple[str, Any]] = set()
+        #: Called as ``on_event(kind, **fields)`` with each new guider event
+        #: (``mount_cal_corrected``, ``mount_cal_persisted``): the
+        #: sequencer's timeline.
+        self.on_event: Any = None
+        self._events_seen: set[tuple[str, Any]] = set()
+        #: The guider's "mount calibration suspect" reason from its last
+        #: status (None: not suspect; docs/guider.md).
+        self.cal_suspect: str | None = None
         self.scope = scope
         self.registry = registry
         self.timeout = timeout
@@ -1079,6 +1118,7 @@ class GuiderRemote:
             if st["state"] == "guiding":
                 break
             if st["state"] in ("failed", "stopped", "idle"):
+                self._forward(st)
                 await self.stop("acquisition failed")
                 raise GuiderError(f"guider {self.scope}: {st['state']}: {st.get('reason')}")
             if asyncio.get_running_loop().time() > deadline:
@@ -1089,6 +1129,7 @@ class GuiderRemote:
                 )
             await asyncio.sleep(0.2)
         self._publish(st)
+        self._forward(st)
         if self.registry is not None:
             self._poll = asyncio.create_task(self._poll_loop(), name=f"guider-poll-{self.scope}")
         return st
@@ -1179,11 +1220,33 @@ class GuiderRemote:
             try:
                 st = await self.status()
                 self._publish(st)
-                self._forward_alarms(st)
+                self._forward(st)
             except Exception as exc:
                 log.warning("guider %s status: %r", self.scope, exc)
                 if self.registry is not None:
                     self.registry.failed(f"{self.scope}.guide_state", repr(exc))
+
+    def _forward(self, st: dict[str, Any]) -> None:
+        """Alarms, events and the calibration-suspect flag from a status."""
+        self._forward_alarms(st)
+        self._forward_events(st)
+        mc = st.get("mount_cal") or {}
+        self.cal_suspect = mc.get("suspect_reason") if mc.get("suspect") else None
+
+    def _forward_events(self, st: dict[str, Any]) -> None:
+        """New guider events to ``on_event`` (once each)."""
+        for e in st.get("events") or []:
+            kind = e.get("kind")
+            key = (kind, e.get("t"))
+            if key in self._events_seen:
+                continue
+            self._events_seen.add(key)
+            if self.on_event is not None:
+                fields = {k: v for k, v in e.items() if k not in ("kind", "t", "utc")}
+                try:
+                    self.on_event(kind, **fields)
+                except Exception:
+                    log.exception("guider %s: on_event", self.scope)
 
     def _forward_alarms(self, st: dict[str, Any]) -> None:
         """New guider alarms of the forwarded kinds to ``on_alarm`` (once each)."""
@@ -1218,6 +1281,14 @@ class GuiderRemote:
             max_age=max(3 * self.poll_interval, 10.0),
             measured=datetime.now(UTC),
         )
+        if "mount_cal" in st:
+            mc = st.get("mount_cal") or {}
+            publish_cal_suspect(
+                self.registry,
+                self.scope,
+                mc.get("suspect_reason") if mc.get("suspect") else None,
+                measured=datetime.now(UTC),
+            )
 
 
 def main(argv: list[str] | None = None) -> None:

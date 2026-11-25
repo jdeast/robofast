@@ -1013,3 +1013,21 @@ async def test_a_calstage_position_is_a_hard_constraint_and_reaches_the_observat
     assert not c.ok and "t2 has no calstage position 'sky'" in c.reasons
     obs = await run_visit(d, "t1")
     assert obs.calstage == "sky"
+
+
+async def test_regression_20261125_idle_until_the_next_window_opens():
+    """night1124: about 30 s of every spectrum cycle was spent idle, because
+    a request's window opened between polls (idle_poll). Now the idle wait
+    ends when the soonest pending window opens."""
+    opens = NIGHT + timedelta(seconds=95)
+    d = make(
+        [group("w", windows=[{"start": opens.isoformat(), "end": "2026-11-16T00:00:00Z"}])],
+        config=DispatchConfig(idle_poll=600.0),
+    )
+    idle = await d.next_observation("t1")
+    assert isinstance(idle, Idle) and idle.seconds == pytest.approx(96.0)
+    peeked = await d.peek("t1")
+    assert isinstance(peeked, Idle) and peeked.seconds == pytest.approx(96.0)
+    # Nothing pending opens later: the full idle_poll.
+    d2 = make([], config=DispatchConfig(idle_poll=600.0))
+    assert (await d2.next_observation("t1")).seconds == 600.0

@@ -55,6 +55,7 @@ import contextlib
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -243,6 +244,80 @@ class Outcome:
         return self.t_end - self.t_start
 
 
+class PACProcess:
+    """The simulated PAC (:mod:`robofast.devices.aqawan_sim`) as a process of
+    its own, with what a night reads from it in-process: its port,
+    :meth:`closed` and :attr:`log` (the commands that change something), from
+    the state file it rewrites every 0.5 s."""
+
+    def __init__(
+        self,
+        out: Path,
+        *,
+        open_time: float,
+        close_time: float,
+        settle: float,
+        heartbeat_timeout: float,
+    ) -> None:
+        self.out = Path(out)
+        self.args = [
+            "--open-time", str(open_time),
+            "--close-time", str(close_time),
+            "--settle", str(settle),
+            "--heartbeat-timeout", str(heartbeat_timeout),
+        ]  # fmt: skip
+        self.state = self.out / "state.json"
+        self.proc: subprocess.Popen | None = None
+        self.port = 0
+
+    def start(self) -> PACProcess:
+        self.out.mkdir(parents=True, exist_ok=True)
+        log = open(self.out / "aqawan_sim.log", "w")  # noqa: SIM115 (the child keeps it)
+        self.proc = subprocess.Popen(
+            [sys.executable, "-m", "robofast.devices.aqawan_sim", "--port", "0",
+             "--state-file", str(self.state), *self.args],
+            stdout=subprocess.PIPE,
+            stderr=log,
+            text=True,
+            cwd=str(ROOT),
+        )  # fmt: skip
+        log.close()
+        assert self.proc.stdout is not None
+        deadline = time.monotonic() + 30
+        line = ""
+        while time.monotonic() < deadline:
+            line = self.proc.stdout.readline()
+            if "aqawan simulator on" in line or not line:
+                break
+        if "aqawan simulator on" not in line:
+            self.stop()
+            raise RuntimeError(f"the PAC simulator did not start (see {self.out}/aqawan_sim.log)")
+        self.port = int(line.strip().rsplit(":", 1)[1])
+        return self
+
+    def _doc(self) -> dict[str, Any]:
+        try:
+            return json.loads(self.state.read_text())
+        except (OSError, ValueError):
+            return {"shutters": [None, None], "log": []}
+
+    def closed(self) -> bool:
+        return self._doc()["shutters"] == ["CLOSED", "CLOSED"]
+
+    @property
+    def log(self) -> list[tuple[float, str]]:
+        return [(float(t), str(c)) for t, c in self._doc()["log"]]
+
+    def stop(self) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(5)
+
+
 class SimulatedNight:
     """The services and the night (module doc). ``out`` receives every
     config, log, data file and record."""
@@ -364,11 +439,37 @@ class SimulatedNight:
         self.outcome.weather.append((time.monotonic(), "safe" if safe else "unsafe"))
         self._note(f"weather {'safe' if safe else 'UNSAFE (humidity 95 %)'}")
 
+    #: Run the simulated PAC as a process of its own, as the real PAC is a
+    #: machine of its own. In this process, any pause of the process (the
+    #: GIL held for a moment by other work) delays its replies, and the
+    #: enclosure server times out on them: night1121-1124 saw 2-20 such
+    #: "dropped" STATUS reads a night that the real system would not.
+    PAC_PROCESS = False
+    #: The PAC client's (``pac``) and the enclosure server's timings: fast
+    #: here, for an accelerated night; the rehearsal uses production's.
+    PAC_TIMINGS: dict[str, dict[str, float]] = {
+        "pac": {
+            "connect_timeout": 1.0,
+            "command_timeout": 2.0,
+            "resend_after": 0.15,
+            "idle_end": 0.1,
+        },
+        "server": {
+            "status_max_age": 0.1,
+            "poll_interval": 0.05,
+            "start_grace": 1.0,
+            "shutter_open_timeout": 5.0,
+            "request_timeout": 3.0,
+        },
+    }
+
     def _start_aqawan(self) -> None:
-        self.aqawan_sim = AqawanSim(
-            open_time=0.6, close_time=0.6, settle=0.05, heartbeat_timeout=15
-        )
-        self.aqawan_sim.start()
+        sim_kw = dict(open_time=0.6, close_time=0.6, settle=0.05, heartbeat_timeout=15)
+        if self.PAC_PROCESS:
+            self.aqawan_sim = PACProcess(self.out / "aqawan-sim", **sim_kw).start()
+        else:
+            self.aqawan_sim = AqawanSim(**sim_kw)
+            self.aqawan_sim.start()
         self._stack.callback(self.aqawan_sim.stop)
         base = json.loads((ROOT / "deploy" / "aqawan.example.json").read_text())
         # The example's emergency log is the production path
@@ -382,19 +483,8 @@ class SimulatedNight:
         }
         base.update(
             listen="127.0.0.1:0",
-            pac={
-                "host": "127.0.0.1",
-                "port": self.aqawan_sim.port,
-                "connect_timeout": 1.0,
-                "command_timeout": 2.0,
-                "resend_after": 0.15,
-                "idle_end": 0.1,
-            },
-            status_max_age=0.1,
-            poll_interval=0.05,
-            start_grace=1.0,
-            shutter_open_timeout=5.0,
-            request_timeout=3.0,
+            pac={"host": "127.0.0.1", "port": self.aqawan_sim.port, **self.PAC_TIMINGS["pac"]},
+            **self.PAC_TIMINGS["server"],
         )
         self.aqawan = AqawanServer(AqawanConfig.from_dict(base)).start()
         self._stack.callback(self.aqawan.stop)

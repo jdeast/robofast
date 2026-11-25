@@ -61,6 +61,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from robofast import hwgate
 from robofast.devices.aqawan_pac import COMMANDS, TelnetFilter
@@ -484,6 +485,11 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--no-prompt", action="store_true")
     ap.add_argument("--no-negotiate", action="store_true")
     ap.add_argument("--echo", action="store_true")
+    ap.add_argument(
+        "--state-file",
+        help="rewrite this JSON file (shutter states, every command seen) every 0.5 s:"
+        " how a harness running the simulator as its own process reads it",
+    )
     args = ap.parse_args(argv)
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -499,13 +505,34 @@ def main(argv: list[str] | None = None) -> None:
         negotiate=not args.no_negotiate,
         echo=args.echo,
     ).start()
+    stop = threading.Event()
+    if args.state_file:
+        threading.Thread(
+            target=_write_state, args=(sim, Path(args.state_file), stop), daemon=True
+        ).start()
     print(f"aqawan simulator on {sim.address}", flush=True)
     try:
         threading.Event().wait()
     except KeyboardInterrupt:
         pass
     finally:
+        stop.set()
         sim.stop()
+
+
+_POLLS = frozenset({"STATUS", "HEARTBEAT", "GET_FAULTS", "GET_ERRORS"})
+
+
+def _write_state(sim: AqawanSim, path: Path, stop: threading.Event) -> None:
+    while not stop.wait(0.5):
+        # Commands that change something (polls left out: a night of STATUS
+        # would make this file large). Times are time.monotonic(), one clock
+        # for every process on the host.
+        log = [list(e) for e in list(sim.log) if e[1] not in _POLLS]
+        doc = {"shutters": list(sim.shutter_states()), "log": log}
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(doc))
+        tmp.replace(path)
 
 
 if __name__ == "__main__":

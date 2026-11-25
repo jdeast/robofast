@@ -1015,6 +1015,14 @@ class Rehearsal(SimulatedNight):
 
     #: A rehearsal is never a science night: every frame is a test frame.
     TEST_FRAMES = True
+    #: A real-time night: the simulated PAC as its own process at
+    #: production's timings (the client's and server's defaults), so the
+    #: dry runs see only the PAC drops the real system could.
+    PAC_PROCESS = True
+    PAC_TIMINGS: dict[str, dict[str, float]] = {
+        "pac": {},
+        "server": {"start_grace": 1.0, "shutter_open_timeout": 5.0},
+    }
 
     def __init__(self, out: Path, settings: RehearsalSettings) -> None:
         # Its own copy: the preflight may drop real telescopes.

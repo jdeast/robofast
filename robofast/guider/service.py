@@ -53,7 +53,13 @@ calibrated) or 503 (a device failed).
   does not open.
 * ``POST /calibrate`` ``{"device": "tiptilt"|"mount", "step", "exposure"?,
   "frames"?, "settle"?}`` -- measure and save that device's matrix (for
-  this ``port``). 409 while guiding.
+  this ``port``). 409 while guiding. A mount calibration also clears the
+  rotator offset (robofast.guider.selfcal).
+* ``POST /rotator`` ``{"event": "lost"|"homed", "why"?}`` -- the port's
+  rotator may have lost its position (a drop-out, reconnect or PWI
+  restart: the calibration is marked suspect and re-measured by the next
+  acquisitions) or was homed (the rotator offset is cleared and the home
+  counted). Nothing moves.
 
 Config (JSON; every key optional except as noted)::
 
@@ -156,6 +162,7 @@ from robofast.guider.loop import (
 )
 from robofast.guider.offload import OffloadConfig, Offloader
 from robofast.guider.redis_pub import TrackingPublisher
+from robofast.guider.selfcal import RotatorOffset, RotatorOffsetStore
 from robofast.guider.sim import (
     Fiber,
     Jitter,
@@ -391,12 +398,12 @@ class GuiderService:
             publisher=publisher,
         )
         self.guider.on_mount_cal_persist = self._persist_mount_cal
+        self.guider.on_rotator_offset_persist = self._persist_rotator_offset
+        self.rotator_store = (
+            RotatorOffsetStore(config.calibration_dir) if config.calibration_dir else None
+        )
         if self.pa_cal is not None:
-            pc = self.pa_cal
-            self.guider.rotator_note = (
-                f"the PA calibration {pc.telescope}/{pc.port}"
-                f" (PA = {pc.offset:.2f} {'+' if pc.sense > 0 else '-'} mechanical)"
-            )
+            self.guider.rotator_sense = int(self.pa_cal.sense)
         self.flux_reporter = None if flux_cfg is None else FluxReporter(self.guider, flux_cfg)
         self.guide_log = None if log_cfg is None else GuideLog(self.guider, log_cfg)
         self._load_calibrations()
@@ -443,6 +450,19 @@ class GuiderService:
                 g.tt_cal = cal
             else:
                 g.mount_cal = cal
+                if self.rotator_store is not None:
+                    try:
+                        g.rotator_offset = self.rotator_store.load(dev.name, self.config.port)
+                    except (OSError, ValueError, TypeError) as exc:
+                        log.error("rotator offset unreadable: %s", exc)
+                    if g.rotator_offset is not None and g.rotator_offset.theta:
+                        log.warning(
+                            "guider %s: rotator offset %+.2f deg since %s (cause: %s)",
+                            self.config.scope,
+                            g.rotator_offset.theta,
+                            g.rotator_offset.since,
+                            g.rotator_offset.cause or "unknown",
+                        )
         self._rebuild_offloader()
 
     def _pa_calibration(self) -> Any:
@@ -489,6 +509,18 @@ class GuiderService:
                 path,
             )
 
+    def _persist_rotator_offset(self, off: RotatorOffset) -> None:
+        """Save the rotator offset since the last home (robofast.guider.selfcal)."""
+        if self.rotator_store is not None:
+            path = self.rotator_store.save(off)
+            log.warning(
+                "guider %s: rotator offset %+.2f deg (homes %d) saved to %s",
+                self.config.scope,
+                off.theta,
+                off.homes,
+                path,
+            )
+
     def _rebuild_offloader(self) -> None:
         g = self.guider
         if (
@@ -502,7 +534,7 @@ class GuiderService:
                 g.tiptilt,
                 g.tt_cal,
                 g.mount,
-                g.mount_cal,
+                g.mount_cal_effective,
                 OffloadConfig(**self.config.offload),
                 clock=self.clock,
             )
@@ -716,6 +748,10 @@ class GuiderService:
                 async with self._hold("locate"):
                     x, y = await g.locate_fiber()
                 return 200, {"target": [x, y]}
+            if parts == ["rotator"]:
+                if g.mount is None:
+                    raise _HTTPError(409, "no mount: no rotator offset to keep")
+                return 200, g.rotator_event(str(args["event"]), str(args.get("why") or ""))
             if parts == ["calibrate"]:
                 self._refuse_if_busy()
                 if g.running:
@@ -969,7 +1005,7 @@ class GuiderService:
         if which == "tiptilt":
             g.tt_cal = cal
         else:
-            g.mount_cal = cal
+            g.full_calibration(cal)  # also clears the rotator offset
         if self.store is not None:
             path = self.store.save(cal)
             log.info("calibration of %s saved to %s", dev.name, path)
@@ -1021,11 +1057,13 @@ class GuiderRemote:
       it every ``poll_interval`` while guiding (the FITS headers), and hands
       each new guider alarm whose kind is in ``forward_alarms`` (default
       ``offset_high``: docs/guider.md, "Guide log, offset alarm and header
-      collection"; ``mount_cal_suspect`` and ``mount_cal_parity``:
+      collection"; ``mount_cal_suspect``, ``mount_cal_parity`` and
+      ``rotator_position_lost``:
       "Self-correcting mount calibration") to ``on_alarm`` (the
       sequencer's alarm: status, console, notifier).
     * each new guider event (``mount_cal_corrected``,
-      ``mount_cal_persisted``) goes to ``on_event`` (the sequencer's
+      ``rotator_offset_saved``, ``mount_scale_saved``, ``rotator_homed``)
+      goes to ``on_event`` (the sequencer's
       timeline), and :attr:`cal_suspect` holds the guider's "mount
       calibration suspect" reason (None: not suspect). Alarms and events
       are also read when :meth:`start` ends, so an acquisition's are
@@ -1046,6 +1084,7 @@ class GuiderRemote:
             "offset_high",
             "mount_cal_suspect",
             "mount_cal_parity",
+            "rotator_position_lost",
         ),
     ) -> None:
         self.url = url.rstrip("/")
@@ -1054,7 +1093,7 @@ class GuiderRemote:
         self.on_alarm: Any = None
         self._alarms_seen: set[tuple[str, Any]] = set()
         #: Called as ``on_event(kind, **fields)`` with each new guider event
-        #: (``mount_cal_corrected``, ``mount_cal_persisted``): the
+        #: (``mount_cal_corrected``, ``rotator_offset_saved``, ...): the
         #: sequencer's timeline.
         self.on_event: Any = None
         self._events_seen: set[tuple[str, Any]] = set()
@@ -1145,6 +1184,18 @@ class GuiderRemote:
                 return await self._call("POST", "/reconnect", {}, timeout=bound)
         except TimeoutError as exc:
             raise GuiderError(f"guider {self.scope}: camera not reconnected in {bound} s") from exc
+
+    async def rotator_event(self, event: str, why: str = "") -> bool:
+        """Tell the guider its rotator may have lost its position
+        (``"lost"``) or was homed (``"homed"``): ``POST /rotator``.
+        Bounded; never raises; True if the guider took it."""
+        try:
+            async with asyncio.timeout(self.timeout):
+                await self._call("POST", "/rotator", {"event": event, "why": why})
+        except Exception as exc:
+            log.warning("guider %s: rotator %s not reported: %r", self.scope, event, exc)
+            return False
+        return True
 
     async def locate(self, timeout: float | None = None) -> tuple[float, float]:
         """Find the fiber with the backlight (``POST /locate``); it becomes

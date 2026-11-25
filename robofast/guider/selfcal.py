@@ -3,65 +3,85 @@ calibration").
 
 Fine acquisition drives the star onto the fiber pixel through the mount's
 calibration ``M`` (:mod:`robofast.guider.calibration`: ``d_pixels = M @
-d_mount``). When ``M`` is rotated from the truth (almost always a poorly
-known rotator angle: the PA), a north correction bleeds into east and the
-star spirals in slowly, walks away, or never gets under the capture radius
-(legacy MINERVA, Dec 2025 - Apr 2026: 57% of spectra hit the 750 s
-acquisition timeout).
+d_mount``). When ``M`` is rotated from the truth, a north correction bleeds
+into east and the star spirals in slowly, walks away, or never gets under
+the capture radius (legacy MINERVA, Dec 2025 - Apr 2026: 57% of spectra hit
+the 750 s acquisition timeout). On MINERVA a rotated matrix almost always
+means the **rotator lost its position** (it drops out, or PWI is killed);
+its physical angle changes only on site visits, and homing it puts it
+right -- but the mechanism survives only ~100 homes, so homes must be rare.
+
+So the mount matrix in use is two parts:
+
+* the **base** matrix (:class:`~robofast.guider.calibration.Calibration`,
+  from a full calibration): the truth for a homed rotator. Only a *scale*
+  correction is ever saved into it;
+* the **rotator offset** (:class:`RotatorOffset`, per device and port, in
+  :class:`RotatorOffsetStore`): the detector rotation ``theta`` since the
+  last rotator home, applied on top, ``R(theta) @ base``. It survives
+  restarts and nights (a lost position stays lost until a home) and is
+  cleared by a rotator home or a full calibration.
 
 Every mount move the acquisition makes is a measurement: the move ``u``
 actually sent (arcsec east, north) and the star's displacement ``d``
 (pixels) between the frame before and the frame after it. With ``p = M @
-u`` the predicted displacement, :func:`estimate` fits ``d = Z p`` with
-``Z`` a rotation by ``theta`` and a scale ``s`` (the complex least squares
-``z = sum(conj(p) d) / sum(|p|^2)``), and also the mirrored model ``d = W
-conj(p)``: with two or more moves in clearly different directions, a mirror
-that fits much better than any rotation is a parity flip.
+u`` the predicted displacement (``M`` the matrix in use), :func:`estimate`
+fits ``d = Z p`` with ``Z`` a rotation by ``theta`` and a scale ``s`` (the
+complex least squares ``z = sum(conj(p) d) / sum(|p|^2)``), and also the
+mirrored model ``d = W conj(p)``: with two or more moves in clearly
+different directions, a mirror that fits much better than any rotation is a
+parity flip.
 
-Pairs are kept only when well measured (:meth:`SelfCalConfig`): the
-predicted move at least ``min_move`` pixels (centroid noise and seeing are
-~1 px, so a 15 px move fixes theta to a few degrees and a 100 px one to
-~0.5 deg), the star found in both frames and not saturated, the move not
-clipped, and ``|d| / |p|`` within ``max_scale_error`` of 1 (else it was
-probably another star).
+Pairs are kept only when well measured (:class:`SelfCalConfig`): the
+predicted move at least ``min_move`` pixels, the star found in both frames
+and not saturated, the move not clipped, and ``|d| / |p|`` within
+``max_scale_error`` of 1 (else it was probably another star).
 
-:class:`SelfCal` keeps one port's state:
+:class:`SelfCal`:
 
-* during an acquisition (:meth:`SelfCal.begin`, :meth:`SelfCal.add`): the
-  estimate from this acquisition's own moves; :meth:`SelfCal.corrected`
-  gives ``Z @ M`` once ``|theta| >= correct_deg``, for the rest of this
-  acquisition (the guider records the ``mount_cal_corrected`` event);
-  :meth:`SelfCal.parity_flipped` says when the moves are mirrored (the
-  guider alarms ``mount_cal_parity`` and fails: it never fixes a parity);
-* after it (:meth:`SelfCal.finish`): a converged acquisition's estimate is
-  kept; ``persist_count`` in a row above ``correct_deg`` that agree within
-  ``persist_tolerance_deg`` (and 5% in scale) give the corrected matrix to
-  save, with provenance (``extra.source = "online"``). One outlier never
-  rewrites the stored calibration;
-* :attr:`SelfCal.suspect`: why the stored calibration is suspect (None:
-  not suspect) -- an estimate above ``correct_deg`` not (yet) persisted, an
-  unstable estimate, a parity flip, or ``not_converging``. Cleared when an
-  acquisition's moves agree with the stored matrix, when one is persisted,
-  or when the mount is calibrated again (:meth:`SelfCal.reset`).
+* during an acquisition (:meth:`SelfCal.begin`, :meth:`SelfCal.add`):
+  :meth:`SelfCal.corrected` gives ``Z @ M`` once ``|theta| >=
+  correct_deg`` or ``|s - 1| >= scale_tolerance``, for the rest of this
+  acquisition (any angle, a 180 deg sign error included);
+  :meth:`SelfCal.parity_flipped` says when the moves are mirrored (never
+  corrected);
+* after it (:meth:`SelfCal.finish`): ``persist_count`` converged
+  acquisitions in a row that need a correction and agree (theta within
+  ``persist_tolerance_deg``, scale within 5%) -- ``persist_after_loss``
+  after a reported rotator drop-out (:meth:`SelfCal.rotator_lost`) --
+  update the rotator offset (never to more than ``max_save_deg``: that is
+  alarmed instead) and, for a scale error, the base matrix. One outlier
+  never saves anything;
+* :attr:`SelfCal.suspect`: why the mount calibration should be measured
+  again or the rotator homed (None: no reason). A rotator offset of
+  ``alarm_deg`` or more keeps it set, even saved, until a rotator home or a
+  full calibration.
 
-The rotator: when the stored matrix came from a PA (``Calibration.pa``), a
-consistent ``theta`` is a PA error: the guider's PA is off by ``-parity *
-theta`` and the FITS / PA-calibration PA (robofast.rotcal, ``pa = offset +
-sense * mechanical``) by ``-theta`` -- fix the PA calibration's offset
-rather than only the matrix (:func:`pa_advice`).
+What ``theta`` means (:func:`rotator_advice`): the image PA (FITS / PA
+calibration convention, robofast.rotcal: ``pa = offset + sense *
+mechanical``) is off by ``-theta``, so the rotator's reported mechanical
+angle is off by ``-sense * theta`` -- a lost position. Only an offset that
+comes back after a rotator home points at the PA calibration's ``offset``.
 """
 
 from __future__ import annotations
 
+import json
 import math
+import os
+import re
+import tempfile
 from collections import deque
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from robofast.guider.calibration import Calibration
+
+HOME_ADVICE = "home the rotator when convenient (the rotator survives ~100 homes; use sparingly)"
 
 
 @dataclass
@@ -72,12 +92,18 @@ class SelfCalConfig:
     min_move: float = 15.0
     #: |d| / |p| must lie within [1/(1+e), 1+e] (else: another star?).
     max_scale_error: float = 1.0
-    #: Correct the matrix during an acquisition from |theta| (deg) on.
+    #: Correct the rotation during an acquisition from |theta| (deg) on.
     correct_deg: float = 5.0
-    #: Alarm ``mount_cal_suspect`` ("run the full calibration") from here.
+    #: Correct the scale from |s - 1| on (legacy MINERVA: 0.81).
+    scale_tolerance: float = 0.05
+    #: A rotator offset from here alarms ``rotator_position_lost``.
     alarm_deg: float = 20.0
-    #: Persist after this many converged acquisitions in a row agree...
+    #: Never save a rotator offset beyond this (deg): alarm instead.
+    max_save_deg: float = 90.0
+    #: Save after this many converged acquisitions in a row agree...
     persist_count: int = 3
+    #: ... or this many after a reported rotator drop-out / PWI restart...
+    persist_after_loss: int = 2
     #: ... within this spread of theta (deg).
     persist_tolerance_deg: float = 3.0
     #: Parity: two or more pairs whose predicted directions span at least
@@ -104,8 +130,18 @@ class SelfCalConfig:
         if unknown:
             raise ValueError(f"mount_selfcal: unknown keys {sorted(unknown)}")
         c = cls(**v)
-        if not (0 < c.correct_deg <= c.alarm_deg) or c.persist_count < 2 or c.min_move <= 0:
-            raise ValueError("mount_selfcal: 0 < correct_deg <= alarm_deg, persist_count >= 2")
+        if (
+            not (0 < c.correct_deg <= c.alarm_deg <= c.max_save_deg)
+            or c.persist_count < 2
+            or c.persist_after_loss < 1
+            or c.min_move <= 0
+            or c.scale_tolerance <= 0
+        ):
+            raise ValueError(
+                "mount_selfcal: 0 < correct_deg <= alarm_deg <= max_save_deg,"
+                " persist_count >= 2, persist_after_loss >= 1, positive min_move"
+                " and scale_tolerance"
+            )
         return c
 
 
@@ -180,24 +216,111 @@ def estimate(m: np.ndarray, pairs: list[Pair]) -> Estimate | None:
     )
 
 
-def pa_advice(cal: Calibration, theta: float) -> dict[str, Any] | None:
-    """What ``theta`` means for the PA, when the matrix came from one."""
-    if cal.pa is None:
-        return None
-    parity = -1 if cal.parity < 0 else 1
-    d_guider = -parity * theta
-    return {
-        "pa_stored": round(float(cal.pa), 3),
-        "pa_measured": round((float(cal.pa) + d_guider) % 360.0, 3),
-        "pa_change_deg": round(d_guider, 3),
-        # The FITS / PA-calibration convention (robofast.rotcal): its
-        # offset (pa = offset + sense * mechanical) is off by this much.
-        "rotcal_offset_change_deg": round(-theta, 3),
-    }
+def rotation(theta_deg: float, scale: float = 1.0) -> np.ndarray:
+    """``s R(theta)`` (theta from +x towards +y on the detector)."""
+    t = math.radians(theta_deg)
+    c, s = scale * math.cos(t), scale * math.sin(t)
+    return np.array([[c, -s], [s, c]])
+
+
+def rotator_advice(theta: float, sense: int | None = None) -> dict[str, Any]:
+    """What a detector rotation ``theta`` (deg) means (module doc): the
+    image PA (FITS convention) is off by ``-theta``; with the rotation
+    ``sense`` known, the rotator's reported mechanical angle by ``-sense *
+    theta`` (a lost position)."""
+    out: dict[str, Any] = {"pa_error_deg": round(-theta, 3)}
+    if sense in (1, -1):
+        out["rotator_angle_error_deg"] = round(-sense * theta, 3)
+    return out
 
 
 def _wrap(a: float) -> float:
     return (a + 180.0) % 360.0 - 180.0
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+@dataclass
+class RotatorOffset:
+    """The rotator offset since the last home (module doc): the matrix in
+    use is ``rotation(theta) @ base``."""
+
+    device: str
+    port: str
+    #: Detector rotation (deg) on top of the base matrix.
+    theta: float = 0.0
+    #: When it was first measured since the last home, last updated, from
+    #: how many moves and acquisitions (the last update), and the event that
+    #: probably lost the position ("" if none was seen).
+    since: str = ""
+    updated: str = ""
+    pairs: int = 0
+    acquisitions: int = 0
+    cause: str = ""
+    #: Rotator homes reported (POST /rotator {"event": "homed"}), the last,
+    #: and the offset just before it (to tell a lost position, which a home
+    #: clears, from a wrong PA calibration, which comes back).
+    homes: int = 0
+    last_home: str = ""
+    theta_before_home: float | None = None
+    #: Past updates, newest last.
+    history: list[dict[str, Any]] = field(default_factory=list)
+
+    def apply(self, base: Calibration) -> Calibration:
+        if self.theta == 0.0:
+            return base
+        return _with_matrix(
+            base,
+            rotation(self.theta) @ base.m,
+            notes=f"{base.notes} + rotator offset {self.theta:+.2f} deg since {self.since}".strip(),
+        )
+
+    def as_json(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> RotatorOffset:
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})
+
+
+_SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+class RotatorOffsetStore:
+    """One JSON file per device and port, beside the calibrations:
+    ``<device>__<port>.rotator.json`` (atomic writes)."""
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root)
+
+    def path(self, device: str, port: str) -> Path:
+        name = f"{_SAFE.sub('_', device)}__{_SAFE.sub('_', port or 'default')}.rotator.json"
+        return self.root / name
+
+    def load(self, device: str, port: str) -> RotatorOffset | None:
+        p = self.path(device, port)
+        if not p.exists():
+            return None
+        with p.open() as f:
+            return RotatorOffset.from_dict(json.load(f))
+
+    def save(self, off: RotatorOffset) -> Path:
+        self.root.mkdir(parents=True, exist_ok=True)
+        p = self.path(off.device, off.port)
+        fd, tmp = tempfile.mkstemp(dir=self.root, prefix=".rot-", suffix=".json")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(off.as_json(), f, indent=1)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, p)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+        return p
 
 
 @dataclass
@@ -207,15 +330,17 @@ class SelfCal:
     config: SelfCalConfig = field(default_factory=SelfCalConfig)
     pairs: list[Pair] = field(default_factory=list)
     rejected: int = 0
-    #: This acquisition's estimate, and whether it corrected the matrix.
+    #: This acquisition's estimate (relative to the matrix in use), and
+    #: whether it corrected the matrix.
     current: Estimate | None = None
     applied: bool = False
-    #: Converged acquisitions' estimates above ``correct_deg``, newest last.
+    #: Converged acquisitions' estimates that needed a correction, newest last.
     history: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=10))
     suspect: str | None = None
     suspect_since: str | None = None
-    persisted: int = 0
-    last_persisted: dict[str, Any] | None = None
+    #: A reported rotator drop-out / PWI restart not yet re-measured.
+    lost: str | None = None
+    saved: int = 0
 
     # -- one acquisition ------------------------------------------------------
 
@@ -234,7 +359,8 @@ class SelfCal:
         clipped: bool = False,
         saturated: bool = False,
     ) -> str | None:
-        """Offer one move; returns why it was rejected (None: kept)."""
+        """Offer one move (``m`` the matrix in use); returns why it was
+        rejected (None: kept)."""
         c = self.config
         u = np.asarray(u, float)
         d = np.asarray(d, float)
@@ -265,99 +391,207 @@ class SelfCal:
             return False
         return e.rms > c.parity_ratio * e.rms_mirror and e.rms > c.parity_floor * e.mean_move
 
-    def corrected(self, base: Calibration) -> Calibration | None:
-        """``Z @ M`` for the rest of this acquisition, once |theta| is
-        at least ``correct_deg`` (None: keep the stored matrix)."""
+    def _off(self, e: Estimate) -> tuple[bool, bool]:
+        c = self.config
+        return abs(e.theta) >= c.correct_deg, abs(e.scale - 1.0) >= c.scale_tolerance
+
+    def corrected(self, inuse: Calibration) -> Calibration | None:
+        """``Z @ M`` for the rest of this acquisition (None: keep ``M``)."""
         e = self.current
-        if e is None or abs(e.theta) < self.config.correct_deg:
+        if e is None or not any(self._off(e)):
             return None
-        return _with_matrix(base, e.z @ base.m, notes="corrected during this acquisition")
+        return _with_matrix(inuse, e.z @ inuse.m, notes="corrected during this acquisition")
 
     # -- across acquisitions --------------------------------------------------
 
-    def finish(self, base: Calibration, converged: bool, now: str | None = None) -> dict[str, Any]:
-        """Close one acquisition. Returns what happened: ``persist`` (a
-        :class:`Calibration` to save), ``alarm`` (text) and ``suspect``."""
+    def finish(
+        self,
+        base: Calibration,
+        offset: RotatorOffset,
+        converged: bool,
+        *,
+        sense: int | None = None,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        """Close one acquisition. Returns what to do: ``offset`` (a new
+        :class:`RotatorOffset` to save), ``base`` (a scale-corrected base
+        :class:`Calibration` to save), ``events`` and ``alarms`` (lists of
+        (kind, text, fields))."""
         c = self.config
         e = self.current
-        out: dict[str, Any] = {}
-        now = now or datetime.now(UTC).isoformat(timespec="seconds")
+        now = now or _now()
+        out: dict[str, Any] = {"events": [], "alarms": []}
         if not converged or e is None:
             return out
-        if abs(e.theta) < c.correct_deg:
-            # The stored matrix is right (within the threshold).
+        rot_off, scale_off = self._off(e)
+        if not (rot_off or scale_off):
+            # The matrix in use is right (within the thresholds).
             self.history.clear()
-            self._clear()
+            self.lost = None
+            self._settle(offset)
             return out
         self.history.append({**e.as_json(), "time": now})
-        last = list(self.history)[-c.persist_count :]
-        if len(last) >= c.persist_count:
-            thetas = [h["theta_deg"] for h in last]
-            ref = thetas[-1]
-            spread = max(abs(_wrap(t - ref)) for t in thetas)
-            scales = [h["scale"] for h in last]
-            mean_s = float(np.mean(scales))
-            if spread <= c.persist_tolerance_deg and max(scales) - min(scales) <= 0.05 * mean_s:
-                theta = ref + float(np.mean([_wrap(t - ref) for t in thetas]))
-                t = math.radians(theta)
-                z = mean_s * np.array([[math.cos(t), -math.sin(t)], [math.sin(t), math.cos(t)]])
-                prov = {
-                    "source": "online",
-                    "theta_deg": round(theta, 3),
-                    "scale": round(mean_s, 4),
-                    "pairs": int(sum(h["pairs"] for h in last)),
-                    "acquisitions": len(last),
-                    "estimates": last,
-                    "time": now,
-                    "previous_matrix": base.matrix,
-                    "previous_measured": base.measured,
-                }
-                advice = pa_advice(base, theta)
-                if advice is not None:
-                    prov["pa"] = advice
-                new = _with_matrix(
-                    base,
-                    z @ base.m,
-                    notes=(
-                        f"online correction: rotated {theta:+.2f} deg, scale {mean_s:.4f},"
-                        f" from {len(last)} acquisitions"
-                    ),
-                )
-                new.measured = now
-                new.extra = {**{k: v for k, v in base.extra.items() if k != "online"}}
-                new.extra["online"] = prov
-                if advice is not None:
-                    # The matrix no longer follows the stored PA.
-                    new.pa = advice["pa_measured"]
-                self.history.clear()
-                self._clear()
-                self.persisted += 1
-                self.last_persisted = prov
-                out["persist"] = new
-                if abs(theta) >= c.alarm_deg:
-                    out["alarm"] = (
-                        f"stored mount calibration was off by {theta:+.1f} deg (corrected"
-                        f" online from {len(last)} acquisitions): run the full calibration"
-                    )
-                return out
-            seen = ", ".join(f"{t:+.1f}" for t in thetas)
-            out["alarm"] = (
-                f"mount calibration estimate unstable: theta {seen} deg over the last"
-                " acquisitions: run the full calibration"
+        need = c.persist_after_loss if self.lost else c.persist_count
+        last = list(self.history)[-need:]
+        if len(last) < need:
+            self.mark(
+                f"mount calibration in use off by {e.theta:+.1f} deg, scale {e.scale:.3f}"
+                f" ({e.n} moves); not saved yet ({len(last)} of {need} agreeing acquisitions)",
+                now,
             )
-        n_ok = len(self.history)
-        self.mark(
-            f"stored mount calibration off by {e.theta:+.1f} deg (online estimate,"
-            f" {e.n} moves); not persisted ({min(n_ok, c.persist_count)} of"
-            f" {c.persist_count} agreeing acquisitions)",
-            now,
-        )
-        out["suspect"] = self.suspect
+            return out
+        thetas = [h["theta_deg"] for h in last]
+        ref = thetas[-1]
+        spread = max(abs(_wrap(t - ref)) for t in thetas)
+        scales = [h["scale"] for h in last]
+        mean_s = float(np.mean(scales))
+        if spread > c.persist_tolerance_deg or max(scales) - min(scales) > 0.05 * mean_s:
+            seen = ", ".join(f"{t:+.1f}" for t in thetas)
+            text = (
+                f"rotator position probably lost (theta {seen} deg over the last acquisitions,"
+                f" unstable; since {self.lost or offset.cause or 'unknown'}): {HOME_ADVICE}"
+            )
+            out["alarms"].append(("rotator_position_lost", text, {"thetas_deg": thetas}))
+            self.mark(text, now)
+            return out
+        theta = ref + float(np.mean([_wrap(t - ref) for t in thetas]))
+        pairs = int(sum(h["pairs"] for h in last))
+        cause = self.lost or offset.cause
+        self.history.clear()
+        self.lost = None
+        new_off: RotatorOffset | None = None
+        too_far = False
+        if abs(theta) >= c.correct_deg:
+            total = _wrap(offset.theta + theta)
+            if abs(total) > c.max_save_deg:
+                too_far = True
+                text = (
+                    f"mount calibration rotated {total:+.1f} deg from the base matrix"
+                    f" ({len(last)} acquisitions agree): over {c.max_save_deg:g} deg, not saved"
+                    " automatically (a sign or port error?): run the full calibration"
+                )
+                out["alarms"].append(("mount_cal_suspect", text, {"theta_deg": round(total, 3)}))
+                self.mark(text, now)
+            else:
+                new_off = RotatorOffset(**offset.as_json())
+                new_off.theta = round(total, 4)
+                new_off.since = offset.since if offset.theta != 0.0 else now
+                new_off.updated = now
+                new_off.pairs = pairs
+                new_off.acquisitions = len(last)
+                new_off.cause = cause or ""
+                prov = {
+                    "time": now,
+                    "theta_deg": round(total, 3),
+                    "change_deg": round(theta, 3),
+                    "pairs": pairs,
+                    "acquisitions": len(last),
+                    "cause": cause or "",
+                    "estimates": last,
+                }
+                new_off.history = [*offset.history, prov][-20:]
+                fields_ = {
+                    "theta_deg": round(total, 3),
+                    "change_deg": round(theta, 3),
+                    "pairs": pairs,
+                    "acquisitions": len(last),
+                    "cause": cause or "unknown",
+                    **rotator_advice(total, sense),
+                }
+                text = (
+                    f"rotator offset {total:+.2f} deg since the last rotator home"
+                    f" ({theta:+.2f} deg from {len(last)} agreeing acquisitions, {pairs} moves;"
+                    f" since {cause or 'unknown'})"
+                )
+                back = offset.theta_before_home
+                if (
+                    offset.theta == 0.0
+                    and back is not None
+                    and abs(_wrap(total - back)) <= c.persist_tolerance_deg
+                ):
+                    # The same offset survived a rotator home: not a lost
+                    # position but the PA calibration (robofast.rotcal).
+                    fields_["pa_calibration_offset_change_deg"] = round(-total, 3)
+                    text += (
+                        f"; it survived a rotator home: the PA calibration's offset looks"
+                        f" {-total:+.1f} deg off -- fix the PA calibration"
+                    )
+                out["events"].append(("rotator_offset_saved", text, fields_))
+                out["offset"] = new_off
+                if abs(total) >= c.alarm_deg:
+                    text = (
+                        f"rotator position probably lost (theta = {total:+.1f} deg, since"
+                        f" {cause or 'unknown'}): {HOME_ADVICE}"
+                    )
+                    out["alarms"].append(("rotator_position_lost", text, fields_))
+        if abs(mean_s - 1.0) >= c.scale_tolerance:
+            prov = {
+                "source": "online",
+                "scale": round(mean_s, 4),
+                "pairs": pairs,
+                "acquisitions": len(last),
+                "estimates": last,
+                "time": now,
+                "previous_matrix": base.matrix,
+                "previous_measured": base.measured,
+            }
+            new = _with_matrix(
+                base,
+                mean_s * base.m,
+                notes=f"online scale correction x{mean_s:.4f} from {len(last)} acquisitions",
+            )
+            new.measured = now
+            new.extra["online"] = prov
+            out["base"] = new
+            out["events"].append(
+                (
+                    "mount_scale_saved",
+                    f"mount calibration scale x{mean_s:.4f} saved to the base matrix"
+                    f" ({len(last)} agreeing acquisitions, {pairs} moves)",
+                    {k: v for k, v in prov.items() if k not in ("estimates", "previous_matrix")},
+                )
+            )
+        self.saved += 1
+        if not too_far:
+            self._settle(new_off or offset)
         return out
+
+    def _settle(self, offset: RotatorOffset) -> None:
+        """Clear the suspect flag unless the rotator offset is large (kept
+        until a rotator home or a full calibration)."""
+        if abs(offset.theta) >= self.config.alarm_deg:
+            self.mark(
+                f"rotator position probably lost (theta = {offset.theta:+.1f} deg, since"
+                f" {offset.cause or 'unknown'}): {HOME_ADVICE}"
+            )
+        else:
+            self._clear()
+
+    def rotator_lost(self, why: str, now: str | None = None) -> None:
+        """A rotator drop-out, reconnect or PWI restart was seen: its
+        position may be lost; the next acquisitions re-measure it."""
+        self.lost = why
+        self.history.clear()
+        self.mark(f"rotator position possibly lost ({why}): re-measuring", now)
+
+    def rotator_homed(self, offset: RotatorOffset, now: str | None = None) -> RotatorOffset:
+        """The rotator was homed: the offset is cleared (and counted)."""
+        now = now or _now()
+        new = RotatorOffset(**offset.as_json())
+        new.theta_before_home = offset.theta if offset.theta != 0.0 else offset.theta_before_home
+        new.theta = 0.0
+        new.since = new.updated = ""
+        new.pairs = new.acquisitions = 0
+        new.cause = ""
+        new.homes = offset.homes + 1
+        new.last_home = now
+        new.history = [*offset.history, {"time": now, "event": "homed"}][-20:]
+        self.reset()
+        return new
 
     def mark(self, why: str, now: str | None = None) -> None:
         if self.suspect is None:
-            self.suspect_since = now or datetime.now(UTC).isoformat(timespec="seconds")
+            self.suspect_since = now or _now()
         self.suspect = why
 
     def _clear(self) -> None:
@@ -365,9 +599,10 @@ class SelfCal:
         self.suspect_since = None
 
     def reset(self) -> None:
-        """The mount was calibrated again: forget everything."""
+        """A new calibration or a rotator home: forget the estimate."""
         self.begin()
         self.history.clear()
+        self.lost = None
         self._clear()
 
     def status(self) -> dict[str, Any]:
@@ -379,10 +614,8 @@ class SelfCal:
             "applied": self.applied,
             "rejected": self.rejected,
             "history": list(self.history),
-            "persisted": self.persisted,
-            "last_persisted": None
-            if self.last_persisted is None
-            else {k: v for k, v in self.last_persisted.items() if k != "estimates"},
+            "rotator_lost": self.lost,
+            "saved": self.saved,
         }
 
 

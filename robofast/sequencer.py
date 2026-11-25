@@ -960,6 +960,8 @@ class Sequencer:
         self.spectrograph_failures = 0
         self.spectrograph_down: str | None = None
         self._spec_recovery: asyncio.Task | None = None
+        #: Rotator-loss reports to the guiders under way (:meth:`_recovery_event`).
+        self._rotator_reports: set[asyncio.Task] = set()
         #: Escalations running (an agent at work; docs/recovery.md), agent
         #: runs per (telescope, device) and the faults escalated tonight.
         self._escalations: set[asyncio.Task] = set()
@@ -1209,7 +1211,7 @@ class Sequencer:
                 self.imaging.pa_stores[u.name] = u.pa_calibration.store
             if u.recovery is not None:
                 u.recovery.alarm = lambda text, u=u: self.alarm(u.name, text)
-                u.recovery.event = lambda what, u=u, **kw: self._event(what, telescope=u.name, **kw)
+                u.recovery.event = lambda what, u=u, **kw: self._recovery_event(u, what, **kw)
             if u.guider is not None and hasattr(u.guider, "on_alarm"):
                 # The guider's forwarded alarms (offset_high: docs/guider.md).
                 u.guider.on_alarm = lambda text, u=u: self.alarm(u.name, text)
@@ -1222,6 +1224,25 @@ class Sequencer:
             if u.cooling is not None:
                 u.cooling.alarm = lambda text, u=u: self.alarm(u.name, text)
                 u.cooling.event = lambda what, u=u, **kw: self._event(what, telescope=u.name, **kw)
+
+    # -- rotator position (docs/guider.md, "Self-correcting mount calibration") --------
+
+    def _recovery_event(self, u: Any, what: str, **kw: Any) -> None:
+        """A recovery-ladder event on the timeline; one after which the
+        telescope's rotator has probably lost its position
+        (:func:`rotator_loss`) is also reported to its guider, which then
+        re-measures the rotator offset. Nothing is moved or homed."""
+        self._event(what, telescope=u.name, **kw)
+        why = rotator_loss(what, kw)
+        if why is None or u.guider is None or not hasattr(u.guider, "rotator_event"):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no loop (a synchronous test)
+        task = loop.create_task(u.guider.rotator_event("lost", why))
+        self._rotator_reports.add(task)
+        task.add_done_callback(self._rotator_reports.discard)
 
     async def run(self) -> None:
         self._wire_pointing()
@@ -4684,3 +4705,26 @@ async def _wait_any(events: Sequence[asyncio.Event], timeout: float) -> None:
 
 async def _no_exposures(exptime: float) -> np.ndarray:
     raise RuntimeError("no exposures here")
+
+
+def rotator_loss(what: str, detail: dict[str, Any]) -> str | None:
+    """Why a recovery event (robofast.recovery) probably cost the
+    telescope's rotator its position (None: it did not): PWI restarted
+    (a ``restart`` of the telescope or rotator, or PWI started again after a
+    power cycle), the telescope or rotator power-cycled, or the rotator
+    reconnected (docs/guider.md, "Self-correcting mount calibration")."""
+    device = detail.get("device")
+    if what == "recovery_pwi_start":
+        return f"PWI restarted (recovery, after a {device} power cycle)"
+    if what == "recovery_restart" and device in ("telescope", "rotator"):
+        return f"PWI restarted (recovery, {device} restart)"
+    if what == "recovery_powercycle" and device in ("telescope", "rotator"):
+        return f"{device} power-cycled (recovery)"
+    if (
+        what == "recovery_step"
+        and device == "rotator"
+        and detail.get("step") == "reconnect"
+        and detail.get("ok")
+    ):
+        return "rotator reconnected (recovery)"
+    return None

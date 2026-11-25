@@ -196,78 +196,120 @@ rotation: calibrate per port, and recalibrate if the rotator angle changes.
 
 Fine acquisition has no feedback from the spectrograph: it drives the star
 to the fiber pixel through the mount's matrix. When the matrix is rotated
-from the truth (almost always a poorly known rotator angle, the PA), a
-north correction bleeds into east: the star spirals in slowly, walks away,
-or never gets under `capture_radius`. Legacy MINERVA, Dec 2025 - Apr 2026:
-57% of spectra hit the 750 s acquire timeout; the median rotation error
-per telescope-night was steady at -3.5 deg on T1, episodic on T2 (17% of
-nights over 10 deg) and a stale -15 deg on all of T4's April nights, and
-every telescope-night with a 5-10 deg error left its telescope behind.
+from the truth, a north correction bleeds into east: the star spirals in
+slowly, walks away, or never gets under `capture_radius`. Legacy MINERVA,
+Dec 2025 - Apr 2026: 57% of spectra hit the 750 s acquire timeout; the
+median rotation error per telescope-night was steady at -3.5 deg on T1,
+episodic on T2 (17% of nights over 10 deg) and -15 deg on all of T4's
+April nights, and every telescope-night with a 5-10 deg error left its
+telescope behind.
 
-`robofast.guider.selfcal` (on by default; `guide.mount_selfcal`: `false`
-for the legacy behaviour, or a mapping of `SelfCalConfig`'s fields) treats
-every acquisition mount move as a measurement: the move `u` actually sent
-and the star's displacement `d` between the frame before and the frame
-after it (after `coarse_settle`). It fits `d = s R(theta) M u` (a rotation
-`theta` and scale `s` relative to the stored `M`) by complex least
-squares, and the mirrored model beside it. A move counts only when the
-predicted motion is at least `min_move` (15) pixels, the star is found in
-both frames and not saturated (`saturation` 60000 ADU), the move was not
-clipped, and `|d|/|p|` is within a factor 2 of 1 (else another star). One
-move of tens of arcsec gives `theta` to about a degree.
+On MINERVA a rotated matrix almost always means the **rotator lost its
+position**: it drops out, or PWI is killed. Its physical angle changes
+only on site visits; homing it puts it right, but the mechanism survives
+only ~100 homes, so homes must be rare. So the matrix in use has two
+parts (`robofast.guider.selfcal`):
 
-* **During an acquisition**: once this acquisition's own moves give
-  `|theta| >= correct_deg` (5), the corrected matrix `Z @ M` is used for
-  the rest of the acquisition (and for a mount-driven fine loop in the
-  observation that follows), the event `mount_cal_corrected` is recorded
-  (theta, scale, pairs, and with a PA-seeded matrix the PA change) and
-  the convergence watch starts afresh. Above `alarm_deg` (20) it also
-  alarms `mount_cal_suspect`: run the full calibration.
+* the **base matrix** (the calibration store, from a full calibration):
+  the truth for a homed rotator. Only a *scale* correction is ever saved
+  into it;
+* the **rotator offset** since the last home
+  (`<calibration_dir>/<device>__<port>.rotator.json`): a detector rotation
+  `theta` applied on top, `R(theta) @ base`, with its provenance (when
+  first and last measured, moves, acquisitions, the event that probably
+  lost the position, past updates) and the rotator homes counted. It
+  survives guider and PWI restarts and nights (a lost position stays lost
+  until a home) and is cleared by a rotator home or a full calibration.
+
+Every acquisition mount move (on by default; `guide.mount_selfcal`:
+`false` for the legacy behaviour, or a mapping of `SelfCalConfig`'s
+fields) is a measurement: the move `u` actually sent and the star's
+displacement `d` between the frame before and the frame after it (after
+`coarse_settle`). It fits `d = s R(theta) M u` (`M` the matrix in use) by
+complex least squares, and the mirrored model beside it. A move counts
+only when the predicted motion is at least `min_move` (15) pixels, the
+star is found in both frames and not saturated (`saturation` 60000 ADU),
+the move was not clipped, and `|d|/|p|` is within a factor 2 of 1 (else
+another star). One move of tens of arcsec gives `theta` to about a
+degree. The guide loop's own mount moves (sub-pixel, or offloads the
+tip/tilt cancels) are not used.
+
+* **During an acquisition**: once this acquisition's moves give `|theta|
+  >= correct_deg` (5) or `|s - 1| >= scale_tolerance` (0.05), the
+  corrected matrix is used for the rest of the acquisition (and for a
+  mount-driven fine loop in the observation that follows), at any angle
+  (a 180 deg sign error included); the event `mount_cal_corrected` is
+  recorded (theta, scale, moves, the rotator offset it implies, the PA
+  error and, with a PA calibration, the rotator angle error) and the
+  convergence watch starts afresh. A rotator offset of `alarm_deg` (20)
+  or more alarms `rotator_position_lost`: "rotator position probably lost
+  (theta = ..., since <event>): home the rotator when convenient (the
+  rotator survives ~100 homes; use sparingly)".
 * **Parity**: with two or more moves whose directions span at least 30
   deg, a mirrored fit three times better than any rotation is a parity
-  flip: alarm `mount_cal_parity` and `not_converging`; the acquisition
-  fails. A parity is never corrected online. (One move cannot tell a
-  mirror from a rotation, so the first move of a mirrored calibration is
-  still "corrected", and the second shows the mirror.)
-* **Persisting**: a converged acquisition's estimate above `correct_deg`
-  is kept. When `persist_count` (3) in a row agree within
-  `persist_tolerance_deg` (3 deg) and 5% in scale, their mean correction
-  is saved to the calibration store with provenance in
-  `extra.online` (`source: "online"`, `theta_deg`, `scale`, `pairs`,
-  `acquisitions`, the estimates, `time`, the previous matrix), and the
-  event `mount_cal_persisted` is recorded. One outlier never rewrites the
-  stored calibration; three that disagree alarm `mount_cal_suspect`
-  ("unstable"). An acquisition whose moves agree with the store (under
-  `correct_deg`) resets the run. A residual under 5 deg (T1's -3.5) is
-  left alone.
+  flip, not a rotator offset: alarm `mount_cal_parity` and
+  `not_converging`; the acquisition fails. A parity is never corrected.
+  (One move cannot tell a mirror from a rotation, so the first move of a
+  mirrored calibration is still "corrected", and the second shows the
+  mirror.)
+* **Saving**: a converged acquisition that needed a correction is kept.
+  When `persist_count` (3) in a row agree within `persist_tolerance_deg`
+  (3 deg) and 5% in scale -- `persist_after_loss` (2) after a reported
+  rotator drop-out -- the rotation goes into the rotator offset (event
+  `rotator_offset_saved`) and a scale error into the base matrix (event
+  `mount_scale_saved`, provenance in its `extra.online`: `source:
+  "online"`, scale, moves, acquisitions, the estimates, time, the previous
+  matrix). A rotator offset beyond `max_save_deg` (90) is never saved:
+  alarm `mount_cal_suspect` (a sign or port error? run the full
+  calibration). One outlier never saves anything; three that disagree
+  alarm `rotator_position_lost` ("unstable"). An acquisition that agrees
+  with the matrix in use resets the run. A residual under 5 deg (T1's
+  -3.5) is left alone.
 * **Calibration suspect**: `status()["mount_cal_suspect"]` (and
-  `["mount_cal"]`, with the reason, estimate and history), the registry
-  value `<scope>.guide_cal_suspect` (and `_reason`), and
-  `GuiderRemote.cal_suspect`. Set by an estimate above `correct_deg` not
-  yet persisted, an unstable estimate, a parity flip, or `not_converging`;
-  cleared by an acquisition that agrees with the store, by persisting, or
-  by a new calibration (`POST /calibrate` with `"device": "mount"`).
-* **The rotator**: when the stored matrix came from a PA (seeded from the
-  PA calibration, docs/rotcal.md), a consistent `theta` is a PA error:
-  the guider's PA is off by `-parity * theta` and the PA calibration's
-  offset (`pa = offset + sense * mechanical`) by `-theta`. The event and
-  the alarm say so (`pa.pa_change_deg`, `pa.rotcal_offset_change_deg`):
-  fix the PA calibration rather than only the matrix.
+  `["mount_cal"]`, with the reason, estimate and history;
+  `["rotator_offset"]`), the registry value `<scope>.guide_cal_suspect`
+  (and `_reason`), and `GuiderRemote.cal_suspect`. Set by a correction
+  not yet saved, an unstable estimate, a parity flip, `not_converging`, a
+  reported rotator drop-out, an offset over 90 deg, or a saved rotator
+  offset of 20 deg or more (which keeps it set until a rotator home or a
+  full calibration). Otherwise cleared by an acquisition that agrees, by
+  saving, by a rotator home or by a full calibration.
+* **What theta means**: the image PA is off by `-theta`; with the PA
+  calibration's sense (docs/rotcal.md), the rotator's reported angle is
+  off by `-sense * theta` -- a lost position, not a wrong PA calibration.
+  Only an offset that comes back after a rotator home (the same theta,
+  measured again from zero) points at the PA calibration's offset; the
+  `rotator_offset_saved` event then says so
+  (`pa_calibration_offset_change_deg`).
 
-Not (yet) used: the guide loop's own mount moves (sub-pixel, or offloads
-the tip/tilt cancels), and the full 2x2 fit (non-orthogonality).
+**Rotator events.** `POST /rotator {"event": "lost"|"homed", "why"}` on
+the guider service (`GuiderRemote.rotator_event`): `lost` marks the
+calibration suspect, so the next acquisitions re-measure the offset
+quickly (the offset may jump at each such event); `homed` clears the
+offset and counts the home. Nothing moves. robofast never homes a rotator
+(its recovery ladder homes only the mount): home it by hand (PWI) and
+report it with `homed`. The sequencer reports `lost` by itself after a
+recovery-ladder event that probably cost the rotator its position
+(`robofast.sequencer.rotator_loss`): PWI restarted (a telescope or
+rotator `restart`, or PWI started again after a power cycle), the
+telescope or rotator power-cycled, or the rotator reconnected. A rotator
+drop-out or PWI restart outside the ladder (PWI's own `rotator connected`
+going false, someone restarting PWI by hand) is not seen yet: robofast's
+PWI server sees `rotator_connected` and PWI going away, but nothing
+passes that to the guider; report it with `lost`. The home count is the
+start of a lifetime alarm (not yet: only reported homes are counted).
 
-The sequencer does **not** run the full calibration by itself: the mount
-calibration moves the mount by `+/- step` around a star for a minute or
-more, which needs a suitable star and a slot between spectra (never on a
-spectrum's target with its shutter open). Its alarms
-(`mount_cal_suspect`, `mount_cal_parity`) reach the sequencer's console
-alarm through `GuiderRemote` (`forward_alarms`), and the events its
-timeline. To run it: between observations, with a star near the fiber
-and the guider stopped, `POST /calibrate {"device": "mount", "step": 20}`
-on the telescope's guider service (or rerun the PA calibration,
-docs/rotcal.md, and restart the guider service to reseed the matrix when
-the PA is the cause).
+**The full calibration** is not run by the sequencer: it moves the mount
+by `+/- step` around a star for a minute or more, which needs a suitable
+star and a slot between spectra (never on a spectrum's target with its
+shutter open). Its alarms (`mount_cal_suspect`, `mount_cal_parity`,
+`rotator_position_lost`) reach the sequencer's console alarm through
+`GuiderRemote` (`forward_alarms`), and the events its timeline. To run
+it: between observations, with a star near the fiber and the guider
+stopped, `POST /calibrate {"device": "mount", "step": 20}` on the
+telescope's guider service (it also clears the rotator offset; measure
+it with the rotator homed). For a lost rotator position, home the rotator
+instead and report it.
 
 ## Fiber acquisition
 
@@ -282,7 +324,8 @@ the PA is the cause).
    Farther than `capture_radius`
    pixels: offset the mount through its calibration, wait `coarse_settle`,
    repeat (up to `coarse_iterations`). Each move also measures the mount
-   calibration's rotation, and a rotation of 5 deg or more is corrected for
+   calibration's rotation (usually a lost rotator position), and a rotation
+   of 5 deg or more is corrected for
    the rest of the acquisition ("Self-correcting mount calibration",
    above). A distance that still grows is the legacy "acquisition not
    converging" alarm (`not_converging`: a parity flip, a wrong star, no
@@ -481,7 +524,8 @@ headers of the frames taken meanwhile (stale values are marked as such).
 **Alarms**: `star_lost`, `tiptilt_limit`, `residual_high`
 (`residual_alarm` px rms), `offset_high` (`offset_alarm` arcsec, above),
 `acquisition_failed`, `not_converging`, `mount_cal_suspect`,
-`mount_cal_parity` (the self-correcting mount calibration, above),
+`mount_cal_parity`, `rotator_position_lost` (the self-correcting mount
+calibration, above),
 `device_error`; repeats within `alarm_repeat` seconds are counted.
 
 **Redis (optional, off by default)**: `"redis": {"host", "port",

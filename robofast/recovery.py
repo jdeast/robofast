@@ -324,7 +324,7 @@ class RecoveryLadder:
         event: Callable[..., None] | None = None,
         pdu: Callable[[str], Any] = PDUSwitch,
         hook: Callable[[dict[str, Any], float], Awaitable[str]] = run_hook,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         bad = set(policies) - set(DEVICES)
@@ -340,7 +340,9 @@ class RecoveryLadder:
         self.event = event or (lambda what, **kw: None)
         self.pdu = pdu
         self.hook = hook
-        self.clock = clock
+        # time.monotonic read at each call, not bound here (virtual time
+        # patches it: robofast/testing/virtual_time.py).
+        self.clock = clock or (lambda: time.monotonic())
         self.sleep = sleep
         #: Next rung per device, when it last failed, power cycles tonight.
         self.level: dict[str, int] = {}

@@ -142,13 +142,15 @@ class LampHours:
         path: str | Path | None,
         *,
         flush_interval: float = 60.0,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] | None = None,
         wall: Callable[[], float] = time.time,
     ) -> None:
         self.rated = dict(rated)
         self.path = None if path is None else Path(path)
         self.flush_interval = flush_interval
-        self.clock = clock
+        # time.monotonic read at each call, not bound here (virtual time
+        # patches it: robofast/testing/virtual_time.py).
+        self.clock = clock or (lambda: time.monotonic())
         self.wall = wall
         self.lamps = {name: _Lamp() for name in self.rated}
         #: Entries in the file for lamps not configured now: written back as read.
@@ -157,7 +159,7 @@ class LampHours:
         self.load_error: str | None = None
         self.write_error: str | None = None
         self._dirty = False
-        self._written = clock()
+        self._written = self.clock()
         self._load()
         for name in self.lamps:
             self._warn_life(name)

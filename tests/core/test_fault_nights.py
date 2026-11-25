@@ -11,6 +11,18 @@ hang or whose device server restarts (``Connected`` false); the weather
 turning unsafe moments after a reopen hold ran out (``reopen_race``, half
 the nights); and targets of opportunity dropped into the scheduler's drop
 box and rung (robofast.doorbell) at random moments.
+
+The night is MINERVA's RV night: spectra fed by both telescopes (fake
+KiwiSpec service and guiders, MINERVA's guider recovery ladder) above
+imaging, which takes over while the spectrograph is down; the enclosure
+has the Aqawan's fault channel. The failures that hit MINERVA:
+``dome_flaky`` (the fault channel unreadable for one or two polls at a
+time, night1121-1124), ``dome_fault`` (the enclosure reports a fault while
+open, then it clears: April 2026's shutter faults), ``dome_hang`` (the dome
+stops answering), ``spec_hang``/``spec_down`` (the KiwiSpec service runs
+every request into its timeout, night1123, or refuses it) and
+``guide_lost`` (clouds over one telescope: its star is lost, and its
+acquisitions time out).
 Faults of one kind on one device may overlap (the device is faulted while
 any is active).
 
@@ -31,7 +43,24 @@ I4  recovery is automatic: an exposure after the last fault clears, unless
 I5  no target of opportunity is lost: every ToO rung into the drop box is
     taken in at once (within 1 s) and started before the night ends, unless
     its telescope gave up.
-I6  no light exposure starts while the dome is not open.
+I6  no light exposure (image or spectrum) starts while the dome is not open.
+I7  the lease is revoked for an unreadable fault channel only once it has
+    been unreadable for ``fault_unreadable_grace`` (never one failed read).
+I8  a dome that hangs longer than the grace (and a few polls) is alarmed.
+I9  no OpenShutter while the enclosure has reported a fault for a poll.
+    (I1 counts a reported fault as unsafe; a hung dome's time to close
+    counts from when it answers again.)
+I10 at most ``spectrograph_max_failures`` spectra are sent to a
+    spectrograph that is out, per outage (then it is marked down).
+I11 no spectrum exposes for long with no telescope of its feed guiding
+    (unless the spectrograph is out and so cannot be aborted).
+I12 no guider stays failed (guiding into nothing): its telescope drops out.
+I13 no telescope guides one spectrum past the feed's wait, the
+    spectrograph's, the exposure, its margin and an unanswered abort.
+I14 spectroscopy resumes after the spectrograph answers again.
+I15 imaging goes on while the spectrograph is marked down.
+I16 clouds never put a telescope out for the night: the guider ladder
+    brings it back.
 
 ``FAULT_NIGHTS`` (default 20) and ``FAULT_SEED`` (default 0) choose the
 seeds; a failure names its seed, and the same seed replays the same night.
@@ -66,12 +95,27 @@ import json
 import os
 import random
 import time
+from datetime import timedelta
+from typing import Any
 
 import pytest
 
+from robofast import SequencerConfig
 from robofast.doorbell import ring
+from robofast.recovery import RecoveryLadder
+from robofast.spectra import SpectrumRecorder
 from robofast.testing.checks import assert_generations_disjoint
+from robofast.testing.fakes import FakeDeviceError
+from tests.core.test_dispatch import NIGHT as MIDNIGHT
 from tests.core.test_dispatch import group, make, too
+from tests.core.test_rv_spectra import (
+    KIWISPEC,
+    MTHOPKINS,
+    CloudyGuider,
+    OutageSpectrograph,
+    _limits,
+    _rv_group,
+)
 
 pytestmark = [pytest.mark.fault_nights, pytest.mark.virtual_time, pytest.mark.timeout(600)]
 
@@ -104,7 +148,21 @@ KINDS = (
     "unsafe", "unsafe", "unsafe", "freeze", "sm_fail", "sm_hang",
     "cam_fail", "cam_hang", "tel_fail", "tel_hang", "flicker", "too", "too",
     "cam_restart", "tel_restart",
+    "dome_flaky", "dome_flaky", "dome_fault", "dome_hang",
+    "spec_hang", "spec_down", "guide_lost", "guide_lost",
 )  # fmt: skip
+#: Kinds that hit one telescope (the fault's index), not the enclosure.
+PER_TELESCOPE = ("cam", "tel", "guide")
+#: MINERVA's enclosure fault channel (the Aqawan's ``Faults``) and its grace
+#: for an unreadable read (SafetyConfig's default; night1124).
+FAULT_CHANNEL = dict(fault_action="Faults", fault_unreadable_grace=15.0)
+#: MINERVA's guider recovery ladder (its tN-recovery.json).
+GUIDER_LADDER = {
+    "guider": {"steps": ["reconnect"], "escalate_window": 300, "requires_parked": False}
+}
+#: SequencerConfig's shipped spectrum timings (SHIPPED_SEQ leaves them at
+#: their defaults).
+SPEC = SequencerConfig()
 SEEDS = range(
     int(os.environ.get("FAULT_SEED", "0")),
     int(os.environ.get("FAULT_SEED", "0")) + int(os.environ.get("FAULT_NIGHTS", "20")),
@@ -121,12 +179,21 @@ def schedule(rng: random.Random) -> list[tuple[float, float, str, int]]:
     return faults
 
 
+def _during(spans: list[list[float]], t: float) -> bool:
+    return any(s <= t < e for s, e in spans)
+
+
 @pytest.mark.parametrize("seed", SEEDS)
 async def test_a_night_of_faults(make_rig, tmp_path, seed):
     rng = random.Random(seed)
     box = tmp_path / "box"
     box.mkdir()
     forever = {"min_interval": 0}
+    born = time.monotonic()
+    # Spectra fed by both telescopes (MINERVA's RV night), above imaging,
+    # which takes over while the spectrograph is down.
+    rv = _rv_group("rv", priority=2.0)
+    rv["requests"][0].setdefault("extra_params", {}).update(cadence=forever, max_attempts=10**6)
     plan = make(
         [
             # Standing requests that outlast the night's failures (dispatch
@@ -137,17 +204,58 @@ async def test_a_night_of_faults(make_rig, tmp_path, seed):
             group(
                 "b", telescopes=["t2"], exptime=300.0, count=3, cadence=forever, max_attempts=10**6
             ),
+            rv,
         ],
+        limits=_limits(),
+        instruments=KIWISPEC,
         too_dropbox=box,
+        # Near midnight all night (the targets stay up), but moving: a
+        # spectrum's id is its visit's start time.
+        clock=lambda: MIDNIGHT + timedelta(seconds=(time.monotonic() - born) / 100.0),
     )
     rig = make_rig(
-        safety=SHIPPED_SAFETY, seq=SHIPPED_SEQ, command_timeout=5.0, telescopes=2, plan=plan
+        safety={**SHIPPED_SAFETY, **FAULT_CHANNEL},
+        seq=SHIPPED_SEQ,
+        command_timeout=5.0,
+        telescopes=2,
+        plan=plan,
     )
     rig.dome._travel = TRAVEL
     for tel in rig.tels:
         tel._slew_time, tel._park_time = 30.0, 40.0
+    seqr = rig.sequencer
+    spec = seqr.spectrograph = OutageSpectrograph(rig.timeline)
+    seqr.spectra = SpectrumRecorder(tmp_path / "spectra", "minerva", MTHOPKINS, "kiwispec")
+    guiders: list[CloudyGuider] = []
+    for name in ("t1", "t2"):
+        guiders.append(CloudyGuider(rig.timeline, name))
+        seqr.units[name].guider = guiders[-1]
+        seqr.units[name].recovery = RecoveryLadder.from_config(name, GUIDER_LADDER)
     sp = SHIPPED_SAFETY
+    grace = FAULT_CHANNEL["fault_unreadable_grace"]
     viol: list[str] = []
+
+    # The enclosure's fault channel: a fault it reports (dome_fault), or a
+    # read that fails (dome_flaky: night1121-1124, the PAC STATUS read late,
+    # 2-20 a night; a hung dome fails it through the fault gate).
+    chan: dict[str, Any] = {"fault": False, "fail_until": -1.0}
+    dome_action = rig.dome.Action
+
+    def faults_action(name: str, parameters: str = "") -> str:
+        if name != "Faults":
+            return dome_action(name, parameters)
+        if time.monotonic() < chan["fail_until"]:
+            raise FakeDeviceError("no complete reply within 2 s")
+        if chan["fault"]:
+            return json.dumps({"fault": True, "error": False, "faults": "shutter fault"})
+        return json.dumps({"fault": False, "error": False})
+
+    rig.dome.Action = faults_action
+    # Ground truth spans [start, end) relative to t0: the fault channel
+    # unreadable, a fault reported, the dome hung.
+    unreadable: list[list[float]] = []
+    reported: list[list[float]] = []
+    hangs: list[list[float]] = []
 
     # The truth at each SafetyMonitor reading, and at each OpenShutter the
     # last reading's: (sent, read at, safe since at the read). The weather
@@ -166,22 +274,40 @@ async def test_a_night_of_faults(make_rig, tmp_path, seed):
     open_shutter = rig.dome.OpenShutter
 
     def opened() -> None:
-        opens.append((time.monotonic(), *last_read[0]))
+        now = time.monotonic()
+        opens.append((now, *last_read[0]))
+        late = now - t0 - (sp["poll_interval"] + sp["dome_timeout"] + 1)
+        if any(s <= late and now - t0 < e for s, e in reported):
+            viol.append(f"I9 t={now - t0:.0f}s: OpenShutter while the enclosure reports a fault")
         open_shutter()
 
     rig.dome.OpenShutter = opened
+    light_starts: list[float] = []
     for i, cam in enumerate(rig.cams):
         start = cam.StartExposure
 
         def started(duration, light, _start=start, _i=i) -> None:
-            if light and not rig.dome_open():
-                viol.append(
-                    f"I6 t={time.monotonic() - t0:.0f}s: t{_i + 1} light frame,"
-                    f" dome {rig.dome.state()}"
-                )
+            if light:
+                light_starts.append(time.monotonic() - t0)
+                if not rig.dome_open():
+                    viol.append(
+                        f"I6 t={time.monotonic() - t0:.0f}s: t{_i + 1} light frame,"
+                        f" dome {rig.dome.state()}"
+                    )
             _start(duration, light)
 
         cam.StartExposure = started
+    spec_expose = spec.expose
+
+    async def expose(**frame):
+        if not rig.dome_open():
+            viol.append(
+                f"I6 t={time.monotonic() - t0:.0f}s: spectrum {frame.get('object')},"
+                f" dome {rig.dome.state()}"
+            )
+        return await spec_expose(**frame)
+
+    spec.expose = expose
 
     faults = schedule(rng)
     refs: dict[tuple[str, int | None], int] = {}
@@ -190,6 +316,7 @@ async def test_a_night_of_faults(make_rig, tmp_path, seed):
 
     async def apply(f, on: bool) -> None:
         _, _, kind, i = f
+        rel = time.monotonic() - t0
         if kind == "too":
             if on:
                 gid = f"too{len(toos)}"
@@ -206,7 +333,7 @@ async def test_a_night_of_faults(make_rig, tmp_path, seed):
                 toos[gid] = (f"t{i + 1}", time.monotonic())
                 await ring(box)
             return
-        key = (kind, i if kind[:3] in ("cam", "tel") else None)
+        key = (kind, i if kind.split("_")[0] in PER_TELESCOPE else None)
         refs[key] = refs.get(key, 0) + (1 if on else -1)
         if refs[key] != (1 if on else 0):
             return  # another fault of this kind on this device still holds
@@ -216,6 +343,28 @@ async def test_a_night_of_faults(make_rig, tmp_path, seed):
             rig.sm.fail("HTTP 500") if on else rig.sm.unfail()
         elif kind == "sm_hang":
             rig.sm.hang() if on else rig.sm.unhang()
+        elif kind == "dome_flaky":
+            pass  # its bursts are drawn in the loop
+        elif kind == "dome_fault":
+            chan["fault"] = on
+            if on:
+                reported.append([rel, NIGHT])
+            else:
+                reported[-1][1] = rel
+        elif kind == "dome_hang":
+            if on:
+                rig.dome.hang()
+                hangs.append([rel, NIGHT])
+                unreadable.append(hangs[-1])
+            else:
+                rig.dome.unhang()
+                hangs[-1][1] = rel
+                dome_free_since[0] = time.monotonic()
+        elif kind.startswith("spec_"):
+            hung = refs.get(("spec_hang", None), 0) > 0
+            spec.mode = "hang" if hung else "down" if refs.get(("spec_down", None)) else None
+        elif kind == "guide_lost":
+            guiders[i].set_clouds(on)
         elif kind[:3] in ("cam", "tel"):
             dev = (rig.cams if kind.startswith("cam") else rig.tels)[i]
             if kind.endswith("restart"):
@@ -234,12 +383,26 @@ async def test_a_night_of_faults(make_rig, tmp_path, seed):
     serve = asyncio.create_task(plan.serve())
     await rig.start()
     t0 = time.monotonic()
+    dome_free_since = [t0]
     active: set[tuple] = set()
     unsafe_since: float | None = None
     safe_since: float | None = t0
     held_before: float | None = None
-    reported = False
+    close_since: float | None = None
+    late_close = False
+    next_burst = 0.0
+    #: Spectrograph outages: [start, end, expose requests refused at the start].
+    outages: list[list[float]] = []
+    #: Seconds of each outage with the spectrograph marked down, the enclosure
+    #: open and nothing else wrong: imaging should go on (by outage index).
+    imaging_due: dict[int, list[float]] = {}
+    unguided: dict[int, float] = {}  # spectrograph job -> since when no feed guides
+    failed_since: dict[int, float] = {}  # guider index -> since when failed
+    told: set[tuple] = set()  # (invariant, key) reported once
     bound = sp["poll_interval"] + sp["read_timeout"] + sp["dome_timeout"] + TRAVEL + 5
+    #: The longest a guider may guide one spectrum: the feed's wait, the
+    #: spectrograph lock's, the exposure, its margin, an unanswered abort.
+    guide_bound = 2 * SPEC.spectrum_ready_timeout + 600 + SPEC.spectrum_margin + 45 + 120
     try:
         while (now := time.monotonic()) - t0 < NIGHT:
             rel = now - t0
@@ -255,6 +418,12 @@ async def test_a_night_of_faults(make_rig, tmp_path, seed):
                 if (box / "accepted" / f"{gid}.json").exists():
                     taken_in[gid] = now
             kinds = {f[2] for f in active}
+            if "dome_flaky" in kinds and now >= next_burst:
+                # One to two polls of failed reads, never as long as the grace.
+                length = rng.uniform(1.0, 2 * sp["poll_interval"] + 1)
+                chan["fail_until"] = now + length
+                unreadable.append([rel, rel + length])
+                next_burst = now + length + rng.uniform(20.0, 120.0)
             if (
                 race
                 and races < 3
@@ -275,24 +444,93 @@ async def test_a_night_of_faults(make_rig, tmp_path, seed):
             if unsafe:
                 if unsafe_since is None:
                     unsafe_since, held_before = now, safe_since
-                if not reported and not rig.dome_closed() and now - unsafe_since > bound:
-                    viol.append(
-                        f"I1 t={rel:.0f}s: unsafe ({sorted(kinds)}) {now - unsafe_since:.0f}s,"
-                        f" dome {rig.dome.state()}"
-                    )
-                    reported = True  # one report per episode
                 safe_since = None
             else:
                 if unsafe_since is not None and now - unsafe_since < sp["poll_interval"]:
                     # An unsafe blip shorter than one poll can go unseen by
                     # design: the hold the supervisor counts goes on.
                     safe_since = held_before
-                unsafe_since, reported = None, False
+                unsafe_since = None
                 safe_since = now if safe_since is None else safe_since
             truth["safe_since"] = safe_since
+            # I1, with a fault the enclosure reports, as with bad weather;
+            # a hung dome cannot close, so its time counts from the unhang.
+            if unsafe or chan["fault"]:
+                close_since = now if close_since is None else close_since
+                since = max(close_since, dome_free_since[0])
+                hung = rig.dome._hung.is_set()
+                if not late_close and not hung and not rig.dome_closed() and now - since > bound:
+                    why = sorted(kinds) + (["reported fault"] if chan["fault"] else [])
+                    viol.append(
+                        f"I1 t={rel:.0f}s: must close ({why}) {now - since:.0f}s,"
+                        f" dome {rig.dome.state()}"
+                    )
+                    late_close = True  # one report per episode
+            else:
+                close_since, late_close = None, False
+            # Spectrograph outages (I10, I14, I15).
+            if spec.mode is not None and (not outages or outages[-1][1] < NIGHT):
+                outages.append([rel, NIGHT, spec.refused])
+            elif spec.mode is None and outages and outages[-1][1] == NIGHT:
+                outages[-1][1] = rel
+                n = spec.refused - int(outages[-1][2])
+                if n > SPEC.spectrograph_max_failures:
+                    viol.append(
+                        f"I10 t={rel:.0f}s: {n} spectra sent to a spectrograph that was out"
+                        f" (from {outages[-1][0]:.0f}s; at most"
+                        f" {SPEC.spectrograph_max_failures} before it is marked down)"
+                    )
+            if (
+                outages
+                and outages[-1][1] == NIGHT
+                and seqr.spectrograph_down is not None
+                and rig.dome_open()
+                and kinds <= {"spec_hang", "spec_down", "too", "dome_flaky"}
+            ):
+                imaging_due.setdefault(len(outages) - 1, []).append(rel)
+            # I11: no spectrum exposes with no telescope guiding it (the
+            # spectrograph's abort cannot reach it while it is out).
+            job = spec.running()
+            settled = not outages or (
+                outages[-1][1] < NIGHT and rel - outages[-1][1] > spec.abort_timeout + 15
+            )
+            if job is not None and settled:
+                feed = job["frames"][0].get("telescopes") or []
+                if any(guiders[int(t[1:]) - 1].guiding for t in feed):
+                    unguided.pop(job["id"], None)
+                else:
+                    unguided.setdefault(job["id"], now)
+                    if now - unguided[job["id"]] > 30 and ("I11", job["id"]) not in told:
+                        told.add(("I11", job["id"]))
+                        viol.append(
+                            f"I11 t={rel:.0f}s: spectrum job {job['id']} ({feed}) exposing"
+                            f" {now - unguided[job['id']]:.0f}s with no telescope guiding"
+                        )
+            for gi, g in enumerate(guiders):
+                # I12: a failed guider is stopped (its telescope dropped);
+                # I13: no telescope guides one spectrum past its bound.
+                if g.state() == "failed":
+                    failed_since.setdefault(gi, now)
+                    key = ("I12", gi, failed_since[gi])
+                    late = now - failed_since[gi] > SPEC.spectrum_ready_timeout + 60
+                    if late and key not in told:
+                        told.add(key)
+                        viol.append(f"I12 t={rel:.0f}s: t{gi + 1} guiding into nothing (failed)")
+                else:
+                    failed_since.pop(gi, None)
+                if g.started_at is not None and now - g.started_at > guide_bound:
+                    key = ("I13", gi, g.started_at)
+                    if key not in told:
+                        told.add(key)
+                        viol.append(
+                            f"I13 t={rel:.0f}s: t{gi + 1} guiding {now - g.started_at:.0f}s"
+                            f" (since {g.started_at - t0:.0f}s)"
+                        )
             await asyncio.sleep(1.0)
     finally:
         serve.cancel()
+        spec.mode = None
+        rig.dome.unhang()
     for t_open, t_read, since in opens:
         held = t_read - since if since is not None else -1.0
         if held < sp["reopen_hold"] - sp["poll_interval"] - 1:
@@ -304,12 +542,17 @@ async def test_a_night_of_faults(make_rig, tmp_path, seed):
                 f"I2 t={t_open - t0:.0f}s: OpenShutter {t_open - t_read:.1f}s after its reading"
             )
     tl = rig.timeline
-    working = {u.name for u in rig.sequencer.units.values() if not u.gave_up}
+    working = {u.name for u in seqr.units.values() if not u.gave_up}
     last_fault = max((f[1] for f in faults if f[2] != "too"), default=0.0)
+    started = [
+        e.t
+        for e in tl.entries()
+        if (e.what == "StartExposure" or (e.what == "spectrum_started" and e.source == "seq"))
+    ]
     if (
         working
         and last_fault < NIGHT - sp["reopen_hold"] - 1800
-        and not [e for e in tl.entries() if e.what == "StartExposure" and e.t > t0 + last_fault]
+        and not [t for t in started if t > t0 + last_fault]
     ):
         viol.append(f"I4: no exposure after the last fault cleared at {last_fault:.0f}s")
     try:
@@ -322,9 +565,53 @@ async def test_a_night_of_faults(make_rig, tmp_path, seed):
             continue
         if taken_in[gid] - rung > 1.0 + 1e-3:  # sampled each second
             viol.append(f"I5: {gid} taken in {taken_in[gid] - rung:.1f}s after its ring")
-        started = [e for e in tl.events("target_start") if e.detail["target"].startswith(f"{gid} ")]
-        if not started and tel in working:
+        started_too = [
+            e for e in tl.events("target_start") if e.detail["target"].startswith(f"{gid} ")
+        ]
+        if not started_too and tel in working:
             viol.append(f"I5: {gid} (rung at {rung - t0:.0f}s, {tel}) never started")
+    # I7: the lease is revoked for an unreadable fault channel only once it
+    # has been unreadable for the grace (never for one failed read).
+    for e in tl.events("alarm", "safety"):
+        if "enclosure faults unreadable for" not in e.detail.get("msg", ""):
+            continue
+        t = e.t - t0
+        lo, hi = t - grace + 0.5, t - sp["dome_timeout"] - 1
+        if not any(s <= lo and end >= hi for s, end in unreadable):
+            viol.append(f"I7 t={t:.0f}s: {e.detail['msg'][:80]} (truth: not unreadable that long)")
+    # I8: a hung dome is alarmed.
+    alarms = [e.t - t0 for e in tl.events("alarm", "safety")]
+    for s, end in hangs:
+        if end - s > grace + 2 * sp["poll_interval"] + sp["dome_timeout"] + 5:
+            if not any(s <= t <= end + 1 for t in alarms):
+                viol.append(f"I8: the dome hung {s:.0f}-{end:.0f}s and nothing alarmed")
+    # I14: spectroscopy resumes once the spectrograph answers again.
+    if outages and working:
+        end = outages[-1][1]
+        quiet = NIGHT - sp["reopen_hold"] - 3600 - SPEC.spectrograph_recovery_interval
+        done = [e.t - t0 for e in tl.events("spectrum_done", "seq")]
+        if end < quiet and last_fault < quiet and not [t for t in done if t > end]:
+            viol.append(f"I14: no spectrum after the spectrograph came back at {end:.0f}s")
+    # I15: imaging goes on while the spectrograph is down.
+    for k, due in imaging_due.items():
+        if len(due) >= 1200 and not [t for t in light_starts if due[0] <= t <= due[-1] + 60]:
+            viol.append(
+                f"I15: spectrograph down {outages[k][0]:.0f}-{outages[k][1]:.0f}s,"
+                f" enclosure open {len(due)}s, and no image"
+            )
+    # I16: clouds (a lost guide star, an acquisition that times out) never
+    # put a telescope out for the night: its guider ladder brings it back.
+    for e in tl.events("giving_up", "seq"):
+        errors = [
+            x
+            for x in tl.events("telescope_error", "seq")
+            if x.detail["telescope"] == e.detail["telescope"] and x.t <= e.t
+        ]
+        if errors and "GuiderError" in errors[-1].detail["error"]:
+            viol.append(
+                f"I16 t={e.t - t0:.0f}s: {e.detail['telescope']} gave up over its guider"
+                f" ({e.detail.get('reason') or errors[-1].detail['error']})"
+            )
     assert not viol, f"seed {seed}: " + "; ".join(viol)
 
 

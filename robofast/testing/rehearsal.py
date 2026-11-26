@@ -1086,10 +1086,22 @@ class Rehearsal(SimulatedNight):
             await self._recover_preflight(name, sorted({k for k, _ in problems[name]}))
             again, still = await asyncio.to_thread(preflight_problems, r, [name])
             seen.update(again)
-            if not still.get(name):
+            # The ladder's own verdict counts too: its devices may answer
+            # again (a restarted PWI server) while the mount behind them is
+            # still unusable (MINERVA T3/T4 2026-11-26: PWI2 back, its mount
+            # controller down; admitted, then dropped at the first command).
+            failed = [
+                x
+                for x in self.outcome.preflight_recovery
+                if x["telescope"] == name and not x["recovered"]
+            ]
+            if not still.get(name) and not failed:
                 self._note(f"{name}: recovered at the preflight; it takes part in the night")
                 continue
-            why = "; ".join(t for _, t in still[name])
+            why = "; ".join(t for _, t in still.get(name, ())) or "; ".join(
+                f"its {x['device']} ladder did not recover it ({', '.join(x['tried'])})"
+                for x in failed
+            )
             r.dropped[name] = why
             del r.real[name]
             r.az_windows.pop(name, None)

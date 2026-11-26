@@ -375,6 +375,8 @@ class FakeMount:
         self.order.append(f"{member} {args[0] if args else ''}".strip())
         if args and args[0] == "MountConnect":
             self.status["pwi"]["connected"] = True
+        if args and args[0] == "MotorsEnable":
+            self.status["pwi"]["az_enabled"] = self.status["pwi"]["alt_enabled"] = True
 
 
 async def test_a_camera_sharing_power_with_the_mount_stops_and_starts_pwi():

@@ -51,6 +51,20 @@ disabled -- the state of a PWI that was just started. An axis PWI disabled
 while connected (a drive fault, e.g. PWI4's I2t) is left disabled: the
 telescope is not usable and the ladder climbs on.
 
+PWI answers `MountConnect` and `MotorsEnable` at once and acts later, so
+each is followed by polling `Status` until PWI reports the mount connected
+(both axes enabled), for at most `mount_connect_timeout` (default 120 s)
+each; the rung fails with "PWI did not connect to the mount within N s"
+otherwise. A controller still booting after its panel power cycle connects
+only after some seconds (MINERVA T3/T4 2026-11-26: not connected 5 s after
+`MountConnect`, connected minutes later; the ladder used to send
+`MotorsEnable` at once and give up).
+
+A rehearsal's preflight (robofast/testing/rehearsal.py) admits a telescope
+whose start-up check failed only if its ladder **recovered** it, not merely
+because its devices answer again afterwards (a restarted PWI server answers
+while its mount controller is still off).
+
 A camera with a `cooling` entry (docs/cooling.md) has its cooler set again
 by every rung that reconnects it -- the camera owner's `on_connect` hook
 runs on each fresh connection -- because MINERVA T1's Andor ASCOM driver

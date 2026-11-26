@@ -540,6 +540,32 @@ async def test_preflight_recovers_a_restarted_pwi2_through_a_guard(tmp_path, pwi
     assert not any(c.startswith(("mount:move", "mount:park")) for c in sim.model.commands)
 
 
+async def test_regression_20261126_preflight_drops_a_telescope_whose_ladder_failed(
+    tmp_path, pwi2, fake_real
+):
+    """MINERVA T3/T4 2026-11-26: PWI2 was down at the start; the preflight
+    ladder restarted it, but the mount controller behind it was off, so PWI
+    never connected and every rung failed. The preflight re-check only asked
+    the PWI server (which answered again) and let both telescopes in; they
+    were dropped at their first command. The ladder's verdict counts now."""
+    sim, server = pwi2()
+    sim.set_mode("http500")
+    with sim.model.lock:
+        sim.model.drop_controller()
+    cam = fake_real().camera
+    ep = Endpoint.parse(f"{server.address}/0")
+    policy = {"telescope": {**POLICY, "restart": restart_hook(sim), "mount_connect_timeout": 1.0}}
+    t2 = fake_real()
+    night = _night(tmp_path, {"t1": RealTelescope(ep, cam, ep, ep), "t2": t2}, {"t1": policy})
+    seen = await night._preflight()
+    assert night.r.real.keys() == {"t2"} and "t1" in night.r.dropped
+    assert "ladder did not recover it" in night.r.dropped["t1"]
+    assert "did not connect to the mount" in night.r.dropped["t1"]
+    assert "dropped" in seen["t1"]
+    [rec] = night.outcome.preflight_recovery
+    assert rec["telescope"] == "t1" and not rec["recovered"]
+
+
 def test_recovery_options(tmp_path):
     from robofast.testing.rehearsal import settings_from_args
     from tests.core.test_rehearsal_guard import args

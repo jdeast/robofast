@@ -179,6 +179,11 @@ class CDK700Model:
         #: The controller dropped (:meth:`drop_controller`): PWI cannot
         #: connect to it until :meth:`power_cycle`.
         self.controller_down = False
+        #: PWI answers ``connect`` at once and reports the mount connected
+        #: only this long (s) after it (MINERVA T3/T4 2026-11-26: a mount
+        #: controller still booting after its panel power cycle).
+        self.connect_delay = 0.0
+        self._connect_at: float | None = None
         self.axes_homed = [homed, homed]
         self.report_homed = report_homed
         self.home_pos = (home_alt, home_az)
@@ -257,6 +262,9 @@ class CDK700Model:
         with self.lock:
             now = time.monotonic() if now is None else now
             dt, self._t = max(0.0, now - self._t), now
+            if self._connect_at is not None and now >= self._connect_at:
+                self._connect_at = None
+                self.connected = not self.controller_down
             if self._model_pending is not None and now >= self._model_pending[1]:
                 self.model_file, self._model_pending = self._model_pending[0], None
             if self.homing_until and now >= self.homing_until and not self.slewing:
@@ -320,6 +328,10 @@ class CDK700Model:
     def connect(self) -> None:
         if self.controller_down:
             self.ignored.append("connect")
+            return
+        if self.connect_delay > 0:
+            if not self.connected and self._connect_at is None:
+                self._connect_at = time.monotonic() + self.connect_delay
             return
         self.connected = True
 
@@ -412,6 +424,7 @@ class CDK700Model:
         it disconnected and cannot connect to it, nor home it, until the
         controller is power-cycled."""
         self.stop()
+        self._connect_at = None
         self.controller_down = True
         self.connected = False
         self.enabled = [False, False]
@@ -420,6 +433,7 @@ class CDK700Model:
     def power_cycle(self) -> None:
         """The mount controller loses power and comes back."""
         self.stop()
+        self._connect_at = None
         self.controller_down = False
         self.connected = False
         self.enabled = [False, False]
@@ -431,6 +445,7 @@ class CDK700Model:
         not connected, motors disabled, not homed, and the default pointing
         model loaded (as PWI2 did on MINERVA T1, 2026-11-06)."""
         self.stop()
+        self._connect_at = None
         self.connected = False
         self.enabled = [False, False]
         self.axes_homed = [False, False]

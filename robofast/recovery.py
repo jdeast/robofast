@@ -60,7 +60,11 @@ On a telescope served by robofast's PWI server (it answers
 the mount: ``Action("MountConnect")`` if PWI says it is not connected, then
 ``Action("MotorsEnable")`` if both axes are disabled (a freshly started
 PWI's state, not a drive fault: an axis PWI disabled while connected is left
-alone).
+alone). PWI answers both at once and acts later, so each is followed by
+polling ``Status`` until PWI reports the mount connected (both axes
+enabled), at most ``mount_connect_timeout`` s each: a controller still
+booting after its power cycle connects only later (MINERVA T3/T4
+2026-11-26).
 
 After each rung the device must answer (``verify``: a read of a member,
 within ``verify_timeout``) or the next rung is tried. A PWI telescope must
@@ -163,6 +167,13 @@ class DevicePolicy:
     #: The ``home`` rung's bound (s): a CDK700 homes in 33-58 s, but azimuth
     #: may first travel ~100 deg to its NoWrap sensor (docs/pwi.md).
     home_timeout: float = 300.0
+    #: After ``MountConnect``: how long (s) to wait for PWI to report the
+    #: mount connected, and after ``MotorsEnable`` for both axes enabled.
+    #: PWI answers the command at once and connects later: a mount controller
+    #: still booting after its panel power cycle (MINERVA T3/T4 2026-11-26,
+    #: T2 2026-11-25) was not connected 5 s after it, and was a few minutes
+    #: later.
+    mount_connect_timeout: float = 120.0
     #: The last step: the agent hook and its limits (robofast/escalation.py).
     escalate: dict[str, Any] | bool | None = None
 
@@ -535,10 +546,41 @@ class RecoveryLadder:
             return
         await call("Action", "MountConnect", "")
         self.event("recovery_mount_connect", device=kind)
-        pwi = (await self._status(probe, call) or {}).get("pwi") or {}
+        wait = self._connect_wait(kind)
+        pwi = await self._until(
+            probe,
+            call,
+            lambda p: p.get("connected") is not False,
+            wait,
+            f"PWI did not connect to the mount within {wait:.0f} s of MountConnect",
+        )
         if pwi.get("az_enabled") is False and pwi.get("alt_enabled") is False:
             await call("Action", "MotorsEnable", "")
             self.event("recovery_motors_enable", device=kind)
+            await self._until(
+                probe,
+                call,
+                lambda p: p.get("az_enabled") is not False and p.get("alt_enabled") is not False,
+                wait,
+                f"the axes were not enabled within {wait:.0f} s of MotorsEnable",
+            )
+
+    def _connect_wait(self, kind: str) -> float:
+        pol = self.policies.get(kind) or self.policies.get("telescope")
+        return pol.mount_connect_timeout if pol is not None else DevicePolicy.mount_connect_timeout
+
+    async def _until(self, probe, call, ok, timeout: float, why: str) -> dict[str, Any]:
+        """Poll the PWI server's ``Status`` until ``ok(pwi)``, at most
+        ``timeout`` s (PWI answers MountConnect and MotorsEnable at once and
+        acts later); its last ``pwi`` entry."""
+        deadline = self.clock() + timeout
+        while True:
+            pwi = (await self._status(probe, call) or {}).get("pwi") or {}
+            if ok(pwi):
+                return pwi
+            if self.clock() >= deadline:
+                raise RuntimeError(why)
+            await self.sleep(min(2.0, max(timeout / 20, 0.05)))
 
     async def _until_still(self, probe, poll: float = 1.0) -> None:
         """Until the mount stops (homing reads as Slewing)."""

@@ -82,7 +82,10 @@ Power cycling is guarded: only outlets the policy names (and the PDU
 server marks ``cycle``: never the enclosure controller, the weather
 station, the network or anything else the safety path needs), at most
 ``max_powercycles`` a night and once per ``min_interval`` s, and only with
-the telescope parked (``requires_parked``) and the camera idle and, if
+the telescope parked (``requires_parked``; the telescope's own outlet also
+when PWI is connected and reports an axis disabled -- a drive fault, which
+the cycle clears -- and the mount, stopped, holds still: ``fault_still_time``,
+``fault_still_deg``; MINERVA T3 2026-11-26) and the camera idle and, if
 ``camera_warm_above`` is set, warmer than that (so a cooled CCD is never
 cut off cold) -- each check skipped only for the device being cycled
 itself when it cannot answer.
@@ -96,6 +99,7 @@ applies to every device; a device's own ``escalate`` is merged over it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
@@ -174,6 +178,11 @@ class DevicePolicy:
     #: T2 2026-11-25) was not connected 5 s after it, and was a few minutes
     #: later.
     mount_connect_timeout: float = 120.0
+    #: The telescope's own power cycle with the mount not parked (module
+    #: doc): the mount must not move by more than ``fault_still_deg`` on
+    #: either axis in ``fault_still_time`` s.
+    fault_still_time: float = 5.0
+    fault_still_deg: float = 0.05
     #: The last step: the agent hook and its limits (robofast/escalation.py).
     escalate: dict[str, Any] | bool | None = None
 
@@ -582,6 +591,52 @@ class RecoveryLadder:
                 raise RuntimeError(why)
             await self.sleep(min(2.0, max(timeout / 20, 0.05)))
 
+    async def _stopped_on_fault(self, pol: DevicePolicy, probe, call) -> str | None:
+        """Why the telescope's own outlet may be cycled although the mount is
+        not parked (module doc), or None. PWI must be connected (so its
+        status is the controller's) and report an axis disabled (a drive
+        fault: the cycle is what clears it); the mount is stopped
+        (``AbortSlew``, best effort: a home in progress) and must then be
+        still -- not tracking, and within ``fault_still_deg`` on both axes
+        over ``fault_still_time`` s. MINERVA T3, 2026-11-26: an azimuth
+        commutation fault during the ladder's own home left the mount
+        unhomed and unparked, and the guard refused the panel cycle that
+        clears such a fault."""
+        st = await self._status(probe, call)
+        pwi = (st or {}).get("pwi") or {}
+        if pwi.get("connected") is not True:
+            return None
+        off = [a for a in ("az", "alt") if pwi.get(f"{a}_enabled") is False]
+        if not off:
+            return None
+        assert call is not None
+        with contextlib.suppress(Exception):
+            await call("AbortSlew")
+        await self.sleep(pol.fault_still_time)
+        now = ((await self._status(probe, call)) or {}).get("pwi") or {}
+        if now.get("connected") is not True or now.get("tracking"):
+            return None
+        for key, wrap in (("alt_deg", None), ("az_deg", 360.0)):
+            a, b = pwi.get(key), now.get(key)
+            if not isinstance(a, int | float) or not isinstance(b, int | float):
+                return None
+            d = abs(b - a)
+            if wrap is not None:
+                d = min(d, wrap - d)
+            if d > pol.fault_still_deg:
+                return None
+        errs = [
+            f"{axis}: {err[1] or err[0]}"
+            for axis, err in (
+                ("az", pwi.get("az_motor_error")),
+                ("alt", pwi.get("alt_motor_error")),
+            )
+            if isinstance(err, list | tuple) and len(err) == 2 and err[0]
+        ]
+        return f"not parked, but stopped with the {' and '.join(off)} axis disabled" + (
+            f" ({'; '.join(errs)})" if errs else ""
+        )
+
     async def _until_still(self, probe, poll: float = 1.0) -> None:
         """Until the mount stops (homing reads as Slewing)."""
         await self.sleep(poll)
@@ -646,7 +701,7 @@ class RecoveryLadder:
                 await self._mount_up(kind, probe, call)
             return
         assert rung == "powercycle" and pol.powercycle is not None
-        await self._may_cycle(kind, pol, probe, others)
+        await self._may_cycle(kind, pol, probe, others, call)
         pc = pol.powercycle
         pwi = bool(pc.get("requires_pwi_stop"))
         if pwi:
@@ -718,7 +773,7 @@ class RecoveryLadder:
                 f"{self.telescope} {kind}: PWI restarted, mount not reinitialized: {why[:120]}"
             )
 
-    async def _may_cycle(self, kind: str, pol: DevicePolicy, probe, others) -> None:
+    async def _may_cycle(self, kind: str, pol: DevicePolicy, probe, others, call=None) -> None:
         done = self.cycles.get(kind, [])
         if len(done) >= pol.max_powercycles:
             raise RuntimeError(f"already power-cycled {len(done)} time(s) tonight")
@@ -737,7 +792,12 @@ class RecoveryLadder:
 
         if pol.requires_parked:
             parked = await read("telescope", "AtPark")
-            if parked is False or (parked is None and kind != "telescope"):
+            if parked is False and kind == "telescope":
+                why = await self._stopped_on_fault(pol, probe, call)
+                if why is None:
+                    raise RuntimeError("the telescope is not parked")
+                self.event("recovery_cycle_unparked", device=kind, reason=why)
+            elif parked is False or (parked is None and kind != "telescope"):
                 raise RuntimeError("the telescope is not parked")
         if pol.requires_camera_idle:
             state = await read("camera", "CameraState")

@@ -431,8 +431,10 @@ class CDK700Model:
         self.axes_homed = [False, False]
 
     def power_cycle(self) -> None:
-        """The mount controller loses power and comes back."""
+        """The mount controller loses power and comes back (clearing its
+        drive faults)."""
         self.stop()
+        self.motor_errors = {}
         self._connect_at = None
         self.controller_down = False
         self.connected = False

@@ -340,3 +340,68 @@ async def test_the_wait_for_pwi_to_connect_is_bounded(rig):
     assert not res.recovered
     assert all("did not connect to the mount within 1 s" in how for _, how in res.tried), res.tried
     assert switched == []
+
+
+def _az_fault(m) -> None:
+    """MINERVA T3, 2026-11-26: during a home PWI2 disabled the azimuth axis
+    ("Automatic commutation: Too many trials during phase 3"); the mount was
+    left connected, unhomed, unparked, altitude still enabled."""
+    with m.lock:
+        m.enabled[0] = False
+        m.stop()
+        m.motor_errors["azm"] = (1, "Automatic commutation: Too many trials during phase 3")
+        m.axes_homed = [False, False]
+
+
+async def test_regression_20261126_a_mount_stopped_on_a_drive_fault_gets_its_panel_cycle(rig):
+    """The panel cycle (which clears a drive fault) was refused because the
+    faulted mount was not parked. A mount PWI reports connected, with an
+    axis disabled, and that holds still once stopped is cycled, then homed."""
+    sim, _server, pdu, switched, owner, grant = rig
+    await grant.call("Unpark")
+    m = sim.model
+    _az_fault(m)
+    events: list = []
+    lad = _ladder({"telescope": _policy(sim, pdu, steps=["powercycle"])}, events)
+    res = await lad.recover(
+        "telescope",
+        reconnect=lambda: owner.reconnect("recovery"),
+        probe=lambda mem: grant.get(mem),
+        others=camera_idle,
+        call=lambda mem, *a: grant.call(mem, *a),
+    )
+    assert res.recovered, res.tried
+    assert switched == [(PANEL, REBOOT)]
+    assert m.connected and all(m.enabled) and m.homed and not m.motor_errors
+    (why,) = [kw["reason"] for w, kw in events if w == "recovery_cycle_unparked"]
+    assert "az axis disabled" in why and "phase 3" in why
+
+
+async def test_a_faulted_mount_that_still_moves_is_not_cycled(rig):
+    """The exception needs the mount still: one that keeps tracking after
+    the ladder's AbortSlew (ignored here) with an axis disabled keeps the
+    parked guard."""
+    sim, _server, pdu, switched, owner, grant = rig
+    await grant.call("Unpark")
+    m = sim.model
+    _az_fault(m)
+    with m.lock:
+        m.tracking = True
+    sent: list = []
+
+    async def call(mem, *a):
+        sent.append(mem)
+        if mem == "AbortSlew":
+            return None
+        return await grant.call(mem, *a)
+
+    res = await _ladder({"telescope": _policy(sim, pdu, steps=["powercycle"])}).recover(
+        "telescope",
+        reconnect=lambda: owner.reconnect("recovery"),
+        probe=lambda mem: grant.get(mem),
+        others=camera_idle,
+        call=call,
+    )
+    assert "AbortSlew" in sent
+    assert not res.recovered and "not parked" in res.tried[0][1]
+    assert switched == []

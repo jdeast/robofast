@@ -159,7 +159,14 @@ guider's) `powercycle` rung, never hidden coupling:
 `"requires_pwi_stop": true` with `pwi_stop` and `pwi_start` hooks (the
 `restart` hook's contract: `pwi_start` exits 0 once PWI answers). It needs
 `requires_parked` (the default): the rung refuses unless the telescope is
-parked. It then runs `pwi_stop`, cycles the outlet, waits `boot_time`, and
+parked -- except the telescope's own outlet on a mount stopped on a drive
+fault: PWI connected and reporting an axis disabled, and the mount, after
+the ladder's `AbortSlew`, not tracking and within `fault_still_deg`
+(0.05 deg) on both axes over `fault_still_time` (5 s). The cycle is what
+clears such a fault, and a fault during the ladder's own home leaves the
+mount unhomed and so unparkable (MINERVA T3, 2026-11-26: "Automatic
+commutation: Too many trials during phase 3"). The event
+`recovery_cycle_unparked` records why. It then runs `pwi_stop`, cycles the outlet, waits `boot_time`, and
 runs `pwi_start` -- also when the cycle failed -- then brings the mount
 back as the telescope's ladder would (reconnect, `MountConnect`,
 `MotorsEnable`, `home` if the PWI server allows it), and reconnects the

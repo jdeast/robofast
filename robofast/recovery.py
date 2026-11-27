@@ -85,7 +85,9 @@ station, the network or anything else the safety path needs), at most
 the telescope parked (``requires_parked``; the telescope's own outlet also
 when PWI is connected and reports an axis disabled -- a drive fault, which
 the cycle clears -- and the mount, stopped, holds still: ``fault_still_time``,
-``fault_still_deg``; MINERVA T3 2026-11-26) and the camera idle and, if
+``fault_still_deg``; MINERVA T3 2026-11-26; or when PWI answers but cannot
+connect to the mount's controller even after ``MountConnect``: MINERVA T4
+2026-11-26) and the camera idle and, if
 ``camera_warm_above`` is set, warmer than that (so a cooled CCD is never
 cut off cold) -- each check skipped only for the device being cycled
 itself when it cannot answer.
@@ -604,6 +606,8 @@ class RecoveryLadder:
         clears such a fault."""
         st = await self._status(probe, call)
         pwi = (st or {}).get("pwi") or {}
+        if pwi.get("connected") is False:
+            return await self._controller_lost(probe, call)
         if pwi.get("connected") is not True:
             return None
         off = [a for a in ("az", "alt") if pwi.get(f"{a}_enabled") is False]
@@ -636,6 +640,30 @@ class RecoveryLadder:
         return f"not parked, but stopped with the {' and '.join(off)} axis disabled" + (
             f" ({'; '.join(errs)})" if errs else ""
         )
+
+    async def _controller_lost(self, probe, call) -> str | None:
+        """Why the telescope's own outlet may be cycled although the mount is
+        not parked, when PWI is not connected to it (module doc), or None:
+        PWI answers (the rungs before restarted it) but cannot connect to
+        the mount's controller, so nothing drives the mount and only its
+        power brings the controller back. MINERVA T4, 2026-11-26: the ACR
+        controller dropped off the network with the mount unparked."""
+        if call is None:
+            return None
+        try:
+            await call("Action", "MountConnect", "")
+        except Exception:
+            return None  # PWI itself does not answer: not the controller's fault
+        self.event("recovery_mount_connect", device="telescope")
+        wait = self._connect_wait("telescope")
+        try:
+            await self._until(probe, call, lambda p: p.get("connected") is not False, wait, "")
+        except RuntimeError:
+            return (
+                f"not parked, but PWI cannot connect to the mount's controller"
+                f" ({wait:.0f} s after MountConnect)"
+            )
+        return None
 
     async def _until_still(self, probe, poll: float = 1.0) -> None:
         """Until the mount stops (homing reads as Slewing)."""

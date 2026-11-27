@@ -179,6 +179,9 @@ class CDK700Model:
         #: The controller dropped (:meth:`drop_controller`): PWI cannot
         #: connect to it until :meth:`power_cycle`.
         self.controller_down = False
+        #: PWI2 answers with this status, frozen when its controller dropped
+        #: (:meth:`drop_controller` ``frozen``), until PWI is restarted.
+        self.frozen_status: str | None = None
         #: PWI answers ``connect`` at once and reports the mount connected
         #: only this long (s) after it (MINERVA T3/T4 2026-11-26: a mount
         #: controller still booting after its panel power cycle).
@@ -419,10 +422,14 @@ class CDK700Model:
             if self.slewing and (self.altaz is None or self.altaz_tracks):
                 self.slewing = False
 
-    def drop_controller(self) -> None:
+    def drop_controller(self, frozen: bool = False) -> None:
         """The mount controller stops answering PWI (module doc): PWI reports
         it disconnected and cannot connect to it, nor home it, until the
-        controller is power-cycled."""
+        controller is power-cycled. ``frozen`` (PWI2): PWI2 instead goes on
+        answering with its last status, its clock and ``connected``
+        included, until it is restarted (MINERVA T4, 2026-11-26)."""
+        if frozen:
+            self.frozen_status = pwi2_status(self)
         self.stop()
         self._connect_at = None
         self.controller_down = True
@@ -446,6 +453,7 @@ class CDK700Model:
         """PWI (the program) is restarted while the controller keeps power:
         not connected, motors disabled, not homed, and the default pointing
         model loaded (as PWI2 did on MINERVA T1, 2026-11-06)."""
+        self.frozen_status = None
         self.stop()
         self._connect_at = None
         self.connected = False
@@ -823,7 +831,7 @@ def pwi2_handle(m: CDK700Model, path: str, q: dict[str, list[str]]) -> str:
                 a.target = v % 360.0 if device.startswith("rotator") else v
         else:
             raise _HTTPError(400, f"unknown device/cmd {device!r}/{cmd!r}")
-        return pwi2_status(m)
+        return m.frozen_status or pwi2_status(m)
 
 
 # -- the server ---------------------------------------------------------------------------

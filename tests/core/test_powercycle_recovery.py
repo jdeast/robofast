@@ -23,7 +23,7 @@ import pytest
 from robofast.devices.apc_pdu import REBOOT, APCPDUSim, Credentials
 from robofast.devices.pdu_server import PDUConfig, PDUServer
 from robofast.devices.pwi_server import PWIServer
-from robofast.devices.pwi_sim import PWISim
+from robofast.devices.pwi_sim import PWISim, pwi2_status
 from robofast.recovery import PDUSwitch, RecoveryLadder
 from robofast.testing.fakes import FakeDeviceError
 from tests.core.test_pwi_recovery import PORT1, no_sleep, pwi2_config, restart_hook, telescope
@@ -162,10 +162,11 @@ async def test_a_dropped_controller_comes_back_by_the_panel_cycle_and_a_home(rig
 
 
 async def test_the_guards_hold_an_unparked_mount_is_not_cycled(rig):
+    """An unparked mount whose controller PWI reaches, with both axes
+    enabled, keeps the parked guard (the exceptions are a drive fault and a
+    controller PWI cannot connect to)."""
     sim, _server, pdu, switched, owner, grant = rig
     await grant.call("Unpark")
-    with sim.model.lock:
-        sim.model.drop_controller()
     res = await _ladder({"telescope": _policy(sim, pdu, steps=["powercycle"])}).recover(
         "telescope",
         reconnect=lambda: owner.reconnect("recovery"),
@@ -174,7 +175,59 @@ async def test_the_guards_hold_an_unparked_mount_is_not_cycled(rig):
         call=lambda mem, *a: grant.call(mem, *a),
     )
     assert not res.recovered and "not parked" in res.tried[0][1]
-    assert switched == [] and sim.model.controller_down
+    assert switched == [] and sim.model.connected
+
+
+async def test_regression_20261126_an_unparked_mount_whose_controller_dropped_is_cycled(rig):
+    """MINERVA T4, 2026-11-26: the ACR controller dropped off the network
+    with the mount unparked, and PWI2 went on answering with its last status
+    (connected, both axes enabled), frozen. robofast's PWI server reads the
+    frozen clock as not connected; the ladder's reconnect, restart and home
+    cannot reach the controller; the panel cycle, refused before because the
+    mount was not parked, brings it back, and the mount is homed."""
+    sim, server, pdu, switched, owner, grant = rig
+    server.mount.config.pwi_frozen_after = 0.3
+    await grant.call("Unpark")
+    m = sim.model
+    with m.lock:
+        m.drop_controller(frozen=True)
+    # Before pwi_frozen_after: PWI2's own word (connected).
+    st = json.loads(await grant.call("Action", "Status", ""))
+    assert st["pwi"]["connected"] is True
+    await asyncio.sleep(0.5)
+    st = json.loads(await grant.call("Action", "Status", ""))
+    assert st["pwi"]["connected"] is False
+    events: list = []
+    lad = _ladder({"telescope": _policy(sim, pdu)}, events)
+    res = await lad.recover(
+        "telescope",
+        reconnect=lambda: owner.reconnect("recovery"),
+        probe=lambda mem: grant.get(mem),
+        others=camera_idle,
+        call=lambda mem, *a: grant.call(mem, *a),
+    )
+    assert res.recovered, res.tried
+    assert [r for r, _ in res.tried] == ["reconnect", "restart", "home", "powercycle"]
+    assert switched == [(PANEL, REBOOT)]
+    assert m.connected and all(m.enabled) and m.homed and not m.controller_down
+    (why,) = [kw["reason"] for w, kw in events if w == "recovery_cycle_unparked"]
+    assert "cannot connect to the mount's controller" in why
+
+
+async def test_a_frozen_pwi2_reads_connected_again_once_its_clock_moves(rig):
+    sim, server, _pdu, _switched, _owner, grant = rig
+    server.mount.config.pwi_frozen_after = 0.2
+    m = sim.model
+    with m.lock:
+        m.frozen_status = pwi2_status(m)
+    await asyncio.sleep(0.4)
+    st = json.loads(await grant.call("Action", "Status", ""))
+    assert st["pwi"]["connected"] is False
+    with m.lock:
+        m.frozen_status = None  # PWI2 got its controller back
+    await asyncio.sleep(0.4)
+    st = json.loads(await grant.call("Action", "Status", ""))
+    assert st["pwi"]["connected"] is True
 
 
 async def test_a_panel_cycle_without_home_permission_does_not_count(rig):

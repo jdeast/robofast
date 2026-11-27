@@ -166,7 +166,13 @@ the ladder's `AbortSlew`, not tracking and within `fault_still_deg`
 clears such a fault, and a fault during the ladder's own home leaves the
 mount unhomed and so unparkable (MINERVA T3, 2026-11-26: "Automatic
 commutation: Too many trials during phase 3"). The event
-`recovery_cycle_unparked` records why. It then runs `pwi_stop`, cycles the outlet, waits `boot_time`, and
+`recovery_cycle_unparked` records why. Also the telescope's own outlet when PWI answers but
+cannot connect to the mount's controller, `MountConnect` included (`mount_connect_timeout`):
+nothing drives the mount, and only its power brings the controller back (MINERVA T4,
+2026-11-26: the ACR controller dropped off the network with the mount unparked). robofast's
+PWI server reads a PWI2 whose own clock has stood still for `pwi_frozen_after` (30 s) as not
+connected: PWI2 keeps answering with its last status, `connected` included, after it loses
+the controller. It then runs `pwi_stop`, cycles the outlet, waits `boot_time`, and
 runs `pwi_start` -- also when the cycle failed -- then brings the mount
 back as the telescope's ladder would (reconnect, `MountConnect`,
 `MotorsEnable`, `home` if the PWI server allows it), and reconnects the

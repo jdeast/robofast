@@ -416,6 +416,7 @@ way. Without `az_wrap_min`/`az_wrap_max` PWI chooses, as before.
 that long reads as not connected), `request_timeout`,
 `aperture_diameter`, `focal_length`, `max_jog_deg` (at most 10),
 `jog_timeout`, `home_timeout`, `home_alt`, `home_az`, `home_tolerance`,
+`home_settle` (PWI2: a home ends only once it has read not finding home that long),
 `home_record`, `allow_find_home`, `allow_unhomed_moves`,
 `pointing_models` (PWI2), `discovery_port`.
 

@@ -182,6 +182,10 @@ class CDK700Model:
         #: PWI2 answers with this status, frozen when its controller dropped
         #: (:meth:`drop_controller` ``frozen``), until PWI is restarted.
         self.frozen_status: str | None = None
+        #: A home reads not finding home during (start, length) s of it
+        #: (:attr:`homing`); None: never.
+        self.home_gap: tuple[float, float] | None = None
+        self._home_started = 0.0
         #: PWI answers ``connect`` at once and reports the mount connected
         #: only this long (s) after it (MINERVA T3/T4 2026-11-26: a mount
         #: controller still booting after its panel power cycle).
@@ -378,7 +382,8 @@ class CDK700Model:
                 self.mech_target = self.mech
                 self._searching = axes
             self.homing_axes = axes
-            self.homing_until = time.monotonic() + self.home_time
+            self._home_started = time.monotonic()
+            self.homing_until = self._home_started + self.home_time
             if self.altaz_tracks:
                 self.tracking = True  # PWI2 on MINERVA T1: a home leaves it tracking
 
@@ -479,7 +484,16 @@ class CDK700Model:
 
     @property
     def homing(self) -> bool:
-        return bool(self.homing_until)
+        """PWI2's ``is_finding_home``: false during ``home_gap`` (s from the
+        home's start, s long) although the home goes on (MINERVA T4,
+        2026-11-26: between the azimuth and altitude phases)."""
+        if not self.homing_until:
+            return False
+        if self.home_gap is not None:
+            t = time.monotonic() - self._home_started
+            if self.home_gap[0] <= t < self.home_gap[0] + self.home_gap[1]:
+                return False
+        return True
 
     def state(self) -> dict[str, Any]:
         with self.lock:

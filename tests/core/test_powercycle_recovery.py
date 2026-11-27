@@ -458,3 +458,27 @@ async def test_a_faulted_mount_that_still_moves_is_not_cycled(rig):
     assert "AbortSlew" in sent
     assert not res.recovered and "not parked" in res.tried[0][1]
     assert switched == []
+
+
+async def test_regression_20261126_a_pwi2_home_with_a_pause_between_its_phases_completes(rig):
+    """MINERVA T4, 2026-11-26: after its panel cycle the ladder's home read
+    as done 30 s in (PWI2 read not finding home between its azimuth and
+    altitude phases); the ladder parked the mount -- a stop -- and the home
+    was cut short, unhomed. A home ends only once PWI2 has read not finding
+    home for home_settle s, or reports the encoders set."""
+    sim, server, pdu, switched, owner, grant = rig
+    server.mount.config.home_settle = 2.0
+    m = sim.model
+    with m.lock:
+        m.axes_homed = [False, False]
+        m.home_time = 5.0
+        m.home_gap = (2.5, 1.0)
+    res = await _ladder({"telescope": _policy(sim, pdu, steps=["home"])}).recover(
+        "telescope",
+        reconnect=lambda: owner.reconnect("recovery"),
+        probe=lambda mem: grant.get(mem),
+        others=camera_idle,
+        call=lambda mem, *a: grant.call(mem, *a),
+    )
+    assert res.recovered, res.tried
+    assert m.homed

@@ -466,7 +466,7 @@ async def test_regression_20261126_a_pwi2_home_with_a_pause_between_its_phases_c
     altitude phases); the ladder parked the mount -- a stop -- and the home
     was cut short, unhomed. A home ends only once PWI2 has read not finding
     home for home_settle s, or reports the encoders set."""
-    sim, server, pdu, switched, owner, grant = rig
+    sim, server, pdu, _switched, owner, grant = rig
     server.mount.config.home_settle = 2.0
     m = sim.model
     with m.lock:

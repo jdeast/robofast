@@ -302,7 +302,6 @@ def args(**kw) -> argparse.Namespace:
         ({"camera": ["t1=127.0.0.1:2/0", "t2=127.0.0.1:3/0"]}, "needs both"),
         ({"telescope": ["t1=127.0.0.1:1"]}, "HOST:PORT/N"),
         ({"telescope": ["t1"]}, "NAME=HOST:PORT/N"),
-        ({"telescope": ["t3=127.0.0.1:1/0"], "camera": ["t3=127.0.0.1:2/0"]}, "unknown"),
         ({"rotator": ["t2=none"]}, "not a real telescope"),
         ({"end_action": "park"}, "leave"),
         ({"end_action": "altaz:10,180"}, "outside"),
@@ -378,12 +377,8 @@ def test_the_plan_is_what_is_up():
     tmpl = spectra[2]["requests"][0]["configurations"][0]["instrument_configs"][0]
     assert tmpl["extra_params"] == {"iodine": False}
     images = [g for g in groups if g["id"].startswith("IMG-")]
-    assert sorted(g["requests"][0]["location"]["telescope"] for g in images) == [
-        "t1",
-        "t1",
-        "t2",
-        "t2",
-    ]
+    # Only the real telescope's: the night is the telescopes given (2026-11-27).
+    assert sorted(g["requests"][0]["location"]["telescope"] for g in images) == ["t1", "t1"]
     with pytest.raises(RehearsalRefused, match="nothing in the catalog"):
         make_requests(s, NIGHT, end, [])
     # In daylight, only with --ignore-twilight, and away from the Sun.

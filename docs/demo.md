@@ -25,7 +25,7 @@ directory as the `rv-night` artifact.
 | weather | the real weather bridge (`robofast.weather_bridge`, a child process) with the shipped `sites/minerva/weather.yaml`, reading a fake site Redis server and fake SAO weather pages |
 | enclosure | the Aqawan PAC simulator and the real Alpaca Dome server (`aqawan_server`) |
 | safety | the real supervisor (`supervisor_service`, a child process), with `sites/minerva/aqawan1.json`'s safety settings (park before close, the dome heartbeat) and shorter timings, in the `robotic` operating mode (the site's default is `attended`; docs/modes.md) |
-| T1, T2 | fake mounts served over Alpaca; simulated star-field imagers on simulated focusers (autofocus and imaging) |
+| T1, T2 | the telescopes `aqawan1.json` names (`NightSettings.telescopes`, the one place they come from): fake mounts served over Alpaca; simulated star-field imagers on simulated focusers (autofocus and imaging) |
 | guiders | one real guider service per telescope (`robofast.guider.service`, child processes): simulated FAU camera, tip/tilt and backlight |
 | KiwiSpec | the spectrograph PC simulator and the real KiwiSpec service (`kiwispec_service`, a child process) |
 | sequencer | the real sequencer service (`sequencer_service.build` and `run`) on `aqawan1.json`. It runs three times, as `deploy/robofast-sequencer@.service` does: evening calibrations, the night (the dispatch plan of `dispatch.example.json`, with autofocus triggers and the console's `operator_control`), and morning calibrations |
@@ -68,7 +68,13 @@ run in real seconds, shortened. The whole night is `n20261109` everywhere.
 6. **A ToO** (a `SPECTRUM` request group with a `too` entry) is dropped
    into the scheduler's drop box. It is taken next, ahead of every normal
    request.
-7. **T2's mount fails** during a two-telescope spectrum. T2 drops out, is
+The director's roles follow the night's telescope list
+(`rv_night.roles`): the first telescope (T1) takes the imaging field and
+finishes the interrupted spectrum; the last (T2) gets the mount fault and
+the console's pause and park. Below, the names are those of the default
+list.
+
+7. **T2's mount fails** during a spectrum every telescope feeds. T2 drops out, is
    made safe and backs off. T1 finishes the spectrum alone. The fault
    clears, and T2 comes back.
 8. **The observer console** pauses T2 (an operator hold through
@@ -158,8 +164,16 @@ camera** in place of the fakes. Everything else stays simulated as above:
 the weather (forced safe), the Aqawan PAC simulator and Dome server (the
 *simulated* roof opens; the real enclosure is never contacted), the
 supervisor, the guiders (simulated FAU cameras that acquire and guide on
-synthetic star fields wherever the real mount points) and KiwiSpec. A
-telescope you do not name stays simulated. It is for an attended session
+synthetic star fields wherever the real mount points) and KiwiSpec. The
+night's telescopes are exactly those you name with `--telescope`, under any
+names (`t1`, `t2` and `t4` is a three-telescope night): no simulated
+telescope is added for a name you do not give, and a name needs no entry
+anywhere in the code. A name the site config (`--site-config`) does not
+list only has its camera's cooler left alone (a warning). The dispatch
+plan's telescopes are the night's: each one's entry from
+`sites/minerva/dispatch.example.json` (Aqawan 1's: T1, T2), or, for a
+telescope it does not list, a copy of its first telescope's without the
+filters; the rehearsal's altitude limits for all. It is for an attended session
 with the **enclosure closed**: it checks that the sequencer drives the real
 mounts and cameras through a whole night (slews, tracking, exposures,
 downloads, headers, the end of the night) without opening anything.
@@ -244,8 +258,7 @@ python -m robofast.testing.rehearsal --out /tmp/rehearsal \
   Before evening twilight nothing is observed until the Sun is at -12 deg;
   `--ignore-twilight` observes at once, keeping targets 45 deg from the Sun
   (only with the enclosure closed).
-* **No autofocus** on a real telescope (dark frames cannot be focused: a
-  log line says so). The real camera takes light frames (the shutter opens
+* **No autofocus** (dark frames cannot be focused: a log line says so). The real camera takes light frames (the shutter opens
   inside the closed enclosure); nothing measures their content (no FWHM, no
   plate solving). The frames, the frame index and the spectrum sidecars are
   written as usual, the headers with the real mount's pointing.
@@ -274,7 +287,8 @@ python -m robofast.testing.rehearsal --out /tmp/rehearsal \
   rendered by `robofast.testing.skysim.GuiderSky` through the guider
   service's `sim.sky` section) instead of one synthetic star: the real
   FAU's sensor (ZWO ASI174, 1936 x 1216), plate scale and fiber position
-  (`sites/minerva/guider_tN.example.json`), the target a few pixels off
+  (`sites/minerva/guider_tN.example.json`; for a telescope without one,
+  T3 or T4, `instruments.json` `telescopes.tN.fau`), the target a few pixels off
   the fiber (a pointing error), full-frame acquisition as on the real FAU.
   `--catalog-source` (`gaia`, the default; `ucac4` or `2mass`, from IRSA)
   and `--catalog-dir` (default `$ROBOFAST_CATALOG_DIR`, else

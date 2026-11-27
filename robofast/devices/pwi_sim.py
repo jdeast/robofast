@@ -179,6 +179,18 @@ class CDK700Model:
         #: The controller dropped (:meth:`drop_controller`): PWI cannot
         #: connect to it until :meth:`power_cycle`.
         self.controller_down = False
+        #: PWI2 answers with this status, frozen when its controller dropped
+        #: (:meth:`drop_controller` ``frozen``), until PWI is restarted.
+        self.frozen_status: str | None = None
+        #: A home reads not finding home during (start, length) s of it
+        #: (:attr:`homing`); None: never.
+        self.home_gap: tuple[float, float] | None = None
+        self._home_started = 0.0
+        #: PWI answers ``connect`` at once and reports the mount connected
+        #: only this long (s) after it (MINERVA T3/T4 2026-11-26: a mount
+        #: controller still booting after its panel power cycle).
+        self.connect_delay = 0.0
+        self._connect_at: float | None = None
         self.axes_homed = [homed, homed]
         self.report_homed = report_homed
         self.home_pos = (home_alt, home_az)
@@ -257,6 +269,9 @@ class CDK700Model:
         with self.lock:
             now = time.monotonic() if now is None else now
             dt, self._t = max(0.0, now - self._t), now
+            if self._connect_at is not None and now >= self._connect_at:
+                self._connect_at = None
+                self.connected = not self.controller_down
             if self._model_pending is not None and now >= self._model_pending[1]:
                 self.model_file, self._model_pending = self._model_pending[0], None
             if self.homing_until and now >= self.homing_until and not self.slewing:
@@ -321,6 +336,10 @@ class CDK700Model:
         if self.controller_down:
             self.ignored.append("connect")
             return
+        if self.connect_delay > 0:
+            if not self.connected and self._connect_at is None:
+                self._connect_at = time.monotonic() + self.connect_delay
+            return
         self.connected = True
 
     def enable(self, axis: int | None = None) -> None:
@@ -363,7 +382,8 @@ class CDK700Model:
                 self.mech_target = self.mech
                 self._searching = axes
             self.homing_axes = axes
-            self.homing_until = time.monotonic() + self.home_time
+            self._home_started = time.monotonic()
+            self.homing_until = self._home_started + self.home_time
             if self.altaz_tracks:
                 self.tracking = True  # PWI2 on MINERVA T1: a home leaves it tracking
 
@@ -407,19 +427,27 @@ class CDK700Model:
             if self.slewing and (self.altaz is None or self.altaz_tracks):
                 self.slewing = False
 
-    def drop_controller(self) -> None:
+    def drop_controller(self, frozen: bool = False) -> None:
         """The mount controller stops answering PWI (module doc): PWI reports
         it disconnected and cannot connect to it, nor home it, until the
-        controller is power-cycled."""
+        controller is power-cycled. ``frozen`` (PWI2): PWI2 instead goes on
+        answering with its last status, its clock and ``connected``
+        included, until it is restarted (MINERVA T4, 2026-11-26)."""
+        if frozen:
+            self.frozen_status = pwi2_status(self)
         self.stop()
+        self._connect_at = None
         self.controller_down = True
         self.connected = False
         self.enabled = [False, False]
         self.axes_homed = [False, False]
 
     def power_cycle(self) -> None:
-        """The mount controller loses power and comes back."""
+        """The mount controller loses power and comes back (clearing its
+        drive faults)."""
         self.stop()
+        self.motor_errors = {}
+        self._connect_at = None
         self.controller_down = False
         self.connected = False
         self.enabled = [False, False]
@@ -430,7 +458,9 @@ class CDK700Model:
         """PWI (the program) is restarted while the controller keeps power:
         not connected, motors disabled, not homed, and the default pointing
         model loaded (as PWI2 did on MINERVA T1, 2026-11-06)."""
+        self.frozen_status = None
         self.stop()
+        self._connect_at = None
         self.connected = False
         self.enabled = [False, False]
         self.axes_homed = [False, False]
@@ -454,7 +484,16 @@ class CDK700Model:
 
     @property
     def homing(self) -> bool:
-        return bool(self.homing_until)
+        """PWI2's ``is_finding_home``: false during ``home_gap`` (s from the
+        home's start, s long) although the home goes on (MINERVA T4,
+        2026-11-26: between the azimuth and altitude phases)."""
+        if not self.homing_until:
+            return False
+        if self.home_gap is not None:
+            t = time.monotonic() - self._home_started
+            if self.home_gap[0] <= t < self.home_gap[0] + self.home_gap[1]:
+                return False
+        return True
 
     def state(self) -> dict[str, Any]:
         with self.lock:
@@ -806,7 +845,7 @@ def pwi2_handle(m: CDK700Model, path: str, q: dict[str, list[str]]) -> str:
                 a.target = v % 360.0 if device.startswith("rotator") else v
         else:
             raise _HTTPError(400, f"unknown device/cmd {device!r}/{cmd!r}")
-        return pwi2_status(m)
+        return m.frozen_status or pwi2_status(m)
 
 
 # -- the server ---------------------------------------------------------------------------

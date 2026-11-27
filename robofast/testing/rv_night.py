@@ -12,9 +12,10 @@ Every piece is the real robofast code, against simulators on loopback
 * the **safety supervisor** (``python -m robofast.supervisor_service``)
   as a child process, with ``sites/minerva/aqawan1.json``'s safety settings
   (park before close, the dome's heartbeat), timings shortened;
-* **T1 and T2**: fake mounts served over Alpaca (the supervisor and the
-  sequencer both reach them over HTTP), and simulated star-field cameras on
-  simulated focusers (for autofocus and imaging);
+* **the telescopes** (:attr:`NightSettings.telescopes`; by default those
+  ``sites/minerva/aqawan1.json`` names): fake mounts served over Alpaca (the
+  supervisor and the sequencer both reach them over HTTP), and simulated
+  star-field cameras on simulated focusers (for autofocus and imaging);
 * a **guider service** per telescope (``python -m robofast.guider.service``,
   simulated FAU camera, tip/tilt and backlight), as child processes;
 * **KiwiSpec**: the spectrograph PC simulator and the KiwiSpec service
@@ -40,8 +41,9 @@ night, ``n20261109``, everywhere.
 
 A *director* plays the night's events: bad weather in the middle of a
 spectrum (and good weather again once the roof is shut), a target of
-opportunity dropped into the scheduler's drop box, and a mount fault on T2
-in the middle of a spectrum (cleared a few seconds later). :func:`check`
+opportunity dropped into the scheduler's drop box, and a mount fault on the
+night's last telescope in the middle of a spectrum (cleared a few seconds
+later; :func:`roles`). :func:`check`
 then verifies the timeline and the outputs (the e2e test,
 ``tests/e2e/test_rv_night.py``, and the demo, ``python -m
 robofast.testing.rv_night``, both use it).
@@ -97,16 +99,49 @@ MINERVA = sky.Site(31.680407, -110.878977, 2316.0)
 #: The night of 2026-11-09 (new Moon): the Sun is at -8 deg at 01:05 UTC,
 #: -12 deg at 01:25 UTC and again at 12:55 UTC.
 DEFAULT_START = datetime(2026, 11, 10, 1, 5, tzinfo=UTC)
-NAMES = ("t1", "t2")
+#: The enclosure config the simulated night runs on (its telescopes, safety
+#: settings and images; the simulators' addresses replace its devices').
+ENCLOSURE = SITES / "aqawan1.json"
 SEQUENCER = "aqawan1-sequencer"
 #: The simulated imagers (and their focus): 512x512, 1"/px, f/6.5.
 PIXEL_SCALE, PIXEL_SIZE, F_RATIO, OBSTRUCTION = 1.0, 13.5, 6.5, 0.47
 TRUE_FOCUS = 20000.0
 
 
+def site_telescopes(path: Path = ENCLOSURE) -> tuple[str, ...]:
+    """The telescopes an enclosure config names (its ``telescopes`` keys):
+    the simulated night's default (:attr:`NightSettings.telescopes`)."""
+    return tuple(json.loads(Path(path).read_text())["telescopes"])
+
+
+def spectrograph_name(name: str) -> str:
+    """KiwiSpec's name for a telescope (``t1`` -> ``T1``): its config's
+    ``telescopes``, the sequencer's ``spectrograph.telescopes`` map and the
+    guiders' flux reports (docs/kiwispec.md)."""
+    return name.upper()
+
+
+def roles(names: tuple[str, ...] | list[str]) -> tuple[str, str]:
+    """The director's two telescopes (module doc) among the night's
+    ``names``: the first takes the imaging field and finishes the spectrum the
+    other drops out of; the last is the one the mount fault, the console's
+    pause and its park hit. The fault needs a second telescope."""
+    if len(names) < 2:
+        raise ValueError(
+            f"the simulated night's director needs at least two telescopes, not {list(names)}"
+        )
+    return names[0], names[-1]
+
+
 @dataclass
 class NightSettings:
     """What the night is made of (all times real seconds unless said)."""
+
+    #: The night's telescopes (each a simulated mount, camera and guider;
+    #: the rehearsal sets its real ones). Default: those of the enclosure
+    #: config the night runs on (:data:`ENCLOSURE`), so that the names live
+    #: in the site config only.
+    telescopes: tuple[str, ...] = field(default_factory=site_telescopes)
 
     #: Simulated seconds per real second for the scheduler's clock. 200, not
     #: faster: exposures, slews and readouts take real seconds, and on a
@@ -126,7 +161,8 @@ class NightSettings:
     bad_weather: float = 2.0
     #: Bad weather arrives during this spectrum (counted from the night's start).
     weather_during_spectrum: int = 2
-    #: How long T2's mount stays unresponsive, and then paused by the console.
+    #: How long the faulted telescope's mount (:func:`roles`) stays
+    #: unresponsive, and then paused by the console.
     fault_duration: float = 3.0
     pause: float = 3.0
     #: The observer console (docs/console.md) on this loopback port during
@@ -138,6 +174,28 @@ class NightSettings:
     #: tile cache (offline: fields it lacks render empty) instead of a
     #: random star field.
     sky_catalog: str | None = None
+
+    def __post_init__(self) -> None:
+        self.telescopes = tuple(str(n) for n in self.telescopes)
+        if not self.telescopes:
+            raise ValueError("a night needs at least one telescope")
+        twice = sorted({n for n in self.telescopes if self.telescopes.count(n) > 1})
+        if twice:
+            raise ValueError(f"telescopes named twice: {twice}")
+
+
+def dispatch_telescopes(entry: dict[str, Any], names: list[str]) -> dict[str, Any]:
+    """A dispatch plan entry's ``telescopes`` for exactly the night's
+    ``names`` (``dispatch_from_config`` wants one entry per telescope, no
+    more): the entry's own for a name it lists; for one it does not (e.g.
+    MINERVA's T3 and T4: ``sites/minerva/dispatch.example.json`` is Aqawan
+    1's plan), a copy of its first telescope's (instruments and limits)
+    without ``filters`` (they name that telescope's wheel)."""
+    own = entry.get("telescopes") or {}
+    if not own:
+        raise ValueError("the dispatch plan entry lists no telescope")
+    first = {k: v for k, v in next(iter(own.values())).items() if k != "filters"}
+    return {n: json.loads(json.dumps(own.get(n) or first)) for n in names}
 
 
 def _recording_telescope(name: str, events: list[tuple[float, str, str]]) -> Any:
@@ -401,7 +459,7 @@ class SimulatedNight:
 
     def _start_telescopes(self) -> None:
         devices: dict[str, Any] = {}
-        for i, name in enumerate(NAMES):
+        for i, name in enumerate(self.s.telescopes):
             mount = _recording_telescope(name, self.outcome.mount_events)
             foc = SimFocuser(position=round(TRUE_FOCUS + 250 * (1 if i == 0 else -1)))
             scene = _scene(31 + i) if self.s.sky_catalog is None else self._sky_scene(mount, i)
@@ -471,7 +529,7 @@ class SimulatedNight:
                 "connect_timeout": 1.0,
                 "command_timeout": 2.0,
             },
-            telescopes=["T1", "T2"],
+            telescopes=self._spectrograph_telescopes(),
             stage_poll=0.05,
             stage_timeout=3.0,
             heater_wait=0.5,
@@ -499,6 +557,11 @@ class SimulatedNight:
         )
         self.services.append(self.kiwispec)
 
+    def _spectrograph_telescopes(self) -> list[str]:
+        """The KiwiSpec service's ``telescopes``: the night's, by KiwiSpec's
+        names (the example config lists MINERVA's four)."""
+        return [spectrograph_name(n) for n in self.s.telescopes]
+
     def _start_guiders(self) -> None:
         # Each guider reports its fiber flux to the KiwiSpec service: the
         # spectra's flux record (docs/kiwispec.md, "Flux from the FAU guide frames").
@@ -515,7 +578,7 @@ class SimulatedNight:
                 "backlight": {"sim": True},
                 "flux_report": {
                     "url": self.kiwispec_url,
-                    "telescope": name.upper(),
+                    "telescope": spectrograph_name(name),
                     "interval": 0.25,
                 },
                 "guide": {
@@ -560,7 +623,7 @@ class SimulatedNight:
     def _enclosure(self) -> dict[str, Any]:
         """``sites/minerva/aqawan1.json`` with simulator addresses and
         shortened timings."""
-        cfg = json.loads((SITES / "aqawan1.json").read_text())
+        cfg = json.loads(ENCLOSURE.read_text())
         cfg.pop("_note", None)
         a = self.alpaca.address
         cfg["devices"] = {
@@ -569,7 +632,8 @@ class SimulatedNight:
             "observingconditions": self.bridge_address,
         }
         cfg["telescopes"] = {
-            name: {"telescope": f"{a}/{i}", "camera": f"{a}/{i}"} for i, name in enumerate(NAMES)
+            name: {"telescope": f"{a}/{i}", "camera": f"{a}/{i}"}
+            for i, name in enumerate(self.s.telescopes)
         }
         cfg["safety"].update(
             poll_interval=0.2,
@@ -651,7 +715,7 @@ class SimulatedNight:
         cfg["spectrograph"] = {
             "type": "kiwispec",
             "url": self.kiwispec_url,
-            "telescopes": {name: name.upper() for name in self.telescopes},
+            "telescopes": {name: spectrograph_name(name) for name in self.telescopes},
             "instrument": "kiwispec",
             "timeout": 5.0,
             "abort_timeout": 8.0,
@@ -748,11 +812,11 @@ class SimulatedNight:
         return entry
 
     def _requests(self) -> list[dict[str, Any]]:
-        """Six spectra (SPECTRUM, both telescopes) -- a B star through
+        """Six spectra (SPECTRUM, every telescope) -- a B star through
         iodine (the iodine calibration), four RV standards (iodine in) and a
-        template (iodine out) -- and one imaging field for T1 in a window in
-        the middle of the night. KiwiSpec is iodine only (docs/kiwispec.md,
-        section 4)."""
+        template (iodine out) -- and one imaging field for the first
+        telescope (:func:`roles`) in a window in the middle of the night.
+        KiwiSpec is iodine only (docs/kiwispec.md, section 4)."""
         start = self.s.start
         lst0 = sky.sky_now(MINERVA, start).lst_hours
         groups = []
@@ -779,7 +843,7 @@ class SimulatedNight:
                         {
                             "id": f"{gid}-r",
                             # Fiber feeds: every telescope may take part.
-                            "extra_params": {"telescopes": list(NAMES)},
+                            "extra_params": {"telescopes": list(self.s.telescopes)},
                             "configurations": [
                                 {
                                     "id": f"{gid}-spec",
@@ -811,7 +875,7 @@ class SimulatedNight:
                 "requests": [
                     {
                         "id": "FIELD-r",
-                        "location": {"telescope": "t1"},
+                        "location": {"telescope": roles(self.s.telescopes)[0]},
                         "windows": [
                             {"start": w0.isoformat(), "end": (w0 + timedelta(hours=2)).isoformat()}
                         ],
@@ -856,7 +920,7 @@ class SimulatedNight:
             "requests": [
                 {
                     "id": "TOO1-r",
-                    "extra_params": {"telescopes": list(NAMES)},
+                    "extra_params": {"telescopes": list(self.s.telescopes)},
                     "configurations": [
                         {
                             "id": "TOO1-spec",
@@ -889,6 +953,7 @@ class SimulatedNight:
             too_poll=0.3,
             reserve_timeout=5.0,
         )
+        entry["telescopes"] = dispatch_telescopes(entry, list(self.s.telescopes))
         for lim in entry["telescopes"].values():
             lim.pop("filters", None)  # the simulated imagers have no filter wheel
         return entry
@@ -896,6 +961,7 @@ class SimulatedNight:
     async def run(self) -> Outcome:
         """Evening calibrations, the night, morning calibrations."""
         s = self.s
+        roles(s.telescopes)  # the director's fault needs two telescopes
         # 1. Evening calibrations, the roof closed (no lease).
         self._note("evening calibrations")
         cal = self._build("evening", self._calibration_plan())
@@ -906,14 +972,14 @@ class SimulatedNight:
         self.set_clock(s.start, s.scale)
         dispatch = dispatch_from_config(
             {k: v for k, v in entry.items() if k != "type"},
-            list(NAMES),
+            list(s.telescopes),
             base=self.out,
             clock=self.clock,
         )
         plan = AutofocusTriggers(
             dispatch,
             TriggerConfig(start_of_night=True, temperature_change=None, fwhm_degradation=None),
-            telescopes=list(NAMES),
+            telescopes=list(s.telescopes),
         )
         seq = self._build("night", entry, plan=plan)
         plan.bind(seq.registry)
@@ -1009,7 +1075,8 @@ class SimulatedNight:
             r = await http.get("/console/api/log?after=0", headers=auth)
             entries = r.json().get("entries", []) if r.status_code == 200 else []
             c["log"] = {"code": r.status_code, "sources": sorted({e["source"] for e in entries})}
-            r = await http.get("/console/api/image/aqawan1/guider-t1?max=128", headers=auth)
+            first = self.s.telescopes[0]
+            r = await http.get(f"/console/api/image/aqawan1/guider-{first}?max=128", headers=auth)
             c["guider_image"] = {"code": r.status_code, "bytes": len(r.content)}
 
     # -- the director ---------------------------------------------------------------
@@ -1031,6 +1098,7 @@ class SimulatedNight:
         """Play the night's events (module doc)."""
         s = self.s
         tl = seq.timeline
+        _, faulted = roles(s.telescopes)
         try:
             # Bad weather during a spectrum.
             await self._until(
@@ -1063,51 +1131,54 @@ class SimulatedNight:
             os.replace(tmp, dropbox / "TOO1.json")
             await ring(dropbox)
             self._note("ToO dropped into the drop box")
-            # T2's mount fails in the middle of a spectrum both feed.
-            n_both = len(self._both(tl))
-            await self._until(lambda: len(self._both(tl)) > n_both, 120, "a two-telescope spectrum")
+            # One telescope's mount fails in the middle of a spectrum they all feed.
+            n_all = len(self._all(tl))
+            await self._until(lambda: len(self._all(tl)) > n_all, 120, "a spectrum fed by all")
             await asyncio.sleep(0.4)
-            self._note("T2 mount fault")
-            self.telescopes["t2"].mount.fail("mount controller not answering")
+            self._note(f"{faulted} mount fault")
+            self.telescopes[faulted].mount.fail("mount controller not answering")
             await self._until(
-                lambda: any(e.detail["telescope"] == "t2" for e in tl.events("spectrum_dropped")),
+                lambda: any(
+                    e.detail["telescope"] == faulted for e in tl.events("spectrum_dropped")
+                ),
                 30,
-                "t2 dropped",
+                f"{faulted} dropped",
             )
             await asyncio.sleep(s.fault_duration)
-            self.telescopes["t2"].mount.unfail()
-            self._note("T2 mount fault cleared")
-            # The observer console pauses T2 for a while, then resumes it.
+            self.telescopes[faulted].mount.unfail()
+            self._note(f"{faulted} mount fault cleared")
+            # The observer console pauses it for a while, then resumes it.
             await asyncio.sleep(1.0)
             control = self.out / "aqawan1-control"
-            send_command(control, "pause", ["t2"], operator="demo", reason="check the FAU")
-            self._note("console: pause t2")
-            await self._until(lambda: "t2" in _holds(control), 30, "t2 held")
+            send_command(control, "pause", [faulted], operator="demo", reason="check the FAU")
+            self._note(f"console: pause {faulted}")
+            await self._until(lambda: faulted in _holds(control), 30, f"{faulted} held")
             await asyncio.sleep(s.pause)
-            send_command(control, "resume", ["t2"], operator="demo", reason="FAU fine")
-            self._note("console: resume t2")
-            await self._until(lambda: "t2" not in _holds(control), 30, "t2 resumed")
-            # Then parks T2 alone at once, and resumes it again.
+            send_command(control, "resume", [faulted], operator="demo", reason="FAU fine")
+            self._note(f"console: resume {faulted}")
+            await self._until(lambda: faulted not in _holds(control), 30, f"{faulted} resumed")
+            # Then parks it alone at once, and resumes it again.
             await asyncio.sleep(1.0)
-            send_command(control, "park", ["t2"], operator="demo", reason="check the mount")
-            self._note("console: park t2")
-            await self._until(lambda: tl.events("operator_parked"), 30, "t2 parked")
-            self._note("t2 parked by the console")
+            send_command(control, "park", [faulted], operator="demo", reason="check the mount")
+            self._note(f"console: park {faulted}")
+            await self._until(lambda: tl.events("operator_parked"), 30, f"{faulted} parked")
+            self._note(f"{faulted} parked by the console")
             await asyncio.sleep(0.5)
-            send_command(control, "resume", ["t2"], operator="demo", reason="mount fine")
-            self._note("console: resume t2 after the park")
-            await self._until(lambda: "t2" not in _holds(control), 30, "t2 resumed")
+            send_command(control, "resume", [faulted], operator="demo", reason="mount fine")
+            self._note(f"console: resume {faulted} after the park")
+            await self._until(lambda: faulted not in _holds(control), 30, f"{faulted} resumed")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self.outcome.errors.append(f"director: {exc}")
             log.exception("director")
-            self.telescopes["t2"].mount.unfail()
+            self.telescopes[faulted].mount.unfail()
             self.set_weather(True)
 
-    @staticmethod
-    def _both(tl: Timeline) -> list[Any]:
-        return [e for e in tl.events("spectrum_started") if len(e.detail["telescopes"]) == 2]
+    def _all(self, tl: Timeline) -> list[Any]:
+        """The spectra started with every telescope feeding."""
+        n = len(self.s.telescopes)
+        return [e for e in tl.events("spectrum_started") if len(e.detail["telescopes"]) == n]
 
 
 def _dump_tasks(why: str) -> None:
@@ -1180,17 +1251,19 @@ def check(o: Outcome) -> list[str]:
             if any(t0 <= t <= t1 for t in opens):
                 bad.append(f"the roof opened during the {tag} calibrations")
 
-    # The night: autofocus first, spectra with both telescopes, imaging.
+    # The night: autofocus first, spectra with every telescope, imaging.
+    names = list(o.settings.telescopes)
+    first, faulted = roles(names)
     af = ev(night, "autofocus_done")
-    if {e.detail.get("telescope") for e in af} != set(NAMES):
+    if {e.detail.get("telescope") for e in af} != set(names):
         bad.append(f"autofocus on {sorted({e.detail.get('telescope') for e in af})}")
     started = ev(night, "spectrum_started")
     done = ev(night, "spectrum_done")
-    both = [e for e in done if sorted(e.detail["telescopes"]) == list(NAMES)]
-    if len(both) < 3:
-        bad.append(f"only {len(both)} spectra fed by both telescopes")
+    fed_by_all = [e for e in done if sorted(e.detail["telescopes"]) == sorted(names)]
+    if len(fed_by_all) < 3:
+        bad.append(f"only {len(fed_by_all)} spectra fed by every telescope ({', '.join(names)})")
     first_spec = {
-        n: min((e.t for e in started if n in e.detail["telescopes"]), default=None) for n in NAMES
+        n: min((e.t for e in started if n in e.detail["telescopes"]), default=None) for n in names
     }
     for e in af:
         t = first_spec.get(e.detail.get("telescope"))
@@ -1201,9 +1274,9 @@ def check(o: Outcome) -> list[str]:
             bad.append(f"{cid} {st} at dawn")
     if "TOO1-spec" not in o.statuses:
         bad.append("the ToO never arrived")
-    fits = list((o.out / "data").glob("minerva/t1/n*/*.FIELD.*.fits*"))
+    fits = list((o.out / "data").glob(f"minerva/{first}/n*/*.FIELD.*.fits*"))
     if len(fits) != 2:
-        bad.append(f"{len(fits)} FIELD frames on disk")
+        bad.append(f"{len(fits)} FIELD frames on disk ({first})")
 
     # The weather interruption: a spectrum aborted, then re-observed.
     aborts = ev(night, "spectrograph_aborted")
@@ -1220,24 +1293,28 @@ def check(o: Outcome) -> list[str]:
         if not any(x["config"] == e["config"] and x["outcome"] == "complete" for x in outcomes):
             bad.append(f"{e['config']} interrupted and never re-observed")
 
-    # T2's fault: dropped from a spectrum that T1 finished.
+    # The faulted telescope (roles): dropped from a spectrum the others finished.
     # (A drop because the lease was revoked -- the bad weather, when it
-    # falls in a spectrum t2 fed -- is not the mount fault.)
-    t2_drops = [
+    # falls in a spectrum it fed -- is not the mount fault.)
+    drops = [
         e
         for e in ev(night, "spectrum_dropped")
-        if e.detail["telescope"] == "t2" and "GrantRevoked" not in str(e.detail.get("error"))
+        if e.detail["telescope"] == faulted and "GrantRevoked" not in str(e.detail.get("error"))
     ]
-    if not t2_drops:
-        bad.append("t2 never dropped out")
+    others = sorted(n for n in names if n != faulted)
+    if not drops:
+        bad.append(f"{faulted} never dropped out")
     else:
-        sid = t2_drops[0].detail["spectrum"]
+        sid = drops[0].detail["spectrum"]
         fin = [e for e in done if e.detail["spectrum"] == sid]
-        if not fin or fin[0].detail["telescopes_end"] != ["t1"]:
-            bad.append(f"the spectrum t2 dropped out of did not finish with t1: {fin}")
+        if not fin or sorted(fin[0].detail["telescopes_end"]) != others:
+            bad.append(
+                f"the spectrum {faulted} dropped out of did not finish with"
+                f" {', '.join(others)}: {fin}"
+            )
     con = o.console
     if con:
-        if con.get("status", {}).get("code") != 200 or con["status"]["telescopes"] != ["t1", "t2"]:
+        if con.get("status", {}).get("code") != 200 or con["status"]["telescopes"] != sorted(names):
             bad.append(f"the console's status: {con.get('status')}")
         if not con.get("sky", {}).get("targets"):
             bad.append(f"the console's sky has no targets: {con.get('sky')}")
@@ -1245,8 +1322,8 @@ def check(o: Outcome) -> list[str]:
             bad.append(f"the console's log: {con.get('log')}")
         if con.get("guider_image", {}).get("code") != 200:
             bad.append(f"the console's guider image: {con.get('guider_image')}")
-    if not any(c == "console: resume t2" for _, c in o.script):
-        bad.append("the console never paused and resumed t2")
+    if not any(c == f"console: resume {faulted}" for _, c in o.script):
+        bad.append(f"the console never paused and resumed {faulted}")
     bad += console_park_problems(o)
     if any(u.gave_up for u in o.runs["night"].units.values()):
         bad.append("a telescope gave up for the night")
@@ -1328,7 +1405,7 @@ def safety_violations(o: Outcome) -> list[str]:
         if c.startswith("OPEN"):
             opened = True
         if c.startswith("CLOSE") and opened:
-            for name in NAMES:
+            for name in o.settings.telescopes:
                 last = [
                     e
                     for e in o.mount_events
@@ -1342,42 +1419,49 @@ def safety_violations(o: Outcome) -> list[str]:
 
 
 def console_park_problems(o: Outcome) -> list[str]:
-    """The console parked T2 alone: T2 parked, T1 not, the roof untouched."""
+    """The console parked the faulted telescope (:func:`roles`) alone: it
+    parked, no other did, the roof untouched."""
     bad = []
     tl = o.timelines["night"]
-    req = [e for e in tl.events("park_requested", SEQUENCER) if e.detail["telescope"] == "t2"]
+    _, tel = roles(o.settings.telescopes)
+    req = [e for e in tl.events("park_requested", SEQUENCER) if e.detail["telescope"] == tel]
     parked = tl.events("operator_parked", SEQUENCER)
     if not req or not parked:
-        return ["the console's park of t2 never happened"]
+        return [f"the console's park of {tel} never happened"]
     p = parked[0]
-    if p.detail["telescope"] != "t2" or not p.detail["parked"]:
+    if p.detail["telescope"] != tel or not p.detail["parked"]:
         bad.append(f"console park: {p.detail}")
     t0, t1 = req[0].t, p.t
     for t, c in o.dome_log:
         if t0 <= t <= t1 + 1.0 and c.startswith(("OPEN", "CLOSE")):
-            bad.append(f"the roof moved ({c}) while the console parked t2")
+            bad.append(f"the roof moved ({c}) while the console parked {tel}")
     # (Unless the generation ended meanwhile -- every telescope idle, or a
-    # revocation: then its cleanup parks t1 too, as it should.)
+    # revocation: then its cleanup parks the others too, as it should.)
     ended = [
         e
         for what in ("idle_release", "cancel_requested")
         for e in tl.events(what, SEQUENCER)
         if t0 <= e.t <= t1 + 1.0
     ]
-    if not ended and any(
-        e[1] == "t1" and e[2] == "park" and t0 <= e[0] <= t1 + 1.0 for e in o.mount_events
-    ):
-        bad.append("t1 parked when the console parked t2")
-    t2 = [e for e in o.mount_events if e[1] == "t2" and e[2] in ("park", "unpark", "slew")]
-    parked_now = any(e[2] == "park" and t0 <= e[0] <= t1 + 0.5 for e in t2)
+    if not ended:
+        for other in sorted(
+            {
+                e[1]
+                for e in o.mount_events
+                if e[1] != tel and e[2] == "park" and t0 <= e[0] <= t1 + 1.0
+            }
+        ):
+            bad.append(f"{other} parked when the console parked {tel}")
+    moves = [e for e in o.mount_events if e[1] == tel and e[2] in ("park", "unpark", "slew")]
+    parked_now = any(e[2] == "park" and t0 <= e[0] <= t1 + 0.5 for e in moves)
     # Already parked when the console asked (its error path parked it and it
     # was idle, unmoved, since: the sequencer then sends no Park), and not
     # moved in the meantime: parked all along.
-    before = [e for e in t2 if e[0] < t0]
-    moved = any(e[2] != "park" and t0 <= e[0] <= t1 + 0.5 for e in t2)
+    before = [e for e in moves if e[0] < t0]
+    moved = any(e[2] != "park" and t0 <= e[0] <= t1 + 0.5 for e in moves)
     parked_all_along = bool(before) and before[-1][2] == "park" and not moved
     if not (parked_now or parked_all_along):
-        bad.append("t2's mount never parked for the console")
+        bad.append(f"{tel}'s mount never parked for the console")
     return bad
 
 

@@ -8,8 +8,10 @@ exactly as in the simulated night: the weather (forced safe), the Aqawan
 (the PAC simulator and the real Aqawan Dome server: the *simulated* roof
 opens; the real enclosure is never contacted), the supervisor, the guiders
 (simulated FAU cameras: they acquire and guide on synthetic star fields
-wherever the real mount points), KiwiSpec (simulator and service). A
-telescope not named on the command line stays simulated. Opt-in:
+wherever the real mount points), KiwiSpec (simulator and service). The
+night's telescopes are exactly the real ones given with ``--telescope``
+(any names, e.g. ``t1``, ``t2`` and ``t4``): no simulated telescope is added
+for a name that is not given. Opt-in:
 ``--kiwispec URL`` uses an already-running (real) KiwiSpec service instead
 of the simulated one (only ``GET /status`` is checked first, and it must
 report ``test_frames``: the service started with ``--test-frames``; never
@@ -22,15 +24,14 @@ at the real FAU's geometry (docs/demo.md).
 * **Real time.** The clock runs at real speed from now, so the real mounts
   point by the real sidereal time. The plan is made now: ``SPECTRUM``
   requests (a B star through iodine, RV standards with iodine, a template
-  without) and a few short imaging requests per telescope, on stars from
+  without; every telescope of the night may feed them) and a few short
+  imaging requests per telescope, on stars from
   ``sites/minerva/requests.example.json`` (and the bright stars below, so
   that something is up at any sidereal time) that are within the
   telescopes' altitude limits (21..83 deg) during the rehearsal. It ends
   after ``--duration`` or at morning twilight, whichever is first, or when
   every request is done.
-* **No autofocus** on a real telescope: dark frames cannot be focused (a
-  log line says so). A simulated telescope still focuses its simulated
-  imager.
+* **No autofocus**: dark frames cannot be focused (a log line says so).
 * **Real exposures are dark** (the enclosure is closed). Nothing looks at
   their content (no FWHM, no plate solving); the frames and sidecars are
   written as usual, with the real mount's pointing in the headers.
@@ -109,8 +110,6 @@ import httpx
 import numpy as np
 
 from robofast import hwgate, sky
-from robofast.autofocus import AutofocusSetup, FocusModel, FocusStore
-from robofast.autofocus_plan import AutofocusTriggers, TriggerConfig
 from robofast.config import camera_entry
 from robofast.cooling import CoolingConfig
 from robofast.dispatch import dispatch_from_config
@@ -120,8 +119,6 @@ from robofast.plan_record import read_record
 from robofast.recovery import MountAccess, RecoveryLadder
 from robofast.request_model import Status
 from robofast.sequencer import Sequencer
-from robofast.testing.alpaca_server import FakeAlpacaServer
-from robofast.testing.focus_sim import SimFocuser, StarfieldCamera
 from robofast.testing.mount_guard import (
     Endpoint,
     MountGuard,
@@ -130,18 +127,14 @@ from robofast.testing.mount_guard import (
     separation,
 )
 from robofast.testing.rv_night import (
-    AUTOFOCUS,
     MINERVA,
-    NAMES,
     SEQUENCER,
     SITES,
-    TRUE_FOCUS,
     NightSettings,
     Outcome,
     SimulatedNight,
     Telescope,
-    _recording_telescope,
-    _scene,
+    dispatch_telescopes,
     night_names,
     safety_violations,
 )
@@ -295,9 +288,7 @@ class RehearsalSettings:
     dropped: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        unknown = set(self.real) - set(NAMES)
-        if unknown:
-            raise ValueError(f"unknown telescopes {sorted(unknown)} (MINERVA's are {NAMES})")
+        # Any names: the night is the real telescopes given (module doc).
         if not self.real:
             raise ValueError("no real telescope: use robofast.testing.rv_night instead")
         for name, policy in self.recovery.items():
@@ -318,6 +309,9 @@ class RehearsalSettings:
                         f"--recovery {name}: {kind} has an escalate.agent; the rehearsal never"
                         " runs an agent hook (it would act outside the rehearsal's guards)"
                     )
+        if self.catalog_guide is not None:
+            for name in self.real:
+                fau_example(name)  # refuses now, not when its guider starts
         self._warn_unknown_keys()
         for name, entry in self.cooling.items():
             try:
@@ -337,13 +331,21 @@ class RehearsalSettings:
     def _warn_unknown_keys(self) -> None:
         """Warn about keys of the real telescopes' site entries that the
         sequencer cannot interpret (the rehearsal builds its own telescope
-        entries, so production's loader never sees these)."""
+        entries, so production's loader never sees these), and about a real
+        telescope the site config does not name (its camera's cooler is then
+        left alone)."""
         from robofast.sequencer_service import TELESCOPE_KEYS
 
         tels = self.site()["telescopes"]
         for name in self.real:
             entry = tels.get(name)
             if not isinstance(entry, dict):
+                log.warning(
+                    "%s: no telescopes.%s: %s's camera cooling is left alone",
+                    self.site_path,
+                    name,
+                    name,
+                )
                 continue
             unknown = {k for k in entry if not str(k).startswith("_")} - TELESCOPE_KEYS
             if unknown:
@@ -385,8 +387,9 @@ class RehearsalSettings:
 
     @property
     def active(self) -> list[str]:
-        """The telescopes of the night: MINERVA's, less those dropped."""
-        return [n for n in NAMES if n not in self.dropped]
+        """The telescopes of the night: the real ones given (``--telescope``,
+        in that order), less those the preflight dropped."""
+        return [n for n in self.real if n not in self.dropped]
 
 
 class RehearsalRefused(Exception):
@@ -395,7 +398,7 @@ class RehearsalRefused(Exception):
 
 #: The MINERVA FAU guide camera (ZWO ASI174; sites/minerva/README.md):
 #: sensor (nx, ny) pixels. Its plate scale and fiber position come from
-#: sites/minerva/guider_tN.example.json.
+#: sites/minerva/guider_tN.example.json (:func:`fau_example`).
 FAU_SENSOR = (1936, 1216)
 #: ``--catalog-guide``: the simulated pointing error (pixels from the
 #: fiber), so the acquisition has to move the target onto the fiber.
@@ -428,10 +431,24 @@ def check_kiwispec(url: str, timeout: float = 10.0) -> dict[str, Any]:
 
 def fau_example(name: str) -> dict[str, Any]:
     """The FAU's fiber position and plate scale from
-    ``sites/minerva/guider_<name>.example.json``."""
-    cfg = json.loads((SITES / f"guider_{name}.example.json").read_text())
-    g = cfg["guide"]
-    return {"fiber": [float(v) for v in g["target"]], "plate_scale": float(g["plate_scale"])}
+    ``sites/minerva/guider_<name>.example.json``; for a telescope without one
+    (T3, T4), from the reference catalog, ``sites/minerva/instruments.json``
+    ``telescopes.<name>.fau`` (legacy ``fau_tN.ini``). A ``ValueError`` if
+    neither has it."""
+    path = SITES / f"guider_{name}.example.json"
+    if path.exists():
+        g = json.loads(path.read_text())["guide"]
+        fiber, scale = g["target"], g["plate_scale"]
+    else:
+        tels = json.loads((SITES / "instruments.json").read_text())["telescopes"]
+        fau = (tels.get(name) or {}).get("fau") or {}
+        if fau.get("fiber") is None or fau.get("plate_scale") is None:
+            raise ValueError(
+                f"--catalog-guide: {name}: no FAU geometry ({path.name} or"
+                f" instruments.json telescopes.{name}.fau)"
+            )
+        fiber, scale = fau["fiber"], fau["plate_scale"]
+    return {"fiber": [float(v) for v in fiber], "plate_scale": float(scale)}
 
 
 def warm_catalog(cfg: dict[str, Any], targets: list[dict[str, Any]], note: Any = print) -> int:
@@ -1027,6 +1044,7 @@ class Rehearsal(SimulatedNight):
         self.r = settings
         start = settings.start or datetime.now(UTC)
         base = NightSettings(
+            telescopes=tuple(settings.active),
             scale=settings.scale,
             start=start,
             rv_exptime=settings.exptime,
@@ -1039,10 +1057,6 @@ class Rehearsal(SimulatedNight):
         self.set_clock(start, settings.scale)
         self.guard: MountGuard | None = None
         self._ended = False
-
-    @property
-    def sim_names(self) -> list[str]:
-        return [n for n in self.r.active if n not in self.r.real]
 
     # -- the services ----------------------------------------------------------------
 
@@ -1105,6 +1119,7 @@ class Rehearsal(SimulatedNight):
             r.dropped[name] = why
             del r.real[name]
             r.az_windows.pop(name, None)
+            self.s.telescopes = tuple(r.active)
             seen[name]["dropped"] = why
             log.warning("%s DROPPED from the rehearsal: %s", name, why)
             self._note(
@@ -1271,20 +1286,7 @@ class Rehearsal(SimulatedNight):
         return cfg
 
     def _start_telescopes(self) -> None:
-        devices: dict[str, Any] = {}
-        for i, name in enumerate(NAMES):
-            if name in self.r.real or name in self.r.dropped:
-                continue
-            mount = _recording_telescope(name, self.outcome.mount_events)
-            foc = SimFocuser(position=round(TRUE_FOCUS + 250 * (1 if i == 0 else -1)))
-            cam = StarfieldCamera(foc, _scene(31 + i))
-            cam.clock = self.clock
-            self.telescopes[name] = Telescope(name, mount, cam, foc)
-            devices[f"telescope/{i}"] = mount
-            devices[f"camera/{i}"] = cam
-        if devices:
-            self.alpaca = FakeAlpacaServer(devices, hang_limit=10).start()
-            self._stack.callback(self.alpaca.stop)
+        # Only the real telescopes: no simulated stand-in (module doc).
         self.guard = MountGuard(
             {
                 name: {"telescope": r.telescope, "focuser": r.focuser, "rotator": r.rotator}
@@ -1314,26 +1316,20 @@ class Rehearsal(SimulatedNight):
         }
         limits = {"min_alt": MIN_ALT, "max_alt": MAX_ALT}
         tels: dict[str, Any] = {}
-        for i, name in enumerate(NAMES):
-            if name in self.r.dropped:
-                continue
-            if name in self.r.real:
-                r = self.r.real[name]
-                g = self.guard.spec(name)
-                tels[name] = {
-                    "telescope": g,
-                    "camera": {"address": str(r.camera)},
-                    "focuser": g,
-                    "limits": limits,
-                }
-                if r.rotator is not None:
-                    tels[name]["rotator"] = g
-                if name in cooling:
-                    # The site config's own entry, as production (docs/cooling.md).
-                    tels[name]["camera"]["cooling"] = cooling[name]
-            else:
-                a = self.alpaca.address
-                tels[name] = {"telescope": f"{a}/{i}", "camera": f"{a}/{i}", "limits": limits}
+        for name in self.r.active:
+            r = self.r.real[name]
+            g = self.guard.spec(name)
+            tels[name] = {
+                "telescope": g,
+                "camera": {"address": str(r.camera)},
+                "focuser": g,
+                "limits": limits,
+            }
+            if r.rotator is not None:
+                tels[name]["rotator"] = g
+            if name in cooling:
+                # The site config's own entry, as production (docs/cooling.md).
+                tels[name]["camera"]["cooling"] = cooling[name]
         cfg["telescopes"] = tels
         cfg["safety"].update(
             poll_interval=0.2,
@@ -1404,15 +1400,7 @@ class Rehearsal(SimulatedNight):
         tl = Timeline(maxlen=200000)
         seq, remote = build(cfg, tl, plan=plan, base=self.out)
         seq._remote = remote  # type: ignore[attr-defined]
-        for name, unit in seq.units.items():
-            if name in self.r.real:
-                continue  # its real camera, from the config; no autofocus
-            t = self.telescopes[name]
-            unit.camera = DeviceOwner(f"{name}.camera", lambda c=t.camera: c, tl, default_timeout=5)
-            unit.focuser = DeviceOwner(
-                f"{name}.focuser", lambda f=t.focuser: f, tl, default_timeout=3
-            )
-            unit.autofocus = AutofocusSetup(dict(AUTOFOCUS), store=FocusStore(), model=FocusModel())
+        # Every unit is real: its camera from the config, no autofocus.
         self.outcome.runs[tag] = seq
         self.outcome.timelines[tag] = tl
         return seq
@@ -1451,8 +1439,8 @@ class Rehearsal(SimulatedNight):
         )
         if r.ignore_twilight:
             entry["max_sun_alt"] = 90.0
-        for name in self.r.dropped:
-            entry["telescopes"].pop(name, None)
+        # Exactly the night's telescopes (the example lists Aqawan 1's).
+        entry["telescopes"] = dispatch_telescopes(entry, r.active)
         for lim in entry["telescopes"].values():
             lim.pop("filters", None)  # no filter wheel in the rehearsal
             lim.update(min_alt=MIN_ALT + ALT_MARGIN / 2, max_alt=MAX_ALT - ALT_MARGIN / 2)
@@ -1480,17 +1468,8 @@ class Rehearsal(SimulatedNight):
             base=self.out,
             clock=self.clock,
         )
-        plan: Any = dispatch
-        if self.sim_names:
-            plan = AutofocusTriggers(
-                plan,
-                TriggerConfig(start_of_night=True, temperature_change=None, fwhm_degradation=None),
-                telescopes=self.sim_names,
-            )
-        plan = ender = RehearsalEnd(plan, dispatch, end, self.clock)
+        plan = ender = RehearsalEnd(dispatch, dispatch, end, self.clock)
         seq = self._build("night", entry, plan=plan)
-        if isinstance(plan.inner, AutofocusTriggers):
-            plan.inner.bind(seq.registry)
         if self.s.console_port is not None:
             await self._start_console()
         self.dispatch = dispatch
@@ -2041,7 +2020,8 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         metavar="NAME=HOST:PORT/N",
         help="a real mount's Alpaca Telescope (its Focuser and Rotator: the same server and N"
-        " unless --focuser/--rotator say otherwise); e.g. t1=127.0.0.1:11121/0",
+        " unless --focuser/--rotator say otherwise); e.g. t1=127.0.0.1:11121/0. The night is"
+        " exactly the telescopes given (any names; none is simulated)",
     )
     ap.add_argument(
         "--camera", action="append", metavar="NAME=HOST:PORT/N", help="its science camera"

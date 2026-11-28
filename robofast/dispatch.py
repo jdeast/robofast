@@ -1064,7 +1064,11 @@ class DispatchScheduler:
         except Exception:
             log.exception("preempt(%s, %s)", telescope, policy)
             accepted = False
-        log.warning("%s: preempt (%s) for %s: %s", telescope, policy, reason, accepted)
+        # Routine (two-telescope spectra preempt for their feed): INFO, and a
+        # refusal WARNING (night1124 logged ~330 a night at WARNING).
+        (log.info if accepted else log.warning)(
+            "%s: preempt (%s) for %s: %s", telescope, policy, reason, accepted
+        )
         self._record(
             self.clock(),
             "preempt",

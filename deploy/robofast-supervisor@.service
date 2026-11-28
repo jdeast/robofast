@@ -18,6 +18,8 @@ Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
+# Headroom over the 1024 default: night1124 (2026-11-25) died of EMFILE.
+LimitNOFILE=16384
 Type=simple
 User=robofast-supervisor
 WorkingDirectory=/opt/robofast/current

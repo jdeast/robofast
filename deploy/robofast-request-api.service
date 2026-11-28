@@ -21,6 +21,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# Headroom over the 1024 default: night1124 (2026-11-25) died of EMFILE.
+LimitNOFILE=16384
 Type=simple
 User=robofast-api
 WorkingDirectory=/opt/robofast/current

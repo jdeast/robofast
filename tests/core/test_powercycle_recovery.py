@@ -23,7 +23,7 @@ import pytest
 from robofast.devices.apc_pdu import REBOOT, APCPDUSim, Credentials
 from robofast.devices.pdu_server import PDUConfig, PDUServer
 from robofast.devices.pwi_server import PWIServer
-from robofast.devices.pwi_sim import PWISim
+from robofast.devices.pwi_sim import PWISim, pwi2_status
 from robofast.recovery import PDUSwitch, RecoveryLadder
 from robofast.testing.fakes import FakeDeviceError
 from tests.core.test_pwi_recovery import PORT1, no_sleep, pwi2_config, restart_hook, telescope
@@ -102,6 +102,7 @@ def _policy(sim: PWISim, pdu: PDUServer, **kw) -> dict:
         "verify_timeout": 1.0,
         "step_timeout": 20.0,
         "home_timeout": 30.0,
+        "mount_connect_timeout": 2.0,
         **kw,
     }
 
@@ -141,7 +142,8 @@ async def test_a_dropped_controller_comes_back_by_the_panel_cycle_and_a_home(rig
     assert res.recovered, res.tried
     assert [r for r, _ in res.tried] == ["reconnect", "restart", "home", "powercycle"]
     assert [o.split(":")[0] for _, o in res.tried] == ["failed", "failed", "failed", "ok"]
-    assert "PWI is not connected" in res.tried[2][1]
+    # The home rung waited for PWI to connect to the dropped controller, in vain.
+    assert "did not connect to the mount" in res.tried[2][1]
     # Only the panel was switched, once.
     assert switched == [(PANEL, REBOOT)]
     assert m.connected and all(m.enabled) and m.homed and not m.controller_down
@@ -160,10 +162,11 @@ async def test_a_dropped_controller_comes_back_by_the_panel_cycle_and_a_home(rig
 
 
 async def test_the_guards_hold_an_unparked_mount_is_not_cycled(rig):
+    """An unparked mount whose controller PWI reaches, with both axes
+    enabled, keeps the parked guard (the exceptions are a drive fault and a
+    controller PWI cannot connect to)."""
     sim, _server, pdu, switched, owner, grant = rig
     await grant.call("Unpark")
-    with sim.model.lock:
-        sim.model.drop_controller()
     res = await _ladder({"telescope": _policy(sim, pdu, steps=["powercycle"])}).recover(
         "telescope",
         reconnect=lambda: owner.reconnect("recovery"),
@@ -172,7 +175,59 @@ async def test_the_guards_hold_an_unparked_mount_is_not_cycled(rig):
         call=lambda mem, *a: grant.call(mem, *a),
     )
     assert not res.recovered and "not parked" in res.tried[0][1]
-    assert switched == [] and sim.model.controller_down
+    assert switched == [] and sim.model.connected
+
+
+async def test_regression_20261126_an_unparked_mount_whose_controller_dropped_is_cycled(rig):
+    """MINERVA T4, 2026-11-26: the ACR controller dropped off the network
+    with the mount unparked, and PWI2 went on answering with its last status
+    (connected, both axes enabled), frozen. robofast's PWI server reads the
+    frozen clock as not connected; the ladder's reconnect, restart and home
+    cannot reach the controller; the panel cycle, refused before because the
+    mount was not parked, brings it back, and the mount is homed."""
+    sim, server, pdu, switched, owner, grant = rig
+    server.mount.config.pwi_frozen_after = 0.3
+    await grant.call("Unpark")
+    m = sim.model
+    with m.lock:
+        m.drop_controller(frozen=True)
+    # Before pwi_frozen_after: PWI2's own word (connected).
+    st = json.loads(await grant.call("Action", "Status", ""))
+    assert st["pwi"]["connected"] is True
+    await asyncio.sleep(0.5)
+    st = json.loads(await grant.call("Action", "Status", ""))
+    assert st["pwi"]["connected"] is False
+    events: list = []
+    lad = _ladder({"telescope": _policy(sim, pdu)}, events)
+    res = await lad.recover(
+        "telescope",
+        reconnect=lambda: owner.reconnect("recovery"),
+        probe=lambda mem: grant.get(mem),
+        others=camera_idle,
+        call=lambda mem, *a: grant.call(mem, *a),
+    )
+    assert res.recovered, res.tried
+    assert [r for r, _ in res.tried] == ["reconnect", "restart", "home", "powercycle"]
+    assert switched == [(PANEL, REBOOT)]
+    assert m.connected and all(m.enabled) and m.homed and not m.controller_down
+    (why,) = [kw["reason"] for w, kw in events if w == "recovery_cycle_unparked"]
+    assert "cannot connect to the mount's controller" in why
+
+
+async def test_a_frozen_pwi2_reads_connected_again_once_its_clock_moves(rig):
+    sim, server, _pdu, _switched, _owner, grant = rig
+    server.mount.config.pwi_frozen_after = 0.2
+    m = sim.model
+    with m.lock:
+        m.frozen_status = pwi2_status(m)
+    await asyncio.sleep(0.4)
+    st = json.loads(await grant.call("Action", "Status", ""))
+    assert st["pwi"]["connected"] is False
+    with m.lock:
+        m.frozen_status = None  # PWI2 got its controller back
+    await asyncio.sleep(0.4)
+    st = json.loads(await grant.call("Action", "Status", ""))
+    assert st["pwi"]["connected"] is True
 
 
 async def test_a_panel_cycle_without_home_permission_does_not_count(rig):
@@ -280,3 +335,150 @@ def test_t1_pdu_config_is_refused_without_hardware():
         with pytest.raises(hwgate.HardwareNotAllowed, match="tunnel"):
             PDUServer(PDUConfig.from_dict(d), credentials=Credentials("r", "w"))
         assert not tunnel.touched
+
+
+async def test_regression_20261126_the_ladder_waits_for_pwi_to_connect_after_the_panel_cycle(rig):
+    """MINERVA T3/T4 2026-11-26 (and T2 2026-11-25): after the panel power
+    cycle PWI answered MountConnect at once but reported the mount connected
+    only later (the controller was still booting); the ladder sent
+    MotorsEnable 5 s after MountConnect, got "PWI is not connected" and gave
+    up, though the mount was connected minutes later. Now it waits for PWI
+    to report the mount connected (and the axes enabled), then homes."""
+    sim, _server, pdu, switched, owner, grant = rig
+    m = sim.model
+    with m.lock:
+        m.drop_controller()
+        m.connect_delay = 1.5
+    events: list = []
+    lad = _ladder({"telescope": _policy(sim, pdu, mount_connect_timeout=20.0)}, events)
+    res = await lad.recover(
+        "telescope",
+        reconnect=lambda: owner.reconnect("recovery"),
+        probe=lambda mem: grant.get(mem),
+        others=camera_idle,
+        call=lambda mem, *a: grant.call(mem, *a),
+    )
+    assert res.recovered, res.tried
+    assert [r for r, _ in res.tried][-1] == "powercycle"
+    assert res.tried[-1][1] == "ok"
+    assert switched == [(PANEL, REBOOT)]
+    assert m.connected and all(m.enabled) and m.homed and not m.controller_down
+    whats = [w for w, _ in events]
+    i = whats.index("recovery_powercycle")
+    after = whats[i:]
+    assert after.index("recovery_mount_connect") < after.index("recovery_motors_enable")
+    assert after.index("recovery_motors_enable") < after.index("recovery_home")
+    # MotorsEnable was sent only once PWI reported the mount connected.
+    assert "enable" not in m.ignored
+
+
+async def test_the_wait_for_pwi_to_connect_is_bounded(rig):
+    """A mount PWI never connects to (the controller stays down): each rung's
+    wait ends after mount_connect_timeout with that reason, not with
+    MotorsEnable's "PWI is not connected", and the ladder climbs on."""
+    sim, _server, pdu, switched, owner, grant = rig
+    m = sim.model
+    with m.lock:
+        m.drop_controller()
+    lad = _ladder(
+        {"telescope": _policy(sim, pdu, steps=["reconnect", "restart"], mount_connect_timeout=1.0)}
+    )
+    res = await lad.recover(
+        "telescope",
+        reconnect=lambda: owner.reconnect("recovery"),
+        probe=lambda mem: grant.get(mem),
+        others=camera_idle,
+        call=lambda mem, *a: grant.call(mem, *a),
+    )
+    assert not res.recovered
+    assert all("did not connect to the mount within 1 s" in how for _, how in res.tried), res.tried
+    assert switched == []
+
+
+def _az_fault(m) -> None:
+    """MINERVA T3, 2026-11-26: during a home PWI2 disabled the azimuth axis
+    ("Automatic commutation: Too many trials during phase 3"); the mount was
+    left connected, unhomed, unparked, altitude still enabled."""
+    with m.lock:
+        m.enabled[0] = False
+        m.stop()
+        m.motor_errors["azm"] = (1, "Automatic commutation: Too many trials during phase 3")
+        m.axes_homed = [False, False]
+
+
+async def test_regression_20261126_a_mount_stopped_on_a_drive_fault_gets_its_panel_cycle(rig):
+    """The panel cycle (which clears a drive fault) was refused because the
+    faulted mount was not parked. A mount PWI reports connected, with an
+    axis disabled, and that holds still once stopped is cycled, then homed."""
+    sim, _server, pdu, switched, owner, grant = rig
+    await grant.call("Unpark")
+    m = sim.model
+    _az_fault(m)
+    events: list = []
+    lad = _ladder({"telescope": _policy(sim, pdu, steps=["powercycle"])}, events)
+    res = await lad.recover(
+        "telescope",
+        reconnect=lambda: owner.reconnect("recovery"),
+        probe=lambda mem: grant.get(mem),
+        others=camera_idle,
+        call=lambda mem, *a: grant.call(mem, *a),
+    )
+    assert res.recovered, res.tried
+    assert switched == [(PANEL, REBOOT)]
+    assert m.connected and all(m.enabled) and m.homed and not m.motor_errors
+    (why,) = [kw["reason"] for w, kw in events if w == "recovery_cycle_unparked"]
+    assert "az axis disabled" in why and "phase 3" in why
+
+
+async def test_a_faulted_mount_that_still_moves_is_not_cycled(rig):
+    """The exception needs the mount still: one that keeps tracking after
+    the ladder's AbortSlew (ignored here) with an axis disabled keeps the
+    parked guard."""
+    sim, _server, pdu, switched, owner, grant = rig
+    await grant.call("Unpark")
+    m = sim.model
+    _az_fault(m)
+    with m.lock:
+        m.tracking = True
+    sent: list = []
+
+    async def call(mem, *a):
+        sent.append(mem)
+        if mem == "AbortSlew":
+            return None
+        return await grant.call(mem, *a)
+
+    res = await _ladder({"telescope": _policy(sim, pdu, steps=["powercycle"])}).recover(
+        "telescope",
+        reconnect=lambda: owner.reconnect("recovery"),
+        probe=lambda mem: grant.get(mem),
+        others=camera_idle,
+        call=call,
+    )
+    assert "AbortSlew" in sent
+    assert not res.recovered and "not parked" in res.tried[0][1]
+    assert switched == []
+
+
+async def test_regression_20261126_a_pwi2_home_with_a_pause_between_its_phases_completes(rig):
+    """MINERVA T4, 2026-11-26: after its panel cycle the ladder's home read
+    as done 30 s in (PWI2 read not finding home between its azimuth and
+    altitude phases); the ladder parked the mount -- a stop -- and the home
+    was cut short, unhomed. A home ends only once PWI2 has read not finding
+    home for home_settle s, or reports the encoders set."""
+    sim, server, pdu, _switched, owner, grant = rig
+    server.mount.config.home_settle = 2.0
+    m = sim.model
+    with m.lock:
+        m.axes_homed = [False, False]
+        m.home_time = 5.0
+        m.home_gap = (2.5, 1.0)
+    res = await _ladder({"telescope": _policy(sim, pdu, steps=["home"])}).recover(
+        "telescope",
+        reconnect=lambda: owner.reconnect("recovery"),
+        probe=lambda mem: grant.get(mem),
+        others=camera_idle,
+        call=lambda mem, *a: grant.call(mem, *a),
+    )
+    assert res.recovered, res.tried
+    assert m.homed

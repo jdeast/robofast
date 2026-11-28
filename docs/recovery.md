@@ -51,6 +51,20 @@ disabled -- the state of a PWI that was just started. An axis PWI disabled
 while connected (a drive fault, e.g. PWI4's I2t) is left disabled: the
 telescope is not usable and the ladder climbs on.
 
+PWI answers `MountConnect` and `MotorsEnable` at once and acts later, so
+each is followed by polling `Status` until PWI reports the mount connected
+(both axes enabled), for at most `mount_connect_timeout` (default 120 s)
+each; the rung fails with "PWI did not connect to the mount within N s"
+otherwise. A controller still booting after its panel power cycle connects
+only after some seconds (MINERVA T3/T4 2026-11-26: not connected 5 s after
+`MountConnect`, connected minutes later; the ladder used to send
+`MotorsEnable` at once and give up).
+
+A rehearsal's preflight (robofast/testing/rehearsal.py) admits a telescope
+whose start-up check failed only if its ladder **recovered** it, not merely
+because its devices answer again afterwards (a restarted PWI server answers
+while its mount controller is still off).
+
 A camera with a `cooling` entry (docs/cooling.md) has its cooler set again
 by every rung that reconnects it -- the camera owner's `on_connect` hook
 runs on each fresh connection -- because MINERVA T1's Andor ASCOM driver
@@ -145,7 +159,20 @@ guider's) `powercycle` rung, never hidden coupling:
 `"requires_pwi_stop": true` with `pwi_stop` and `pwi_start` hooks (the
 `restart` hook's contract: `pwi_start` exits 0 once PWI answers). It needs
 `requires_parked` (the default): the rung refuses unless the telescope is
-parked. It then runs `pwi_stop`, cycles the outlet, waits `boot_time`, and
+parked -- except the telescope's own outlet on a mount stopped on a drive
+fault: PWI connected and reporting an axis disabled, and the mount, after
+the ladder's `AbortSlew`, not tracking and within `fault_still_deg`
+(0.05 deg) on both axes over `fault_still_time` (5 s). The cycle is what
+clears such a fault, and a fault during the ladder's own home leaves the
+mount unhomed and so unparkable (MINERVA T3, 2026-11-26: "Automatic
+commutation: Too many trials during phase 3"). The event
+`recovery_cycle_unparked` records why. Also the telescope's own outlet when PWI answers but
+cannot connect to the mount's controller, `MountConnect` included (`mount_connect_timeout`):
+nothing drives the mount, and only its power brings the controller back (MINERVA T4,
+2026-11-26: the ACR controller dropped off the network with the mount unparked). robofast's
+PWI server reads a PWI2 whose own clock has stood still for `pwi_frozen_after` (30 s) as not
+connected: PWI2 keeps answering with its last status, `connected` included, after it loses
+the controller. It then runs `pwi_stop`, cycles the outlet, waits `boot_time`, and
 runs `pwi_start` -- also when the cycle failed -- then brings the mount
 back as the telescope's ladder would (reconnect, `MountConnect`,
 `MotorsEnable`, `home` if the PWI server allows it), and reconnects the

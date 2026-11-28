@@ -329,6 +329,13 @@ class PWIConfig:
     az_wrap_max: float | None = None
     #: Reads reuse a PWI reply this recent (s).
     status_max_age: float = 0.3
+    #: PWI2 whose own clock (``status.jd``) has not advanced for this long
+    #: (s, wall clock) has lost its controller, whatever it says: read it as
+    #: not connected. MINERVA T4, 2026-11-26: the ACR controller dropped off
+    #: the network and PWI2 went on answering with its last status, frozen
+    #: at that second, ``connected`` and both axes enabled, for hours.
+    #: None: off.
+    pwi_frozen_after: float | None = 30.0
     #: A slew or offset that finds tracking off within this long (s) of our
     #: own ``tracking on`` re-reads PWI until it reports tracking, before
     #: refusing (night 2026-11-09: MINERVA T2's PWI2 still read tracking
@@ -352,6 +359,13 @@ class PWIConfig:
     home_alt: float | None = None
     home_az: float | None = None
     home_tolerance: float = 1.0
+    #: A PWI2 home counts as ended only once ``is_finding_home`` has read
+    #: false this long (s), or PWI2 reports the encoders set. MINERVA T4,
+    #: 2026-11-26: PWI2's home read not finding home for a moment between
+    #: its azimuth and altitude phases; the home read as done at 30 s, the
+    #: recovery ladder stopped the mount and it was left unhomed. (A full
+    #: home: azimuth ~30 s, ~30 s still, then altitude.)
+    home_settle: float = 8.0
     home_record: str | None = None
     #: Moves while PWI does not report the mount homed are refused unless
     #: this is true AND the command line says --allow-unhomed (engineering).
@@ -535,6 +549,8 @@ class PWIMount:
         self._lock = asyncio.Lock()
         self._moving_since = -1e9
         self._homing_since: float | None = None
+        #: Since when a PWI2 home of ours has read not finding home (home_settle).
+        self._home_quiet_since: float | None = None
         self._homing_axes: tuple[int, ...] = ()
         self._home_at: tuple[float, float] | None = None
         #: Axes this process saw homed (for a PWI that reports no homed flag).
@@ -592,6 +608,10 @@ class PWIMount:
         self.models = config.model_files()
         self._model_due = True
         self._pwi_up = False
+        #: PWI2's last clock reading and since when (wall) it has read so;
+        #: it stood still past ``pwi_frozen_after`` (:meth:`_frozen`).
+        self._pwi_clock: tuple[str, float] | None = None
+        self._pwi_frozen = False
         self._was_connected: bool | None = None
         self._was_port: int | None = None
         #: Every setmodel sent: (port, file, error or None), once its outcome
@@ -619,7 +639,36 @@ class PWIMount:
             assert self._st is not None
             return self._st
 
+    def _frozen(self, st: PWIStatus) -> PWIStatus:
+        """``pwi_frozen_after``: ``st`` as not connected if PWI2's clock has
+        stood still that long. Wall time, not ``time.monotonic``: virtual
+        time (robofast/testing/virtual_time.py) moves the latter only, and
+        the simulator's clock follows the wall."""
+        after = self.config.pwi_frozen_after
+        clock = st.raw.get("status.jd") or st.raw.get("status.utc")
+        if after is None or st.backend != "pwi2" or not clock:
+            return st
+        wall = time.time()
+        if self._pwi_clock is None or self._pwi_clock[0] != clock:
+            if self._pwi_frozen:
+                log.warning("PWI2's clock moves again (%s): its status is live", clock)
+                self._pwi_frozen = False
+            self._pwi_clock = (clock, wall)
+            return st
+        if wall - self._pwi_clock[1] < after or not st.connected:
+            return st
+        if not self._pwi_frozen:
+            log.error(
+                "PWI2's clock has stood at %s for %.0f s: it has lost the mount's controller"
+                " (reading it as not connected)",
+                clock,
+                wall - self._pwi_clock[1],
+            )
+            self._pwi_frozen = True
+        return dataclasses.replace(st, connected=False)
+
     def _take(self, st: PWIStatus, t: float) -> None:
+        st = self._frozen(st)
         if self._prev is not None and t - self._prev[0] > 0.05:
             dt = t - self._prev[0]
             self.speed = _sep_deg(st.alt_deg, st.az_deg, self._prev[1], self._prev[2]) / dt
@@ -1119,13 +1168,22 @@ class PWIMount:
         if self._homing_since is None:
             return False
         st = st or await self.status()
+        now = time.monotonic()
         if st.finding_home:
+            self._home_quiet_since = None
             return True
-        if time.monotonic() - self._homing_since < 2.0:
+        if now - self._homing_since < 2.0:
             return True
         if st.backend == "pwi4" and st.slewing:
             return True
+        if st.backend == "pwi2" and st.homed is not True:
+            # Between its phases PWI2 can read not finding home (home_settle).
+            if self._home_quiet_since is None:
+                self._home_quiet_since = now
+            if now - self._home_quiet_since < self.config.home_settle:
+                return True
         self._homing_since = None
+        self._home_quiet_since = None
         self._home_at = (st.alt_deg, st.az_deg)
         log.info("homing done (axes %s); PWI homed: %s", self._homing_axes, st.homed)
         if st.tracking:
@@ -1411,6 +1469,7 @@ class PWIMount:
         self._homing_axes = (0, 1) if axis is None else (axis,)
         self.homed_here -= set(self._homing_axes)
         self._homing_since = time.monotonic()
+        self._home_quiet_since = None
         self._home_at = None
         self._disarm_slew()
         self.slew_error = None

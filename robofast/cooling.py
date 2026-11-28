@@ -30,8 +30,26 @@ rest of the night.
 Before each exposure (:meth:`CameraCooling.check`) the CCD temperature is
 read: within ``tolerance`` of the setpoint it is settled. If not, a light
 frame waits for it -- but never past ``settle_timeout`` s after the cooler
-was last set; after that the frames are taken anyway, with a warning event
-and ``COOLOK = F`` in their headers. Cooling never stops the night.
+was last set. After that:
+
+* a CCD still **warmer** than its setpoint by more than ``tolerance``, with
+  the cooler on (the commanded setpoint was not reached: MINERVA T4,
+  2026-11-27/28, CCD at 20.7 C all night with its cooler at 100% and the
+  setpoint -50 C) is a camera fault (``not_settled: "fault"``, the
+  default): :meth:`CameraCooling.check` raises :class:`CoolingFault`
+  (a ``cooling_fault`` event), the sequencer makes the telescope safe and
+  climbs the camera's recovery ladder, waiting again for the CCD to settle
+  after each rung (:meth:`CameraCooling.settle`), and a camera the ladder
+  cannot bring back (or one without a ladder) is **disabled** for the
+  night: no more exposures on it, and the plan no longer gets imaging for
+  that telescope (spectra go on; docs/cooling.md, "A cooler that cannot
+  reach its setpoint");
+* otherwise (a CCD colder than a warm setpoint, a temperature that cannot
+  be read, a cooler that is off, or ``not_settled: "warn"``) the frames are
+  taken anyway, with a warning event and ``COOLOK = F`` in their headers.
+
+A camera that cannot set its temperature, or one robofast does not cool
+(no ``cooling`` entry), never faults here.
 """
 
 from __future__ import annotations
@@ -48,10 +66,34 @@ from robofast.owner import Unsupported
 
 log = logging.getLogger(__name__)
 
-__all__ = ["CameraCooling", "CoolingConfig", "CoolingStatus", "set_cooling"]
+__all__ = [
+    "COOLING_FAULT",
+    "CameraCooling",
+    "CoolingConfig",
+    "CoolingFault",
+    "CoolingStatus",
+    "is_cooling_fault",
+    "set_cooling",
+]
 
 #: ASCOM NotImplemented and PropertyNotImplemented.
 NOT_IMPLEMENTED = (0x400, 0x401)
+#: In every :class:`CoolingFault`'s message (and so in the sequencer's error
+#: text for it, its ``repr``): :func:`is_cooling_fault`.
+COOLING_FAULT = "camera cooling fault"
+#: ``not_settled`` values.
+NOT_SETTLED = ("fault", "warn")
+
+
+class CoolingFault(Exception):
+    """The camera's cooler is on but the CCD did not reach its setpoint
+    within ``settle_timeout`` (module doc): the camera cannot take useful
+    frames. Not a :class:`~robofast.owner.DeviceError`: the camera answers."""
+
+
+def is_cooling_fault(error: str) -> bool:
+    """A :class:`CoolingFault`, from the sequencer's error text."""
+    return COOLING_FAULT in error
 
 
 @dataclass(frozen=True)
@@ -69,9 +111,23 @@ class CoolingConfig:
     restart_interval: float = 300.0
     #: How often to read the temperature while waiting to settle (s).
     poll: float = 5.0
+    #: A CCD still too warm ``settle_timeout`` after the cooler was set,
+    #: with the cooler on: ``"fault"`` (the camera's recovery ladder, then
+    #: disabled for the night) or ``"warn"`` (expose anyway, as before
+    #: 2026-11-28).
+    not_settled: str = "fault"
+    #: After each rung of the camera's recovery ladder for a cooling fault:
+    #: how long (s) to wait for the CCD to reach its setpoint before the
+    #: rung counts as failed. None: ``settle_timeout``.
+    recovery_settle_timeout: float | None = None
 
     def __post_init__(self) -> None:
-        for name in ("setpoint", "tolerance", "settle_timeout", "restart_interval", "poll"):
+        if self.not_settled not in NOT_SETTLED:
+            raise ValueError(f"cooling.not_settled: one of {NOT_SETTLED}")
+        names = ["setpoint", "tolerance", "settle_timeout", "restart_interval", "poll"]
+        if self.recovery_settle_timeout is not None:
+            names.append("recovery_settle_timeout")
+        for name in names:
             v = getattr(self, name)
             if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
                 raise ValueError(f"cooling.{name}: a number (got {v!r})")
@@ -81,6 +137,15 @@ class CoolingConfig:
             raise ValueError("cooling.tolerance: must be > 0")
         if self.settle_timeout < 0 or self.restart_interval < 0 or self.poll <= 0:
             raise ValueError("cooling: settle_timeout, restart_interval >= 0 and poll > 0")
+        if self.recovery_settle_timeout is not None and self.recovery_settle_timeout < 0:
+            raise ValueError("cooling.recovery_settle_timeout: must be >= 0")
+
+    @property
+    def recovery_settle(self) -> float:
+        """How long a recovery rung waits for the CCD (s; ``recovery_settle_timeout``)."""
+        if self.recovery_settle_timeout is None:
+            return self.settle_timeout
+        return float(self.recovery_settle_timeout)
 
     @classmethod
     def from_dict(cls, d: Any) -> CoolingConfig:
@@ -196,11 +261,54 @@ class CameraCooling:
     def _in_tolerance(self, temp: float | None) -> bool:
         return temp is not None and abs(temp - self.config.setpoint) <= self.config.tolerance
 
+    def _too_warm(self, temp: float | None) -> bool:
+        """Warmer than the setpoint by more than the tolerance (a CCD colder
+        than a warm setpoint is not a fault: module doc)."""
+        return temp is not None and temp > self.config.setpoint + self.config.tolerance
+
+    def _fault_text(self, temp: float | None, seconds: float) -> str:
+        cfg = self.config
+        return (
+            f"{self.name} {COOLING_FAULT}: CCD at {temp if temp is None else round(temp, 1)} C,"
+            f" not within {cfg.tolerance} C of its setpoint {cfg.setpoint} C"
+            f" {seconds:g} s after the cooler was set (cooler on)"
+        )
+
+    async def settle(self, grant: Any, why: str) -> float | None:
+        """After a recovery rung for a :class:`CoolingFault`: set the cooler
+        again (:meth:`apply`: setpoint and ``CoolerOn``; harmless after the
+        reconnect's own ``on_connect``) and wait, at most
+        ``recovery_settle_timeout`` s, for the CCD to reach its setpoint
+        (within ``tolerance``, or colder). Returns the CCD temperature;
+        raises :class:`CoolingFault` if it does not get there, and
+        :class:`RuntimeError` if the cooler cannot be set or the camera does
+        not answer."""
+        cfg = self.config
+        if not await self.apply(grant, why):
+            raise RuntimeError(f"{self.name}: the cooler could not be set ({self.unsupported})")
+        bound = cfg.recovery_settle
+        deadline = self.clock() + bound
+        temp = _float(await grant.get("CCDTemperature"))
+        while temp is None or self._too_warm(temp):
+            if self.clock() >= deadline:
+                text = self._fault_text(temp, bound)
+                self.event("cooling_not_recovered", ccd_temp=temp, setpoint=cfg.setpoint, text=text)
+                raise CoolingFault(text)
+            await asyncio.sleep(min(cfg.poll, max(0.0, deadline - self.clock())))
+            temp = _float(await grant.get("CCDTemperature"))
+        self.warned = False
+        self.event("cooling_recovered", ccd_temp=temp, setpoint=cfg.setpoint)
+        return temp
+
     async def check(self, grant: Any, *, wait: bool) -> CoolingStatus | None:
         """Before an exposure (module doc): turn a cooler found off back on
         (rate-limited, with an alarm); with ``wait`` (a light frame) and the
         cooler on, wait for the CCD to settle, no later than
-        ``settle_timeout`` after the cooler was set. None: the camera cannot be cooled."""
+        ``settle_timeout`` after the cooler was set. None: the camera cannot be cooled.
+
+        Raises :class:`CoolingFault` (``not_settled: "fault"``) when the
+        cooler is on, ``settle_timeout`` has passed since it was set, and
+        the CCD is still too warm (module doc); light and dark frames alike."""
         if self.unsupported is not None:
             return None
         cfg = self.config
@@ -234,6 +342,23 @@ class CameraCooling:
             self.event("cooling_waited", seconds=round(waited, 1), ccd_temp=temp, settled=settled)
         if settled:
             self.warned = False
+        elif (
+            cfg.not_settled == "fault"
+            and cooler
+            and self.applied_at is not None
+            and self.clock() - self.applied_at >= cfg.settle_timeout
+            and self._too_warm(temp)
+        ):
+            text = self._fault_text(temp, cfg.settle_timeout)
+            log.error("%s", text)
+            self.event(
+                "cooling_fault",
+                ccd_temp=temp,
+                setpoint=cfg.setpoint,
+                level="critical",
+                text=text,
+            )
+            raise CoolingFault(text)
         elif wait and not self.warned:
             self.warned = True
             text = (

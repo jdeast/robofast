@@ -658,6 +658,8 @@ def snapshot(seq: Sequencer, interval: float = 5.0) -> dict[str, Any]:
             "consecutive_errors": u.consecutive_errors,
             "current": current.get(name),
             "park_requested": u.park_requested,
+            # Why its camera is disabled for the night (None: it is not).
+            "camera_disabled": u.camera_disabled,
             "alarms": list(u.alarms),
             # Finished incidents, each with its one summary for a person.
             "incidents": [i.as_dict() for i in u.incidents if i.finished],
@@ -803,10 +805,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     if seq.needs_operator:
         log.critical(
-            "%s: needs an operator (quarantined=%s, gave up: %s)",
+            "%s: needs an operator (quarantined=%s, gave up: %s, camera disabled: %s)",
             seq.name,
             seq.quarantined,
             [u.name for u in seq.units.values() if u.gave_up],
+            [u.name for u in seq.units.values() if u.camera_disabled is not None],
         )
         sys.exit(NEEDS_OPERATOR)
 

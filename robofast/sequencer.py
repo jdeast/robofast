@@ -236,6 +236,28 @@ goes on. While down its status is checked every
 ``spectrograph_auto_recover``) or the operator's :meth:`Sequencer.clear_spectrograph`
 marks it up. docs/rv_night.md.
 
+A camera that cannot reach its setpoint
+---------------------------------------
+A cooled camera (docs/cooling.md) whose cooler is on but whose CCD is still
+warmer than its setpoint (beyond ``tolerance``) ``settle_timeout`` after the
+cooler was set raises :class:`~robofast.cooling.CoolingFault` before the
+exposure: the observation fails and the telescope is made safe (parked) as
+after any error, then the **camera's** recovery ladder is climbed
+(docs/recovery.md), each rung followed by setting the cooler again and
+waiting for the CCD to reach its setpoint (``recovery_settle_timeout``).
+Recovered: the camera stays in. Exhausted (escalated as any exhausted
+ladder: an agent, if configured, and one summary for a person), or no
+camera ladder at all: the camera is **disabled** for the night
+(``camera_disabled``, critical, an alarm; the status snapshot's
+``camera_disabled``), not the telescope. A plan with
+``set_camera_available(telescope, available, reason)`` (the dispatch
+scheduler) is told and no longer hands that telescope anything that needs
+its camera; any such observation that still comes (kinds whose
+``camera`` is True, or any exposure on it) is reported ``unsupported``.
+Spectra (and spectrograph calibrations) need only the guide camera and the
+spectrograph, so the telescope goes on feeding them. Every telescope is
+told its camera is available at the start of the night.
+
 Config-defined sequences
 ------------------------
 An observation of ``kind="sequence"`` runs one of the enclosure config's
@@ -317,7 +339,12 @@ from robofast.autofocus import (
 from robofast.camera_state import CAMERA_IDLE, image_ready
 from robofast.cancel import shielded, stop_task, stop_tasks
 from robofast.clock import Clock, NightRule, real_clock
-from robofast.cooling import CameraCooling, CoolingStatus
+from robofast.cooling import (
+    COOLING_FAULT,
+    CameraCooling,
+    CoolingStatus,
+    is_cooling_fault,
+)
 from robofast.escalation import DEFAULT_SAFE, AgentResult, Incident, fault_signature, run_agent
 from robofast.imagebytes import ImageArray, fits_order
 from robofast.imaging import FrameWriteFailed, Imaging, PendingFrame
@@ -375,6 +402,20 @@ def _parsed_follow(
     orbit: tuple[tuple[str, Any], ...], site: tuple[float, float, float]
 ) -> tuple[Orbit, Any]:
     return Orbit(**dict(orbit)), sky.Site(*site).location
+
+
+def _fault_text(error: str) -> str:
+    """A cooling fault's own text from the sequencer's error text (its
+    exception's repr): from "camera cooling fault" on."""
+    i = error.find(COOLING_FAULT)
+    if i < 0:
+        return error
+    text = error[i:]
+    return text[:-2] if text.endswith(("')", '")')) else text
+
+
+def _tried(result: RecoveryResult) -> str:
+    return "; ".join(f"{r}: {o}" for r, o in result.tried)
 
 
 def _follow_place(obs: Observation, when: datetime) -> tuple[float, float]:
@@ -647,6 +688,9 @@ class TelescopeUnit:
     #: Keeps the camera cooled (docs/cooling.md); None: robofast leaves
     #: its cooler alone.
     cooling: CameraCooling | None = None
+    #: Why its camera is disabled for the night (a cooler that cannot reach
+    #: its setpoint, module doc), or None: no more exposures on it.
+    camera_disabled: str | None = field(default=None, init=False)
     #: The incident being escalated (an agent working on one of its devices,
     #: robofast/escalation.py): out of the plan until it ends.
     escalation: Incident | None = field(default=None, init=False)
@@ -1192,8 +1236,11 @@ class Sequencer:
 
     @property
     def needs_operator(self) -> bool:
-        """Quarantined, or some telescope gave up: an operator should look."""
-        return self.quarantined or any(u.gave_up for u in self.units.values())
+        """Quarantined, or some telescope gave up or had its camera
+        disabled: an operator should look."""
+        return self.quarantined or any(
+            u.gave_up or u.camera_disabled is not None for u in self.units.values()
+        )
 
     # -- main loop --------------------------------------------------------
 
@@ -1777,6 +1824,9 @@ class Sequencer:
         (module doc) and tell it, once a night per telescope. A read that
         fails is left out (the runtime check stays the backstop)."""
         unit.capabilities_told = True
+        if unit.camera_disabled is None:
+            # A new night: a camera disabled last night is available again.
+            self._tell_plan_camera(unit, True, "")
         hook = getattr(self.plan, "set_capabilities", None)
         if hook is None:
             return
@@ -2054,6 +2104,9 @@ class Sequencer:
             parked=bool(report.parked),
             errors=report.errors,
         )
+        if is_cooling_fault(error):
+            await self._camera_cooling_failed(state, unit, tel, cam, error)
+            return
         result = await self._recover_device(state, unit, tel, cam, error)
         if result is not None and result.exhausted:
             why = self._escalate(unit, result, error)
@@ -2084,6 +2137,79 @@ class Sequencer:
             unit.retry_at = time.monotonic() + cfg.error_backoff
             self._event("telescope_backoff", telescope=unit.name, seconds=cfg.error_backoff)
 
+    # -- a camera that cannot reach its setpoint (module doc) ---------------------------
+
+    async def _camera_cooling_failed(
+        self, state: _Generation, unit: TelescopeUnit, tel: Grant, cam: Grant, error: str
+    ) -> None:
+        """A :class:`~robofast.cooling.CoolingFault` (the telescope is safe
+        already): climb the camera's ladder, if it has one; recovered, the
+        telescope goes on (after the usual backoff); exhausted (and
+        escalated) or no ladder, the camera is disabled for the night and
+        the telescope goes on without it (spectra)."""
+        cfg = self.config
+        ladder = unit.recovery
+        if ladder is None or "camera" not in ladder.policies:
+            self._disable_camera(unit, f"{_fault_text(error)}; no camera recovery ladder")
+            return
+        result = await self._recover_device(state, unit, tel, cam, error, kind="camera")
+        # None: fenced mid-ladder (the generation is ending); counted as any
+        # error, and the next light frame finds the CCD warm again.
+        if result is not None and result.exhausted:
+            why = self._escalate(unit, result, error)
+            if why is None:
+                return  # an agent is at work; its end disables the camera or not
+            self._disable_camera(
+                unit, f"{_fault_text(error)}; recovery ladder exhausted ({_tried(result)}); {why}"
+            )
+            return
+        if result is not None and result.recovered:
+            unit.consecutive_errors = min(unit.consecutive_errors, cfg.max_consecutive_errors - 1)
+        if unit.consecutive_errors >= cfg.max_consecutive_errors:
+            unit.gave_up = True
+            self._event(
+                "giving_up", telescope=unit.name, errors=unit.consecutive_errors, level="critical"
+            )
+        else:
+            unit.retry_at = time.monotonic() + cfg.error_backoff
+            self._event("telescope_backoff", telescope=unit.name, seconds=cfg.error_backoff)
+
+    def _disable_camera(self, unit: TelescopeUnit, why: str) -> None:
+        """No more exposures on ``unit``'s camera tonight (module doc); the
+        telescope goes on with what needs no camera (spectra), at once."""
+        if unit.camera_disabled is not None:
+            return
+        unit.camera_disabled = why
+        unit.consecutive_errors = 0  # handled: it does not count towards giving up
+        unit.retry_at = time.monotonic()
+        self._event("camera_disabled", telescope=unit.name, reason=why[:500], level="critical")
+        self.alarm(
+            unit.name,
+            f"{unit.name} camera DISABLED for the night (no imaging; spectra go on): {why[:300]}",
+        )
+        self._tell_plan_camera(unit, False, why)
+
+    def _tell_plan_camera(self, unit: TelescopeUnit, available: bool, why: str) -> None:
+        hook = getattr(self.plan, "set_camera_available", None)
+        if hook is None:
+            return
+        try:
+            hook(unit.name, available, why)
+        except Exception:  # the plan's bug must not end this telescope's night
+            log.exception("%s: plan.set_camera_available(%s)", self.name, unit.name)
+
+    @staticmethod
+    def _camera_usable(unit: TelescopeUnit) -> None:
+        """Raise :class:`Unsupported` once ``unit``'s camera is disabled."""
+        if unit.camera_disabled is not None:
+            raise Unsupported(f"{unit.name}'s camera is disabled tonight: {unit.camera_disabled}")
+
+    async def _cooling_settle(self, unit: TelescopeUnit, grant: Grant, why: str) -> None:
+        """The recovery check for a cooling fault: the cooler set again and
+        the CCD back at its setpoint (:meth:`CameraCooling.settle`)."""
+        assert unit.cooling is not None
+        await unit.cooling.settle(grant, why)
+
     def _devices(
         self, state: _Generation, unit: TelescopeUnit, tel: Grant, cam: Grant
     ) -> dict[str, tuple[DeviceOwner, Grant]]:
@@ -2099,14 +2225,25 @@ class Sequencer:
         return out
 
     async def _recover_device(
-        self, state: _Generation, unit: TelescopeUnit, tel: Grant, cam: Grant, error: str
+        self,
+        state: _Generation,
+        unit: TelescopeUnit,
+        tel: Grant,
+        cam: Grant,
+        error: str,
+        *,
+        kind: str | None = None,
     ) -> RecoveryResult | None:
-        """Climb the failed device's recovery ladder, if it has one (docs/recovery.md)."""
+        """Climb the failed device's recovery ladder, if it has one
+        (docs/recovery.md); ``kind``: that device's (else from ``error``).
+        A cooling fault's rungs must also bring the CCD back to its
+        setpoint (module doc)."""
         ladder = unit.recovery
         if ladder is None:
             return None
         devices = self._devices(state, unit, tel, cam)
-        kind = ladder.device_for(error, {k: o.name for k, (o, _) in devices.items()})
+        if kind is None:
+            kind = ladder.device_for(error, {k: o.name for k, (o, _) in devices.items()})
         if kind is None or (kind == "guider" and unit.guider is None):
             return None
         self._event("recovery_start", gen=state.gen, telescope=unit.name, device=kind)
@@ -2130,6 +2267,11 @@ class Sequencer:
             reconnect = lambda: owner.reconnect("recovery")  # noqa: E731
             probe = lambda member: grant.get(member)  # noqa: E731
             call = lambda member, *args: grant.call(member, *args)  # noqa: E731
+        check = None
+        check_time = 0.0
+        if kind == "camera" and unit.cooling is not None and is_cooling_fault(error):
+            check = lambda: self._cooling_settle(unit, cam, "recovery")  # noqa: E731
+            check_time = unit.cooling.config.recovery_settle + 30.0
         try:
             result = await ladder.recover(
                 kind,
@@ -2138,6 +2280,8 @@ class Sequencer:
                 others=others,
                 call=call,
                 mount=None if kind == "telescope" else mount,
+                check=check,
+                check_time=check_time,
             )
         except GrantRevoked:
             return None  # fenced: the generation's cleanup takes over
@@ -2308,16 +2452,21 @@ class Sequencer:
         else:
             inc.agent = "exited 0 (asks for a retry)"
             try:
-                await self._verify_device(unit, inc.device)
+                await self._verify_device(
+                    unit, inc.device, cooling_fault=is_cooling_fault(inc.error)
+                )
                 why = None
             except Exception as exc:
                 why = f"robofast's own check after the agent failed: {str(exc)[:200] or exc!r}"
         self._end_escalation(unit, inc, why)
 
-    async def _verify_device(self, unit: TelescopeUnit, kind: str) -> None:
+    async def _verify_device(
+        self, unit: TelescopeUnit, kind: str, *, cooling_fault: bool = False
+    ) -> None:
         """Robofast's own check that ``kind`` answers (and, a PWI telescope,
-        is usable), never the agent's word: a fresh connection, read through
-        a grant of its own."""
+        is usable; a camera after a cooling fault, back at its setpoint),
+        never the agent's word: a fresh connection, read through a grant of
+        its own."""
         if kind == "guider" and unit.recovery is not None:
             reconnect, probe = self._guider_access(unit)
             await unit.recovery.verify(kind, reconnect=reconnect, probe=probe)
@@ -2334,6 +2483,9 @@ class Sequencer:
                 probe=lambda member: grant.get(member),
                 call=lambda member, *args: grant.call(member, *args),
             )
+            if cooling_fault and kind == "camera" and unit.cooling is not None:
+                async with asyncio.timeout(unit.cooling.config.recovery_settle + 30.0):
+                    await self._cooling_settle(unit, grant, "escalation")
         finally:
             grant.revoke("escalation verified")
 
@@ -2358,6 +2510,13 @@ class Sequencer:
             unit.recovery.reset(inc.device)
             unit.consecutive_errors = 0
             unit.retry_at = time.monotonic()
+        elif inc.device == "camera" and is_cooling_fault(inc.error):
+            # Not the telescope: only its camera is out (module doc).
+            inc.finish("dropped", why)
+            self._disable_camera(
+                unit,
+                f"{_fault_text(inc.error)}; recovery ladder exhausted; escalation: {inc.agent}",
+            )
         else:
             inc.finish("dropped", why)
             unit.gave_up = True
@@ -2417,6 +2576,8 @@ class Sequencer:
         if obs.light and state.lease is None:
             raise RuntimeError(f"{obs.name}: light frames in a closed generation")
         handler = OBSERVATION_KINDS[obs.kind]
+        if handler.camera:
+            self._camera_usable(unit)
         run = KindRun(self, state, unit, tel, cam, obs, taken)
         if handler.stage == "before_setup":
             await handler.run(run)
@@ -2626,6 +2787,7 @@ class Sequencer:
         # A lamp frame takes no sky light but opens the shutter on the lamp.
         shutter = obs.light or OBSERVATION_KINDS[obs.kind].shutter
         for i in range(obs.count):
+            self._camera_usable(unit)
             if imaging is not None:
                 imaging.check(unit.name)  # a lost frame stops the telescope first
             if check is not None:
@@ -3160,6 +3322,7 @@ class Sequencer:
     ) -> np.ndarray:
         """One light exposure, saved (with imaging) and returned in FITS
         order (rows = y): what a calibration routine measures."""
+        self._camera_usable(unit)
         imaging = self.imaging
         if imaging is not None:
             imaging.check(unit.name)
@@ -3699,6 +3862,7 @@ class Sequencer:
         imaging = self.imaging
 
         async def expose(exptime: float) -> np.ndarray:
+            self._camera_usable(unit)
             if imaging is not None:
                 imaging.check(unit.name)
             i = len(taken)

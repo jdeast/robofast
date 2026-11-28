@@ -223,7 +223,9 @@ async def test_out_of_tolerance_warns_once_and_exposes_anyway(make_rig, tmp_path
     )  # fmt: skip
     rig = make_rig(plan=plan)
     rig.cam.coldest = -25.0  # a warm night: the cooler cannot reach -30
-    cooled(rig, settle_timeout=0.3)
+    # "warn": exposing anyway (the default, "fault", is
+    # tests/core/test_cooling_fault.py).
+    cooled(rig, settle_timeout=0.3, not_settled="warn")
     imaging = attach(rig, tmp_path)
     await run_night(rig, imaging)
     [w] = rig.timeline.events("cooling_not_settled")

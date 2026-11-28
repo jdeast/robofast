@@ -20,9 +20,12 @@ has the Aqawan's fault channel. The failures that hit MINERVA:
 time, night1121-1124), ``dome_fault`` (the enclosure reports a fault while
 open, then it clears: April 2026's shutter faults), ``dome_hang`` (the dome
 stops answering), ``spec_hang``/``spec_down`` (the KiwiSpec service runs
-every request into its timeout, night1123, or refuses it) and
+every request into its timeout, night1123, or refuses it),
 ``guide_lost`` (clouds over one telescope: its star is lost, and its
-acquisitions time out).
+acquisitions time out) and ``cam_warm`` (a camera's cooler on at full
+power but its CCD stuck at room temperature, MINERVA T4 2026-11-27/28:
+both cameras are cooled to -50 C here, with no camera ladder, so the
+camera is disabled for the night).
 Faults of one kind on one device may overlap (the device is faulted while
 any is active).
 
@@ -42,7 +45,7 @@ I4  recovery is automatic: an exposure after the last fault clears, unless
     every telescope gave up for the night.
 I5  no target of opportunity is lost: every ToO rung into the drop box is
     taken in at once (within 1 s) and started before the night ends, unless
-    its telescope gave up.
+    its telescope gave up (or its camera was disabled: they are imaging).
 I6  no light exposure (image or spectrum) starts while the dome is not open.
 I7  the lease is revoked for an unreadable fault channel only once it has
     been unreadable for ``fault_unreadable_grace`` (never one failed read).
@@ -61,6 +64,10 @@ I14 spectroscopy resumes after the spectrograph answers again.
 I15 imaging goes on while the spectrograph is marked down.
 I16 clouds never put a telescope out for the night: the guider ladder
     brings it back.
+I17 no light frame starts on a CCD that is too warm (beyond the tolerance
+    above its setpoint, its cooler on) once its cooler was last set more
+    than ``settle_timeout`` ago; a telescope whose camera is disabled does
+    not give up (it feeds spectra).
 
 ``FAULT_NIGHTS`` (default 20) and ``FAULT_SEED`` (default 0) choose the
 seeds; a failure names its seed, and the same seed replays the same night.
@@ -101,6 +108,7 @@ from typing import Any
 import pytest
 
 from robofast import SequencerConfig
+from robofast.cooling import CameraCooling, CoolingConfig
 from robofast.doorbell import ring
 from robofast.recovery import RecoveryLadder
 from robofast.spectra import SpectrumRecorder
@@ -149,13 +157,17 @@ KINDS = (
     "cam_fail", "cam_hang", "tel_fail", "tel_hang", "flicker", "too", "too",
     "cam_restart", "tel_restart",
     "dome_flaky", "dome_flaky", "dome_fault", "dome_hang",
-    "spec_hang", "spec_down", "guide_lost", "guide_lost",
+    "spec_hang", "spec_down", "guide_lost", "guide_lost", "cam_warm",
 )  # fmt: skip
 #: Kinds that hit one telescope (the fault's index), not the enclosure.
 PER_TELESCOPE = ("cam", "tel", "guide")
 #: MINERVA's enclosure fault channel (the Aqawan's ``Faults``) and its grace
 #: for an unreadable read (SafetyConfig's default; night1124).
 FAULT_CHANNEL = dict(fault_action="Faults", fault_unreadable_grace=15.0)
+#: MINERVA T1's camera cooling (sites/minerva/aqawan1.json), at the
+#: shipped poll; ``cam_warm`` sticks the CCD at ``WARM``.
+COOLING = CoolingConfig(setpoint=-50.0, tolerance=0.75, settle_timeout=900.0)
+WARM = 20.7
 #: MINERVA's guider recovery ladder (its tN-recovery.json).
 GUIDER_LADDER = {
     "guider": {"steps": ["reconnect"], "escalate_window": 300, "requires_parked": False}
@@ -231,6 +243,7 @@ async def test_a_night_of_faults(make_rig, tmp_path, seed):
         guiders.append(CloudyGuider(rig.timeline, name))
         seqr.units[name].guider = guiders[-1]
         seqr.units[name].recovery = RecoveryLadder.from_config(name, GUIDER_LADDER)
+        seqr.units[name].cooling = CameraCooling(name, COOLING)
     sp = SHIPPED_SAFETY
     grace = FAULT_CHANNEL["fault_unreadable_grace"]
     viol: list[str] = []
@@ -283,17 +296,42 @@ async def test_a_night_of_faults(make_rig, tmp_path, seed):
 
     rig.dome.OpenShutter = opened
     light_starts: list[float] = []
+    # I17's truth: when each camera's setpoint was last commanded, and since
+    # when its CCD has been stuck warm (cam_warm).
+    cooler_set = [-1e18 for _ in rig.cams]
+    warm_since: list[float | None] = [None for _ in rig.cams]
     for i, cam in enumerate(rig.cams):
         start = cam.StartExposure
+        cam_set = cam.set
 
-        def started(duration, light, _start=start, _i=i) -> None:
+        async def set_member(member, value, *, timeout=None, _set=cam_set, _i=i):
+            await _set(member, value, timeout=timeout)
+            if member == "SetCCDTemperature":
+                cooler_set[_i] = time.monotonic()
+
+        cam.set = set_member
+
+        def started(duration, light, _start=start, _i=i, _cam=cam) -> None:
+            now = time.monotonic()
             if light:
-                light_starts.append(time.monotonic() - t0)
+                light_starts.append(now - t0)
                 if not rig.dome_open():
                     viol.append(
-                        f"I6 t={time.monotonic() - t0:.0f}s: t{_i + 1} light frame,"
-                        f" dome {rig.dome.state()}"
+                        f"I6 t={now - t0:.0f}s: t{_i + 1} light frame, dome {rig.dome.state()}"
                     )
+            ws = warm_since[_i]
+            if (
+                ws is not None
+                and now - ws > 5.0
+                and now - cooler_set[_i] > COOLING.settle_timeout + 5.0
+                and _cam.CoolerOn
+                and _cam.CCDTemperature > COOLING.setpoint + COOLING.tolerance
+            ):
+                viol.append(
+                    f"I17 t={now - t0:.0f}s: t{_i + 1} exposing with its CCD at"
+                    f" {_cam.CCDTemperature:.1f} C (setpoint {COOLING.setpoint} C), cooler set"
+                    f" {now - cooler_set[_i]:.0f}s ago"
+                )
             _start(duration, light)
 
         cam.StartExposure = started
@@ -365,6 +403,11 @@ async def test_a_night_of_faults(make_rig, tmp_path, seed):
             spec.mode = "hang" if hung else "down" if refs.get(("spec_down", None)) else None
         elif kind == "guide_lost":
             guiders[i].set_clouds(on)
+        elif kind == "cam_warm":
+            # The cooler runs, the CCD stays warm (until the fault ends).
+            cam = rig.cams[i]
+            cam.coldest = WARM if on else None
+            warm_since[i] = time.monotonic() if on else None
         elif kind[:3] in ("cam", "tel"):
             dev = (rig.cams if kind.startswith("cam") else rig.tels)[i]
             if kind.endswith("restart"):
@@ -568,7 +611,8 @@ async def test_a_night_of_faults(make_rig, tmp_path, seed):
         started_too = [
             e for e in tl.events("target_start") if e.detail["target"].startswith(f"{gid} ")
         ]
-        if not started_too and tel in working:
+        # An imaging ToO waits for good on a telescope whose camera is disabled.
+        if not started_too and tel in working and seqr.units[tel].camera_disabled is None:
             viol.append(f"I5: {gid} (rung at {rung - t0:.0f}s, {tel}) never started")
     # I7: the lease is revoked for an unreadable fault channel only once it
     # has been unreadable for the grace (never for one failed read).
@@ -593,7 +637,10 @@ async def test_a_night_of_faults(make_rig, tmp_path, seed):
         if end < quiet and last_fault < quiet and not [t for t in done if t > end]:
             viol.append(f"I14: no spectrum after the spectrograph came back at {end:.0f}s")
     # I15: imaging goes on while the spectrograph is down.
+    disabled_at = {e.detail["telescope"]: e.t - t0 for e in tl.events("camera_disabled", "seq")}
     for k, due in imaging_due.items():
+        if len(disabled_at) == len(seqr.units) and max(disabled_at.values()) <= due[-1]:
+            continue  # no camera left to image with
         if len(due) >= 1200 and not [t for t in light_starts if due[0] <= t <= due[-1] + 60]:
             viol.append(
                 f"I15: spectrograph down {outages[k][0]:.0f}-{outages[k][1]:.0f}s,"
@@ -612,6 +659,16 @@ async def test_a_night_of_faults(make_rig, tmp_path, seed):
                 f"I16 t={e.t - t0:.0f}s: {e.detail['telescope']} gave up over its guider"
                 f" ({e.detail.get('reason') or errors[-1].detail['error']})"
             )
+    # I17: a disabled camera does not put its telescope out for the night.
+    for e in tl.events("giving_up", "seq"):
+        name = e.detail["telescope"]
+        errors = [
+            x
+            for x in tl.events("telescope_error", "seq")
+            if x.detail["telescope"] == name and x.t <= e.t
+        ]
+        if errors and "camera cooling fault" in errors[-1].detail["error"]:
+            viol.append(f"I17 t={e.t - t0:.0f}s: {name} gave up over its camera's cooling")
     assert not viol, f"seed {seed}: " + "; ".join(viol)
 
 

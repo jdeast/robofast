@@ -1524,6 +1524,10 @@ class Rehearsal(SimulatedNight):
                     "cooling_set",
                     "cooling_unsupported",
                     "cooling_not_settled",
+                    "cooling_fault",
+                    "cooling_recovered",
+                    "cooling_not_recovered",
+                    "camera_disabled",
                     "giving_up",
                     "plan_exhausted",
                     "observe_start",
@@ -1663,6 +1667,9 @@ def check(o: RehearsalOutcome) -> list[str]:
         bad.append("the night did not end by itself")
     if any(u.gave_up for u in o.runs["night"].units.values()):
         bad.append("a telescope gave up")
+    for u in o.runs["night"].units.values():
+        if u.camera_disabled is not None:
+            bad.append(f"{u.name}: camera disabled ({u.camera_disabled[:200]})")
     for name, rec in o.end.items():
         if rec.get("error"):
             continue  # in o.errors
@@ -1817,7 +1824,15 @@ def summary(o: RehearsalOutcome) -> str:
                 f"recovery {d['telescope']} {d['device']}:"
                 f" {'recovered' if d['recovered'] else 'NOT recovered'} ({'; '.join(d['tried'])})"
             )
-        for what in ("cooling_set", "cooling_unsupported", "cooling_not_settled"):
+        for what in (
+            "cooling_set",
+            "cooling_unsupported",
+            "cooling_not_settled",
+            "cooling_fault",
+            "cooling_recovered",
+            "cooling_not_recovered",
+            "camera_disabled",
+        ):
             for e in night.events(what, SEQUENCER):
                 d = e.detail
                 lines.append(

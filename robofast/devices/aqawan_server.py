@@ -144,6 +144,7 @@ from robofast.devices.aqawan_pac import (
     HardwareNotAllowed,
     PACClient,
     PACError,
+    PACPreempted,
     PACReadOnly,
     PACRefused,
     PACStatus,
@@ -847,6 +848,11 @@ class AqawanServer(ThreadingHTTPServer):
         except PACReadOnly as exc:
             log.warning("%s: %s", what, exc)
             raise AlpacaException(INVALID_OPERATION, str(exc)) from None
+        except PACPreempted as exc:
+            # A close (or other priority command) took the channel on
+            # purpose; the caller is told, but it is not a fault.
+            log.info("%s: %s", what, exc)
+            raise AlpacaException(DRIVER_ERROR, str(exc)) from None
         except PACRefused as exc:
             log.error("%s: %s", what, exc)
             raise AlpacaException(PAC_REFUSED, str(exc)) from None

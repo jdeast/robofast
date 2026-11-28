@@ -141,6 +141,9 @@ class RemoteSupervisor:
 
 
 class RemoteLease(OpenLease):
+    #: The longest pause between attempts to deliver a release (seconds).
+    RELEASE_RETRY_MAX = 30.0
+
     def __init__(self, client: RemoteSupervisor, state: dict[str, Any]) -> None:
         super().__init__(state["id"], state["holder"], state["ttl"])
         self.token: str = state["token"]
@@ -209,17 +212,42 @@ class RemoteLease(OpenLease):
         self._client._spawn(self._send("release"), f"lease-{self.token}-release")
 
     async def _send(self, action: str, attempts: int = 3) -> None:
-        for attempt in range(attempts):
+        """POST ``action`` for this lease. A release is retried until it is
+        delivered (it is idempotent, and an undelivered one blocks every new
+        lease until a restart or an operator clears it: night1124, where the
+        process had run out of file descriptors). Other actions get
+        ``attempts`` tries."""
+        attempt = 0
+        while True:
             try:
                 await self._client._call("POST", f"/leases/{self.token}/{action}")
+                if attempt >= attempts:
+                    log.warning(
+                        "lease %s: %s delivered at attempt %d", self.token, action, attempt + 1
+                    )
                 return
             except (httpx.HTTPError, SupervisorAPIError, ValueError) as exc:
                 # Harmless if the supervisor is gone or restarted (the lease
                 # died with it); otherwise an undelivered release fails closed
                 # (no new lease until it arrives), and an undelivered
                 # quarantine still leaves the lease blocking new ones.
-                log.warning("lease %s: %s not delivered: %r", self.token, action, exc)
                 if isinstance(exc, SupervisorAPIError) and "HTTP 404" in str(exc):
                     return
-            if attempt + 1 < attempts:
-                await asyncio.sleep(self._client.retry)
+                attempt += 1
+                if attempt < attempts:
+                    log.warning("lease %s: %s not delivered: %r", self.token, action, exc)
+                elif action != "release":
+                    log.warning("lease %s: %s not delivered: %r", self.token, action, exc)
+                    return
+                elif attempt == attempts:
+                    log.error(
+                        "lease %s: release not delivered after %d attempts (%r); no new"
+                        " lease until it is: retrying every %g s at most",
+                        self.token,
+                        attempts,
+                        exc,
+                        self.RELEASE_RETRY_MAX,
+                    )
+            await asyncio.sleep(
+                min(self._client.retry * 2 ** max(0, attempt - 1), self.RELEASE_RETRY_MAX)
+            )

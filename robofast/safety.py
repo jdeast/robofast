@@ -546,6 +546,8 @@ class SafetySupervisor:
         self._fault: str | None = "not read yet" if self._faults else None
         self._fault_kind: object = "not read yet"  # (fault, error), or why unknown
         self._fault_escalated = False
+        #: When each alarm message was last raised (_alarm's dedupe).
+        self._alarmed_at: dict[str, float] = {}
         #: Since when the fault channel has failed to read (None: it reads).
         self._fault_unreadable_since: float | None = None
         #: The enclosure reports an emergency stop (never cleared automatically).
@@ -1202,11 +1204,27 @@ class SafetySupervisor:
         self.shutter = int(status)
         return self.shutter
 
+    #: An alarm among the last few is not raised again within this many
+    #: seconds. Comparing with the last alarm only let two alternating alarms
+    #: through on every loop: night1124 logged "lease ... orphaned" 643 times.
+    ALARM_REPEAT = 300.0
+
     def _alarm(self, msg: str, level: str = "alarm") -> None:
-        if not self.alarms or self.alarms[-1] != msg:
-            self.alarms.append(msg)
-            self.timeline.event(self.name, "alarm", msg=msg, level=level)
-            (log.critical if level == "critical" else log.error)("%s: %s", self.name, msg)
+        now = time.monotonic()
+        last = self._alarmed_at.get(msg)
+        if self.alarms and (
+            self.alarms[-1] == msg
+            or (
+                msg in list(self.alarms)[-4:]
+                and last is not None
+                and now - last < self.ALARM_REPEAT
+            )
+        ):
+            return
+        self._alarmed_at[msg] = now
+        self.alarms.append(msg)
+        self.timeline.event(self.name, "alarm", msg=msg, level=level)
+        (log.critical if level == "critical" else log.error)("%s: %s", self.name, msg)
 
     def _want_open(self, now: float) -> bool:
         lease = self._lease
@@ -1789,7 +1807,12 @@ class SafetySupervisor:
                     )
                     self._pinged_at = time.monotonic()
                 except DeviceError as exc:
-                    self._alarm(f"heartbeat ping failed: {exc}")
+                    if "pre-empted" in str(exc):
+                        # A close took the PAC channel on purpose (night1121-
+                        # 1124 logged these as ERRORs); the next ping follows.
+                        log.info("%s: heartbeat ping pre-empted: %s", self.name, exc)
+                    else:
+                        self._alarm(f"heartbeat ping failed: {exc}")
             elif age is not None:
                 self._alarm(
                     f"enclosure loop stuck > {cfg.heartbeat_max_loop_age} s; heartbeat withheld"

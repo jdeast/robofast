@@ -105,6 +105,15 @@ once, with the reasons (logged, in the plan record's ``refused`` entry and
 in :attr:`DispatchScheduler.refused`). Both are kept in the state file, so a
 restart does not try again.
 
+A telescope whose camera the sequencer disabled for the night (a cooler
+that cannot reach its setpoint: :meth:`DispatchScheduler.set_camera_available`)
+gets no configuration whose kind takes camera frames (``camera``:
+imaging, darks, flats, focus, pointing runs, lamp frames) while it is
+disabled: the reason is "<telescope>'s camera is disabled (...)". That is
+not a refusal: the configuration goes to another telescope, or waits (and
+expires at the end of its window). Spectra and spectrograph calibrations
+are still scheduled on it.
+
 Spectra fed by several telescopes
 ---------------------------------
 A ``SPECTRUM`` configuration (:mod:`robofast.request_model`) is taken
@@ -501,6 +510,10 @@ class DispatchScheduler:
         #: Why the spectrograph is down (:meth:`set_spectrograph_available`),
         #: or None: while it is down no SPECTRUM configuration is scheduled.
         self.spectrograph_down: str | None = None
+        #: Telescopes whose camera the sequencer disabled tonight, and why
+        #: (:meth:`set_camera_available`): nothing that needs the camera is
+        #: scheduled on them.
+        self.camera_down: dict[str, str] = {}
         #: Target vetting at intake (:class:`robofast.vetting.Vetter`,
         #: docs/sky.md), and its results by group id.
         self.vetter = vetter
@@ -555,6 +568,29 @@ class DispatchScheduler:
         self.spectrograph_down = down
         log.warning("spectrograph %s", "available again" if down is None else f"down: {down}")
         self._record(self.clock(), "spectrograph", available=available, reason=reason)
+
+    def set_camera_available(self, telescope: str, available: bool, reason: str = "") -> None:
+        """The sequencer's verdict on ``telescope``'s science camera (module
+        doc, "What a telescope cannot do"): while it is disabled (a cooler
+        that cannot reach its setpoint), no configuration whose kind uses
+        the camera is scheduled on that telescope; they go to another
+        telescope, or wait. Spectra still are. Not kept in the state file:
+        the sequencer says it at the start of every night."""
+        if telescope not in self.limits:
+            return
+        if available:
+            if self.camera_down.pop(telescope, None) is None:
+                return
+            log.warning("%s: camera available again", telescope)
+        else:
+            why = reason or "disabled"
+            if self.camera_down.get(telescope) == why:
+                return
+            self.camera_down[telescope] = why
+            log.warning("%s: camera disabled: %s", telescope, why)
+        self._record(
+            self.clock(), "camera", telescope=telescope, available=available, reason=reason
+        )
 
     def set_capabilities(self, telescope: str, caps: dict[str, bool]) -> None:
         """What ``telescope`` can do, read from its devices by the sequencer
@@ -1388,6 +1424,8 @@ class DispatchScheduler:
                         why = requestable(self.sequences[ic.sequence], c.type)
                         if why is not None:
                             reasons.append(why)
+        if telescope in self.camera_down and any(c.kind.camera for c in configs):
+            reasons.append(f"{telescope}'s camera is disabled ({self.camera_down[telescope]})")
         if any(c.kind.spectrograph for c in configs):
             if self.spectrograph_down is not None:
                 reasons.append(f"spectrograph down ({self.spectrograph_down})")

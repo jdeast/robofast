@@ -40,6 +40,12 @@ service use when present:
 * ``set_capabilities(telescope, caps)`` -- what the telescope can do, read
   from its devices before its first observation (``{"tracking_rates":
   bool}``), so the plan can avoid handing out what would be unsupported;
+* ``set_camera_available(telescope, available, reason)`` -- the
+  telescope's science camera was disabled for the night (a cooler that
+  cannot reach its setpoint; docs/cooling.md) or is available (said at the
+  start of every night): while disabled, hand that telescope nothing whose
+  kind takes camera frames (spectra are fine); the sequencer reports any
+  such observation ``unsupported``;
 * a ``files`` keyword on ``report`` -- with the sequencer's frame pipeline
   (:mod:`robofast.imaging`) on, the sequencer passes the observation's
   written frames as paths relative to the data root (a ``complete`` report

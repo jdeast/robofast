@@ -70,6 +70,16 @@ by every rung that reconnects it -- the camera owner's `on_connect` hook
 runs on each fresh connection -- because MINERVA T1's Andor ASCOM driver
 switches its cooler off whenever it is connected again.
 
+A cooled camera whose cooler is on but cannot bring the CCD to its setpoint
+within the settle time (a **cooling fault**, docs/cooling.md, "A cooler
+that cannot reach its setpoint"; MINERVA T4, 2026-11-27/28) climbs the
+camera's ladder too. Each rung must then also see the CCD reach its
+setpoint (the cooler set again, up to `recovery_settle_timeout`, default
+the camera's `settle_timeout`; the rung's bound grows by that) before it
+counts. An exhausted ladder (after its escalation) -- or no `camera` ladder
+at all -- **disables the camera** for the night instead of giving up on the
+telescope: no imaging on it, and it goes on feeding spectra.
+
 After each rung the device must answer (`AtPark`, `CameraState`, `Position`
 read within `verify_timeout`; the guider: `GET /status` answering and not
 `failed`), else the next rung is tried. A PWI telescope

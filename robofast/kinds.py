@@ -136,6 +136,12 @@ class ObservationKind:
     shutter: ClassVar[bool] = False
     #: Its request types are always guided.
     always_guided: ClassVar[bool] = False
+    #: It takes frames with the telescope's science camera: True (refused
+    #: while that camera is disabled, and not scheduled on that telescope:
+    #: robofast/sequencer.py, "A camera that cannot reach its setpoint"),
+    #: False (it never does: spectra, through the guide camera and the
+    #: spectrograph), or None (it depends: each exposure is checked).
+    camera: ClassVar[bool | None] = True
 
     # -- validation -------------------------------------------------------------------
 
@@ -247,6 +253,8 @@ class Manual(ObservationKind):
 
     name = "manual"
     stage = "before_setup"
+    #: The operator's: each exposure it takes is checked.
+    camera = None
 
     def validate(self, obs: Observation) -> None:
         if not obs.light:
@@ -396,6 +404,7 @@ class Spectrum(ObservationKind):
     spectrograph = True
     fiber = True
     always_guided = True
+    camera = False
 
     def validate(self, obs: Observation) -> None:
         super().validate(obs)
@@ -457,6 +466,7 @@ class SpectrographCalibration(ObservationKind):
     light = False
     fields = ("calibration",)
     spectrograph = True
+    camera = False
 
     def validate(self, obs: Observation) -> None:
         if obs.light:
@@ -562,6 +572,8 @@ class SequenceKind(ObservationKind):
 
     name = "sequence"
     fields = ("sequence", "sequence_params")
+    #: Its steps say: each exposure is checked.
+    camera = None
 
     def validate(self, obs: Observation) -> None:
         if not isinstance(obs.sequence, str) or not obs.sequence:

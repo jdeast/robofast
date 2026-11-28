@@ -53,7 +53,13 @@ service's ``GET /status``, answering and not ``failed``.
 
 Every reconnection runs the device owner's ``on_connect`` hook: a cooled
 camera's cooler is set again there (robofast/cooling.py; MINERVA T1's
-Andor driver switches it off on a reconnect).
+Andor driver switches it off on a reconnect). A camera's **cooling fault**
+(its cooler on, the CCD not at its setpoint after the settle time:
+:class:`~robofast.cooling.CoolingFault`) climbs the camera's ladder too;
+there each rung also sets the cooler again and must see the CCD reach its
+setpoint (``recover``'s ``check``) before it counts as a recovery, and an
+exhausted ladder disables the camera for the night rather than giving up
+on the telescope (robofast/sequencer.py, docs/cooling.md).
 
 On a telescope served by robofast's PWI server (it answers
 ``Action("Status")``), ``reconnect`` and ``restart`` also reconnect PWI to
@@ -423,6 +429,8 @@ class RecoveryLadder:
         others: Callable[[str, str], Awaitable[Any]] | None = None,
         call: Callable[..., Awaitable[Any]] | None = None,
         mount: MountAccess | None = None,
+        check: Callable[[], Awaitable[Any]] | None = None,
+        check_time: float = 0.0,
     ) -> RecoveryResult:
         """Climb ``kind``'s ladder (module doc). ``reconnect()`` drops its
         client (it may return an awaitable: the guider's asks its service);
@@ -431,7 +439,10 @@ class RecoveryLadder:
         preconditions); ``call(member, *args)`` calls one of its methods
         (a telescope's PWI actions and ``FindHome``; None: none). ``mount``
         reaches the telescope itself, to bring it back after a power cycle
-        with ``requires_pwi_stop``."""
+        with ``requires_pwi_stop``. ``check()``, if given, runs after each
+        rung's verify and must pass too (a camera's cooling fault: the CCD
+        back at its setpoint, robofast/cooling.py), bounded by a further
+        ``check_time`` s."""
         pol = self.policies[kind]
         now = self.clock()
         if now - self.last_failure.get(kind, -1e18) > pol.escalate_window:
@@ -448,12 +459,14 @@ class RecoveryLadder:
                 # The cycle, its boot, and the home after it (module doc).
                 bound += pol.home_timeout
             try:
-                async with asyncio.timeout(bound + pol.verify_timeout):
+                async with asyncio.timeout(bound + pol.verify_timeout + check_time):
                     await self._rung(rung, kind, pol, reconnect, probe, others, call, mount)
                     # A mount whose own power was cut counts only once homed.
                     await self._verify(
                         kind, pol, reconnect, probe, call, homed=rung == "powercycle"
                     )
+                    if check is not None:
+                        await check()
             except Skipped as exc:
                 why = str(exc)
                 tried.append((rung, f"skipped: {why}"))
